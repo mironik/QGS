@@ -14,6 +14,14 @@ pub const WIRE_HEADER_LEN: usize = 24;
 /// Maximum payload size accepted by QGS v0.1 wire decoding.
 pub const MAX_PAYLOAD_LEN: u32 = 4096;
 
+/// Maximum number of devices in one DEVICE_LIST response.
+pub const MAX_DEVICE_COUNT: usize = 16;
+
+/// Maximum UTF-8 device name size in bytes.
+pub const MAX_DEVICE_NAME_LEN: usize = 128;
+
+const DEVICE_ENTRY_FIXED_LEN: usize = 32;
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ProtocolVersion {
     pub major: u16,
@@ -96,6 +104,7 @@ impl TryFrom<u8> for MessageKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Request {
     Hello(HelloRequest),
+    EnumerateDevices(EnumerateDevicesRequest),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -114,9 +123,13 @@ impl HelloRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnumerateDevicesRequest;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Response {
     Welcome(WelcomeResponse),
     Error(ErrorResponse),
+    DeviceList(DeviceListResponse),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,6 +141,128 @@ pub struct WelcomeResponse {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ErrorResponse {
     pub code: ProtocolErrorCode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceListResponse {
+    pub devices: Vec<DeviceDesc>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DeviceId(u64);
+
+impl DeviceId {
+    pub fn new(raw: u64) -> Result<Self, ProtocolError> {
+        if raw == 0 {
+            Err(ProtocolError::InvalidDeviceId)
+        } else {
+            Ok(Self(raw))
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceClass {
+    IntegratedGpu,
+    DiscreteGpu,
+    Software,
+    Other,
+}
+
+impl DeviceClass {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::IntegratedGpu => 1,
+            Self::DiscreteGpu => 2,
+            Self::Software => 3,
+            Self::Other => 4,
+        }
+    }
+}
+
+impl TryFrom<u8> for DeviceClass {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::IntegratedGpu),
+            2 => Ok(Self::DiscreteGpu),
+            3 => Ok(Self::Software),
+            4 => Ok(Self::Other),
+            _ => Err(ProtocolError::MalformedPayload),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendApi {
+    Vulkan,
+}
+
+impl BackendApi {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::Vulkan => 1,
+        }
+    }
+}
+
+impl TryFrom<u8> for BackendApi {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Vulkan),
+            _ => Err(ProtocolError::MalformedPayload),
+        }
+    }
+}
+
+impl fmt::Display for BackendApi {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Vulkan => write!(f, "Vulkan"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApiVersion {
+    pub major: u16,
+    pub minor: u16,
+    pub patch: u16,
+}
+
+impl ApiVersion {
+    pub const fn new(major: u16, minor: u16, patch: u16) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+}
+
+impl fmt::Display for ApiVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceDesc {
+    pub id: DeviceId,
+    pub class: DeviceClass,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub name: String,
+    pub backend: BackendApi,
+    pub api_version: ApiVersion,
+    pub driver_version: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -149,6 +284,12 @@ pub enum ProtocolErrorCode {
     InvalidSessionId = 10,
     SessionIdsExhausted = 11,
     InvalidFlags = 12,
+    InvalidDeviceId = 13,
+    DeviceCountTooLarge = 14,
+    DeviceNameTooLong = 15,
+    InvalidUtf8 = 16,
+    SessionRequired = 17,
+    DiscoveryFailed = 18,
 }
 
 impl ProtocolErrorCode {
@@ -174,6 +315,12 @@ impl TryFrom<u32> for ProtocolErrorCode {
             10 => Ok(Self::InvalidSessionId),
             11 => Ok(Self::SessionIdsExhausted),
             12 => Ok(Self::InvalidFlags),
+            13 => Ok(Self::InvalidDeviceId),
+            14 => Ok(Self::DeviceCountTooLarge),
+            15 => Ok(Self::DeviceNameTooLong),
+            16 => Ok(Self::InvalidUtf8),
+            17 => Ok(Self::SessionRequired),
+            18 => Ok(Self::DiscoveryFailed),
             _ => Err(ProtocolError::MalformedPayload),
         }
     }
@@ -185,6 +332,7 @@ pub enum ProtocolError {
         actual: u32,
     },
     InvalidSessionId,
+    InvalidDeviceId,
     SessionIdsExhausted,
     UnknownMessageKind {
         kind: u8,
@@ -211,6 +359,17 @@ pub enum ProtocolError {
     InvalidFlags {
         flags: u16,
     },
+    DeviceCountTooLarge {
+        count: usize,
+        max: usize,
+    },
+    DeviceNameTooLong {
+        len: usize,
+        max: usize,
+    },
+    InvalidUtf8,
+    SessionRequired,
+    DiscoveryFailed,
     MalformedPayload,
     InvalidVersionRange {
         min: ProtocolVersion,
@@ -228,6 +387,7 @@ impl fmt::Display for ProtocolError {
         match self {
             Self::InvalidMagic { actual } => write!(f, "invalid protocol magic: {actual:#010x}"),
             Self::InvalidSessionId => write!(f, "session id must be non-zero"),
+            Self::InvalidDeviceId => write!(f, "device id must be non-zero"),
             Self::SessionIdsExhausted => write!(f, "session ids are exhausted"),
             Self::UnknownMessageKind { kind } => write!(f, "unknown message kind: {kind}"),
             Self::UnknownOpcode { kind, opcode } => {
@@ -252,6 +412,15 @@ impl fmt::Display for ProtocolError {
                 write!(f, "payload has {len} trailing bytes")
             }
             Self::InvalidFlags { flags } => write!(f, "invalid flags: {flags:#06x}"),
+            Self::DeviceCountTooLarge { count, max } => {
+                write!(f, "device count {count} exceeds maximum {max}")
+            }
+            Self::DeviceNameTooLong { len, max } => {
+                write!(f, "device name length {len} exceeds maximum {max}")
+            }
+            Self::InvalidUtf8 => write!(f, "invalid UTF-8 device name"),
+            Self::SessionRequired => write!(f, "session required"),
+            Self::DiscoveryFailed => write!(f, "device discovery failed"),
             Self::MalformedPayload => write!(f, "malformed payload"),
             Self::InvalidVersionRange { min, max } => {
                 write!(f, "invalid protocol version range: {min}..={max}")
@@ -275,6 +444,7 @@ impl From<&ProtocolError> for ProtocolErrorCode {
         match value {
             ProtocolError::InvalidMagic { .. } => Self::InvalidMagic,
             ProtocolError::InvalidSessionId => Self::InvalidSessionId,
+            ProtocolError::InvalidDeviceId => Self::InvalidDeviceId,
             ProtocolError::SessionIdsExhausted => Self::SessionIdsExhausted,
             ProtocolError::UnknownMessageKind { .. } => Self::UnknownMessageKind,
             ProtocolError::UnknownOpcode { .. } => Self::UnknownOpcode,
@@ -285,6 +455,11 @@ impl From<&ProtocolError> for ProtocolErrorCode {
                 Self::MalformedPayload
             }
             ProtocolError::InvalidFlags { .. } => Self::InvalidFlags,
+            ProtocolError::DeviceCountTooLarge { .. } => Self::DeviceCountTooLarge,
+            ProtocolError::DeviceNameTooLong { .. } => Self::DeviceNameTooLong,
+            ProtocolError::InvalidUtf8 => Self::InvalidUtf8,
+            ProtocolError::SessionRequired => Self::SessionRequired,
+            ProtocolError::DiscoveryFailed => Self::DiscoveryFailed,
             ProtocolError::InvalidVersionRange { .. } => Self::InvalidVersionRange,
             ProtocolError::UnsupportedVersion { .. } => Self::UnsupportedVersion,
         }
@@ -304,12 +479,14 @@ pub fn validate_header(header: &MessageHeader) -> Result<(), ProtocolError> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestOpcode {
     Hello,
+    EnumerateDevices,
 }
 
 impl RequestOpcode {
     const fn wire_value(self) -> u8 {
         match self {
             Self::Hello => 1,
+            Self::EnumerateDevices => 2,
         }
     }
 }
@@ -318,6 +495,7 @@ impl RequestOpcode {
 pub enum ResponseOpcode {
     Welcome,
     Error,
+    DeviceList,
 }
 
 impl ResponseOpcode {
@@ -325,6 +503,7 @@ impl ResponseOpcode {
         match self {
             Self::Welcome => 1,
             Self::Error => 2,
+            Self::DeviceList => 3,
         }
     }
 }
@@ -345,6 +524,9 @@ pub enum WireMessage {
         request_id: u64,
         request: HelloRequest,
     },
+    EnumerateDevices {
+        request_id: u64,
+    },
     Welcome {
         request_id: u64,
         response: WelcomeResponse,
@@ -353,14 +535,20 @@ pub enum WireMessage {
         request_id: u64,
         response: ErrorResponse,
     },
+    DeviceList {
+        request_id: u64,
+        response: DeviceListResponse,
+    },
 }
 
 impl WireMessage {
     pub const fn request_id(&self) -> u64 {
         match self {
             Self::Hello { request_id, .. }
+            | Self::EnumerateDevices { request_id }
             | Self::Welcome { request_id, .. }
-            | Self::Error { request_id, .. } => *request_id,
+            | Self::Error { request_id, .. }
+            | Self::DeviceList { request_id, .. } => *request_id,
         }
     }
 }
@@ -375,6 +563,12 @@ pub fn encode_wire_message(message: &WireMessage) -> Vec<u8> {
             RequestOpcode::Hello.wire_value(),
             *request_id,
             encode_hello_payload(request),
+        ),
+        WireMessage::EnumerateDevices { request_id } => (
+            MessageKind::Request,
+            RequestOpcode::EnumerateDevices.wire_value(),
+            *request_id,
+            Vec::new(),
         ),
         WireMessage::Welcome {
             request_id,
@@ -393,6 +587,15 @@ pub fn encode_wire_message(message: &WireMessage) -> Vec<u8> {
             ResponseOpcode::Error.wire_value(),
             *request_id,
             encode_error_payload(response),
+        ),
+        WireMessage::DeviceList {
+            request_id,
+            response,
+        } => (
+            MessageKind::Response,
+            ResponseOpcode::DeviceList.wire_value(),
+            *request_id,
+            encode_device_list_payload(response),
         ),
     };
 
@@ -499,6 +702,15 @@ pub fn decode_wire_message_parts(
             request_id: header.request_id,
             request: decode_hello_payload(payload)?,
         }),
+        (MessageKind::Request, 2) => {
+            if payload.is_empty() {
+                Ok(WireMessage::EnumerateDevices {
+                    request_id: header.request_id,
+                })
+            } else {
+                Err(ProtocolError::TrailingPayload { len: payload.len() })
+            }
+        }
         (MessageKind::Response, 1) => Ok(WireMessage::Welcome {
             request_id: header.request_id,
             response: decode_welcome_payload(payload)?,
@@ -506,6 +718,10 @@ pub fn decode_wire_message_parts(
         (MessageKind::Response, 2) => Ok(WireMessage::Error {
             request_id: header.request_id,
             response: decode_error_payload(payload)?,
+        }),
+        (MessageKind::Response, 3) => Ok(WireMessage::DeviceList {
+            request_id: header.request_id,
+            response: decode_device_list_payload(payload)?,
         }),
         _ => Err(ProtocolError::UnknownOpcode {
             kind: header.kind,
@@ -567,7 +783,7 @@ fn encode_wire_header(header: &WireHeader, bytes: &mut Vec<u8>) {
 
 fn validate_opcode(kind: MessageKind, opcode: u8) -> Result<(), ProtocolError> {
     match (kind, opcode) {
-        (MessageKind::Request, 1) | (MessageKind::Response, 1 | 2) => Ok(()),
+        (MessageKind::Request, 1 | 2) | (MessageKind::Response, 1..=3) => Ok(()),
         _ => Err(ProtocolError::UnknownOpcode { kind, opcode }),
     }
 }
@@ -632,6 +848,127 @@ fn decode_error_payload(bytes: &[u8]) -> Result<ErrorResponse, ProtocolError> {
     Ok(ErrorResponse {
         code: ProtocolErrorCode::try_from(read_u32(bytes, 0))?,
     })
+}
+
+fn encode_device_list_payload(response: &DeviceListResponse) -> Vec<u8> {
+    let count = response.devices.len();
+    assert!(count <= MAX_DEVICE_COUNT);
+
+    let mut bytes = Vec::with_capacity(2 + count * DEVICE_ENTRY_FIXED_LEN);
+    bytes.extend_from_slice(&(count as u16).to_le_bytes());
+
+    for device in &response.devices {
+        let name = device.name.as_bytes();
+        assert!(name.len() <= MAX_DEVICE_NAME_LEN);
+
+        bytes.extend_from_slice(&device.id.get().to_le_bytes());
+        bytes.push(device.class.wire_value());
+        bytes.push(device.backend.wire_value());
+        bytes.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&device.vendor_id.to_le_bytes());
+        bytes.extend_from_slice(&device.device_id.to_le_bytes());
+        bytes.extend_from_slice(&device.api_version.major.to_le_bytes());
+        bytes.extend_from_slice(&device.api_version.minor.to_le_bytes());
+        bytes.extend_from_slice(&device.api_version.patch.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&device.driver_version.to_le_bytes());
+        bytes.extend_from_slice(name);
+    }
+
+    bytes
+}
+
+fn decode_device_list_payload(bytes: &[u8]) -> Result<DeviceListResponse, ProtocolError> {
+    if bytes.len() < 2 {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    let count = read_u16(bytes, 0) as usize;
+    if count > MAX_DEVICE_COUNT {
+        return Err(ProtocolError::DeviceCountTooLarge {
+            count,
+            max: MAX_DEVICE_COUNT,
+        });
+    }
+
+    let minimum_len = 2_usize
+        .checked_add(
+            count
+                .checked_mul(DEVICE_ENTRY_FIXED_LEN)
+                .ok_or(ProtocolError::MalformedPayload)?,
+        )
+        .ok_or(ProtocolError::MalformedPayload)?;
+    if bytes.len() < minimum_len {
+        return Err(ProtocolError::TruncatedPayload {
+            actual: bytes.len(),
+            expected: minimum_len,
+        });
+    }
+
+    let mut offset: usize = 2;
+    let mut devices = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let fixed_end = offset
+            .checked_add(DEVICE_ENTRY_FIXED_LEN)
+            .ok_or(ProtocolError::MalformedPayload)?;
+        if fixed_end > bytes.len() {
+            return Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len() - offset,
+                expected: DEVICE_ENTRY_FIXED_LEN,
+            });
+        }
+
+        let id = DeviceId::new(read_u64(bytes, offset))?;
+        let class = DeviceClass::try_from(bytes[offset + 8])?;
+        let backend = BackendApi::try_from(bytes[offset + 9])?;
+        let name_len = read_u16(bytes, offset + 10) as usize;
+        if name_len > MAX_DEVICE_NAME_LEN {
+            return Err(ProtocolError::DeviceNameTooLong {
+                len: name_len,
+                max: MAX_DEVICE_NAME_LEN,
+            });
+        }
+
+        let name_start = fixed_end;
+        let name_end = name_start
+            .checked_add(name_len)
+            .ok_or(ProtocolError::MalformedPayload)?;
+        if name_end > bytes.len() {
+            return Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len() - name_start,
+                expected: name_len,
+            });
+        }
+
+        let name = std::str::from_utf8(&bytes[name_start..name_end])
+            .map_err(|_| ProtocolError::InvalidUtf8)?;
+
+        devices.push(DeviceDesc {
+            id,
+            class,
+            vendor_id: read_u32(bytes, offset + 12),
+            device_id: read_u32(bytes, offset + 16),
+            name: name.to_owned(),
+            backend,
+            api_version: ApiVersion::new(
+                read_u16(bytes, offset + 20),
+                read_u16(bytes, offset + 22),
+                read_u16(bytes, offset + 24),
+            ),
+            driver_version: read_u32(bytes, offset + 28),
+        });
+
+        offset = name_end;
+    }
+
+    if offset != bytes.len() {
+        return Err(ProtocolError::TrailingPayload {
+            len: bytes.len() - offset,
+        });
+    }
+
+    Ok(DeviceListResponse { devices })
 }
 
 fn read_u16(bytes: &[u8], start: usize) -> u16 {
@@ -957,5 +1294,207 @@ mod tests {
             decode_wire_message(&bytes),
             Err(ProtocolError::InvalidSessionId)
         );
+    }
+
+    #[test]
+    fn device_id_rejects_zero() {
+        assert_eq!(DeviceId::new(0), Err(ProtocolError::InvalidDeviceId));
+        assert_eq!(DeviceId::new(1).expect("device id").get(), 1);
+    }
+
+    #[test]
+    fn device_class_wire_round_trip() {
+        for class in [
+            DeviceClass::IntegratedGpu,
+            DeviceClass::DiscreteGpu,
+            DeviceClass::Software,
+            DeviceClass::Other,
+        ] {
+            assert_eq!(DeviceClass::try_from(class.wire_value()), Ok(class));
+        }
+    }
+
+    #[test]
+    fn device_desc_wire_round_trip() {
+        let message = WireMessage::DeviceList {
+            request_id: 9,
+            response: DeviceListResponse {
+                devices: vec![sample_device("Sample GPU", DeviceClass::IntegratedGpu, 1)],
+            },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn device_list_with_zero_devices_round_trips() {
+        let message = WireMessage::DeviceList {
+            request_id: 10,
+            response: DeviceListResponse {
+                devices: Vec::new(),
+            },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn device_list_with_multiple_devices_round_trips() {
+        let message = WireMessage::DeviceList {
+            request_id: 11,
+            response: DeviceListResponse {
+                devices: vec![
+                    sample_device("Integrated", DeviceClass::IntegratedGpu, 1),
+                    sample_device("Discrete", DeviceClass::DiscreteGpu, 2),
+                    sample_device("Software", DeviceClass::Software, 3),
+                ],
+            },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn accepts_maximum_valid_device_name_length() {
+        let name = "x".repeat(MAX_DEVICE_NAME_LEN);
+        let message = WireMessage::DeviceList {
+            request_id: 12,
+            response: DeviceListResponse {
+                devices: vec![sample_device(&name, DeviceClass::Other, 1)],
+            },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn rejects_overlong_device_name() {
+        let mut bytes = encode_wire_message(&WireMessage::DeviceList {
+            request_id: 13,
+            response: DeviceListResponse {
+                devices: vec![sample_device("short", DeviceClass::Other, 1)],
+            },
+        });
+        bytes[WIRE_HEADER_LEN + 2 + 10..WIRE_HEADER_LEN + 2 + 12]
+            .copy_from_slice(&((MAX_DEVICE_NAME_LEN as u16) + 1).to_le_bytes());
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::DeviceNameTooLong {
+                len: MAX_DEVICE_NAME_LEN + 1,
+                max: MAX_DEVICE_NAME_LEN,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_device_name() {
+        let mut bytes = encode_wire_message(&WireMessage::DeviceList {
+            request_id: 14,
+            response: DeviceListResponse {
+                devices: vec![sample_device("x", DeviceClass::Other, 1)],
+            },
+        });
+        let name_offset = WIRE_HEADER_LEN + 2 + DEVICE_ENTRY_FIXED_LEN;
+        bytes[name_offset] = 0xff;
+
+        assert_eq!(decode_wire_message(&bytes), Err(ProtocolError::InvalidUtf8));
+    }
+
+    #[test]
+    fn rejects_excessive_device_count() {
+        let mut bytes = encode_wire_message(&WireMessage::DeviceList {
+            request_id: 15,
+            response: DeviceListResponse {
+                devices: Vec::new(),
+            },
+        });
+        bytes[WIRE_HEADER_LEN..WIRE_HEADER_LEN + 2]
+            .copy_from_slice(&((MAX_DEVICE_COUNT as u16) + 1).to_le_bytes());
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::DeviceCountTooLarge {
+                count: MAX_DEVICE_COUNT + 1,
+                max: MAX_DEVICE_COUNT,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_device_entry() {
+        let mut bytes = encode_wire_message(&WireMessage::DeviceList {
+            request_id: 16,
+            response: DeviceListResponse {
+                devices: vec![sample_device("x", DeviceClass::Other, 1)],
+            },
+        });
+        bytes.truncate(bytes.len() - 2);
+
+        assert!(matches!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::TruncatedPayload { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_device_count() {
+        let mut bytes = encode_wire_message(&WireMessage::DeviceList {
+            request_id: 17,
+            response: DeviceListResponse {
+                devices: Vec::new(),
+            },
+        });
+        bytes[12..16].copy_from_slice(&1_u32.to_le_bytes());
+        bytes.truncate(WIRE_HEADER_LEN + 1);
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::MalformedPayload)
+        );
+    }
+
+    #[test]
+    fn preserves_request_id_for_enumerate_devices_and_device_list() {
+        let enumerate = WireMessage::EnumerateDevices { request_id: 18 };
+        let device_list = WireMessage::DeviceList {
+            request_id: 19,
+            response: DeviceListResponse {
+                devices: vec![sample_device("x", DeviceClass::Other, 1)],
+            },
+        };
+
+        let decoded_enumerate =
+            decode_wire_message(&encode_wire_message(&enumerate)).expect("enumerate");
+        let decoded_device_list =
+            decode_wire_message(&encode_wire_message(&device_list)).expect("device list");
+
+        assert_eq!(decoded_enumerate.request_id(), 18);
+        assert_eq!(decoded_device_list.request_id(), 19);
+    }
+
+    fn sample_device(name: &str, class: DeviceClass, raw_id: u64) -> DeviceDesc {
+        DeviceDesc {
+            id: DeviceId::new(raw_id).expect("device id"),
+            class,
+            vendor_id: 0x1234,
+            device_id: 0x5678,
+            name: name.to_owned(),
+            backend: BackendApi::Vulkan,
+            api_version: ApiVersion::new(1, 3, 0),
+            driver_version: 42,
+        }
     }
 }

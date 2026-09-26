@@ -3,12 +3,12 @@
 use std::path::PathBuf;
 
 use qgs_linux::{connect_socket, default_socket_path, receive_message, send_message};
-use qgs_protocol::{HelloRequest, WireMessage, CURRENT_PROTOCOL_VERSION};
+use qgs_protocol::{DeviceDesc, HelloRequest, WireMessage, CURRENT_PROTOCOL_VERSION};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = socket_path_from_args();
-    let request_id = 1;
     let mut stream = connect_socket(&socket_path)?;
+    let mut request_id = 1;
 
     send_message(
         &mut stream,
@@ -36,12 +36,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "verified HELLO -> WELCOME version={} session_id={}",
+        "QGS session established: version={} session_id={}",
         response.version,
         response.session_id.get()
     );
 
+    request_id += 1;
+    send_message(&mut stream, &WireMessage::EnumerateDevices { request_id })?;
+
+    let response = receive_message(&mut stream)?;
+    let WireMessage::DeviceList {
+        request_id: response_request_id,
+        response,
+    } = response
+    else {
+        return Err("expected DEVICE_LIST response".into());
+    };
+
+    if response_request_id != request_id {
+        return Err("device list request_id did not match request".into());
+    }
+
+    println!();
+    println!("Devices:");
+    for device in response.devices {
+        print_device(&device);
+    }
+
     Ok(())
+}
+
+fn print_device(device: &DeviceDesc) {
+    println!("- [{:?}] {}", device.class, device.name);
+    println!(
+        "  vendor=0x{:04x} device=0x{:04x} backend={} api={}",
+        device.vendor_id, device.device_id, device.backend, device.api_version
+    );
 }
 
 fn socket_path_from_args() -> PathBuf {

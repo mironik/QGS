@@ -3,6 +3,7 @@ members = [
     "crates/qgs-core",
     "crates/qgs-linux",
     "crates/qgs-protocol",
+    "crates/qgs-vulkan",
     "daemon/qgsd",
     "tools/qgs-test",
 ]

@@ -1,0 +1,11 @@
+[package]
+name = "qgs-vulkan"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+qgs-core = { path = "../qgs-core" }
+qgs-protocol = { path = "../qgs-protocol" }
+vulkano = { version = "0.35.2", default-features = false }
+

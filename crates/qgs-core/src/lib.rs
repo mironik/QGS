@@ -2,7 +2,40 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use qgs_protocol::{handle_hello, HelloRequest, ProtocolError, SessionId, WelcomeResponse};
+use qgs_protocol::{
+    handle_hello, DeviceDesc, HelloRequest, ProtocolError, SessionId, WelcomeResponse,
+};
+
+pub trait DeviceDiscovery {
+    fn enumerate_devices(&self) -> Result<Vec<DeviceDesc>, DeviceDiscoveryError>;
+}
+
+#[derive(Debug)]
+pub enum DeviceDiscoveryError {
+    BackendUnavailable,
+    BackendFailed,
+    Protocol(ProtocolError),
+}
+
+impl std::fmt::Display for DeviceDiscoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BackendUnavailable => write!(f, "device discovery backend is unavailable"),
+            Self::BackendFailed => write!(f, "device discovery backend failed"),
+            Self::Protocol(err) => {
+                write!(f, "device discovery produced invalid protocol data: {err}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DeviceDiscoveryError {}
+
+impl From<ProtocolError> for DeviceDiscoveryError {
+    fn from(value: ProtocolError) -> Self {
+        Self::Protocol(value)
+    }
+}
 
 #[derive(Debug)]
 pub struct SessionManager {
