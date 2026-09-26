@@ -53,16 +53,46 @@ Vulkan-specific types and handles stop at `qgs-vulkan`. `qgs-core` and
 `qgs-protocol` use QGS-owned device descriptions and must not expose
 `VkPhysicalDevice` or other Vulkan implementation details.
 
+## Resource Ownership Boundary
+
+The M1 buffer-resource path is:
+
+```text
+Session
+    owns
+ResourceId
+    represents
+Buffer
+    backed by
+backend resource
+```
+
+`qgs-core` owns resource lifecycle semantics. A `ResourceId` is non-zero,
+opaque, session-owned, and not persistent across daemon restarts. A resource
+must not outlive the session that owns it, and a resource from one session is
+not usable by another session. When a client disconnects, its session is
+dropped and all resources still registered under that session are released by
+Rust ownership/drop.
+
+`qgs-vulkan` owns the Vulkan implementation objects that back buffers.
+Vulkan buffers, memory objects, and handles do not escape `qgs-vulkan`.
+`qgs-protocol` owns only the protocol representation.
+
+M1 Step 5 implements buffers only. The maximum single buffer size is 64 MiB as
+a conservative M1 safety limit, not as a final product limit.
+
 ## Current Scope
 
 The initial workspace contains an explicit v0.1 protocol wire encoding, minimal
 session management, Linux Unix Domain Socket transport, and Vulkan-backed
 device enumeration and static capability discovery through the `DeviceDiscovery`
 abstraction. It reports compute queue limits, memory heap/type summaries, and
-external-memory/synchronization mechanism availability. It does not include an
-async runtime, daemonization, DRM, DMA-BUF transfer/export, video decode, video
-encode, GPU resource allocation, compute execution, workload scheduling,
-performance benchmarking, telemetry, or free-memory reporting.
+external-memory/synchronization mechanism availability. It can create and
+destroy session-owned Vulkan-backed buffer resources. It does not include an
+async runtime, daemonization, DRM, DMA-BUF transfer/export, external handle
+transfer, images, video surfaces, video decode, video encode, compute
+execution, workload scheduling, performance benchmarking, telemetry, or
+free-memory reporting.
 
 Capability discovery is static information reported by the backend. It is not a
 measurement of current load, available/free VRAM, throughput, or scheduling

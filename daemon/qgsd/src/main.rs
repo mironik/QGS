@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use qgs_core::{DeviceDiscovery, SessionManager};
+use qgs_core::{DeviceDiscovery, ResourceBackend, ResourceError, Session, SessionManager};
 use qgs_linux::{
     bind_socket, default_socket_path, receive_message, remove_socket_file, send_message,
     TransportError,
@@ -34,14 +34,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn handle_client(
     stream: &mut std::os::unix::net::UnixStream,
     sessions: &SessionManager,
-    discovery: &impl DeviceDiscovery,
+    discovery: &(impl DeviceDiscovery + ResourceBackend),
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut session_established = false;
+    let mut session: Option<Session> = None;
 
     loop {
         let message = match receive_message(stream) {
             Ok(message) => message,
             Err(TransportError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                if let Some(session) = &session {
+                    if session.resource_count() > 0 {
+                        eprintln!(
+                            "client disconnected; releasing {} resource(s) for session {}",
+                            session.resource_count(),
+                            session.id().get()
+                        );
+                    }
+                }
                 return Ok(());
             }
             Err(TransportError::Protocol(err)) => {
@@ -61,11 +70,24 @@ fn handle_client(
         let request_id = message.request_id();
 
         let response = match message {
-            WireMessage::Hello { request, .. } => match sessions.handle_hello(&request) {
-                Ok(response) => WireMessage::Welcome {
-                    request_id,
-                    response,
-                },
+            WireMessage::Hello { request, .. } => match sessions.create_session() {
+                Ok(created_session) => {
+                    match qgs_protocol::handle_hello(&request, created_session.id()) {
+                        Ok(response) => {
+                            session = Some(created_session);
+                            WireMessage::Welcome {
+                                request_id,
+                                response,
+                            }
+                        }
+                        Err(err) => WireMessage::Error {
+                            request_id,
+                            response: ErrorResponse {
+                                code: ProtocolErrorCode::from(&err),
+                            },
+                        },
+                    }
+                }
                 Err(err) => WireMessage::Error {
                     request_id,
                     response: ErrorResponse {
@@ -74,7 +96,7 @@ fn handle_client(
                 },
             },
             WireMessage::EnumerateDevices { .. } => {
-                if !session_established {
+                if session.is_none() {
                     WireMessage::Error {
                         request_id,
                         response: ErrorResponse {
@@ -100,7 +122,7 @@ fn handle_client(
                 }
             }
             WireMessage::QueryDeviceCapabilities { request, .. } => {
-                if !session_established {
+                if session.is_none() {
                     WireMessage::Error {
                         request_id,
                         response: ErrorResponse {
@@ -133,10 +155,61 @@ fn handle_client(
                     }
                 }
             }
+            WireMessage::CreateBuffer { request, .. } => {
+                if let Some(session) = &mut session {
+                    match session.create_buffer(discovery, &request.desc) {
+                        Ok(response) => WireMessage::BufferCreated {
+                            request_id,
+                            response,
+                        },
+                        Err(err) => {
+                            eprintln!("buffer creation failed: {err}");
+                            WireMessage::Error {
+                                request_id,
+                                response: ErrorResponse {
+                                    code: protocol_code_from_resource_error(&err),
+                                },
+                            }
+                        }
+                    }
+                } else {
+                    WireMessage::Error {
+                        request_id,
+                        response: ErrorResponse {
+                            code: ProtocolErrorCode::SessionRequired,
+                        },
+                    }
+                }
+            }
+            WireMessage::DestroyResource { request, .. } => {
+                if let Some(session) = &mut session {
+                    match session.destroy_resource(request.resource_id) {
+                        Ok(response) => WireMessage::ResourceDestroyed {
+                            request_id,
+                            response,
+                        },
+                        Err(err) => WireMessage::Error {
+                            request_id,
+                            response: ErrorResponse {
+                                code: protocol_code_from_resource_error(&err),
+                            },
+                        },
+                    }
+                } else {
+                    WireMessage::Error {
+                        request_id,
+                        response: ErrorResponse {
+                            code: ProtocolErrorCode::SessionRequired,
+                        },
+                    }
+                }
+            }
             WireMessage::Welcome { .. }
             | WireMessage::Error { .. }
             | WireMessage::DeviceList { .. }
-            | WireMessage::DeviceCapabilities { .. } => WireMessage::Error {
+            | WireMessage::DeviceCapabilities { .. }
+            | WireMessage::BufferCreated { .. }
+            | WireMessage::ResourceDestroyed { .. } => WireMessage::Error {
                 request_id,
                 response: ErrorResponse {
                     code: ProtocolErrorCode::from(&ProtocolError::MalformedPayload),
@@ -144,10 +217,20 @@ fn handle_client(
             },
         };
 
-        if matches!(response, WireMessage::Welcome { .. }) {
-            session_established = true;
-        }
         send_message(stream, &response)?;
+    }
+}
+
+fn protocol_code_from_resource_error(err: &ResourceError) -> ProtocolErrorCode {
+    match err {
+        ResourceError::UnknownResource => ProtocolErrorCode::UnknownResource,
+        ResourceError::InvalidBufferSize => ProtocolErrorCode::InvalidBufferSize,
+        ResourceError::AllocationFailed => ProtocolErrorCode::AllocationFailed,
+        ResourceError::UnsupportedMemoryRequirements => {
+            ProtocolErrorCode::UnsupportedMemoryRequirements
+        }
+        ResourceError::UnknownDeviceId => ProtocolErrorCode::UnknownDeviceId,
+        ResourceError::Protocol(err) => ProtocolErrorCode::from(err),
     }
 }
 

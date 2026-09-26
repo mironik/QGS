@@ -50,6 +50,46 @@ operation and must be sent after HELLO/WELCOME. Its payload is:
 | --- | ---: | --- |
 | 0 | u64 | QGS `DeviceId` from the current `qgsd` process/session |
 
+CREATE_BUFFER is request kind `1`, opcode `4`. It is a session operation and
+must be sent after HELLO/WELCOME. Its payload is a fixed-size `BufferDesc`:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `DeviceId` from the current `qgsd` process/session |
+| 8 | u64 | buffer size in bytes |
+| 16 | u32 | buffer usage flags |
+| 20 | u8 | memory preference flags |
+| 21 | 3 bytes | reserved, currently `0` |
+
+Buffer usage flag values are:
+
+| Bit | Usage |
+| ---: | --- |
+| 0 | TRANSFER_SRC |
+| 1 | TRANSFER_DST |
+| 2 | STORAGE |
+
+At least one usage flag must be set. Unknown usage bits are rejected.
+
+Memory preference flags are:
+
+| Bit | Meaning |
+| ---: | --- |
+| 0 | device-local memory preferred |
+| 1 | host-visible memory required |
+| 2 | host-coherent memory preferred |
+
+The memory model is preference/requirement based. It does not assume that GPU
+memory is split into simple RAM vs VRAM categories; integrated GPUs may select
+memory that is both device-local and host-visible.
+
+DESTROY_RESOURCE is request kind `1`, opcode `5`. It is a session operation and
+must be sent after HELLO/WELCOME. Its payload is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `ResourceId` owned by the current session |
+
 WELCOME is response kind `2`, opcode `1`. Its payload is:
 
 | Offset | Width | Field |
@@ -147,6 +187,39 @@ decisions. Interop mechanism fields report that the backend exposes the
 mechanism. They do not guarantee that every resource, image format, or usage is
 exportable/importable with that mechanism.
 
+BUFFER_CREATED is response kind `2`, opcode `5`. Its payload is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `ResourceId` |
+| 8 | u64 | buffer size in bytes |
+| 16 | u8 | selected memory property flags |
+| 17 | 7 bytes | reserved, currently `0` |
+
+Selected memory property flags are:
+
+| Bit | Meaning |
+| ---: | --- |
+| 0 | selected memory is device-local |
+| 1 | selected memory is host-visible |
+| 2 | selected memory is host-coherent |
+
+RESOURCE_DESTROYED is response kind `2`, opcode `6`. Its payload is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | destroyed QGS `ResourceId` |
+
+`ResourceId` is a non-zero, opaque, QGS-owned identifier. It does not expose
+pointers, Vulkan handles, file descriptors, or any native resource handle.
+For M1 Step 5, a `ResourceId` is unique within its owning session/lifetime and
+is not persistent across sessions or daemon restarts. A resource belongs to
+exactly one session. Another session cannot use or destroy it.
+
+M1 Step 5 supports only `Buffer` resources. The maximum single buffer size is
+64 MiB. This is an M1 safety limit to prevent unbounded allocation requests; it
+is not a final product limit.
+
 ## Validation
 
 Receivers must reject invalid magic, unknown message kinds, unknown opcodes,
@@ -157,11 +230,16 @@ protocol versions, invalid protocol ranges, zero `SessionId` values, zero
 invalid UTF-8 device names. DEVICE_CAPABILITIES receivers must also reject
 excessive memory heap counts, excessive memory type counts, malformed boolean
 or reserved fields, truncated heap entries, and trailing payload bytes.
+CREATE_BUFFER receivers must reject zero or oversized buffer sizes, unknown
+usage bits, empty usage flags, malformed memory preference flags, nonzero
+reserved bytes, truncated payloads, and trailing payload bytes. DESTROY_RESOURCE
+receivers must reject zero `ResourceId` values. Unknown resources and
+cross-session resource attempts return a stable UnknownResource error.
 
 Major protocol versions are incompatible. Minor versions are backward-compatible
 only within the same major version. A server selects the highest protocol
 version it supports that is inside the client's supported range. The
-implementation through M1 Step 4 supports only server version `0.1`.
+implementation through M1 Step 5 supports only server version `0.1`.
 
 ## Transport
 

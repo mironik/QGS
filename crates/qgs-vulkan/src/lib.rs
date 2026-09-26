@@ -2,15 +2,20 @@
 
 use std::sync::Arc;
 
-use qgs_core::{DeviceDiscovery, DeviceDiscoveryError};
-use qgs_protocol::{
-    ApiVersion, BackendApi, ComputeCapabilities, DeviceCapabilities, DeviceClass, DeviceDesc,
-    DeviceId, InteropCapabilities, MemoryCapabilities, MemoryHeapDesc, MAX_DEVICE_COUNT,
-    MAX_DEVICE_NAME_LEN, MAX_MEMORY_HEAP_COUNT, MAX_MEMORY_TYPE_COUNT,
+use qgs_core::{
+    BackendBufferAllocation, DeviceDiscovery, DeviceDiscoveryError, ResourceBackend, ResourceError,
 };
+use qgs_protocol::{
+    ApiVersion, BackendApi, BufferDesc, BufferUsageFlags, ComputeCapabilities, DeviceCapabilities,
+    DeviceClass, DeviceDesc, DeviceId, InteropCapabilities, MemoryCapabilities, MemoryHeapDesc,
+    SelectedMemoryProperties, MAX_DEVICE_COUNT, MAX_DEVICE_NAME_LEN, MAX_MEMORY_HEAP_COUNT,
+    MAX_MEMORY_TYPE_COUNT,
+};
+use vulkano::buffer::{Buffer, BufferCreateInfo, BufferMemory, BufferUsage, Subbuffer};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
-use vulkano::device::QueueFlags;
+use vulkano::device::{Device, DeviceCreateInfo, QueueCreateInfo, QueueFlags};
 use vulkano::instance::{Instance, InstanceCreateInfo};
+use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::memory::{MemoryHeapFlags, MemoryPropertyFlags};
 use vulkano::{Version, VulkanLibrary};
 
@@ -35,9 +40,31 @@ impl VulkanDeviceDiscovery {
             }
 
             let desc = describe_device((index as u64) + 1, &physical_device)?;
+            let queue_family_index = physical_device
+                .queue_family_properties()
+                .iter()
+                .position(|queue| queue.queue_count > 0)
+                .ok_or(DeviceDiscoveryError::BackendFailed)?
+                as u32;
+            let (logical_device, _) = Device::new(
+                physical_device.clone(),
+                DeviceCreateInfo {
+                    queue_create_infos: vec![QueueCreateInfo {
+                        queue_family_index,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )
+            .map_err(|_| DeviceDiscoveryError::BackendFailed)?;
+            let memory_allocator =
+                Arc::new(StandardMemoryAllocator::new_default(logical_device.clone()));
+
             devices.push(RegisteredDevice {
                 desc,
                 physical_device,
+                logical_device,
+                memory_allocator,
             });
         }
 
@@ -71,10 +98,55 @@ impl DeviceDiscovery for VulkanDeviceDiscovery {
     }
 }
 
+impl ResourceBackend for VulkanDeviceDiscovery {
+    fn create_buffer(&self, desc: &BufferDesc) -> Result<BackendBufferAllocation, ResourceError> {
+        let device = self
+            .devices
+            .iter()
+            .find(|device| device.desc.id == desc.device_id)
+            .ok_or(ResourceError::UnknownDeviceId)?;
+
+        let usage = map_buffer_usage(desc.usage)?;
+        let memory_type_filter = map_memory_preference(desc);
+        let buffer = Buffer::new_slice::<u8>(
+            device.memory_allocator.clone(),
+            BufferCreateInfo {
+                usage,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter,
+                ..Default::default()
+            },
+            desc.size_bytes,
+        )
+        .map_err(|err| {
+            eprintln!("vulkan buffer allocation failed: {err}");
+            ResourceError::AllocationFailed
+        })?;
+
+        let selected_memory = selected_memory_properties(&device.physical_device, &buffer)?;
+
+        Ok(BackendBufferAllocation {
+            resource: Box::new(VulkanBufferResource { buffer }),
+            selected_memory,
+        })
+    }
+}
+
 #[derive(Debug)]
 struct RegisteredDevice {
     desc: DeviceDesc,
     physical_device: Arc<PhysicalDevice>,
+    #[allow(dead_code)]
+    logical_device: Arc<Device>,
+    memory_allocator: Arc<StandardMemoryAllocator>,
+}
+
+#[derive(Debug)]
+struct VulkanBufferResource {
+    #[allow(dead_code)]
+    buffer: Subbuffer<[u8]>,
 }
 
 fn describe_device(
@@ -204,6 +276,67 @@ fn to_qgs_api_version(version: Version) -> ApiVersion {
         u16::try_from(version.minor).unwrap_or(u16::MAX),
         u16::try_from(version.patch).unwrap_or(u16::MAX),
     )
+}
+
+fn map_buffer_usage(usage: BufferUsageFlags) -> Result<BufferUsage, ResourceError> {
+    let mut mapped = BufferUsage::empty();
+    if usage.contains(BufferUsageFlags::TRANSFER_SRC) {
+        mapped |= BufferUsage::TRANSFER_SRC;
+    }
+    if usage.contains(BufferUsageFlags::TRANSFER_DST) {
+        mapped |= BufferUsage::TRANSFER_DST;
+    }
+    if usage.contains(BufferUsageFlags::STORAGE) {
+        mapped |= BufferUsage::STORAGE_BUFFER;
+    }
+
+    if mapped.is_empty() {
+        Err(ResourceError::UnsupportedMemoryRequirements)
+    } else {
+        Ok(mapped)
+    }
+}
+
+fn map_memory_preference(desc: &BufferDesc) -> MemoryTypeFilter {
+    let preference = desc.memory_preference;
+    let mut filter = MemoryTypeFilter::empty();
+
+    if preference.device_preferred {
+        filter = filter | MemoryTypeFilter::PREFER_DEVICE;
+    }
+    if preference.host_visible_required {
+        filter = filter | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE;
+    }
+    if preference.host_coherent_preferred {
+        filter.preferred_flags |= MemoryPropertyFlags::HOST_COHERENT;
+    }
+
+    filter
+}
+
+fn selected_memory_properties(
+    physical_device: &PhysicalDevice,
+    buffer: &Subbuffer<[u8]>,
+) -> Result<SelectedMemoryProperties, ResourceError> {
+    let memory_type_index = match buffer.buffer().memory() {
+        BufferMemory::Normal(memory) => memory.device_memory().memory_type_index(),
+        BufferMemory::Sparse | BufferMemory::External => {
+            return Err(ResourceError::AllocationFailed);
+        }
+        _ => return Err(ResourceError::AllocationFailed),
+    };
+    let memory_type = physical_device
+        .memory_properties()
+        .memory_types
+        .get(memory_type_index as usize)
+        .ok_or(ResourceError::AllocationFailed)?;
+    let flags = memory_type.property_flags;
+
+    Ok(SelectedMemoryProperties {
+        device_local: flags.intersects(MemoryPropertyFlags::DEVICE_LOCAL),
+        host_visible: flags.intersects(MemoryPropertyFlags::HOST_VISIBLE),
+        host_coherent: flags.intersects(MemoryPropertyFlags::HOST_COHERENT),
+    })
 }
 
 #[cfg(test)]

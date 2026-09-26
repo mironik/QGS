@@ -26,9 +26,16 @@ pub const MAX_MEMORY_HEAP_COUNT: usize = 16;
 /// Maximum number of memory types summarized in DEVICE_CAPABILITIES.
 pub const MAX_MEMORY_TYPE_COUNT: usize = 32;
 
+/// Conservative M1 single-buffer allocation safety limit.
+pub const MAX_BUFFER_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+
 const DEVICE_ENTRY_FIXED_LEN: usize = 32;
 const DEVICE_CAPABILITIES_FIXED_PREFIX_LEN: usize = 52;
 const MEMORY_HEAP_ENTRY_LEN: usize = 16;
+const CREATE_BUFFER_PAYLOAD_LEN: usize = 24;
+const BUFFER_CREATED_PAYLOAD_LEN: usize = 24;
+const DESTROY_RESOURCE_PAYLOAD_LEN: usize = 8;
+const RESOURCE_DESTROYED_PAYLOAD_LEN: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ProtocolVersion {
@@ -114,6 +121,8 @@ pub enum Request {
     Hello(HelloRequest),
     EnumerateDevices(EnumerateDevicesRequest),
     QueryDeviceCapabilities(QueryDeviceCapabilitiesRequest),
+    CreateBuffer(CreateBufferRequest),
+    DestroyResource(DestroyResourceRequest),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,11 +149,23 @@ pub struct QueryDeviceCapabilitiesRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateBufferRequest {
+    pub desc: BufferDesc,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DestroyResourceRequest {
+    pub resource_id: ResourceId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Response {
     Welcome(WelcomeResponse),
     Error(ErrorResponse),
     DeviceList(DeviceListResponse),
     DeviceCapabilities(DeviceCapabilitiesResponse),
+    BufferCreated(BufferCreatedResponse),
+    ResourceDestroyed(ResourceDestroyedResponse),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -285,6 +306,137 @@ pub struct DeviceCapabilitiesResponse {
     pub capabilities: DeviceCapabilities,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ResourceId(u64);
+
+impl ResourceId {
+    pub fn new(raw: u64) -> Result<Self, ProtocolError> {
+        if raw == 0 {
+            Err(ProtocolError::InvalidResourceId)
+        } else {
+            Ok(Self(raw))
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceKind {
+    Buffer,
+}
+
+impl ResourceKind {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::Buffer => 1,
+        }
+    }
+}
+
+impl TryFrom<u8> for ResourceKind {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Buffer),
+            _ => Err(ProtocolError::MalformedPayload),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BufferUsageFlags(u32);
+
+impl BufferUsageFlags {
+    pub const TRANSFER_SRC: Self = Self(0x1);
+    pub const TRANSFER_DST: Self = Self(0x2);
+    pub const STORAGE: Self = Self(0x4);
+
+    pub fn new(raw: u32) -> Result<Self, ProtocolError> {
+        let flags = Self(raw);
+        if raw == 0 || raw & !Self::all_known().bits() != 0 {
+            Err(ProtocolError::InvalidBufferUsage { flags: raw })
+        } else {
+            Ok(flags)
+        }
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    const fn all_known() -> Self {
+        Self(Self::TRANSFER_SRC.0 | Self::TRANSFER_DST.0 | Self::STORAGE.0)
+    }
+}
+
+impl std::ops::BitOr for BufferUsageFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryPreference {
+    pub device_preferred: bool,
+    pub host_visible_required: bool,
+    pub host_coherent_preferred: bool,
+}
+
+impl MemoryPreference {
+    pub const fn device_preferred() -> Self {
+        Self {
+            device_preferred: true,
+            host_visible_required: false,
+            host_coherent_preferred: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BufferDesc {
+    pub device_id: DeviceId,
+    pub size_bytes: u64,
+    pub usage: BufferUsageFlags,
+    pub memory_preference: MemoryPreference,
+}
+
+impl BufferDesc {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        validate_buffer_size(self.size_bytes)?;
+        BufferUsageFlags::new(self.usage.bits())?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SelectedMemoryProperties {
+    pub device_local: bool,
+    pub host_visible: bool,
+    pub host_coherent: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BufferCreatedResponse {
+    pub resource_id: ResourceId,
+    pub size_bytes: u64,
+    pub selected_memory: SelectedMemoryProperties,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResourceDestroyedResponse {
+    pub resource_id: ResourceId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceCapabilities {
     pub device_id: DeviceId,
@@ -352,6 +504,12 @@ pub enum ProtocolErrorCode {
     UnknownDeviceId = 19,
     MemoryHeapCountTooLarge = 20,
     MemoryTypeCountTooLarge = 21,
+    InvalidResourceId = 22,
+    UnknownResource = 23,
+    InvalidBufferSize = 24,
+    AllocationFailed = 25,
+    UnsupportedMemoryRequirements = 26,
+    InvalidBufferUsage = 27,
 }
 
 impl ProtocolErrorCode {
@@ -386,6 +544,12 @@ impl TryFrom<u32> for ProtocolErrorCode {
             19 => Ok(Self::UnknownDeviceId),
             20 => Ok(Self::MemoryHeapCountTooLarge),
             21 => Ok(Self::MemoryTypeCountTooLarge),
+            22 => Ok(Self::InvalidResourceId),
+            23 => Ok(Self::UnknownResource),
+            24 => Ok(Self::InvalidBufferSize),
+            25 => Ok(Self::AllocationFailed),
+            26 => Ok(Self::UnsupportedMemoryRequirements),
+            27 => Ok(Self::InvalidBufferUsage),
             _ => Err(ProtocolError::MalformedPayload),
         }
     }
@@ -443,6 +607,17 @@ pub enum ProtocolError {
     MemoryTypeCountTooLarge {
         count: usize,
         max: usize,
+    },
+    InvalidResourceId,
+    UnknownResource,
+    InvalidBufferSize {
+        size: u64,
+        max: u64,
+    },
+    AllocationFailed,
+    UnsupportedMemoryRequirements,
+    InvalidBufferUsage {
+        flags: u32,
     },
     MalformedPayload,
     InvalidVersionRange {
@@ -502,6 +677,18 @@ impl fmt::Display for ProtocolError {
             Self::MemoryTypeCountTooLarge { count, max } => {
                 write!(f, "memory type count {count} exceeds maximum {max}")
             }
+            Self::InvalidResourceId => write!(f, "resource id must be non-zero"),
+            Self::UnknownResource => write!(f, "unknown resource id"),
+            Self::InvalidBufferSize { size, max } => {
+                write!(f, "invalid buffer size {size}; allowed range is 1..={max}")
+            }
+            Self::AllocationFailed => write!(f, "resource allocation failed"),
+            Self::UnsupportedMemoryRequirements => {
+                write!(f, "unsupported buffer memory requirements")
+            }
+            Self::InvalidBufferUsage { flags } => {
+                write!(f, "invalid buffer usage flags: {flags:#010x}")
+            }
             Self::MalformedPayload => write!(f, "malformed payload"),
             Self::InvalidVersionRange { min, max } => {
                 write!(f, "invalid protocol version range: {min}..={max}")
@@ -544,6 +731,12 @@ impl From<&ProtocolError> for ProtocolErrorCode {
             ProtocolError::DiscoveryFailed => Self::DiscoveryFailed,
             ProtocolError::MemoryHeapCountTooLarge { .. } => Self::MemoryHeapCountTooLarge,
             ProtocolError::MemoryTypeCountTooLarge { .. } => Self::MemoryTypeCountTooLarge,
+            ProtocolError::InvalidResourceId => Self::InvalidResourceId,
+            ProtocolError::UnknownResource => Self::UnknownResource,
+            ProtocolError::InvalidBufferSize { .. } => Self::InvalidBufferSize,
+            ProtocolError::AllocationFailed => Self::AllocationFailed,
+            ProtocolError::UnsupportedMemoryRequirements => Self::UnsupportedMemoryRequirements,
+            ProtocolError::InvalidBufferUsage { .. } => Self::InvalidBufferUsage,
             ProtocolError::InvalidVersionRange { .. } => Self::InvalidVersionRange,
             ProtocolError::UnsupportedVersion { .. } => Self::UnsupportedVersion,
         }
@@ -565,6 +758,8 @@ pub enum RequestOpcode {
     Hello,
     EnumerateDevices,
     QueryDeviceCapabilities,
+    CreateBuffer,
+    DestroyResource,
 }
 
 impl RequestOpcode {
@@ -573,6 +768,8 @@ impl RequestOpcode {
             Self::Hello => 1,
             Self::EnumerateDevices => 2,
             Self::QueryDeviceCapabilities => 3,
+            Self::CreateBuffer => 4,
+            Self::DestroyResource => 5,
         }
     }
 }
@@ -583,6 +780,8 @@ pub enum ResponseOpcode {
     Error,
     DeviceList,
     DeviceCapabilities,
+    BufferCreated,
+    ResourceDestroyed,
 }
 
 impl ResponseOpcode {
@@ -592,6 +791,8 @@ impl ResponseOpcode {
             Self::Error => 2,
             Self::DeviceList => 3,
             Self::DeviceCapabilities => 4,
+            Self::BufferCreated => 5,
+            Self::ResourceDestroyed => 6,
         }
     }
 }
@@ -619,6 +820,14 @@ pub enum WireMessage {
         request_id: u64,
         request: QueryDeviceCapabilitiesRequest,
     },
+    CreateBuffer {
+        request_id: u64,
+        request: CreateBufferRequest,
+    },
+    DestroyResource {
+        request_id: u64,
+        request: DestroyResourceRequest,
+    },
     Welcome {
         request_id: u64,
         response: WelcomeResponse,
@@ -635,6 +844,14 @@ pub enum WireMessage {
         request_id: u64,
         response: DeviceCapabilitiesResponse,
     },
+    BufferCreated {
+        request_id: u64,
+        response: BufferCreatedResponse,
+    },
+    ResourceDestroyed {
+        request_id: u64,
+        response: ResourceDestroyedResponse,
+    },
 }
 
 impl WireMessage {
@@ -643,10 +860,14 @@ impl WireMessage {
             Self::Hello { request_id, .. }
             | Self::EnumerateDevices { request_id }
             | Self::QueryDeviceCapabilities { request_id, .. }
+            | Self::CreateBuffer { request_id, .. }
+            | Self::DestroyResource { request_id, .. }
             | Self::Welcome { request_id, .. }
             | Self::Error { request_id, .. }
             | Self::DeviceList { request_id, .. }
-            | Self::DeviceCapabilities { request_id, .. } => *request_id,
+            | Self::DeviceCapabilities { request_id, .. }
+            | Self::BufferCreated { request_id, .. }
+            | Self::ResourceDestroyed { request_id, .. } => *request_id,
         }
     }
 }
@@ -676,6 +897,24 @@ pub fn encode_wire_message(message: &WireMessage) -> Vec<u8> {
             RequestOpcode::QueryDeviceCapabilities.wire_value(),
             *request_id,
             encode_query_device_capabilities_payload(request),
+        ),
+        WireMessage::CreateBuffer {
+            request_id,
+            request,
+        } => (
+            MessageKind::Request,
+            RequestOpcode::CreateBuffer.wire_value(),
+            *request_id,
+            encode_create_buffer_payload(request),
+        ),
+        WireMessage::DestroyResource {
+            request_id,
+            request,
+        } => (
+            MessageKind::Request,
+            RequestOpcode::DestroyResource.wire_value(),
+            *request_id,
+            encode_destroy_resource_payload(request),
         ),
         WireMessage::Welcome {
             request_id,
@@ -712,6 +951,24 @@ pub fn encode_wire_message(message: &WireMessage) -> Vec<u8> {
             ResponseOpcode::DeviceCapabilities.wire_value(),
             *request_id,
             encode_device_capabilities_payload(response),
+        ),
+        WireMessage::BufferCreated {
+            request_id,
+            response,
+        } => (
+            MessageKind::Response,
+            ResponseOpcode::BufferCreated.wire_value(),
+            *request_id,
+            encode_buffer_created_payload(response),
+        ),
+        WireMessage::ResourceDestroyed {
+            request_id,
+            response,
+        } => (
+            MessageKind::Response,
+            ResponseOpcode::ResourceDestroyed.wire_value(),
+            *request_id,
+            encode_resource_destroyed_payload(response),
         ),
     };
 
@@ -831,6 +1088,14 @@ pub fn decode_wire_message_parts(
             request_id: header.request_id,
             request: decode_query_device_capabilities_payload(payload)?,
         }),
+        (MessageKind::Request, 4) => Ok(WireMessage::CreateBuffer {
+            request_id: header.request_id,
+            request: decode_create_buffer_payload(payload)?,
+        }),
+        (MessageKind::Request, 5) => Ok(WireMessage::DestroyResource {
+            request_id: header.request_id,
+            request: decode_destroy_resource_payload(payload)?,
+        }),
         (MessageKind::Response, 1) => Ok(WireMessage::Welcome {
             request_id: header.request_id,
             response: decode_welcome_payload(payload)?,
@@ -846,6 +1111,14 @@ pub fn decode_wire_message_parts(
         (MessageKind::Response, 4) => Ok(WireMessage::DeviceCapabilities {
             request_id: header.request_id,
             response: decode_device_capabilities_payload(payload)?,
+        }),
+        (MessageKind::Response, 5) => Ok(WireMessage::BufferCreated {
+            request_id: header.request_id,
+            response: decode_buffer_created_payload(payload)?,
+        }),
+        (MessageKind::Response, 6) => Ok(WireMessage::ResourceDestroyed {
+            request_id: header.request_id,
+            response: decode_resource_destroyed_payload(payload)?,
         }),
         _ => Err(ProtocolError::UnknownOpcode {
             kind: header.kind,
@@ -907,7 +1180,7 @@ fn encode_wire_header(header: &WireHeader, bytes: &mut Vec<u8>) {
 
 fn validate_opcode(kind: MessageKind, opcode: u8) -> Result<(), ProtocolError> {
     match (kind, opcode) {
-        (MessageKind::Request, 1..=3) | (MessageKind::Response, 1..=4) => Ok(()),
+        (MessageKind::Request, 1..=5) | (MessageKind::Response, 1..=6) => Ok(()),
         _ => Err(ProtocolError::UnknownOpcode { kind, opcode }),
     }
 }
@@ -987,6 +1260,67 @@ fn decode_query_device_capabilities_payload(
 
     Ok(QueryDeviceCapabilitiesRequest {
         device_id: DeviceId::new(read_u64(bytes, 0))?,
+    })
+}
+
+fn encode_create_buffer_payload(request: &CreateBufferRequest) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(CREATE_BUFFER_PAYLOAD_LEN);
+    bytes.extend_from_slice(&request.desc.device_id.get().to_le_bytes());
+    bytes.extend_from_slice(&request.desc.size_bytes.to_le_bytes());
+    bytes.extend_from_slice(&request.desc.usage.bits().to_le_bytes());
+    bytes.push(encode_memory_preference(request.desc.memory_preference));
+    bytes.extend_from_slice(&[0_u8; 3]);
+    bytes
+}
+
+fn decode_create_buffer_payload(bytes: &[u8]) -> Result<CreateBufferRequest, ProtocolError> {
+    if bytes.len() != CREATE_BUFFER_PAYLOAD_LEN {
+        return if bytes.len() < CREATE_BUFFER_PAYLOAD_LEN {
+            Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len(),
+                expected: CREATE_BUFFER_PAYLOAD_LEN,
+            })
+        } else {
+            Err(ProtocolError::TrailingPayload {
+                len: bytes.len() - CREATE_BUFFER_PAYLOAD_LEN,
+            })
+        };
+    }
+    if bytes[21..24].iter().any(|value| *value != 0) {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    let desc = BufferDesc {
+        device_id: DeviceId::new(read_u64(bytes, 0))?,
+        size_bytes: read_u64(bytes, 8),
+        usage: BufferUsageFlags::new(read_u32(bytes, 16))?,
+        memory_preference: decode_memory_preference(bytes[20])?,
+    };
+    desc.validate()?;
+
+    Ok(CreateBufferRequest { desc })
+}
+
+fn encode_destroy_resource_payload(request: &DestroyResourceRequest) -> Vec<u8> {
+    request.resource_id.get().to_le_bytes().to_vec()
+}
+
+fn decode_destroy_resource_payload(bytes: &[u8]) -> Result<DestroyResourceRequest, ProtocolError> {
+    if bytes.len() != DESTROY_RESOURCE_PAYLOAD_LEN {
+        return if bytes.len() < DESTROY_RESOURCE_PAYLOAD_LEN {
+            Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len(),
+                expected: DESTROY_RESOURCE_PAYLOAD_LEN,
+            })
+        } else {
+            Err(ProtocolError::TrailingPayload {
+                len: bytes.len() - DESTROY_RESOURCE_PAYLOAD_LEN,
+            })
+        };
+    }
+
+    Ok(DestroyResourceRequest {
+        resource_id: ResourceId::new(read_u64(bytes, 0))?,
     })
 }
 
@@ -1243,6 +1577,111 @@ fn decode_device_capabilities_payload(
                 external_fence_fd: read_bool(bytes[51])?,
             },
         },
+    })
+}
+
+fn encode_buffer_created_payload(response: &BufferCreatedResponse) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(BUFFER_CREATED_PAYLOAD_LEN);
+    bytes.extend_from_slice(&response.resource_id.get().to_le_bytes());
+    bytes.extend_from_slice(&response.size_bytes.to_le_bytes());
+    bytes.push(encode_selected_memory(response.selected_memory));
+    bytes.extend_from_slice(&[0_u8; 7]);
+    bytes
+}
+
+fn decode_buffer_created_payload(bytes: &[u8]) -> Result<BufferCreatedResponse, ProtocolError> {
+    if bytes.len() != BUFFER_CREATED_PAYLOAD_LEN {
+        return if bytes.len() < BUFFER_CREATED_PAYLOAD_LEN {
+            Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len(),
+                expected: BUFFER_CREATED_PAYLOAD_LEN,
+            })
+        } else {
+            Err(ProtocolError::TrailingPayload {
+                len: bytes.len() - BUFFER_CREATED_PAYLOAD_LEN,
+            })
+        };
+    }
+    if bytes[17..24].iter().any(|value| *value != 0) {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(BufferCreatedResponse {
+        resource_id: ResourceId::new(read_u64(bytes, 0))?,
+        size_bytes: validate_buffer_size(read_u64(bytes, 8))?,
+        selected_memory: decode_selected_memory(bytes[16])?,
+    })
+}
+
+fn encode_resource_destroyed_payload(response: &ResourceDestroyedResponse) -> Vec<u8> {
+    response.resource_id.get().to_le_bytes().to_vec()
+}
+
+fn decode_resource_destroyed_payload(
+    bytes: &[u8],
+) -> Result<ResourceDestroyedResponse, ProtocolError> {
+    if bytes.len() != RESOURCE_DESTROYED_PAYLOAD_LEN {
+        return if bytes.len() < RESOURCE_DESTROYED_PAYLOAD_LEN {
+            Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len(),
+                expected: RESOURCE_DESTROYED_PAYLOAD_LEN,
+            })
+        } else {
+            Err(ProtocolError::TrailingPayload {
+                len: bytes.len() - RESOURCE_DESTROYED_PAYLOAD_LEN,
+            })
+        };
+    }
+
+    Ok(ResourceDestroyedResponse {
+        resource_id: ResourceId::new(read_u64(bytes, 0))?,
+    })
+}
+
+fn validate_buffer_size(size: u64) -> Result<u64, ProtocolError> {
+    if size == 0 || size > MAX_BUFFER_SIZE_BYTES {
+        Err(ProtocolError::InvalidBufferSize {
+            size,
+            max: MAX_BUFFER_SIZE_BYTES,
+        })
+    } else {
+        Ok(size)
+    }
+}
+
+fn encode_memory_preference(preference: MemoryPreference) -> u8 {
+    bool_to_u8(preference.device_preferred)
+        | (bool_to_u8(preference.host_visible_required) << 1)
+        | (bool_to_u8(preference.host_coherent_preferred) << 2)
+}
+
+fn decode_memory_preference(value: u8) -> Result<MemoryPreference, ProtocolError> {
+    if value & !0x7 != 0 {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(MemoryPreference {
+        device_preferred: value & 0x1 != 0,
+        host_visible_required: value & 0x2 != 0,
+        host_coherent_preferred: value & 0x4 != 0,
+    })
+}
+
+fn encode_selected_memory(memory: SelectedMemoryProperties) -> u8 {
+    bool_to_u8(memory.device_local)
+        | (bool_to_u8(memory.host_visible) << 1)
+        | (bool_to_u8(memory.host_coherent) << 2)
+}
+
+fn decode_selected_memory(value: u8) -> Result<SelectedMemoryProperties, ProtocolError> {
+    if value & !0x7 != 0 {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(SelectedMemoryProperties {
+        device_local: value & 0x1 != 0,
+        host_visible: value & 0x2 != 0,
+        host_coherent: value & 0x4 != 0,
     })
 }
 
@@ -2031,6 +2470,240 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resource_id_rejects_zero() {
+        assert_eq!(ResourceId::new(0), Err(ProtocolError::InvalidResourceId));
+        assert_eq!(ResourceId::new(1).expect("resource id").get(), 1);
+    }
+
+    #[test]
+    fn create_buffer_request_round_trip() {
+        let message = WireMessage::CreateBuffer {
+            request_id: 34,
+            request: CreateBufferRequest {
+                desc: sample_buffer_desc(),
+            },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn buffer_created_response_round_trip() {
+        let message = WireMessage::BufferCreated {
+            request_id: 35,
+            response: sample_buffer_created(9),
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn destroy_resource_request_round_trip() {
+        let message = WireMessage::DestroyResource {
+            request_id: 36,
+            request: DestroyResourceRequest {
+                resource_id: ResourceId::new(9).expect("resource id"),
+            },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn resource_destroyed_response_round_trip() {
+        let message = WireMessage::ResourceDestroyed {
+            request_id: 37,
+            response: ResourceDestroyedResponse {
+                resource_id: ResourceId::new(9).expect("resource id"),
+            },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn rejects_zero_sized_buffer_payload() {
+        let mut bytes = encode_wire_message(&WireMessage::CreateBuffer {
+            request_id: 38,
+            request: CreateBufferRequest {
+                desc: sample_buffer_desc(),
+            },
+        });
+        bytes[WIRE_HEADER_LEN + 8..WIRE_HEADER_LEN + 16].copy_from_slice(&0_u64.to_le_bytes());
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::InvalidBufferSize {
+                size: 0,
+                max: MAX_BUFFER_SIZE_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_buffer_payload() {
+        let mut bytes = encode_wire_message(&WireMessage::CreateBuffer {
+            request_id: 39,
+            request: CreateBufferRequest {
+                desc: sample_buffer_desc(),
+            },
+        });
+        bytes[WIRE_HEADER_LEN + 8..WIRE_HEADER_LEN + 16]
+            .copy_from_slice(&(MAX_BUFFER_SIZE_BYTES + 1).to_le_bytes());
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::InvalidBufferSize {
+                size: MAX_BUFFER_SIZE_BYTES + 1,
+                max: MAX_BUFFER_SIZE_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_create_buffer_payload() {
+        let mut bytes = encode_wire_message(&WireMessage::CreateBuffer {
+            request_id: 40,
+            request: CreateBufferRequest {
+                desc: sample_buffer_desc(),
+            },
+        });
+        bytes.truncate(bytes.len() - 1);
+
+        assert!(matches!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::TruncatedPayload { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_buffer_usage_flags() {
+        let mut bytes = encode_wire_message(&WireMessage::CreateBuffer {
+            request_id: 41,
+            request: CreateBufferRequest {
+                desc: sample_buffer_desc(),
+            },
+        });
+        bytes[WIRE_HEADER_LEN + 16..WIRE_HEADER_LEN + 20].copy_from_slice(&0x8_u32.to_le_bytes());
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::InvalidBufferUsage { flags: 0x8 })
+        );
+    }
+
+    #[test]
+    fn rejects_zero_resource_id_in_destroy_request() {
+        let mut bytes = encode_wire_message(&WireMessage::DestroyResource {
+            request_id: 42,
+            request: DestroyResourceRequest {
+                resource_id: ResourceId::new(1).expect("resource id"),
+            },
+        });
+        bytes[WIRE_HEADER_LEN..WIRE_HEADER_LEN + 8].copy_from_slice(&0_u64.to_le_bytes());
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::InvalidResourceId)
+        );
+    }
+
+    #[test]
+    fn preserves_request_id_for_resource_messages() {
+        let create = WireMessage::CreateBuffer {
+            request_id: 43,
+            request: CreateBufferRequest {
+                desc: sample_buffer_desc(),
+            },
+        };
+        let created = WireMessage::BufferCreated {
+            request_id: 44,
+            response: sample_buffer_created(10),
+        };
+        let destroy = WireMessage::DestroyResource {
+            request_id: 45,
+            request: DestroyResourceRequest {
+                resource_id: ResourceId::new(10).expect("resource id"),
+            },
+        };
+        let destroyed = WireMessage::ResourceDestroyed {
+            request_id: 46,
+            response: ResourceDestroyedResponse {
+                resource_id: ResourceId::new(10).expect("resource id"),
+            },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&create))
+                .expect("create buffer")
+                .request_id(),
+            43
+        );
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&created))
+                .expect("buffer created")
+                .request_id(),
+            44
+        );
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&destroy))
+                .expect("destroy resource")
+                .request_id(),
+            45
+        );
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&destroyed))
+                .expect("resource destroyed")
+                .request_id(),
+            46
+        );
+    }
+
+    #[test]
+    fn resource_error_codes_are_stable() {
+        for (error, code) in [
+            (
+                ProtocolError::InvalidResourceId,
+                ProtocolErrorCode::InvalidResourceId,
+            ),
+            (
+                ProtocolError::UnknownResource,
+                ProtocolErrorCode::UnknownResource,
+            ),
+            (
+                ProtocolError::InvalidBufferSize {
+                    size: 0,
+                    max: MAX_BUFFER_SIZE_BYTES,
+                },
+                ProtocolErrorCode::InvalidBufferSize,
+            ),
+            (
+                ProtocolError::AllocationFailed,
+                ProtocolErrorCode::AllocationFailed,
+            ),
+            (
+                ProtocolError::UnsupportedMemoryRequirements,
+                ProtocolErrorCode::UnsupportedMemoryRequirements,
+            ),
+        ] {
+            assert_eq!(ProtocolErrorCode::from(&error), code);
+            assert_eq!(ProtocolErrorCode::try_from(code.wire_value()), Ok(code));
+        }
+    }
+
     fn sample_device(name: &str, class: DeviceClass, raw_id: u64) -> DeviceDesc {
         DeviceDesc {
             id: DeviceId::new(raw_id).expect("device id"),
@@ -2068,6 +2741,33 @@ mod tests {
                 dma_buf: true,
                 external_semaphore_fd: true,
                 external_fence_fd: true,
+            },
+        }
+    }
+
+    fn sample_buffer_desc() -> BufferDesc {
+        BufferDesc {
+            device_id: DeviceId::new(1).expect("device id"),
+            size_bytes: 1024 * 1024,
+            usage: BufferUsageFlags::TRANSFER_SRC
+                | BufferUsageFlags::TRANSFER_DST
+                | BufferUsageFlags::STORAGE,
+            memory_preference: MemoryPreference {
+                device_preferred: true,
+                host_visible_required: false,
+                host_coherent_preferred: true,
+            },
+        }
+    }
+
+    fn sample_buffer_created(raw_id: u64) -> BufferCreatedResponse {
+        BufferCreatedResponse {
+            resource_id: ResourceId::new(raw_id).expect("resource id"),
+            size_bytes: 1024 * 1024,
+            selected_memory: SelectedMemoryProperties {
+                device_local: true,
+                host_visible: true,
+                host_coherent: false,
             },
         }
     }
