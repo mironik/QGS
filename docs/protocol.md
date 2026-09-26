@@ -1,34 +1,79 @@
 # QGS Protocol
 
-The QGS protocol starts with a HELLO/WELCOME exchange.
+QGS v0.1 has an explicit little-endian wire representation. Rust in-memory
+types are not the wire ABI and are never serialized by copying struct memory.
 
-## HELLO
+## Header
 
-A client sends HELLO with the minimum and maximum QGS protocol versions it can
-support. The current Rust model represents this as `HelloRequest`.
+Every v0.1 message starts with a fixed 24-byte header:
 
-## WELCOME
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u32 | magic, `0x51475300` |
+| 4 | u16 | protocol major |
+| 6 | u16 | protocol minor |
+| 8 | u8 | message kind: request `1`, response `2`, event `3` |
+| 9 | u8 | opcode |
+| 10 | u16 | flags, currently `0` |
+| 12 | u32 | payload length in bytes |
+| 16 | u64 | request id |
 
-The service selects a compatible protocol version and replies with WELCOME. The
-current Rust model represents this as `WelcomeResponse`, containing the selected
-protocol version and a typed `SessionId`.
+All integer fields are little-endian. The maximum payload size is 4096 bytes.
+Decoders must reject oversized payload lengths before allocating payload
+storage.
 
-If the requested version range is invalid or incompatible, negotiation fails
-with a protocol error instead of WELCOME.
+`request_id` correlates a response with a request. `request_id` 0 is reserved
+for messages that do not correlate to a request. Normal request/response
+messages preserve the original non-zero request id.
 
-## Wire Format Boundary
+`SessionId` is not part of the transport header. It appears only in payloads
+that need it, such as WELCOME.
 
-The current Rust in-memory types are not the final wire format. They are a
-temporary protocol model used to keep early crate boundaries clear.
+## Message Types
 
-A future wire format must be specified explicitly. It must define framing,
-integer encoding, byte order, validation rules, compatibility behavior, and
-transport error handling. QGS must not use serde or bincode as its wire
-protocol.
+HELLO is request kind `1`, opcode `1`. Its payload is:
 
-## Temporary Demonstration
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u16 | minimum protocol major |
+| 2 | u16 | minimum protocol minor |
+| 4 | u16 | maximum protocol major |
+| 6 | u16 | maximum protocol minor |
 
-The current daemon and test client demonstrate HELLO/WELCOME in-process. This
-is temporary and is not the final transport. No async runtime, Unix socket, or
-other IPC transport is part of this initial skeleton.
+WELCOME is response kind `2`, opcode `1`. Its payload is:
 
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u16 | selected protocol major |
+| 2 | u16 | selected protocol minor |
+| 4 | u64 | session id |
+
+ERROR is response kind `2`, opcode `2`. Its payload is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u32 | stable numeric error code |
+
+Clients must use numeric error codes for behavior. Human-readable diagnostics
+are for logging only and are not part of M1 Step 2 payloads.
+
+## Validation
+
+Receivers must reject invalid magic, unknown message kinds, unknown opcodes,
+nonzero flags, oversized payload lengths, malformed or truncated headers,
+malformed or truncated payloads, unexpected trailing payload bytes, invalid
+protocol versions, invalid protocol ranges, and zero `SessionId` values.
+
+Major protocol versions are incompatible. Minor versions are backward-compatible
+only within the same major version. A server selects the highest protocol
+version it supports that is inside the client's supported range. M1 Step 2
+supports only server version `0.1`.
+
+## Transport
+
+The protocol is transport-independent. `qgs-protocol` contains concepts and
+wire encoding/decoding, but no Unix-specific code.
+
+For Linux M1, `qgsd` and `qgs-test` communicate over a Unix Domain Socket using
+synchronous blocking I/O. This is the first real IPC transport, but it does not
+change the protocol's transport independence.

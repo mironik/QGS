@@ -6,5 +6,5 @@ version.workspace = true
 
 [dependencies]
 qgs-core = { path = "../../crates/qgs-core" }
+qgs-linux = { path = "../../crates/qgs-linux" }
 qgs-protocol = { path = "../../crates/qgs-protocol" }
-

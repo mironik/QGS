@@ -31,8 +31,7 @@ not require a specific distribution.
 
 ## Current Scope
 
-The initial workspace contains only a protocol skeleton, minimal session
-management, and in-process HELLO/WELCOME demonstration binaries. It does not
-include a daemon transport, async runtime, Unix sockets, Vulkan, DRM, DMA-BUF,
-video decode, or video encode.
-
+The initial workspace contains an explicit v0.1 protocol wire encoding, minimal
+session management, and a Linux Unix Domain Socket transport used by `qgsd` and
+`qgs-test` for a real HELLO/WELCOME IPC exchange. It does not include an async
+runtime, daemonization, Vulkan, DRM, DMA-BUF, video decode, or video encode.

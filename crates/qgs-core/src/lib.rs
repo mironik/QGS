@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use qgs_protocol::{ProtocolError, SessionId};
+use qgs_protocol::{handle_hello, HelloRequest, ProtocolError, SessionId, WelcomeResponse};
 
 #[derive(Debug)]
 pub struct SessionManager {
@@ -31,6 +31,11 @@ impl SessionManager {
             .map_err(|_| ProtocolError::SessionIdsExhausted)?;
         let id = SessionId::new(raw)?;
         Ok(Session { id })
+    }
+
+    pub fn handle_hello(&self, request: &HelloRequest) -> Result<WelcomeResponse, ProtocolError> {
+        let session = self.create_session()?;
+        handle_hello(request, session.id())
     }
 }
 

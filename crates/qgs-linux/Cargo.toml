@@ -1,0 +1,12 @@
+[package]
+name = "qgs-linux"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+qgs-protocol = { path = "../qgs-protocol" }
+
+[dev-dependencies]
+qgs-core = { path = "../qgs-core" }
+
