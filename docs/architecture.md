@@ -57,6 +57,15 @@ Vulkan-specific types and handles stop at `qgs-vulkan`. `qgs-core` and
 
 The initial workspace contains an explicit v0.1 protocol wire encoding, minimal
 session management, Linux Unix Domain Socket transport, and Vulkan-backed
-device enumeration through the `DeviceDiscovery` abstraction. It does not
-include an async runtime, daemonization, DRM, DMA-BUF, video decode, video
-encode, GPU resource allocation, compute workloads, or workload scheduling.
+device enumeration and static capability discovery through the `DeviceDiscovery`
+abstraction. It reports compute queue limits, memory heap/type summaries, and
+external-memory/synchronization mechanism availability. It does not include an
+async runtime, daemonization, DRM, DMA-BUF transfer/export, video decode, video
+encode, GPU resource allocation, compute execution, workload scheduling,
+performance benchmarking, telemetry, or free-memory reporting.
+
+Capability discovery is static information reported by the backend. It is not a
+measurement of current load, available/free VRAM, throughput, or scheduling
+suitability. Interop mechanism availability means that the backend exposes an
+API mechanism; it does not guarantee that every resource, image format, or usage
+can be exported or imported with that mechanism.

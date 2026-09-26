@@ -43,6 +43,13 @@ HELLO is request kind `1`, opcode `1`. Its payload is:
 ENUMERATE_DEVICES is request kind `1`, opcode `2`. It has no payload. It is a
 session operation and must be sent after HELLO/WELCOME.
 
+QUERY_DEVICE_CAPABILITIES is request kind `1`, opcode `3`. It is a session
+operation and must be sent after HELLO/WELCOME. Its payload is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `DeviceId` from the current `qgsd` process/session |
+
 WELCOME is response kind `2`, opcode `1`. Its payload is:
 
 | Offset | Width | Field |
@@ -97,8 +104,48 @@ Backend API value `1` means Vulkan.
 
 M1 Step 3 limits a DEVICE_LIST response to 16 devices. Each device name is
 limited to 128 UTF-8 bytes. `DeviceId` is a non-zero QGS-owned identifier that
-is stable only within the current `qgsd` process/session for Step 3; clients
+is stable only within the current `qgsd` process/session for M1; clients
 must not treat it as globally persistent or stable across boots.
+
+DEVICE_CAPABILITIES is response kind `2`, opcode `4`. It reports static
+capability information for one `DeviceId`.
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `DeviceId` |
+| 8 | u8 | compute supported, boolean |
+| 9 | 3 bytes | reserved, currently `0` |
+| 12 | 3 x u32 | maximum compute workgroup count |
+| 24 | 3 x u32 | maximum compute workgroup size |
+| 36 | u32 | maximum compute workgroup invocations |
+| 40 | u16 | memory heap count |
+| 42 | u16 | memory type count summary |
+| 44 | u8 | host-visible memory exists, boolean |
+| 45 | u8 | host-coherent memory exists, boolean |
+| 46 | u8 | device-local memory exists, boolean |
+| 47 | u8 | reserved, currently `0` |
+| 48 | u8 | external memory FD mechanism available, boolean |
+| 49 | u8 | DMA-BUF external memory mechanism available, boolean |
+| 50 | u8 | external semaphore FD mechanism available, boolean |
+| 51 | u8 | external fence FD mechanism available, boolean |
+
+Each memory heap entry is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | heap size in bytes |
+| 8 | u8 | heap is device-local, boolean |
+| 9 | 7 bytes | reserved, currently `0` |
+
+M1 Step 4 limits DEVICE_CAPABILITIES to 16 memory heaps and 32 memory types.
+The memory type count is a summary only; individual memory type flags are not
+transmitted in this milestone.
+
+Capability discovery is static backend-reported information. It does not report
+telemetry, current load, free memory, free VRAM, throughput, or scheduling
+decisions. Interop mechanism fields report that the backend exposes the
+mechanism. They do not guarantee that every resource, image format, or usage is
+exportable/importable with that mechanism.
 
 ## Validation
 
@@ -107,12 +154,14 @@ nonzero flags, oversized payload lengths, malformed or truncated headers,
 malformed or truncated payloads, unexpected trailing payload bytes, invalid
 protocol versions, invalid protocol ranges, zero `SessionId` values, zero
 `DeviceId` values, excessive device counts, excessive device-name lengths, and
-invalid UTF-8 device names.
+invalid UTF-8 device names. DEVICE_CAPABILITIES receivers must also reject
+excessive memory heap counts, excessive memory type counts, malformed boolean
+or reserved fields, truncated heap entries, and trailing payload bytes.
 
 Major protocol versions are incompatible. Minor versions are backward-compatible
 only within the same major version. A server selects the highest protocol
-version it supports that is inside the client's supported range. M1 Step 2
-supports only server version `0.1`.
+version it supports that is inside the client's supported range. The
+implementation through M1 Step 4 supports only server version `0.1`.
 
 ## Transport
 

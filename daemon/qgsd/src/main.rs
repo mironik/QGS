@@ -8,7 +8,8 @@ use qgs_linux::{
     TransportError,
 };
 use qgs_protocol::{
-    DeviceListResponse, ErrorResponse, ProtocolError, ProtocolErrorCode, WireMessage,
+    DeviceCapabilitiesResponse, DeviceListResponse, ErrorResponse, ProtocolError,
+    ProtocolErrorCode, WireMessage,
 };
 use qgs_vulkan::VulkanDeviceDiscovery;
 
@@ -16,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = socket_path_from_args();
     let listener = bind_socket(&socket_path)?;
     let sessions = SessionManager::new();
-    let discovery = VulkanDeviceDiscovery::new();
+    let discovery = VulkanDeviceDiscovery::new()?;
 
     println!("qgsd listening on {}", socket_path.display());
 
@@ -98,9 +99,44 @@ fn handle_client(
                     }
                 }
             }
+            WireMessage::QueryDeviceCapabilities { request, .. } => {
+                if !session_established {
+                    WireMessage::Error {
+                        request_id,
+                        response: ErrorResponse {
+                            code: ProtocolErrorCode::SessionRequired,
+                        },
+                    }
+                } else {
+                    match discovery.query_device_capabilities(request.device_id) {
+                        Ok(capabilities) => WireMessage::DeviceCapabilities {
+                            request_id,
+                            response: DeviceCapabilitiesResponse { capabilities },
+                        },
+                        Err(qgs_core::DeviceDiscoveryError::UnknownDeviceId) => {
+                            WireMessage::Error {
+                                request_id,
+                                response: ErrorResponse {
+                                    code: ProtocolErrorCode::UnknownDeviceId,
+                                },
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("device capability discovery failed: {err}");
+                            WireMessage::Error {
+                                request_id,
+                                response: ErrorResponse {
+                                    code: ProtocolErrorCode::DiscoveryFailed,
+                                },
+                            }
+                        }
+                    }
+                }
+            }
             WireMessage::Welcome { .. }
             | WireMessage::Error { .. }
-            | WireMessage::DeviceList { .. } => WireMessage::Error {
+            | WireMessage::DeviceList { .. }
+            | WireMessage::DeviceCapabilities { .. } => WireMessage::Error {
                 request_id,
                 response: ErrorResponse {
                     code: ProtocolErrorCode::from(&ProtocolError::MalformedPayload),

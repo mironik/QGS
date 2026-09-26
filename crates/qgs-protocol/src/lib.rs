@@ -20,7 +20,15 @@ pub const MAX_DEVICE_COUNT: usize = 16;
 /// Maximum UTF-8 device name size in bytes.
 pub const MAX_DEVICE_NAME_LEN: usize = 128;
 
+/// Maximum number of memory heaps in DEVICE_CAPABILITIES.
+pub const MAX_MEMORY_HEAP_COUNT: usize = 16;
+
+/// Maximum number of memory types summarized in DEVICE_CAPABILITIES.
+pub const MAX_MEMORY_TYPE_COUNT: usize = 32;
+
 const DEVICE_ENTRY_FIXED_LEN: usize = 32;
+const DEVICE_CAPABILITIES_FIXED_PREFIX_LEN: usize = 52;
+const MEMORY_HEAP_ENTRY_LEN: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ProtocolVersion {
@@ -105,6 +113,7 @@ impl TryFrom<u8> for MessageKind {
 pub enum Request {
     Hello(HelloRequest),
     EnumerateDevices(EnumerateDevicesRequest),
+    QueryDeviceCapabilities(QueryDeviceCapabilitiesRequest),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -126,10 +135,16 @@ impl HelloRequest {
 pub struct EnumerateDevicesRequest;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryDeviceCapabilitiesRequest {
+    pub device_id: DeviceId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Response {
     Welcome(WelcomeResponse),
     Error(ErrorResponse),
     DeviceList(DeviceListResponse),
+    DeviceCapabilities(DeviceCapabilitiesResponse),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -266,6 +281,50 @@ pub struct DeviceDesc {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceCapabilitiesResponse {
+    pub capabilities: DeviceCapabilities,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceCapabilities {
+    pub device_id: DeviceId,
+    pub compute: ComputeCapabilities,
+    pub memory: MemoryCapabilities,
+    pub interop: InteropCapabilities,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComputeCapabilities {
+    pub supported: bool,
+    pub max_workgroup_count: [u32; 3],
+    pub max_workgroup_size: [u32; 3],
+    pub max_workgroup_invocations: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryCapabilities {
+    pub heaps: Vec<MemoryHeapDesc>,
+    pub memory_type_count: u16,
+    pub host_visible: bool,
+    pub host_coherent: bool,
+    pub device_local: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryHeapDesc {
+    pub size_bytes: u64,
+    pub device_local: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InteropCapabilities {
+    pub external_memory_fd: bool,
+    pub dma_buf: bool,
+    pub external_semaphore_fd: bool,
+    pub external_fence_fd: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     SessionClosed { session_id: SessionId },
 }
@@ -290,6 +349,9 @@ pub enum ProtocolErrorCode {
     InvalidUtf8 = 16,
     SessionRequired = 17,
     DiscoveryFailed = 18,
+    UnknownDeviceId = 19,
+    MemoryHeapCountTooLarge = 20,
+    MemoryTypeCountTooLarge = 21,
 }
 
 impl ProtocolErrorCode {
@@ -321,6 +383,9 @@ impl TryFrom<u32> for ProtocolErrorCode {
             16 => Ok(Self::InvalidUtf8),
             17 => Ok(Self::SessionRequired),
             18 => Ok(Self::DiscoveryFailed),
+            19 => Ok(Self::UnknownDeviceId),
+            20 => Ok(Self::MemoryHeapCountTooLarge),
+            21 => Ok(Self::MemoryTypeCountTooLarge),
             _ => Err(ProtocolError::MalformedPayload),
         }
     }
@@ -333,6 +398,7 @@ pub enum ProtocolError {
     },
     InvalidSessionId,
     InvalidDeviceId,
+    UnknownDeviceId,
     SessionIdsExhausted,
     UnknownMessageKind {
         kind: u8,
@@ -370,6 +436,14 @@ pub enum ProtocolError {
     InvalidUtf8,
     SessionRequired,
     DiscoveryFailed,
+    MemoryHeapCountTooLarge {
+        count: usize,
+        max: usize,
+    },
+    MemoryTypeCountTooLarge {
+        count: usize,
+        max: usize,
+    },
     MalformedPayload,
     InvalidVersionRange {
         min: ProtocolVersion,
@@ -388,6 +462,7 @@ impl fmt::Display for ProtocolError {
             Self::InvalidMagic { actual } => write!(f, "invalid protocol magic: {actual:#010x}"),
             Self::InvalidSessionId => write!(f, "session id must be non-zero"),
             Self::InvalidDeviceId => write!(f, "device id must be non-zero"),
+            Self::UnknownDeviceId => write!(f, "unknown device id"),
             Self::SessionIdsExhausted => write!(f, "session ids are exhausted"),
             Self::UnknownMessageKind { kind } => write!(f, "unknown message kind: {kind}"),
             Self::UnknownOpcode { kind, opcode } => {
@@ -421,6 +496,12 @@ impl fmt::Display for ProtocolError {
             Self::InvalidUtf8 => write!(f, "invalid UTF-8 device name"),
             Self::SessionRequired => write!(f, "session required"),
             Self::DiscoveryFailed => write!(f, "device discovery failed"),
+            Self::MemoryHeapCountTooLarge { count, max } => {
+                write!(f, "memory heap count {count} exceeds maximum {max}")
+            }
+            Self::MemoryTypeCountTooLarge { count, max } => {
+                write!(f, "memory type count {count} exceeds maximum {max}")
+            }
             Self::MalformedPayload => write!(f, "malformed payload"),
             Self::InvalidVersionRange { min, max } => {
                 write!(f, "invalid protocol version range: {min}..={max}")
@@ -445,6 +526,7 @@ impl From<&ProtocolError> for ProtocolErrorCode {
             ProtocolError::InvalidMagic { .. } => Self::InvalidMagic,
             ProtocolError::InvalidSessionId => Self::InvalidSessionId,
             ProtocolError::InvalidDeviceId => Self::InvalidDeviceId,
+            ProtocolError::UnknownDeviceId => Self::UnknownDeviceId,
             ProtocolError::SessionIdsExhausted => Self::SessionIdsExhausted,
             ProtocolError::UnknownMessageKind { .. } => Self::UnknownMessageKind,
             ProtocolError::UnknownOpcode { .. } => Self::UnknownOpcode,
@@ -460,6 +542,8 @@ impl From<&ProtocolError> for ProtocolErrorCode {
             ProtocolError::InvalidUtf8 => Self::InvalidUtf8,
             ProtocolError::SessionRequired => Self::SessionRequired,
             ProtocolError::DiscoveryFailed => Self::DiscoveryFailed,
+            ProtocolError::MemoryHeapCountTooLarge { .. } => Self::MemoryHeapCountTooLarge,
+            ProtocolError::MemoryTypeCountTooLarge { .. } => Self::MemoryTypeCountTooLarge,
             ProtocolError::InvalidVersionRange { .. } => Self::InvalidVersionRange,
             ProtocolError::UnsupportedVersion { .. } => Self::UnsupportedVersion,
         }
@@ -480,6 +564,7 @@ pub fn validate_header(header: &MessageHeader) -> Result<(), ProtocolError> {
 pub enum RequestOpcode {
     Hello,
     EnumerateDevices,
+    QueryDeviceCapabilities,
 }
 
 impl RequestOpcode {
@@ -487,6 +572,7 @@ impl RequestOpcode {
         match self {
             Self::Hello => 1,
             Self::EnumerateDevices => 2,
+            Self::QueryDeviceCapabilities => 3,
         }
     }
 }
@@ -496,6 +582,7 @@ pub enum ResponseOpcode {
     Welcome,
     Error,
     DeviceList,
+    DeviceCapabilities,
 }
 
 impl ResponseOpcode {
@@ -504,6 +591,7 @@ impl ResponseOpcode {
             Self::Welcome => 1,
             Self::Error => 2,
             Self::DeviceList => 3,
+            Self::DeviceCapabilities => 4,
         }
     }
 }
@@ -527,6 +615,10 @@ pub enum WireMessage {
     EnumerateDevices {
         request_id: u64,
     },
+    QueryDeviceCapabilities {
+        request_id: u64,
+        request: QueryDeviceCapabilitiesRequest,
+    },
     Welcome {
         request_id: u64,
         response: WelcomeResponse,
@@ -539,6 +631,10 @@ pub enum WireMessage {
         request_id: u64,
         response: DeviceListResponse,
     },
+    DeviceCapabilities {
+        request_id: u64,
+        response: DeviceCapabilitiesResponse,
+    },
 }
 
 impl WireMessage {
@@ -546,9 +642,11 @@ impl WireMessage {
         match self {
             Self::Hello { request_id, .. }
             | Self::EnumerateDevices { request_id }
+            | Self::QueryDeviceCapabilities { request_id, .. }
             | Self::Welcome { request_id, .. }
             | Self::Error { request_id, .. }
-            | Self::DeviceList { request_id, .. } => *request_id,
+            | Self::DeviceList { request_id, .. }
+            | Self::DeviceCapabilities { request_id, .. } => *request_id,
         }
     }
 }
@@ -569,6 +667,15 @@ pub fn encode_wire_message(message: &WireMessage) -> Vec<u8> {
             RequestOpcode::EnumerateDevices.wire_value(),
             *request_id,
             Vec::new(),
+        ),
+        WireMessage::QueryDeviceCapabilities {
+            request_id,
+            request,
+        } => (
+            MessageKind::Request,
+            RequestOpcode::QueryDeviceCapabilities.wire_value(),
+            *request_id,
+            encode_query_device_capabilities_payload(request),
         ),
         WireMessage::Welcome {
             request_id,
@@ -596,6 +703,15 @@ pub fn encode_wire_message(message: &WireMessage) -> Vec<u8> {
             ResponseOpcode::DeviceList.wire_value(),
             *request_id,
             encode_device_list_payload(response),
+        ),
+        WireMessage::DeviceCapabilities {
+            request_id,
+            response,
+        } => (
+            MessageKind::Response,
+            ResponseOpcode::DeviceCapabilities.wire_value(),
+            *request_id,
+            encode_device_capabilities_payload(response),
         ),
     };
 
@@ -711,6 +827,10 @@ pub fn decode_wire_message_parts(
                 Err(ProtocolError::TrailingPayload { len: payload.len() })
             }
         }
+        (MessageKind::Request, 3) => Ok(WireMessage::QueryDeviceCapabilities {
+            request_id: header.request_id,
+            request: decode_query_device_capabilities_payload(payload)?,
+        }),
         (MessageKind::Response, 1) => Ok(WireMessage::Welcome {
             request_id: header.request_id,
             response: decode_welcome_payload(payload)?,
@@ -722,6 +842,10 @@ pub fn decode_wire_message_parts(
         (MessageKind::Response, 3) => Ok(WireMessage::DeviceList {
             request_id: header.request_id,
             response: decode_device_list_payload(payload)?,
+        }),
+        (MessageKind::Response, 4) => Ok(WireMessage::DeviceCapabilities {
+            request_id: header.request_id,
+            response: decode_device_capabilities_payload(payload)?,
         }),
         _ => Err(ProtocolError::UnknownOpcode {
             kind: header.kind,
@@ -783,7 +907,7 @@ fn encode_wire_header(header: &WireHeader, bytes: &mut Vec<u8>) {
 
 fn validate_opcode(kind: MessageKind, opcode: u8) -> Result<(), ProtocolError> {
     match (kind, opcode) {
-        (MessageKind::Request, 1 | 2) | (MessageKind::Response, 1..=3) => Ok(()),
+        (MessageKind::Request, 1..=3) | (MessageKind::Response, 1..=4) => Ok(()),
         _ => Err(ProtocolError::UnknownOpcode { kind, opcode }),
     }
 }
@@ -847,6 +971,22 @@ fn decode_error_payload(bytes: &[u8]) -> Result<ErrorResponse, ProtocolError> {
 
     Ok(ErrorResponse {
         code: ProtocolErrorCode::try_from(read_u32(bytes, 0))?,
+    })
+}
+
+fn encode_query_device_capabilities_payload(request: &QueryDeviceCapabilitiesRequest) -> Vec<u8> {
+    request.device_id.get().to_le_bytes().to_vec()
+}
+
+fn decode_query_device_capabilities_payload(
+    bytes: &[u8],
+) -> Result<QueryDeviceCapabilitiesRequest, ProtocolError> {
+    if bytes.len() != 8 {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(QueryDeviceCapabilitiesRequest {
+        device_id: DeviceId::new(read_u64(bytes, 0))?,
     })
 }
 
@@ -969,6 +1109,157 @@ fn decode_device_list_payload(bytes: &[u8]) -> Result<DeviceListResponse, Protoc
     }
 
     Ok(DeviceListResponse { devices })
+}
+
+fn encode_device_capabilities_payload(response: &DeviceCapabilitiesResponse) -> Vec<u8> {
+    let capabilities = &response.capabilities;
+    let heap_count = capabilities.memory.heaps.len();
+    assert!(heap_count <= MAX_MEMORY_HEAP_COUNT);
+    assert!(usize::from(capabilities.memory.memory_type_count) <= MAX_MEMORY_TYPE_COUNT);
+
+    let mut bytes = Vec::with_capacity(
+        DEVICE_CAPABILITIES_FIXED_PREFIX_LEN + heap_count * MEMORY_HEAP_ENTRY_LEN,
+    );
+    bytes.extend_from_slice(&capabilities.device_id.get().to_le_bytes());
+    bytes.push(bool_to_u8(capabilities.compute.supported));
+    bytes.extend_from_slice(&[0_u8; 3]);
+    for value in capabilities.compute.max_workgroup_count {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    for value in capabilities.compute.max_workgroup_size {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes.extend_from_slice(&capabilities.compute.max_workgroup_invocations.to_le_bytes());
+    bytes.extend_from_slice(&(heap_count as u16).to_le_bytes());
+    bytes.extend_from_slice(&capabilities.memory.memory_type_count.to_le_bytes());
+    bytes.push(bool_to_u8(capabilities.memory.host_visible));
+    bytes.push(bool_to_u8(capabilities.memory.host_coherent));
+    bytes.push(bool_to_u8(capabilities.memory.device_local));
+    bytes.push(0);
+    bytes.push(bool_to_u8(capabilities.interop.external_memory_fd));
+    bytes.push(bool_to_u8(capabilities.interop.dma_buf));
+    bytes.push(bool_to_u8(capabilities.interop.external_semaphore_fd));
+    bytes.push(bool_to_u8(capabilities.interop.external_fence_fd));
+
+    for heap in &capabilities.memory.heaps {
+        bytes.extend_from_slice(&heap.size_bytes.to_le_bytes());
+        bytes.push(bool_to_u8(heap.device_local));
+        bytes.extend_from_slice(&[0_u8; 7]);
+    }
+
+    bytes
+}
+
+fn decode_device_capabilities_payload(
+    bytes: &[u8],
+) -> Result<DeviceCapabilitiesResponse, ProtocolError> {
+    if bytes.len() < DEVICE_CAPABILITIES_FIXED_PREFIX_LEN {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    let heap_count = read_u16(bytes, 40) as usize;
+    if heap_count > MAX_MEMORY_HEAP_COUNT {
+        return Err(ProtocolError::MemoryHeapCountTooLarge {
+            count: heap_count,
+            max: MAX_MEMORY_HEAP_COUNT,
+        });
+    }
+
+    let memory_type_count = read_u16(bytes, 42);
+    if usize::from(memory_type_count) > MAX_MEMORY_TYPE_COUNT {
+        return Err(ProtocolError::MemoryTypeCountTooLarge {
+            count: usize::from(memory_type_count),
+            max: MAX_MEMORY_TYPE_COUNT,
+        });
+    }
+
+    let expected_len = DEVICE_CAPABILITIES_FIXED_PREFIX_LEN
+        .checked_add(
+            heap_count
+                .checked_mul(MEMORY_HEAP_ENTRY_LEN)
+                .ok_or(ProtocolError::MalformedPayload)?,
+        )
+        .ok_or(ProtocolError::MalformedPayload)?;
+    if bytes.len() < expected_len {
+        return Err(ProtocolError::TruncatedPayload {
+            actual: bytes.len(),
+            expected: expected_len,
+        });
+    }
+    if bytes.len() > expected_len {
+        return Err(ProtocolError::TrailingPayload {
+            len: bytes.len() - expected_len,
+        });
+    }
+
+    let mut offset = DEVICE_CAPABILITIES_FIXED_PREFIX_LEN;
+    let mut heaps = Vec::with_capacity(heap_count);
+    for _ in 0..heap_count {
+        heaps.push(MemoryHeapDesc {
+            size_bytes: read_u64(bytes, offset),
+            device_local: read_bool(bytes[offset + 8])?,
+        });
+        if bytes[offset + 9..offset + MEMORY_HEAP_ENTRY_LEN]
+            .iter()
+            .any(|value| *value != 0)
+        {
+            return Err(ProtocolError::MalformedPayload);
+        }
+        offset += MEMORY_HEAP_ENTRY_LEN;
+    }
+
+    if bytes[9..12].iter().any(|value| *value != 0) || bytes[47] != 0 {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(DeviceCapabilitiesResponse {
+        capabilities: DeviceCapabilities {
+            device_id: DeviceId::new(read_u64(bytes, 0))?,
+            compute: ComputeCapabilities {
+                supported: read_bool(bytes[8])?,
+                max_workgroup_count: [
+                    read_u32(bytes, 12),
+                    read_u32(bytes, 16),
+                    read_u32(bytes, 20),
+                ],
+                max_workgroup_size: [
+                    read_u32(bytes, 24),
+                    read_u32(bytes, 28),
+                    read_u32(bytes, 32),
+                ],
+                max_workgroup_invocations: read_u32(bytes, 36),
+            },
+            memory: MemoryCapabilities {
+                heaps,
+                memory_type_count,
+                host_visible: read_bool(bytes[44])?,
+                host_coherent: read_bool(bytes[45])?,
+                device_local: read_bool(bytes[46])?,
+            },
+            interop: InteropCapabilities {
+                external_memory_fd: read_bool(bytes[48])?,
+                dma_buf: read_bool(bytes[49])?,
+                external_semaphore_fd: read_bool(bytes[50])?,
+                external_fence_fd: read_bool(bytes[51])?,
+            },
+        },
+    })
+}
+
+const fn bool_to_u8(value: bool) -> u8 {
+    if value {
+        1
+    } else {
+        0
+    }
+}
+
+fn read_bool(value: u8) -> Result<bool, ProtocolError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(ProtocolError::MalformedPayload),
+    }
 }
 
 fn read_u16(bytes: &[u8], start: usize) -> u16 {
@@ -1485,6 +1776,261 @@ mod tests {
         assert_eq!(decoded_device_list.request_id(), 19);
     }
 
+    #[test]
+    fn capability_request_round_trip() {
+        let message = WireMessage::QueryDeviceCapabilities {
+            request_id: 20,
+            request: QueryDeviceCapabilitiesRequest {
+                device_id: DeviceId::new(7).expect("device id"),
+            },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn capability_response_round_trip() {
+        let message = WireMessage::DeviceCapabilities {
+            request_id: 21,
+            response: DeviceCapabilitiesResponse {
+                capabilities: sample_capabilities(7),
+            },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn rejects_zero_device_id_in_capability_request() {
+        let mut bytes = encode_wire_message(&WireMessage::QueryDeviceCapabilities {
+            request_id: 22,
+            request: QueryDeviceCapabilitiesRequest {
+                device_id: DeviceId::new(1).expect("device id"),
+            },
+        });
+        bytes[WIRE_HEADER_LEN..WIRE_HEADER_LEN + 8].copy_from_slice(&0_u64.to_le_bytes());
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::InvalidDeviceId)
+        );
+    }
+
+    #[test]
+    fn unknown_device_id_has_stable_error_code() {
+        assert_eq!(
+            ProtocolErrorCode::from(&ProtocolError::UnknownDeviceId),
+            ProtocolErrorCode::UnknownDeviceId
+        );
+        assert_eq!(
+            ProtocolErrorCode::try_from(ProtocolErrorCode::UnknownDeviceId.wire_value()),
+            Ok(ProtocolErrorCode::UnknownDeviceId)
+        );
+    }
+
+    #[test]
+    fn compute_capability_encoding_round_trips() {
+        let mut capabilities = sample_capabilities(8);
+        capabilities.compute = ComputeCapabilities {
+            supported: true,
+            max_workgroup_count: [1, 2, 3],
+            max_workgroup_size: [4, 5, 6],
+            max_workgroup_invocations: 7,
+        };
+        let message = WireMessage::DeviceCapabilities {
+            request_id: 23,
+            response: DeviceCapabilitiesResponse { capabilities },
+        };
+
+        let decoded = decode_wire_message(&encode_wire_message(&message)).expect("capabilities");
+
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn multiple_memory_heaps_round_trip() {
+        let mut capabilities = sample_capabilities(9);
+        capabilities.memory.heaps = vec![
+            MemoryHeapDesc {
+                size_bytes: 64 * 1024 * 1024,
+                device_local: true,
+            },
+            MemoryHeapDesc {
+                size_bytes: 128 * 1024 * 1024,
+                device_local: false,
+            },
+        ];
+        let message = WireMessage::DeviceCapabilities {
+            request_id: 24,
+            response: DeviceCapabilitiesResponse { capabilities },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn maximum_valid_heap_count_round_trips() {
+        let mut capabilities = sample_capabilities(10);
+        capabilities.memory.heaps = (0..MAX_MEMORY_HEAP_COUNT)
+            .map(|index| MemoryHeapDesc {
+                size_bytes: index as u64 + 1,
+                device_local: index % 2 == 0,
+            })
+            .collect();
+        let message = WireMessage::DeviceCapabilities {
+            request_id: 25,
+            response: DeviceCapabilitiesResponse { capabilities },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn rejects_excessive_heap_count() {
+        let mut bytes = encode_wire_message(&WireMessage::DeviceCapabilities {
+            request_id: 26,
+            response: DeviceCapabilitiesResponse {
+                capabilities: sample_capabilities(11),
+            },
+        });
+        bytes[WIRE_HEADER_LEN + 40..WIRE_HEADER_LEN + 42]
+            .copy_from_slice(&((MAX_MEMORY_HEAP_COUNT as u16) + 1).to_le_bytes());
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::MemoryHeapCountTooLarge {
+                count: MAX_MEMORY_HEAP_COUNT + 1,
+                max: MAX_MEMORY_HEAP_COUNT,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_excessive_memory_type_count() {
+        let mut bytes = encode_wire_message(&WireMessage::DeviceCapabilities {
+            request_id: 27,
+            response: DeviceCapabilitiesResponse {
+                capabilities: sample_capabilities(12),
+            },
+        });
+        bytes[WIRE_HEADER_LEN + 42..WIRE_HEADER_LEN + 44]
+            .copy_from_slice(&((MAX_MEMORY_TYPE_COUNT as u16) + 1).to_le_bytes());
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::MemoryTypeCountTooLarge {
+                count: MAX_MEMORY_TYPE_COUNT + 1,
+                max: MAX_MEMORY_TYPE_COUNT,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_heap_entry() {
+        let mut bytes = encode_wire_message(&WireMessage::DeviceCapabilities {
+            request_id: 28,
+            response: DeviceCapabilitiesResponse {
+                capabilities: sample_capabilities(13),
+            },
+        });
+        bytes.truncate(bytes.len() - 1);
+
+        assert!(matches!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::TruncatedPayload { .. })
+        ));
+    }
+
+    #[test]
+    fn interop_capability_encoding_round_trips() {
+        let mut capabilities = sample_capabilities(14);
+        capabilities.interop = InteropCapabilities {
+            external_memory_fd: true,
+            dma_buf: false,
+            external_semaphore_fd: true,
+            external_fence_fd: false,
+        };
+        let message = WireMessage::DeviceCapabilities {
+            request_id: 29,
+            response: DeviceCapabilitiesResponse { capabilities },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_capability_payload() {
+        let mut bytes = encode_wire_message(&WireMessage::DeviceCapabilities {
+            request_id: 30,
+            response: DeviceCapabilitiesResponse {
+                capabilities: sample_capabilities(15),
+            },
+        });
+        bytes[WIRE_HEADER_LEN + 8] = 2;
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::MalformedPayload)
+        );
+    }
+
+    #[test]
+    fn preserves_request_id_for_capability_messages() {
+        let request = WireMessage::QueryDeviceCapabilities {
+            request_id: 31,
+            request: QueryDeviceCapabilitiesRequest {
+                device_id: DeviceId::new(1).expect("device id"),
+            },
+        };
+        let response = WireMessage::DeviceCapabilities {
+            request_id: 32,
+            response: DeviceCapabilitiesResponse {
+                capabilities: sample_capabilities(16),
+            },
+        };
+
+        let decoded_request =
+            decode_wire_message(&encode_wire_message(&request)).expect("capability request");
+        let decoded_response =
+            decode_wire_message(&encode_wire_message(&response)).expect("capability response");
+
+        assert_eq!(decoded_request.request_id(), 31);
+        assert_eq!(decoded_response.request_id(), 32);
+    }
+
+    #[test]
+    fn rejects_trailing_capability_payload() {
+        let mut bytes = encode_wire_message(&WireMessage::DeviceCapabilities {
+            request_id: 33,
+            response: DeviceCapabilitiesResponse {
+                capabilities: sample_capabilities(17),
+            },
+        });
+        let payload_len = (bytes.len() - WIRE_HEADER_LEN + 1) as u32;
+        bytes[12..16].copy_from_slice(&payload_len.to_le_bytes());
+        bytes.push(0);
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::TrailingPayload { len: 1 })
+        );
+    }
+
     fn sample_device(name: &str, class: DeviceClass, raw_id: u64) -> DeviceDesc {
         DeviceDesc {
             id: DeviceId::new(raw_id).expect("device id"),
@@ -1495,6 +2041,34 @@ mod tests {
             backend: BackendApi::Vulkan,
             api_version: ApiVersion::new(1, 3, 0),
             driver_version: 42,
+        }
+    }
+
+    fn sample_capabilities(raw_id: u64) -> DeviceCapabilities {
+        DeviceCapabilities {
+            device_id: DeviceId::new(raw_id).expect("device id"),
+            compute: ComputeCapabilities {
+                supported: true,
+                max_workgroup_count: [65_535, 65_535, 65_535],
+                max_workgroup_size: [1024, 1024, 64],
+                max_workgroup_invocations: 1024,
+            },
+            memory: MemoryCapabilities {
+                heaps: vec![MemoryHeapDesc {
+                    size_bytes: 256 * 1024 * 1024,
+                    device_local: true,
+                }],
+                memory_type_count: 4,
+                host_visible: true,
+                host_coherent: true,
+                device_local: true,
+            },
+            interop: InteropCapabilities {
+                external_memory_fd: true,
+                dma_buf: true,
+                external_semaphore_fd: true,
+                external_fence_fd: true,
+            },
         }
     }
 }
