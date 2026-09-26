@@ -1,0 +1,10 @@
+[package]
+name = "qgs-test"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+qgs-core = { path = "../../crates/qgs-core" }
+qgs-protocol = { path = "../../crates/qgs-protocol" }
+
