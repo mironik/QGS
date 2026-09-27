@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::os::fd::OwnedFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use qgs_linux::{
     connect_socket, default_socket_path, receive_message, receive_message_with_attachments,
@@ -342,7 +343,7 @@ fn inspect_mxf(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let source = MediaSource::parse(&bytes)?;
 
     println!("MXF:");
-    println!("  path: {}", path.display());
+    println!("  file: {}", mxf_file_label(path));
     if let Some(duration) = source.duration {
         println!("  duration edit units: {duration}");
     }
@@ -369,9 +370,8 @@ fn inspect_mxf(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     println!("Packages:");
     for package in &source.packages {
         println!(
-            "  {:?}: uid={} tracks={}",
+            "  {:?}: uid=<redacted> tracks={}",
             package.kind,
-            package.uid,
             package.track_refs.len()
         );
     }
@@ -424,6 +424,17 @@ fn inspect_mxf(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
                     println!("    bit depth: {:?}", audio.bit_depth);
                 }
             }
+            TrackKind::Data => {
+                if let Some(data) = &track.data {
+                    println!("    descriptor source: {:?}", data.source);
+                    if let Some(rate) = data.sample_rate {
+                        println!("    sample rate: {}/{}", rate.numerator, rate.denominator);
+                    }
+                    if let Some(essence) = data.essence {
+                        println!("    essence: {essence}");
+                    }
+                }
+            }
             TrackKind::Timecode | TrackKind::Other => {}
         }
     }
@@ -434,6 +445,13 @@ fn inspect_mxf(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .filter(|entry| entry.random_access == RandomAccess::Yes)
         .count();
+    let random_access_positions = source
+        .index
+        .video
+        .iter()
+        .filter(|entry| entry.random_access == RandomAccess::Yes)
+        .map(|entry| entry.edit_unit)
+        .collect::<Vec<_>>();
     println!("Index:");
     let index_source = if source
         .index
@@ -448,6 +466,7 @@ fn inspect_mxf(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     println!("  source: {index_source}");
     println!("  video entries: {}", source.index.video.len());
     println!("  random access points: {random_access_points}");
+    println!("  random access edit units: {:?}", random_access_positions);
     println!("  index segments: {}", source.index_segments.len());
     for segment in &source.index_segments {
         println!(
@@ -500,8 +519,217 @@ fn inspect_mxf(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         "  picture kind: {:?}",
         parsed.slices.first().map(|slice| &slice.kind)
     );
+    print_h264_gop_summary(&source, &bytes)?;
+    if let Some(sidecar) = SonyXmlSummary::from_mxf_path(path)? {
+        print_sony_xml_comparison(&source, &parsed, &sidecar);
+    }
 
     Ok(())
+}
+
+fn print_h264_gop_summary(
+    source: &MediaSource,
+    bytes: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut state = qgs_codec_h264::H264DecoderState::new();
+    let mut kinds = BTreeMap::new();
+    let mut random_access_positions = Vec::new();
+    let targets = [
+        0_usize,
+        source.index.video.len() / 2,
+        source.index.video.len().saturating_sub(1),
+    ];
+    let mut target_summaries = Vec::new();
+    for index in 0..source.index.video.len() {
+        let access_unit = source.extract_video_access_unit(bytes, index)?;
+        let parsed = state.parse_access_unit(&access_unit)?;
+        if parsed.slices.iter().any(|slice| slice.idr) {
+            random_access_positions.push(index);
+        }
+        if let Some(kind) = parsed
+            .slices
+            .first()
+            .map(|slice| format!("{:?}", slice.kind))
+        {
+            *kinds.entry(kind.clone()).or_insert(0_usize) += 1;
+            if targets.contains(&index) {
+                target_summaries.push((
+                    index,
+                    kind,
+                    parsed.desc.bit_depth.get(),
+                    parsed.desc.chroma,
+                ));
+            }
+        }
+        state.finish_picture(&parsed)?;
+    }
+    println!("GOP structure:");
+    println!("  picture counts: {:?}", kinds);
+    println!("  IDR positions: {:?}", random_access_positions);
+    for (index, kind, bit_depth, chroma) in target_summaries {
+        println!("  sample edit unit {index}: kind={kind} bit_depth={bit_depth} chroma={chroma:?}");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct SonyXmlSummary {
+    duration: Option<u64>,
+    ltc_tc_fps: Option<String>,
+    ltc_half_step: Option<bool>,
+    video_codec: Option<String>,
+    capture_fps: Option<String>,
+    format_fps: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    aspect_ratio: Option<String>,
+    audio_channels: Option<u16>,
+    audio_codecs: Vec<String>,
+    color_values: BTreeMap<String, String>,
+    camera_model: Option<String>,
+}
+
+impl SonyXmlSummary {
+    fn from_mxf_path(path: &Path) -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            return Ok(None);
+        };
+        let sidecar = path.with_file_name(format!("{stem}M01.XML"));
+        if !sidecar.exists() {
+            return Ok(None);
+        }
+        let xml = std::fs::read_to_string(sidecar)?;
+        Ok(Some(Self::parse(&xml)))
+    }
+
+    fn parse(xml: &str) -> Self {
+        let duration = find_attr(xml, "<Duration", "value").and_then(|value| value.parse().ok());
+        let ltc_tc_fps = find_attr(xml, "<LtcChangeTable", "tcFps");
+        let ltc_half_step =
+            find_attr(xml, "<LtcChangeTable", "halfStep").map(|value| value == "true");
+        let video_codec = find_attr(xml, "<VideoFrame", "videoCodec");
+        let capture_fps = find_attr(xml, "<VideoFrame", "captureFps");
+        let format_fps = find_attr(xml, "<VideoFrame", "formatFps");
+        let width = find_attr(xml, "<VideoLayout", "pixel").and_then(|value| value.parse().ok());
+        let height = find_attr(xml, "<VideoLayout", "numOfVerticalLine")
+            .and_then(|value| value.parse().ok());
+        let aspect_ratio = find_attr(xml, "<VideoLayout", "aspectRatio");
+        let audio_channels =
+            find_attr(xml, "<AudioFormat", "numOfChannel").and_then(|value| value.parse().ok());
+        let audio_codecs = find_all_attrs(xml, "<AudioRecPort", "audioCodec");
+        let camera_model = find_attr(xml, "<Device", "modelName");
+        let mut color_values = BTreeMap::new();
+        for name in [
+            "CaptureGammaEquation",
+            "CaptureColorPrimaries",
+            "CodingEquations",
+        ] {
+            if let Some(value) = find_item_value(xml, name) {
+                color_values.insert(name.to_string(), value);
+            }
+        }
+        Self {
+            duration,
+            ltc_tc_fps,
+            ltc_half_step,
+            video_codec,
+            capture_fps,
+            format_fps,
+            width,
+            height,
+            aspect_ratio,
+            audio_channels,
+            audio_codecs,
+            color_values,
+            camera_model,
+        }
+    }
+}
+
+fn print_sony_xml_comparison(
+    source: &MediaSource,
+    parsed: &qgs_codec_h264::ParsedH264AccessUnit,
+    sidecar: &SonyXmlSummary,
+) {
+    println!("Sony XML sidecar comparison:");
+    if let Some(model) = &sidecar.camera_model {
+        println!("  camera model: {model}");
+    }
+    println!("  XML duration edit units: {:?}", sidecar.duration);
+    println!("  MXF duration edit units: {:?}", source.duration);
+    println!("  XML video codec: {:?}", sidecar.video_codec);
+    println!(
+        "  XML fps: capture={:?} format={:?}",
+        sidecar.capture_fps, sidecar.format_fps
+    );
+    println!(
+        "  XML layout: {:?} x {:?} aspect={:?}",
+        sidecar.width, sidecar.height, sidecar.aspect_ratio
+    );
+    println!(
+        "  H.264 SPS: {} x {} bit_depth={} chroma={:?}",
+        parsed.desc.coded_width,
+        parsed.desc.coded_height,
+        parsed.desc.bit_depth.get(),
+        parsed.desc.chroma
+    );
+    println!("  XML audio channels: {:?}", sidecar.audio_channels);
+    println!("  XML audio codecs: {:?}", sidecar.audio_codecs);
+    println!(
+        "  XML LTC: tcFps={:?} halfStep={:?}",
+        sidecar.ltc_tc_fps, sidecar.ltc_half_step
+    );
+    if !sidecar.color_values.is_empty() {
+        println!("  XML color/acquisition: {:?}", sidecar.color_values);
+    }
+}
+
+fn find_attr(xml: &str, tag_prefix: &str, attr: &str) -> Option<String> {
+    let start = xml.find(tag_prefix)?;
+    let rest = &xml[start..];
+    let end = rest.find('>')?;
+    attr_in_tag(&rest[..end], attr)
+}
+
+fn find_all_attrs(xml: &str, tag_prefix: &str, attr: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(tag_prefix) {
+        rest = &rest[start..];
+        let Some(end) = rest.find('>') else { break };
+        if let Some(value) = attr_in_tag(&rest[..end], attr) {
+            values.push(value);
+        }
+        rest = &rest[end..];
+    }
+    values
+}
+
+fn find_item_value(xml: &str, name: &str) -> Option<String> {
+    let needle = format!("<Item name=\"{name}\"");
+    let start = xml.find(&needle)?;
+    let rest = &xml[start..];
+    let end = rest.find('>')?;
+    attr_in_tag(&rest[..end], "value")
+}
+
+fn attr_in_tag(tag: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let end = tag[start..].find('"')?;
+    Some(tag[start..start + end].to_string())
+}
+
+fn mxf_file_label(path: &Path) -> String {
+    if path.is_absolute() {
+        if let Ok(current_dir) = std::env::current_dir() {
+            if let Ok(relative) = path.strip_prefix(current_dir) {
+                return relative.display().to_string();
+            }
+        }
+        return "<external>".to_string();
+    }
+    path.display().to_string()
 }
 
 fn print_haswell_diagnostic_report(report: &qgs_vulkan::HaswellVideoDiagnosticReport) {
@@ -2066,5 +2294,62 @@ impl Args {
             haswell_video_diagnostic,
             mxf_inspect_path,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mxf_file_label, SonyXmlSummary};
+    use std::path::PathBuf;
+
+    #[test]
+    fn sony_xml_summary_extracts_technical_fields_without_private_ids() {
+        let xml = r#"
+            <Duration value="106"/>
+            <LtcChangeTable tcFps="25" halfStep="true"/>
+            <VideoFrame videoCodec="AVC50_1920_1080_H422P@L42" captureFps="50.00p" formatFps="50p"/>
+            <VideoLayout pixel="1920" numOfVerticalLine="1080" aspectRatio="16:9"/>
+            <AudioFormat numOfChannel="4"/>
+            <AudioRecPort audioCodec="LPCM24" channel="CH1"/>
+            <AudioRecPort audioCodec="LPCM24" channel="CH2"/>
+            <Device manufacturer="Sony" modelName="ILME-FX6V" serialNo="PRIVATE-SERIAL"/>
+            <Item name="CaptureGammaEquation" value="rec709"/>
+            <Item name="CaptureColorPrimaries" value="rec709"/>
+            <Item name="CodingEquations" value="rec709"/>
+            <TargetMaterial umidRef="PRIVATE-UMID"/>
+        "#;
+
+        let summary = SonyXmlSummary::parse(xml);
+
+        assert_eq!(summary.duration, Some(106));
+        assert_eq!(
+            summary.video_codec.as_deref(),
+            Some("AVC50_1920_1080_H422P@L42")
+        );
+        assert_eq!(summary.capture_fps.as_deref(), Some("50.00p"));
+        assert_eq!(summary.format_fps.as_deref(), Some("50p"));
+        assert_eq!(summary.width, Some(1920));
+        assert_eq!(summary.height, Some(1080));
+        assert_eq!(summary.audio_channels, Some(4));
+        assert_eq!(summary.audio_codecs, vec!["LPCM24", "LPCM24"]);
+        assert_eq!(summary.camera_model.as_deref(), Some("ILME-FX6V"));
+        assert_eq!(
+            summary
+                .color_values
+                .get("CaptureGammaEquation")
+                .map(String::as_str),
+            Some("rec709")
+        );
+
+        let debug = format!("{summary:?}");
+        assert!(!debug.contains("PRIVATE-SERIAL"));
+        assert!(!debug.contains("PRIVATE-UMID"));
+    }
+
+    #[test]
+    fn external_mxf_file_labels_are_redacted() {
+        let path = PathBuf::from("/home/example/private-camera/Clip 0001.MXF");
+
+        assert_eq!(mxf_file_label(&path), "<external>");
     }
 }

@@ -274,6 +274,11 @@ access stays local to the `qgs-mxf` library and `qgs-test` inspection tool in
 M2 Step 8; no daemon `OPEN_PATH` or arbitrary filesystem protocol surface is
 introduced.
 
+Real camera-source compatibility adds generic MXF data-track representation for
+streams such as SMPTE 436M ANC. QGS preserves the data track and essence
+identity but does not interpret ANC payloads in M2 Step 8. This remains a
+container/source-media concept, not a vendor product classification.
+
 ## H.264 Decode Frontend Boundary
 
 M2 Step 3B adds the first narrow hardware decode proof:

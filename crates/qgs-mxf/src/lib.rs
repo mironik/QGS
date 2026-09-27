@@ -74,6 +74,9 @@ const CDCI_DESCRIPTOR_SET_KEY: Ul = Ul([
 const WAVE_AUDIO_DESCRIPTOR_SET_KEY: Ul = Ul([
     0x06, 0x0e, 0x2b, 0x34, 0x02, 0x53, 0x01, 0x01, 0x0d, 0x01, 0x01, 0x01, 0x01, 0x01, 0x47, 0x00,
 ]);
+const DATA_ESSENCE_DESCRIPTOR_SET_KEY: Ul = Ul([
+    0x06, 0x0e, 0x2b, 0x34, 0x02, 0x53, 0x01, 0x01, 0x0d, 0x01, 0x01, 0x01, 0x01, 0x01, 0x5c, 0x00,
+]);
 const ESSENCE_CONTAINER_DATA_SET_KEY: Ul = Ul([
     0x06, 0x0e, 0x2b, 0x34, 0x02, 0x53, 0x01, 0x01, 0x0d, 0x01, 0x01, 0x01, 0x01, 0x01, 0x23, 0x00,
 ]);
@@ -271,6 +274,7 @@ pub struct TrackId(pub u32);
 pub enum TrackKind {
     Video,
     Audio,
+    Data,
     Timecode,
     Other,
 }
@@ -302,6 +306,7 @@ pub struct MxfTrack {
     pub edit_rate: Option<Rational>,
     pub video: Option<VideoEssenceDescriptor>,
     pub audio: Option<AudioEssenceDescriptor>,
+    pub data: Option<DataEssenceDescriptor>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -335,6 +340,13 @@ pub struct AudioEssenceDescriptor {
     pub bit_depth: Option<u8>,
     pub block_align: Option<u16>,
     pub average_bytes_per_second: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DataEssenceDescriptor {
+    pub source: DescriptorSource,
+    pub essence: Option<Ul>,
+    pub sample_rate: Option<Rational>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -554,6 +566,7 @@ impl MediaSource {
                 edit_rate: None,
                 video: Some(h264_desc.clone()),
                 audio: None,
+                data: None,
             });
         }
         if let Some(track) = tracks.iter_mut().find(|track| track.id == video_track_id) {
@@ -931,6 +944,7 @@ fn is_metadata_set_key(key: Ul) -> bool {
             | MULTIPLE_DESCRIPTOR_SET_KEY
             | CDCI_DESCRIPTOR_SET_KEY
             | WAVE_AUDIO_DESCRIPTOR_SET_KEY
+            | DATA_ESSENCE_DESCRIPTOR_SET_KEY
             | ESSENCE_CONTAINER_DATA_SET_KEY
     ) || key
         .0
@@ -1100,6 +1114,7 @@ fn parse_tracks_from_metadata(sets: &[MetadataSet]) -> Result<Vec<MxfTrack>, Mxf
                     edit_rate: descriptor_sample_rate(set)?,
                     video: Some(parse_cdci_descriptor(set)?),
                     audio: None,
+                    data: None,
                 });
             }
             WAVE_AUDIO_DESCRIPTOR_SET_KEY => {
@@ -1114,6 +1129,22 @@ fn parse_tracks_from_metadata(sets: &[MetadataSet]) -> Result<Vec<MxfTrack>, Mxf
                     edit_rate: descriptor_sample_rate(set)?,
                     video: None,
                     audio: Some(parse_wave_audio_descriptor(set)?),
+                    data: None,
+                });
+            }
+            DATA_ESSENCE_DESCRIPTOR_SET_KEY => {
+                if tracks.len() >= MAX_TRACK_COUNT {
+                    return Err(MxfError::ExcessiveBatchCount);
+                }
+                let track_id = descriptor_linked_track_id(set).unwrap_or((tracks.len() + 1) as u32);
+                tracks.push(MxfTrack {
+                    id: TrackId(track_id),
+                    track_number: None,
+                    kind: TrackKind::Data,
+                    edit_rate: descriptor_sample_rate(set)?,
+                    video: None,
+                    audio: None,
+                    data: Some(parse_data_essence_descriptor(set)?),
                 });
             }
             _ => {}
@@ -1204,6 +1235,14 @@ fn parse_wave_audio_descriptor(set: &MetadataSet) -> Result<AudioEssenceDescript
         bit_depth: read_optional_u32_tag(set, 0x3d01)?.map(|value| value as u8),
         block_align: read_optional_u16_tag(set, 0x3d0a)?,
         average_bytes_per_second: read_optional_u32_tag(set, 0x3d09)?,
+    })
+}
+
+fn parse_data_essence_descriptor(set: &MetadataSet) -> Result<DataEssenceDescriptor, MxfError> {
+    Ok(DataEssenceDescriptor {
+        source: DescriptorSource::MxfMetadata,
+        essence: read_optional_ul_tag(set, 0x3004)?,
+        sample_rate: descriptor_sample_rate(set)?,
     })
 }
 
@@ -1807,6 +1846,7 @@ mod tests {
             edit_rate: Some(Rational::new(25, 1).expect("rate")),
             video: None,
             audio: None,
+            data: None,
         };
 
         assert!(matches!(
@@ -1948,6 +1988,35 @@ mod tests {
                 .and_then(|audio| audio.channels),
             Some(1)
         );
+    }
+
+    #[test]
+    fn parses_data_essence_descriptor() {
+        let set = MetadataSet {
+            key: DATA_ESSENCE_DESCRIPTOR_SET_KEY,
+            instance_uid: Some(InstanceUid([4_u8; 16])),
+            properties: vec![
+                property_u32(0x3006, 7),
+                MetadataProperty {
+                    local_tag: 0x3001,
+                    property: Ul([0_u8; 16]),
+                    value: [50_u32.to_be_bytes(), 1_u32.to_be_bytes()].concat(),
+                },
+                MetadataProperty {
+                    local_tag: 0x3004,
+                    property: Ul([0_u8; 16]),
+                    value: [0x06_u8; 16].to_vec(),
+                },
+            ],
+        };
+        let tracks = parse_tracks_from_metadata(&[set]).expect("tracks");
+
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].kind, TrackKind::Data);
+        assert_eq!(tracks[0].id, TrackId(7));
+        let data = tracks[0].data.as_ref().expect("data descriptor");
+        assert_eq!(data.sample_rate, Some(Rational::new(50, 1).expect("rate")));
+        assert_eq!(data.essence, Some(Ul([0x06_u8; 16])));
     }
 
     #[test]
@@ -2130,6 +2199,14 @@ mod tests {
     }
 
     fn property_u16(local_tag: u16, value: u16) -> MetadataProperty {
+        MetadataProperty {
+            local_tag,
+            property: Ul([0_u8; 16]),
+            value: value.to_be_bytes().to_vec(),
+        }
+    }
+
+    fn property_u32(local_tag: u16, value: u32) -> MetadataProperty {
         MetadataProperty {
             local_tag,
             property: Ul([0_u8; 16]),

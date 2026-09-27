@@ -11,6 +11,204 @@ No daemon file-opening protocol was added. MXF inspection remains a local
 `qgs-test` tool/library path. The frozen Haswell VA -> Vulkan path was not
 modified.
 
+## Real Sony FX6 Compatibility Update
+
+An external read-only Sony FX6 compatibility sample was inspected after the
+synthetic Step 8 foundation. The MXF copy's SHA-256 matched the expected
+compatibility-corpus hash. The media and XML sidecar were not copied into the
+repository and are not committed.
+
+Privacy handling: this report uses an anonymized sample description and omits
+the local path, original clip basename, serial number, full private UMIDs, and
+private production timestamps.
+
+### Initial Parser Result On Real FX6 MXF
+
+Before the final compatibility patch, the existing Step 8 parser successfully
+reported:
+
+- MXF OP1a operational pattern
+- 106 video edit units at 50/1
+- two package objects
+- 64 metadata sets
+- video descriptor: H.264, 10-bit, 4:2:2, stored 1920 x 1088, display
+  1920 x 1080
+- four independent mono PCM audio descriptors at 48 kHz, 24-bit
+- one MXF-provided Index Table Segment with 106 entries
+- random access lookup for the middle edit unit
+- H.264 classification as High 4:2:2, 10-bit, 4:2:2, 1920 x 1080
+
+The initial gap was that the SMPTE 436M ANC/data track was not represented in
+the public `MxfTrack` model, and the inspector did not yet summarize GOP shape
+or compare the Sony XML sidecar.
+
+### Synthetic Vs Camera Differences Found
+
+Compared with the synthetic OP1a fixtures, the camera sample adds:
+
+- much larger header metadata and index areas
+- header partition with BodySID `2` and IndexSID `1`
+- footer partition without an index SID
+- Material Package with 8 track references and Source Package with 7 track
+  references
+- stored video height padded to 1088 with display height 1080
+- 4 independent 24-bit mono PCM audio tracks
+- SMPTE 436M ANC/data track
+- Index Table Segment with 7 delta entries and 106 index entries
+- random-access positions at edit units `0, 24, 48, 72, 96`
+
+### Primer Pack Result
+
+The FX6 Primer Pack parsed successfully with 120 local-tag mappings. QGS uses
+the primer to resolve local tags to property ULs; no FX6-specific local tag
+numbers were hardcoded.
+
+### Metadata Graph Result
+
+The bounded graph parser resolved the package/reference shape needed for this
+sample without duplicate `InstanceUID` or missing-reference errors. Strong
+reference batches remained within configured limits.
+
+### Operational Pattern
+
+The operational pattern parsed from partition metadata is OP1a:
+
+`060e2b34040101010d01020101010900`
+
+### Partition And RIP Structure
+
+The sample has:
+
+- header partition at offset 0, BodySID `2`, IndexSID `1`
+- footer partition near EOF, BodySID `0`, IndexSID `0`
+- RIP with two partition entries
+
+QGS preserves partition offsets and SIDs without assuming the synthetic fixture
+layout.
+
+### Video Descriptor Result
+
+MXF CDCI metadata reports:
+
+- codec family: H.264/AVC by essence coding metadata
+- stored dimensions: 1920 x 1088
+- display dimensions: 1920 x 1080
+- component depth: 10
+- chroma: 4:2:2
+- edit/sample rate: 50/1
+- aspect ratio: 16/9
+- progressive frame layout
+
+The stored height padding is treated as container storage metadata, not as a
+codec/display mismatch.
+
+### H.264 SPS/PPS Cross-Check
+
+Extracted access units classify through `qgs-codec-h264` as:
+
+- H.264 High 4:2:2
+- 10-bit
+- 4:2:2
+- 1920 x 1080
+- progressive
+
+The H.264 SPS agrees with MXF display dimensions, bit depth, and chroma.
+
+### Actual GOP Structure
+
+The inspected 106 access units contain:
+
+- I pictures: 5
+- P pictures: 31
+- B pictures: 70
+- MXF index random-access edit units: `0, 24, 48, 72, 96`
+
+The first, middle, and final sampled edit units classified as I, B, and P
+respectively. This proves Long-GOP structure without decoding frames.
+
+### Audio Track Discovery
+
+QGS discovers four independent audio tracks:
+
+- track 3: mono PCM, 48 kHz, 24-bit
+- track 4: mono PCM, 48 kHz, 24-bit
+- track 5: mono PCM, 48 kHz, 24-bit
+- track 6: mono PCM, 48 kHz, 24-bit
+
+The tracks are not flattened into one implicit 4-channel stream.
+
+### SMPTE 436M ANC/Data Track Discovery
+
+QGS now represents a generic `TrackKind::Data` with a QGS-owned
+`DataEssenceDescriptor`. The FX6 sample reports one data track with 50/1 sample
+rate and a SMPTE 436M ANC-related essence identity. QGS does not interpret ANC
+payloads yet.
+
+### MXF Timecode Result
+
+MXF Timecode Component metadata parses as:
+
+- start frame: `2506142`
+- rate: `50/1`
+- drop-frame: `false`
+
+### Sony XML Timecode Comparison
+
+The Sony sidecar XML reports an LTC table with `tcFps=25` and `halfStep=true`.
+That representation is compatible with 50p half-step timecode semantics, but it
+is intentionally reported as a separate XML source rather than collapsed into
+the MXF Timecode Component.
+
+### Duration And Edit-Unit Result
+
+MXF/index parsing reports 106 video edit units at 50/1, matching the sidecar
+duration value of 106. This corresponds to 2.12 seconds without hardcoding the
+reference observation.
+
+### Index Table Segment Result
+
+The FX6 Index Table Segment parsed successfully:
+
+- IndexEditRate: 50/1
+- IndexDuration: 106
+- IndexSID: 1
+- BodySID: 2
+- DeltaEntryArray entries: 7
+- IndexEntryArray entries: 106
+- signed temporal/key-frame offsets preserved
+- stream offsets preserved with checked arithmetic
+
+### MXF-Provided Vs QGS-Derived Index Comparison
+
+The FX6 file provides a usable MXF index, so QGS marks entries as
+`MxfProvided`. QGS-derived KLV scanning still supplies and bounds compressed
+essence byte ranges for extraction. The two agree sufficiently for the random
+access proof; no malformed-index fallback was needed.
+
+### Random-Access Proof
+
+For target edit unit 53:
+
+- nearest MXF random-access point: edit unit 48
+- QGS extracted bounded H.264 access units from edit unit 48 through 53
+- `qgs-codec-h264` parsed the stateful sequence
+- target picture classified as B, High 4:2:2, 10-bit, 4:2:2
+
+No hardware decode was attempted.
+
+### Capability Result On Current Intel
+
+The current Intel HD Graphics 4600/i965 capability query still reports H.264
+Baseline/Main/High 8-bit 4:2:0 decode only. It does not advertise H.264 High
+4:2:2 10-bit decode. Therefore this real FX6 stream is valid and parsed, but
+current Intel hardware selection must reject it as unsupported decode
+configuration.
+
+### Synthetic Regression Tests Added
+
+Added generic synthetic unit coverage for `TrackKind::Data` and
+`DataEssenceDescriptor` so normal tests do not require the external FX6 media.
+
 ## Primer Pack Implementation
 
 `qgs-mxf` now parses Primer Packs as counted 18-byte local-tag mappings:
@@ -256,16 +454,16 @@ Unit tests cover:
 
 `cargo test --workspace` passed.
 
-Total: 195 tests passed.
+Total: 198 tests passed.
 
 - `qgs-codec-h264`: 6 passed
 - `qgs-core`: 26 passed
 - `qgs-linux`: 4 passed
-- `qgs-mxf`: 30 passed
+- `qgs-mxf`: 31 passed
 - `qgs-protocol`: 118 passed
 - `qgs-vaapi`: 9 passed
 - `qgs-vulkan`: 2 passed
-- `qgs-test`: 0 tests
+- `qgs-test`: 2 passed
 - `qgsd`: 0 tests
 - doctests: 0 tests
 
