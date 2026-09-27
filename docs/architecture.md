@@ -44,6 +44,10 @@ DeviceDiscovery abstraction
     |
 qgs-vulkan
     |
+QGS-owned safe Vulkan wrappers
+    |
+ash
+    |
 Vulkan loader/driver
     |
 hardware
@@ -82,6 +86,15 @@ images. Vulkan buffers, images, memory objects, layouts, tiling details, and
 handles do not escape `qgs-vulkan`. `qgs-protocol` owns only the protocol
 representation.
 
+QGS GPU R1 replaced the previous Vulkano backend with a QGS-owned direct
+Vulkan implementation built on `ash`. This is not a Vulkan fork, loader, driver,
+or general graphics engine. `qgs-vulkan` wraps only the Vulkan subset QGS
+currently needs: instance/device discovery, queues, buffers, images, memory,
+command submission, fixed compute pipelines, DMA-BUF/external-memory FD
+import/export, sync-FD semaphore import/export, and reusable DRM modifier query
+foundations. The rest of QGS remains Vulkan-independent and sees only QGS-owned
+types.
+
 M1 Step 9 supports buffers and simple single-plane RGBA images. M2 Step 1 adds
 the vendor-neutral `VideoSurface` model, but does not allocate real video
 surfaces or decode video yet. The maximum single buffer size is 64 MiB as a
@@ -109,8 +122,9 @@ uses `SCM_RIGHTS` for the native FD attachment. Buffer contents are not copied
 through IPC.
 
 Unsafe Rust remains prohibited in all normal QGS crates. A narrowly scoped,
-documented unsafe boundary exists in `qgs-vulkan` only for Vulkano external
-memory import where no practical safe API is available. See `docs/safety.md`.
+documented unsafe boundary exists in `qgs-vulkan` for direct Vulkan FFI through
+`ash`, plus the retained Haswell imported-video diagnostic. See
+`docs/safety.md`.
 
 ## External Synchronization Boundary
 
@@ -169,6 +183,10 @@ producer side initializes the image with GPU work and signals a sync FD. The
 consumer side imports the image, waits on the sync FD, runs a fixed
 `qgs-vulkan` image shader, and copies the result to a readback buffer only for
 validation. Pixel payloads are not carried in normal QGS IPC messages.
+
+After GPU R1, the proof uses explicit QGS-owned Vulkan descriptor layouts and
+pipeline setup instead of Vulkano shader reflection. Shaders remain fixed,
+embedded QGS SPIR-V modules; there is still no public shader API.
 
 This is not a public QGS image-processing or shader API. The protocol does not
 expose image layouts, Vulkan tiling, DRM format modifiers, shader modules,

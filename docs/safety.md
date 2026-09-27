@@ -25,127 +25,77 @@ Unsafe Rust is permitted only when all of the following are true:
 
 ## Current Unsafe Inventory
 
-### qgs-vulkan external-memory import
+### qgs-vulkan direct ash backend
 
 Location:
 
-- `crates/qgs-vulkan/src/external_memory.rs`
+- `crates/qgs-vulkan/src/lib.rs`
 
-Unsafe API:
+Unsafe API categories:
 
-- `vulkano::memory::DeviceMemory::import`
+- Vulkan instance/device/layer/extension/property calls through `ash`
+- Vulkan object creation and destruction for instance, device, memory, buffers,
+  images, image views, semaphores, fences, command pools, shader modules,
+  descriptor resources, pipelines, and command buffers
+- Vulkan queue submission and command recording
+- Vulkan external-memory FD export/import
+- borrowed-FD `vkGetMemoryFdPropertiesKHR`
+- Vulkan external semaphore sync-FD export/import
+- host memory mapping, flush, invalidate, and bounded pointer copies
+- fixed embedded SPIR-V shader module creation and compute dispatch
 
 Why unsafe is required:
 
-Vulkano 0.35.2 exposes memory export as a safe API, but importing external
-Vulkan device memory from an FD requires `unsafe DeviceMemory::import`. No
-higher-level safe Vulkano buffer-import API satisfying M1 Step 6 was found.
+GPU R1 migrated `qgs-vulkan` from Vulkano to a QGS-owned Vulkan backend over
+`ash`. Vulkan is a C ABI and `ash` exposes Vulkan calls as unsafe. QGS keeps
+that unsafety private to `qgs-vulkan` and exposes only QGS-owned safe APIs to
+the rest of the workspace.
 
 The safe QGS wrapper validates:
 
-- the imported handle type matches QGS export metadata
-- the logical device enables the required external-memory extensions
-- the target physical device matches the QGS-visible exported device identity
-- the imported buffer is created with matching size, usage, and external handle
-  type
-- allocation size and memory type index come from the exporter metadata
-- dedicated-allocation state is reproduced when reported by the exporter
-- the owned FD is moved into the import call and is not used again by QGS code
-
-Remaining assumptions:
-
-- Vulkano and the Vulkan driver uphold the documented FD ownership behavior.
-- Backend memory type indices in export metadata are interpreted only by
-  `qgs-vulkan` for the matching backend/device.
-- M1 Step 6 validation uses host-visible shared memory and a quiescent CPU
-  read/write sequence. GPU ordering is handled separately by Step 7.
-
-### qgs-vulkan external synchronization
-
-Location:
-
-- `crates/qgs-vulkan/src/external_sync.rs`
-
-Unsafe APIs:
-
-- `vulkano::sync::semaphore::Semaphore::export_fd`
-- `vulkano::sync::semaphore::Semaphore::import_fd`
-- `vulkano::device::QueueGuard::submit`
-
-Why unsafe is required:
-
-Vulkano 0.35.2 exposes POSIX FD semaphore export/import and direct queue submit
-as unsafe operations. Step 7 needs the external semaphore FD to be signaled by a
-GPU queue submission, transferred to another process, imported into a second
-Vulkan context, and waited on by a consumer GPU submission. No higher-level safe
-Vulkano path satisfying those exact external-handle semantics was found.
-
-The safe QGS wrapper validates or constrains:
-
-- the selected handle type is Linux sync FD
-- the physical device reports sync FD external semaphore import/export support
+- device descriptions are copied into QGS-owned protocol types and raw Vulkan
+  handles do not escape `qgs-vulkan`
+- queue-family selection chooses a reported queue family and checks compute
+  support for compute proofs
+- memory type selection intersects Vulkan `memoryTypeBits` with required and
+  preferred QGS memory properties
+- allocation sizes come from Vulkan memory requirements or QGS-validated import
+  metadata
+- host-visible map/copy/read paths bounds-check byte ranges and flush or
+  invalidate non-coherent memory as required
+- imported FD memory properties are queried with a borrowed FD before the owned
+  FD is consumed by Vulkan memory import
+- external buffer/image support is queried before exportable/importable resource
+  creation
+- DMA-BUF and opaque-FD handle types are translated only inside `qgs-vulkan`
+- sync FD support is queried before semaphore creation/export/import
 - the semaphore is binary and created with sync FD export support
-- export occurs only after QGS has submitted exactly one producer GPU signal
-  operation and no producer-side wait operation
-- the sync FD is transferred as an owned transport attachment and moved into
-  the import call
+- producer GPU work signals the exported semaphore payload
 - sync FD import uses temporary payload semantics as required for
   copy-transference handles
-- producer and consumer contexts are matched using QGS-visible backend/device
-  identity rather than Vulkan enumeration order
-- submitted command buffers, semaphores, and fences are retained for the
-  operation lifetime
+- fixed compute shaders use explicit descriptor set layout `set=0,binding=0`
+  and no client-provided SPIR-V is accepted
+- submitted work is retained or waited at cleanup boundaries before Vulkan
+  resources and semaphores are destroyed
+- optional validation-layer runs can be enabled with
+  `QGS_VULKAN_ENABLE_VALIDATION=1`
 
 Remaining assumptions:
 
-- Vulkano and the Vulkan driver uphold documented sync FD ownership and
-  semaphore-payload semantics.
+- `ash` forwards raw Vulkan calls according to the Vulkan ABI.
+- The Vulkan loader and driver uphold Vulkan object, FD, and synchronization
+  semantics.
+- Backend memory type indices in export metadata are interpreted only by
+  `qgs-vulkan` for the matching backend/device.
 - The backend/device identity used by M1 is sufficient for the local
   two-process proof, but it is not a persistent identity model.
-- The Step 7 proof validates one-shot ordering for a minimal transfer path; it
-  is not a reusable frame synchronization protocol.
+- The external sync proofs remain one-shot validation paths, not a reusable
+  frame synchronization protocol.
+- Device idle waits are used at resource cleanup boundaries to make destruction
+  validity explicit; they are not the producer-to-consumer dependency.
 
-### qgs-vulkan compute proof
-
-Location:
-
-- `crates/qgs-vulkan/src/external_compute.rs`
-
-Unsafe APIs:
-
-- `vulkano::shader::ShaderModule::new`
-- `vulkano::command_buffer::AutoCommandBufferBuilder::dispatch`
-
-Why unsafe is required:
-
-Vulkano 0.35.2 requires unsafe calls for creating a shader module from SPIR-V
-words and for recording a dispatch. M1 Step 8 needs a real GPU compute dispatch
-against the imported shared buffer, but it does not expose shaders or dispatch
-commands to QGS clients.
-
-The safe QGS wrapper validates or constrains:
-
-- the SPIR-V is a fixed QGS-owned shader embedded in `qgs-vulkan`
-- no client-provided SPIR-V or shader parameters are accepted
-- the shader layout is reflected by Vulkano before pipeline creation
-- descriptor set `0`, binding `0` is bound to the imported shared storage
-  buffer before dispatch
-- the input element count is non-zero and a multiple of the fixed local size
-- the dispatch group count is derived from the validated input element count
-- the selected queue family supports compute
-- the compute submission waits on the imported external sync FD before touching
-  the shared buffer
-- a fence wait is used only after submission so CPU validation can read the
-  result
-
-Remaining assumptions:
-
-- Vulkano and the Vulkan driver uphold shader-module and dispatch validation
-  requirements for the fixed embedded SPIR-V.
-- The embedded shader remains a small audited proof shader and is not treated as
-  a public QGS compute interface.
-
-Unsafe block count in QGS-owned code after M1 Step 8: 6.
+Unsafe block count in QGS-owned production Vulkan backend code after GPU R1:
+82.
 
 ### qgs-vulkan Haswell video interop diagnostic
 
@@ -186,4 +136,6 @@ Remaining assumptions:
 - The diagnostic is not a public QGS protocol surface and must not be treated
   as a production video processing path.
 
-Unsafe block count in QGS-owned code after M2 Step 4B diagnostics: 38.
+Unsafe block count in retained Haswell diagnostic code after GPU R1: 32.
+
+Unsafe block count in all QGS-owned code after GPU R1: 114.
