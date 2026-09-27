@@ -18,17 +18,25 @@ use qgs_protocol::{
     ScanMode, SelectedMemoryProperties, SubmitAccessUnitRequest, SyncExportHandleType, SyncId,
     SyncKind, VideoCapabilities, VideoCodec, VideoProfile, WireMessage, CURRENT_PROTOCOL_VERSION,
 };
-use qgs_vulkan::VulkanDeviceDiscovery;
+use qgs_vulkan::{
+    diagnose_haswell_video_import, DiagnosticDrmLayer, DiagnosticDrmObject, DiagnosticDrmPlane,
+    HaswellVideoDiagnosticInput, VulkanDeviceDiscovery,
+};
 
 const DEMO_BUFFER_SIZE: u64 = 1024 * 1024;
 const IMAGE_PROOF_WIDTH: u32 = 64;
 const IMAGE_PROOF_HEIGHT: u32 = 64;
 const VIDEO_CAPABILITIES_ONLY_ARG: &str = "--video-capabilities-only";
 const H264_DECODE_ONLY_ARG: &str = "--h264-decode-only";
+const HASWELL_VIDEO_DIAGNOSTIC_ARG: &str = "--haswell-video-diagnostic";
 const H264_FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/h264/idr-64x64-baseline.h264");
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    if args.haswell_video_diagnostic {
+        return run_haswell_video_diagnostic();
+    }
+
     let socket_path = args.socket_path;
     let mut stream = connect_socket(&socket_path)?;
     let mut request_id = 1;
@@ -246,6 +254,187 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn run_haswell_video_diagnostic() -> Result<(), Box<dyn std::error::Error>> {
+    println!("QGS M2 Step 4B Haswell imported-video diagnostic");
+    println!("Validation layer: VK_LAYER_KHRONOS_validation requested");
+    println!("Synchronization validation: requested through VkValidationFeaturesEXT");
+
+    let render_node = PathBuf::from("/dev/dri/renderD128");
+    let decoded = qgs_vaapi::decode_h264_drm_prime_for_diagnostic(&render_node, H264_FIXTURE)?;
+    println!("VA decode/export:");
+    println!("  render node: {}", render_node.display());
+    println!("  checksum: 0x{:08x}", decoded.validation_checksum);
+    println!("  fourcc: 0x{:08x}", decoded.fourcc);
+    println!("  size: {} x {}", decoded.width, decoded.height);
+    println!("  objects: {}", decoded.objects.len());
+    println!("  layers: {}", decoded.layers.len());
+    for (index, object) in decoded.objects.iter().enumerate() {
+        println!(
+            "  object {index}: size={} modifier={}",
+            object.size, object.drm_format_modifier
+        );
+    }
+    for (layer_index, layer) in decoded.layers.iter().enumerate() {
+        println!(
+            "  layer {layer_index}: drm_format=0x{:08x} planes={}",
+            layer.drm_format, layer.num_planes
+        );
+        for plane_index in 0..layer.num_planes as usize {
+            println!(
+                "    plane {plane_index}: object={} pitch={} offset={}",
+                layer.object_index[plane_index],
+                layer.pitch[plane_index],
+                layer.offset[plane_index]
+            );
+        }
+    }
+
+    let input = HaswellVideoDiagnosticInput {
+        vendor_id: 0x8086,
+        device_id: 0x0416,
+        width: decoded.width,
+        height: decoded.height,
+        drm_fourcc: decoded.fourcc,
+        objects: decoded
+            .objects
+            .into_iter()
+            .map(|object| DiagnosticDrmObject {
+                fd: object.fd,
+                size: object.size,
+                modifier: object.drm_format_modifier,
+            })
+            .collect(),
+        layers: decoded
+            .layers
+            .into_iter()
+            .map(|layer| DiagnosticDrmLayer {
+                drm_format: layer.drm_format,
+                planes: (0..layer.num_planes as usize)
+                    .map(|index| DiagnosticDrmPlane {
+                        object_index: u32::from(layer.object_index[index]),
+                        offset: layer.offset[index],
+                        pitch: layer.pitch[index],
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+
+    let report = diagnose_haswell_video_import(input)?;
+    print_haswell_diagnostic_report(&report);
+    Ok(())
+}
+
+fn print_haswell_diagnostic_report(report: &qgs_vulkan::HaswellVideoDiagnosticReport) {
+    println!();
+    println!("Vulkan diagnostic:");
+    println!("  device: {}", report.physical_device_name);
+    println!("  queue family: {}", report.queue_family_index);
+    println!("  modifier: {}", report.modifier);
+    println!("  modifier exposed: {}", yes_no(report.modifier_exposed));
+    println!(
+        "  modifier plane count: {}",
+        optional_u32(report.modifier_plane_count)
+    );
+    println!(
+        "  modifier tiling features raw: {}",
+        report
+            .modifier_tiling_features_raw
+            .map(|value| format!("0x{value:016x}"))
+            .unwrap_or_else(|| "n/a".to_string())
+    );
+    println!("  sampled-image: {}", yes_no(report.supports_sampled_image));
+    println!("  transfer-src: {}", yes_no(report.supports_transfer_src));
+    println!("  transfer-dst: {}", yes_no(report.supports_transfer_dst));
+    println!(
+        "  ycbcr linear filter: {}",
+        yes_no(report.supports_ycbcr_linear_filter)
+    );
+    println!(
+        "  ycbcr separate reconstruction: {}",
+        yes_no(report.supports_ycbcr_separate_reconstruction_filter)
+    );
+    println!(
+        "  memory fd type bits: {}",
+        optional_hex_u32(report.memory_fd_type_bits)
+    );
+    println!(
+        "  image memory size: {}",
+        optional_u64(report.image_memory_size)
+    );
+    println!(
+        "  image memory alignment: {}",
+        optional_u64(report.image_memory_alignment)
+    );
+    println!(
+        "  image memory type bits: {}",
+        optional_hex_u32(report.image_memory_type_bits)
+    );
+    println!(
+        "  selected memory type index: {}",
+        optional_u32(report.selected_memory_type_index)
+    );
+    println!("  VA objects: {}", report.va_object_count);
+    println!("  NV12 format planes: {}", report.nv12_format_plane_count);
+    println!(
+        "  Vulkan modifier memory planes: {}",
+        optional_u32(report.vulkan_modifier_memory_plane_count)
+    );
+    println!("  disjoint image: {}", yes_no(report.image_create_disjoint));
+    println!(
+        "  imported memory objects: {}",
+        report.imported_memory_objects
+    );
+    println!("  memory bindings: {}", report.vulkan_memory_bindings);
+    println!("  binding offsets: {:?}", report.binding_offsets);
+
+    if let Some(barrier) = &report.barrier {
+        println!("Acquire barrier:");
+        println!("  srcStageMask: {}", barrier.src_stage_mask);
+        println!("  srcAccessMask: {}", barrier.src_access_mask);
+        println!("  dstStageMask: {}", barrier.dst_stage_mask);
+        println!("  dstAccessMask: {}", barrier.dst_access_mask);
+        println!("  oldLayout: {}", barrier.old_layout);
+        println!("  newLayout: {}", barrier.new_layout);
+        println!("  srcQueueFamilyIndex: {}", barrier.src_queue_family_index);
+        println!("  dstQueueFamilyIndex: {}", barrier.dst_queue_family_index);
+        println!("  aspectMask: {}", barrier.aspect_mask);
+        println!("  baseMipLevel: {}", barrier.base_mip_level);
+        println!("  levelCount: {}", barrier.level_count);
+        println!("  baseArrayLayer: {}", barrier.base_array_layer);
+        println!("  layerCount: {}", barrier.layer_count);
+    }
+
+    println!("Results:");
+    println!(
+        "  vkQueueSubmit: {}",
+        report.queue_submit_result.as_deref().unwrap_or("not run")
+    );
+    println!(
+        "  fence wait: {}",
+        report.fence_wait_result.as_deref().unwrap_or("not run")
+    );
+    println!(
+        "  GPU read attempted: {}",
+        yes_no(report.gpu_read_attempted)
+    );
+    println!(
+        "  GPU read result: {}",
+        report.gpu_read_result.as_deref().unwrap_or("not run")
+    );
+    println!("  classification: {}", report.classification);
+    println!("  recommendation: {}", report.recommendation);
+
+    println!("Validation messages:");
+    if report.validation_messages.is_empty() {
+        println!("  none captured");
+    } else {
+        for message in &report.validation_messages {
+            println!("  {message}");
+        }
+    }
 }
 
 fn print_device(device: &DeviceDesc) {
@@ -1419,6 +1608,24 @@ fn format_size(size_bytes: u64) -> String {
     }
 }
 
+fn optional_u32(value: Option<u32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn optional_hex_u32(value: Option<u32>) -> String {
+    value
+        .map(|value| format!("0x{value:08x}"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
 const fn yes_no(value: bool) -> &'static str {
     if value {
         "yes"
@@ -1431,6 +1638,7 @@ struct Args {
     socket_path: PathBuf,
     video_capabilities_only: bool,
     h264_decode_only: bool,
+    haswell_video_diagnostic: bool,
 }
 
 impl Args {
@@ -1438,12 +1646,15 @@ impl Args {
         let mut socket_path = None;
         let mut video_capabilities_only = false;
         let mut h264_decode_only = false;
+        let mut haswell_video_diagnostic = false;
 
         for arg in std::env::args_os().skip(1) {
             if arg == VIDEO_CAPABILITIES_ONLY_ARG {
                 video_capabilities_only = true;
             } else if arg == H264_DECODE_ONLY_ARG {
                 h264_decode_only = true;
+            } else if arg == HASWELL_VIDEO_DIAGNOSTIC_ARG {
+                haswell_video_diagnostic = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -1453,6 +1664,7 @@ impl Args {
             socket_path: socket_path.unwrap_or_else(default_socket_path),
             video_capabilities_only,
             h264_decode_only,
+            haswell_video_diagnostic,
         }
     }
 }

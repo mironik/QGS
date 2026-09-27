@@ -2,6 +2,7 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -170,12 +171,126 @@ pub struct VaapiDeviceInfo {
     pub driver: Option<String>,
 }
 
+pub struct VaapiDecodedPrimeSurfaceDiagnostic {
+    pub fourcc: u32,
+    pub width: u32,
+    pub height: u32,
+    pub objects: Vec<VaapiPrimeObjectDiagnostic>,
+    pub layers: Vec<VaapiPrimeLayerDiagnostic>,
+    pub validation_checksum: u32,
+    _surface: Surface<()>,
+}
+
+#[derive(Debug)]
+pub struct VaapiPrimeObjectDiagnostic {
+    pub fd: OwnedFd,
+    pub size: u32,
+    pub drm_format_modifier: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct VaapiPrimeLayerDiagnostic {
+    pub drm_format: u32,
+    pub num_planes: u32,
+    pub object_index: [u8; 4],
+    pub offset: [u32; 4],
+    pub pitch: [u32; 4],
+}
+
+pub fn decode_h264_drm_prime_for_diagnostic(
+    render_node: &Path,
+    access_unit: &[u8],
+) -> Result<VaapiDecodedPrimeSurfaceDiagnostic, DecoderError> {
+    let parsed = parse_annex_b_access_unit(access_unit).map_err(decoder_error_from_h264)?;
+    let display = Display::open_drm_display(render_node)
+        .map_err(|_| DecoderError::UnsupportedDecodeConfiguration)?;
+    let profile = va_profile_from_h264(decoder_profile_from_parsed(&parsed))?;
+    let entrypoints = display
+        .query_config_entrypoints(profile)
+        .map_err(|_| DecoderError::UnsupportedDecodeConfiguration)?;
+    if !entrypoints.contains(&VAEntrypoint::VAEntrypointVLD) {
+        return Err(DecoderError::UnsupportedDecodeConfiguration);
+    }
+
+    let attrs = vec![VAConfigAttrib {
+        type_: VAConfigAttribType::VAConfigAttribRTFormat,
+        value: VA_RT_FORMAT_YUV420,
+    }];
+    let config = display
+        .create_config(attrs, profile, VAEntrypoint::VAEntrypointVLD)
+        .map_err(|_| DecoderError::UnsupportedDecodeConfiguration)?;
+    let surfaces = display
+        .create_surfaces(
+            VA_RT_FORMAT_YUV420,
+            Some(VA_FOURCC_NV12),
+            parsed.desc.coded_width,
+            parsed.desc.coded_height,
+            None,
+            vec![()],
+        )
+        .map_err(|_| DecoderError::UnsupportedDecodeConfiguration)?;
+    let context = display
+        .create_context(
+            &config,
+            parsed.desc.coded_width,
+            parsed.desc.coded_height,
+            Some(&surfaces),
+            true,
+        )
+        .map_err(|_| DecoderError::UnsupportedDecodeConfiguration)?;
+    let surface = surfaces
+        .into_iter()
+        .next()
+        .ok_or(DecoderError::DecodeFailed)?;
+    let surface = decode_h264_access_unit(context, surface, &parsed)?;
+    let validation_checksum =
+        validation_checksum(&surface, parsed.desc.coded_width, parsed.desc.coded_height)
+            .map_err(|_| DecoderError::DecodeFailed)?;
+    let descriptor = surface
+        .export_prime()
+        .map_err(|_| DecoderError::DecodeFailed)?;
+    let objects = descriptor
+        .objects
+        .into_iter()
+        .map(|object| VaapiPrimeObjectDiagnostic {
+            fd: object.fd,
+            size: object.size,
+            drm_format_modifier: object.drm_format_modifier,
+        })
+        .collect();
+    let layers = descriptor
+        .layers
+        .into_iter()
+        .map(|layer| VaapiPrimeLayerDiagnostic {
+            drm_format: layer.drm_format,
+            num_planes: layer.num_planes,
+            object_index: layer.object_index,
+            offset: layer.offset,
+            pitch: layer.pitch,
+        })
+        .collect();
+
+    Ok(VaapiDecodedPrimeSurfaceDiagnostic {
+        fourcc: descriptor.fourcc,
+        width: descriptor.width,
+        height: descriptor.height,
+        objects,
+        layers,
+        validation_checksum,
+        _surface: surface,
+    })
+}
+
 #[derive(Debug)]
 struct VaapiDevice {
     path: PathBuf,
     vendor_id: u32,
     device_id: u32,
     driver: Option<String>,
+}
+
+fn decoder_profile_from_parsed(parsed: &ParsedH264AccessUnit) -> VideoProfile {
+    qgs_codec_h264::decoder_profile(parsed)
 }
 
 struct VaapiH264Decoder {

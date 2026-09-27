@@ -470,6 +470,7 @@ version = "0.1.0"
 dependencies = [
  "qgs-linux",
  "qgs-protocol",
+ "qgs-vaapi",
  "qgs-vulkan",
 ]
 
@@ -487,6 +488,7 @@ dependencies = [
 name = "qgs-vulkan"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "qgs-core",
  "qgs-protocol",
  "vulkano",

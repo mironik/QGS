@@ -146,3 +146,44 @@ Remaining assumptions:
   a public QGS compute interface.
 
 Unsafe block count in QGS-owned code after M1 Step 8: 6.
+
+### qgs-vulkan Haswell video interop diagnostic
+
+Location:
+
+- `crates/qgs-vulkan/src/haswell_video_diagnostic.rs`
+
+Unsafe APIs:
+
+- raw Vulkan instance/device creation through `ash`
+- `VK_LAYER_KHRONOS_validation` debug callback setup
+- DRM modifier format-property queries
+- borrowed-FD `vkGetMemoryFdPropertiesKHR`
+- diagnostic raw image creation/import/bind/acquire commands where reached
+
+Why unsafe is required:
+
+M2 Step 4B needs exact Vulkan diagnostics for an imported VA/DRM PRIME NV12
+surface, including validation-layer capture and DRM modifier memory-plane
+inspection. These operations sit at the same interop boundary identified in the
+M2 Step 4 audit and are not exposed by Vulkano's safe image-state model.
+
+The safe QGS wrapper constrains:
+
+- the diagnostic to the Intel Haswell vendor/device identity
+- validation-layer enablement
+- QGS-owned bounded DRM PRIME descriptor metadata
+- exact modifier lookup before any import/acquire attempt
+- RAII `OwnedFd` input from the VA diagnostic helper
+- early stop when the exact modifier memory-plane model does not match the
+  currently safe reusable binding path
+
+Remaining assumptions:
+
+- `ash` forwards raw Vulkan calls according to the Vulkan ABI.
+- The Vulkan loader, validation layer, and Intel driver are trusted diagnostic
+  components.
+- The diagnostic is not a public QGS protocol surface and must not be treated
+  as a production video processing path.
+
+Unsafe block count in QGS-owned code after M2 Step 4B diagnostics: 38.

@@ -5,7 +5,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+ash = { version = "0.38.0", default-features = false, features = ["linked", "std", "debug"] }
 qgs-core = { path = "../qgs-core" }
 qgs-protocol = { path = "../qgs-protocol" }
 vulkano = { version = "0.35.2", default-features = false }
-

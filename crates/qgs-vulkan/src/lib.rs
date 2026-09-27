@@ -69,6 +69,13 @@ mod external_compute;
 mod external_memory;
 #[allow(unsafe_code)]
 mod external_sync;
+#[allow(unsafe_code)]
+mod haswell_video_diagnostic;
+
+pub use haswell_video_diagnostic::{
+    diagnose_haswell_video_import, DiagnosticDrmLayer, DiagnosticDrmObject, DiagnosticDrmPlane,
+    HaswellVideoDiagnosticInput, HaswellVideoDiagnosticReport,
+};
 
 const SHARED_VALIDATION_MARKER: &[u8] = b"QGS-M1S6";
 const COMPUTE_LOCAL_SIZE_X: u32 = 64;

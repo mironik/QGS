@@ -7,4 +7,5 @@ version.workspace = true
 [dependencies]
 qgs-linux = { path = "../../crates/qgs-linux" }
 qgs-protocol = { path = "../../crates/qgs-protocol" }
+qgs-vaapi = { path = "../../crates/qgs-vaapi" }
 qgs-vulkan = { path = "../../crates/qgs-vulkan" }
