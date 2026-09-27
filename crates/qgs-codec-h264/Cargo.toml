@@ -1,0 +1,9 @@
+[package]
+name = "qgs-codec-h264"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+h264-reader = "0.9.0"
+qgs-protocol = { version = "0.1.0", path = "../qgs-protocol" }

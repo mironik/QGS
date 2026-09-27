@@ -198,6 +198,39 @@ surface formats into QGS-owned values. A known device with no proven decode
 backend or no supported decode entrypoints returns a valid empty capability
 list rather than inferred support.
 
+CREATE_DECODER is request kind `1`, opcode `11`. It is a session operation and
+must be sent after HELLO/WELCOME. Its payload is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `DeviceId` |
+| 8 | u8 | `VideoCodec` |
+| 9 | u8 | codec-specific profile |
+| 10 | u8 | bit depth |
+| 11 | u8 | chroma subsampling |
+| 12 | u32 | coded width |
+| 16 | u32 | coded height |
+| 20 | u8 | scan mode |
+| 21 | 7 bytes | reserved, currently `0` |
+
+SUBMIT_ACCESS_UNIT is request kind `1`, opcode `12`. Its payload is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `DecoderId` |
+| 8 | u32 | compressed access-unit byte length |
+| 12 | variable | compressed access-unit bytes |
+
+The maximum compressed access-unit payload is 4000 bytes. M2 Step 3B permits
+bounded compressed H.264 access units through normal QGS IPC. Raw decoded video
+pixels must not travel through normal protocol messages.
+
+DESTROY_DECODER is request kind `1`, opcode `13`. Its payload is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `DecoderId` owned by the current session |
+
 WELCOME is response kind `2`, opcode `1`. Its payload is:
 
 | Offset | Width | Field |
@@ -468,6 +501,42 @@ expose exact maximum coded dimensions through the queried capability interface,
 QGS reports its bounded M2 model ceiling in the max-width/max-height fields and
 documents that backend limitation in the milestone report.
 
+DECODER_CREATED is response kind `2`, opcode `12`. Its payload is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `DecoderId` |
+
+DECODE_OUTPUT is response kind `2`, opcode `13`. Its payload is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `DecoderId` |
+| 8 | u64 | QGS `ResourceId` for the decoded `VideoSurface` |
+| 16 | u32 | coded width |
+| 20 | u32 | coded height |
+| 24 | u32 | visible x |
+| 28 | u32 | visible y |
+| 32 | u32 | visible width |
+| 36 | u32 | visible height |
+| 40 | u8 | `VideoSurfaceFormat` |
+| 41 | u8 | bit depth |
+| 42 | u8 | chroma subsampling |
+| 43 | u8 | scan mode |
+| 44 | u8 | field order |
+| 45 | 3 bytes | reserved, currently `0` |
+
+DECODER_DESTROYED is response kind `2`, opcode `14`. Its payload is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `DecoderId` |
+
+`DecoderId` is non-zero, opaque, session-owned, and not persistent across daemon
+restarts. Decoder state is released by `DESTROY_DECODER` or by session
+disconnect. Decoded output is owned as a normal session resource with
+`ResourceKind::VideoSurface`.
+
 `SyncId` is a non-zero, opaque, QGS-owned identifier. It represents an ordering
 primitive, not resource memory. For M1 Step 7, a `SyncId` is unique within its
 owning session/lifetime and is not persistent across sessions or daemon
@@ -523,11 +592,21 @@ invalid bit depths, unknown chroma values, unknown output surface formats,
 invalid dimensions, malformed boolean or reserved fields, truncated entries,
 and trailing payload bytes. VideoSurface model validation rejects zero or
 oversized coded dimensions and visible regions outside the coded frame.
+CREATE_DECODER receivers must reject zero `DeviceId` values, unknown codecs,
+unknown codec-specific profiles, invalid bit depths, unsupported chroma values,
+unsupported scan modes, invalid coded dimensions, nonzero reserved bytes,
+truncated payloads, and trailing payload bytes. SUBMIT_ACCESS_UNIT receivers
+must reject zero `DecoderId` values, compressed payloads larger than 4000
+bytes, truncated compressed payloads, and trailing payload bytes. Unsupported
+H.264 syntax returns a stable UnsupportedH264StreamFeature error rather than
+being silently interpreted as the Step 3B subset. DESTROY_DECODER receivers
+must reject zero `DecoderId` values. Unknown decoder IDs and cross-session
+decoder attempts return a stable UnknownDecoder error.
 
 Major protocol versions are incompatible. Minor versions are backward-compatible
 only within the same major version. A server selects the highest protocol
 version it supports that is inside the client's supported range. The
-implementation through M2 Step 1 supports only server version `0.1`.
+implementation through M2 Step 3B supports only server version `0.1`.
 
 ## Transport
 

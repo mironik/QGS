@@ -9,12 +9,14 @@ use qgs_linux::{
     send_message,
 };
 use qgs_protocol::{
-    BufferDesc, BufferUsageFlags, CreateBufferRequest, CreateImageRequest, CreateSyncRequest,
-    DestroyResourceRequest, DeviceCapabilities, DeviceClass, DeviceDesc, ErrorResponse,
-    ExportResourceRequest, ExportSyncRequest, ExternalHandleType, ExternalSharing, HelloRequest,
-    ImageDesc, ImageUsageFlags, MemoryPreference, PixelFormat, QueryDeviceCapabilitiesRequest,
-    QueryVideoCapabilitiesRequest, ResourceId, SelectedMemoryProperties, SyncExportHandleType,
-    SyncId, SyncKind, VideoCapabilities, WireMessage, CURRENT_PROTOCOL_VERSION,
+    BitDepth, BufferDesc, BufferUsageFlags, ChromaSubsampling, CreateBufferRequest,
+    CreateDecoderRequest, CreateImageRequest, CreateSyncRequest, DecoderConfig,
+    DestroyDecoderRequest, DestroyResourceRequest, DeviceCapabilities, DeviceClass, DeviceDesc,
+    ErrorResponse, ExportResourceRequest, ExportSyncRequest, ExternalHandleType, ExternalSharing,
+    H264Profile, HelloRequest, ImageDesc, ImageUsageFlags, MemoryPreference, PixelFormat,
+    ProtocolErrorCode, QueryDeviceCapabilitiesRequest, QueryVideoCapabilitiesRequest, ResourceId,
+    ScanMode, SelectedMemoryProperties, SubmitAccessUnitRequest, SyncExportHandleType, SyncId,
+    SyncKind, VideoCapabilities, VideoCodec, VideoProfile, WireMessage, CURRENT_PROTOCOL_VERSION,
 };
 use qgs_vulkan::VulkanDeviceDiscovery;
 
@@ -22,6 +24,8 @@ const DEMO_BUFFER_SIZE: u64 = 1024 * 1024;
 const IMAGE_PROOF_WIDTH: u32 = 64;
 const IMAGE_PROOF_HEIGHT: u32 = 64;
 const VIDEO_CAPABILITIES_ONLY_ARG: &str = "--video-capabilities-only";
+const H264_DECODE_ONLY_ARG: &str = "--h264-decode-only";
+const H264_FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/h264/idr-64x64-baseline.h264");
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -140,12 +144,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_video_capabilities(&response.capabilities);
     }
 
-    if args.video_capabilities_only {
-        return Ok(());
-    }
-
-    println!();
-    println!("Buffers:");
     let physical_devices = response
         .devices
         .iter()
@@ -156,6 +154,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .collect::<Vec<_>>();
+
+    if args.video_capabilities_only {
+        return Ok(());
+    }
+
+    if args.h264_decode_only {
+        println!();
+        println!("H.264 VA-API decode proof:");
+        for device in &physical_devices {
+            request_id = test_h264_decode(&mut stream, request_id, device)?;
+            println!();
+        }
+        request_id = leave_h264_decoder_for_disconnect(&mut stream, request_id, &physical_devices)?;
+        let _ = request_id;
+        return Ok(());
+    }
+
+    println!();
+    println!("Buffers:");
 
     for device in &physical_devices {
         request_id += 1;
@@ -194,6 +211,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Image processing proof:");
     for device in &physical_devices {
         request_id = test_image_processing_proof(&mut stream, request_id, device)?;
+        println!();
+    }
+
+    println!("H.264 VA-API decode proof:");
+    for device in &physical_devices {
+        request_id = test_h264_decode(&mut stream, request_id, device)?;
         println!();
     }
 
@@ -1108,6 +1131,245 @@ fn validate_import(
     Ok(())
 }
 
+fn test_h264_decode(
+    stream: &mut std::os::unix::net::UnixStream,
+    mut request_id: u64,
+    device: &DeviceDesc,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    println!("H.264 decode proof:");
+    println!("[{:?}] {}", device.class, device.name);
+
+    request_id += 1;
+    send_message(
+        stream,
+        &WireMessage::QueryVideoCapabilities {
+            request_id,
+            request: QueryVideoCapabilitiesRequest {
+                device_id: device.id,
+            },
+        },
+    )?;
+    let response = receive_message(stream)?;
+    let WireMessage::VideoCapabilities {
+        request_id: response_request_id,
+        response,
+    } = response
+    else {
+        return Err("expected VIDEO_CAPABILITIES response".into());
+    };
+    if response_request_id != request_id {
+        return Err("video capability response request_id did not match request".into());
+    }
+    let supports_h264_baseline = response.capabilities.decode.iter().any(|capability| {
+        capability.codec == VideoCodec::H264
+            && capability.profile == VideoProfile::H264(H264Profile::Baseline)
+            && capability.bit_depth.get() == 8
+            && capability.chroma == ChromaSubsampling::Cs420
+            && capability
+                .output_surface_formats
+                .contains(&qgs_protocol::VideoSurfaceFormat::Nv12)
+    });
+
+    request_id += 1;
+    let config = DecoderConfig {
+        device_id: device.id,
+        codec: VideoCodec::H264,
+        profile: VideoProfile::H264(H264Profile::Baseline),
+        bit_depth: BitDepth::new(8)?,
+        chroma: ChromaSubsampling::Cs420,
+        coded_width: 64,
+        coded_height: 64,
+        scan_mode: ScanMode::Progressive,
+    };
+    send_message(
+        stream,
+        &WireMessage::CreateDecoder {
+            request_id,
+            request: CreateDecoderRequest { config },
+        },
+    )?;
+    let response = receive_message(stream)?;
+    let decoder_id = match response {
+        WireMessage::DecoderCreated {
+            request_id: response_request_id,
+            response,
+        } => {
+            if response_request_id != request_id {
+                return Err("decoder created request_id did not match request".into());
+            }
+            if !supports_h264_baseline {
+                return Err("decoder succeeded on device without advertised H.264 support".into());
+            }
+            println!("Decoder created:");
+            println!("  id: {}", response.decoder_id.get());
+            response.decoder_id
+        }
+        WireMessage::Error {
+            request_id: response_request_id,
+            response,
+        } => {
+            if response_request_id != request_id {
+                return Err("decoder error request_id did not match request".into());
+            }
+            if supports_h264_baseline {
+                return Err(format!(
+                    "decoder creation failed despite advertised support: {:?}",
+                    response.code
+                )
+                .into());
+            }
+            if response.code != ProtocolErrorCode::UnsupportedDecodeConfiguration {
+                return Err(
+                    format!("unexpected unsupported decoder error: {:?}", response.code).into(),
+                );
+            }
+            println!("Decoder unsupported as expected for this device.");
+            return Ok(request_id);
+        }
+        _ => return Err("expected DECODER_CREATED or ERROR response".into()),
+    };
+
+    request_id += 1;
+    send_message(
+        stream,
+        &WireMessage::SubmitAccessUnit {
+            request_id,
+            request: SubmitAccessUnitRequest {
+                decoder_id,
+                data: H264_FIXTURE.to_vec(),
+            },
+        },
+    )?;
+    let response = receive_message(stream)?;
+    let WireMessage::DecodeOutput {
+        request_id: response_request_id,
+        response,
+    } = response
+    else {
+        return Err("expected DECODE_OUTPUT response".into());
+    };
+    if response_request_id != request_id {
+        return Err("decode output request_id did not match request".into());
+    }
+    if response.decoder_id != decoder_id {
+        return Err("decode output decoder_id did not match request".into());
+    }
+    println!("Decoded VideoSurface:");
+    println!("  resource id: {}", response.resource_id.get());
+    println!(
+        "  {} x {} {:?}",
+        response.surface.coded_width, response.surface.coded_height, response.surface.format
+    );
+    println!("  validation: backend VA readback succeeded");
+
+    request_id += 1;
+    destroy_resource(stream, request_id, response.resource_id)?;
+    println!("Decoded VideoSurface destroyed successfully.");
+
+    request_id += 1;
+    send_message(
+        stream,
+        &WireMessage::DestroyDecoder {
+            request_id,
+            request: DestroyDecoderRequest { decoder_id },
+        },
+    )?;
+    let response = receive_message(stream)?;
+    let WireMessage::DecoderDestroyed {
+        request_id: response_request_id,
+        response,
+    } = response
+    else {
+        return Err("expected DECODER_DESTROYED response".into());
+    };
+    if response_request_id != request_id || response.decoder_id != decoder_id {
+        return Err("decoder destroyed response did not match request".into());
+    }
+    println!("Decoder destroyed successfully.");
+
+    Ok(request_id)
+}
+
+fn leave_h264_decoder_for_disconnect(
+    stream: &mut std::os::unix::net::UnixStream,
+    mut request_id: u64,
+    devices: &[&DeviceDesc],
+) -> Result<u64, Box<dyn std::error::Error>> {
+    for device in devices {
+        request_id += 1;
+        let config = DecoderConfig {
+            device_id: device.id,
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264(H264Profile::Baseline),
+            bit_depth: BitDepth::new(8)?,
+            chroma: ChromaSubsampling::Cs420,
+            coded_width: 64,
+            coded_height: 64,
+            scan_mode: ScanMode::Progressive,
+        };
+        send_message(
+            stream,
+            &WireMessage::CreateDecoder {
+                request_id,
+                request: CreateDecoderRequest { config },
+            },
+        )?;
+
+        let response = receive_message(stream)?;
+        let decoder_id = match response {
+            WireMessage::DecoderCreated {
+                request_id: response_request_id,
+                response,
+            } => {
+                if response_request_id != request_id {
+                    return Err("transient decoder response request_id did not match".into());
+                }
+                response.decoder_id
+            }
+            WireMessage::Error { response, .. }
+                if response.code == ProtocolErrorCode::UnsupportedDecodeConfiguration =>
+            {
+                continue;
+            }
+            _ => return Err("expected transient DECODER_CREATED or unsupported error".into()),
+        };
+
+        request_id += 1;
+        send_message(
+            stream,
+            &WireMessage::SubmitAccessUnit {
+                request_id,
+                request: SubmitAccessUnitRequest {
+                    decoder_id,
+                    data: H264_FIXTURE.to_vec(),
+                },
+            },
+        )?;
+        let response = receive_message(stream)?;
+        let WireMessage::DecodeOutput {
+            request_id: response_request_id,
+            response,
+        } = response
+        else {
+            return Err("expected transient DECODE_OUTPUT response".into());
+        };
+        if response_request_id != request_id {
+            return Err("transient decode output request_id did not match".into());
+        }
+
+        println!("Leaving transient H.264 decoder and VideoSurface alive for disconnect cleanup:");
+        println!(
+            "  decoder id: {} resource id: {}",
+            decoder_id.get(),
+            response.resource_id.get()
+        );
+        return Ok(request_id);
+    }
+
+    println!("No H.264 decoder available for disconnect cleanup exercise.");
+    Ok(request_id)
+}
+
 fn destroy_resource(
     stream: &mut std::os::unix::net::UnixStream,
     request_id: u64,
@@ -1168,16 +1430,20 @@ const fn yes_no(value: bool) -> &'static str {
 struct Args {
     socket_path: PathBuf,
     video_capabilities_only: bool,
+    h264_decode_only: bool,
 }
 
 impl Args {
     fn parse() -> Self {
         let mut socket_path = None;
         let mut video_capabilities_only = false;
+        let mut h264_decode_only = false;
 
         for arg in std::env::args_os().skip(1) {
             if arg == VIDEO_CAPABILITIES_ONLY_ARG {
                 video_capabilities_only = true;
+            } else if arg == H264_DECODE_ONLY_ARG {
+                h264_decode_only = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -1186,6 +1452,7 @@ impl Args {
         Self {
             socket_path: socket_path.unwrap_or_else(default_socket_path),
             video_capabilities_only,
+            h264_decode_only,
         }
     }
 }

@@ -47,12 +47,20 @@ pub const MAX_VIDEO_SURFACE_WIDTH: u32 = 8192;
 /// Conservative M2 maximum coded VideoSurface height.
 pub const MAX_VIDEO_SURFACE_HEIGHT: u32 = 8192;
 
+/// Conservative M2 Step 3B compressed H.264 access-unit payload limit.
+pub const MAX_COMPRESSED_DECODE_PACKET_BYTES: usize = 4000;
+
 const DEVICE_ENTRY_FIXED_LEN: usize = 32;
 const DEVICE_CAPABILITIES_FIXED_PREFIX_LEN: usize = 52;
 const MEMORY_HEAP_ENTRY_LEN: usize = 16;
 const QUERY_VIDEO_CAPABILITIES_PAYLOAD_LEN: usize = 8;
 const VIDEO_CAPABILITIES_PREFIX_LEN: usize = 12;
 const VIDEO_DECODE_CAPABILITY_FIXED_LEN: usize = 16;
+const CREATE_DECODER_PAYLOAD_LEN: usize = 28;
+const DECODER_CREATED_PAYLOAD_LEN: usize = 8;
+const DESTROY_DECODER_PAYLOAD_LEN: usize = 8;
+const DECODER_DESTROYED_PAYLOAD_LEN: usize = 8;
+const DECODE_OUTPUT_FIXED_LEN: usize = 48;
 const CREATE_BUFFER_PAYLOAD_LEN: usize = 24;
 const CREATE_IMAGE_PAYLOAD_LEN: usize = 24;
 const BUFFER_CREATED_PAYLOAD_LEN: usize = 24;
@@ -151,6 +159,9 @@ pub enum Request {
     EnumerateDevices(EnumerateDevicesRequest),
     QueryDeviceCapabilities(QueryDeviceCapabilitiesRequest),
     QueryVideoCapabilities(QueryVideoCapabilitiesRequest),
+    CreateDecoder(CreateDecoderRequest),
+    SubmitAccessUnit(SubmitAccessUnitRequest),
+    DestroyDecoder(DestroyDecoderRequest),
     CreateBuffer(CreateBufferRequest),
     CreateImage(CreateImageRequest),
     DestroyResource(DestroyResourceRequest),
@@ -185,6 +196,22 @@ pub struct QueryDeviceCapabilitiesRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryVideoCapabilitiesRequest {
     pub device_id: DeviceId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateDecoderRequest {
+    pub config: DecoderConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubmitAccessUnitRequest {
+    pub decoder_id: DecoderId,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DestroyDecoderRequest {
+    pub decoder_id: DecoderId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -229,6 +256,9 @@ pub enum Response {
     DeviceList(DeviceListResponse),
     DeviceCapabilities(DeviceCapabilitiesResponse),
     VideoCapabilities(VideoCapabilitiesResponse),
+    DecoderCreated(DecoderCreatedResponse),
+    DecodeOutput(DecodeOutputResponse),
+    DecoderDestroyed(DecoderDestroyedResponse),
     BufferCreated(BufferCreatedResponse),
     ImageCreated(ImageCreatedResponse),
     ResourceDestroyed(ResourceDestroyedResponse),
@@ -955,6 +985,65 @@ pub struct VideoCapabilitiesResponse {
     pub capabilities: VideoCapabilities,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DecoderId(u64);
+
+impl DecoderId {
+    pub fn new(raw: u64) -> Result<Self, ProtocolError> {
+        if raw == 0 {
+            Err(ProtocolError::InvalidDecoderId)
+        } else {
+            Ok(Self(raw))
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecoderConfig {
+    pub device_id: DeviceId,
+    pub codec: VideoCodec,
+    pub profile: VideoProfile,
+    pub bit_depth: BitDepth,
+    pub chroma: ChromaSubsampling,
+    pub coded_width: u32,
+    pub coded_height: u32,
+    pub scan_mode: ScanMode,
+}
+
+impl DecoderConfig {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.profile.codec() != self.codec {
+            return Err(ProtocolError::UnsupportedVideoProfile);
+        }
+        validate_video_surface_dimensions(self.coded_width, self.coded_height)?;
+        if self.scan_mode != ScanMode::Progressive {
+            return Err(ProtocolError::UnsupportedScanMode);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecoderCreatedResponse {
+    pub decoder_id: DecoderId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodeOutputResponse {
+    pub decoder_id: DecoderId,
+    pub resource_id: ResourceId,
+    pub surface: VideoSurfaceDesc,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecoderDestroyedResponse {
+    pub decoder_id: DecoderId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourceDestroyedResponse {
     pub resource_id: ResourceId,
@@ -1236,6 +1325,13 @@ pub enum ProtocolErrorCode {
     InvalidVideoVisibleRegion = 47,
     VideoDecodeCapabilityCountTooLarge = 48,
     VideoOutputFormatCountTooLarge = 49,
+    InvalidDecoderId = 50,
+    UnknownDecoder = 51,
+    UnsupportedDecodeConfiguration = 52,
+    MalformedCompressedData = 53,
+    CompressedPacketTooLarge = 54,
+    UnsupportedH264StreamFeature = 55,
+    DecodeFailed = 56,
 }
 
 impl ProtocolErrorCode {
@@ -1298,6 +1394,13 @@ impl TryFrom<u32> for ProtocolErrorCode {
             47 => Ok(Self::InvalidVideoVisibleRegion),
             48 => Ok(Self::VideoDecodeCapabilityCountTooLarge),
             49 => Ok(Self::VideoOutputFormatCountTooLarge),
+            50 => Ok(Self::InvalidDecoderId),
+            51 => Ok(Self::UnknownDecoder),
+            52 => Ok(Self::UnsupportedDecodeConfiguration),
+            53 => Ok(Self::MalformedCompressedData),
+            54 => Ok(Self::CompressedPacketTooLarge),
+            55 => Ok(Self::UnsupportedH264StreamFeature),
+            56 => Ok(Self::DecodeFailed),
             _ => Err(ProtocolError::MalformedPayload),
         }
     }
@@ -1405,6 +1508,16 @@ pub enum ProtocolError {
         count: usize,
         max: usize,
     },
+    InvalidDecoderId,
+    UnknownDecoder,
+    UnsupportedDecodeConfiguration,
+    MalformedCompressedData,
+    CompressedPacketTooLarge {
+        len: usize,
+        max: usize,
+    },
+    UnsupportedH264StreamFeature,
+    DecodeFailed,
     MalformedPayload,
     InvalidVersionRange {
         min: ProtocolVersion,
@@ -1520,6 +1633,15 @@ impl fmt::Display for ProtocolError {
             Self::VideoOutputFormatCountTooLarge { count, max } => {
                 write!(f, "video output format count {count} exceeds maximum {max}")
             }
+            Self::InvalidDecoderId => write!(f, "decoder id must be non-zero"),
+            Self::UnknownDecoder => write!(f, "unknown decoder"),
+            Self::UnsupportedDecodeConfiguration => write!(f, "unsupported decode configuration"),
+            Self::MalformedCompressedData => write!(f, "malformed compressed data"),
+            Self::CompressedPacketTooLarge { len, max } => {
+                write!(f, "compressed packet size {len} exceeds maximum {max}")
+            }
+            Self::UnsupportedH264StreamFeature => write!(f, "unsupported H.264 stream feature"),
+            Self::DecodeFailed => write!(f, "decode failed"),
             Self::MalformedPayload => write!(f, "malformed payload"),
             Self::InvalidVersionRange { min, max } => {
                 write!(f, "invalid protocol version range: {min}..={max}")
@@ -1596,6 +1718,13 @@ impl From<&ProtocolError> for ProtocolErrorCode {
             ProtocolError::VideoOutputFormatCountTooLarge { .. } => {
                 Self::VideoOutputFormatCountTooLarge
             }
+            ProtocolError::InvalidDecoderId => Self::InvalidDecoderId,
+            ProtocolError::UnknownDecoder => Self::UnknownDecoder,
+            ProtocolError::UnsupportedDecodeConfiguration => Self::UnsupportedDecodeConfiguration,
+            ProtocolError::MalformedCompressedData => Self::MalformedCompressedData,
+            ProtocolError::CompressedPacketTooLarge { .. } => Self::CompressedPacketTooLarge,
+            ProtocolError::UnsupportedH264StreamFeature => Self::UnsupportedH264StreamFeature,
+            ProtocolError::DecodeFailed => Self::DecodeFailed,
             ProtocolError::InvalidVersionRange { .. } => Self::InvalidVersionRange,
             ProtocolError::UnsupportedVersion { .. } => Self::UnsupportedVersion,
         }
@@ -1624,6 +1753,9 @@ pub enum RequestOpcode {
     ExportSync,
     CreateImage,
     QueryVideoCapabilities,
+    CreateDecoder,
+    SubmitAccessUnit,
+    DestroyDecoder,
 }
 
 impl RequestOpcode {
@@ -1639,6 +1771,9 @@ impl RequestOpcode {
             Self::ExportSync => 8,
             Self::CreateImage => 9,
             Self::QueryVideoCapabilities => 10,
+            Self::CreateDecoder => 11,
+            Self::SubmitAccessUnit => 12,
+            Self::DestroyDecoder => 13,
         }
     }
 }
@@ -1656,6 +1791,9 @@ pub enum ResponseOpcode {
     SyncExported,
     ImageCreated,
     VideoCapabilities,
+    DecoderCreated,
+    DecodeOutput,
+    DecoderDestroyed,
 }
 
 impl ResponseOpcode {
@@ -1672,6 +1810,9 @@ impl ResponseOpcode {
             Self::SyncExported => 9,
             Self::ImageCreated => 10,
             Self::VideoCapabilities => 11,
+            Self::DecoderCreated => 12,
+            Self::DecodeOutput => 13,
+            Self::DecoderDestroyed => 14,
         }
     }
 }
@@ -1702,6 +1843,18 @@ pub enum WireMessage {
     QueryVideoCapabilities {
         request_id: u64,
         request: QueryVideoCapabilitiesRequest,
+    },
+    CreateDecoder {
+        request_id: u64,
+        request: CreateDecoderRequest,
+    },
+    SubmitAccessUnit {
+        request_id: u64,
+        request: SubmitAccessUnitRequest,
+    },
+    DestroyDecoder {
+        request_id: u64,
+        request: DestroyDecoderRequest,
     },
     CreateBuffer {
         request_id: u64,
@@ -1747,6 +1900,18 @@ pub enum WireMessage {
         request_id: u64,
         response: VideoCapabilitiesResponse,
     },
+    DecoderCreated {
+        request_id: u64,
+        response: DecoderCreatedResponse,
+    },
+    DecodeOutput {
+        request_id: u64,
+        response: DecodeOutputResponse,
+    },
+    DecoderDestroyed {
+        request_id: u64,
+        response: DecoderDestroyedResponse,
+    },
     BufferCreated {
         request_id: u64,
         response: BufferCreatedResponse,
@@ -1780,6 +1945,9 @@ impl WireMessage {
             | Self::EnumerateDevices { request_id }
             | Self::QueryDeviceCapabilities { request_id, .. }
             | Self::QueryVideoCapabilities { request_id, .. }
+            | Self::CreateDecoder { request_id, .. }
+            | Self::SubmitAccessUnit { request_id, .. }
+            | Self::DestroyDecoder { request_id, .. }
             | Self::CreateBuffer { request_id, .. }
             | Self::CreateImage { request_id, .. }
             | Self::DestroyResource { request_id, .. }
@@ -1791,6 +1959,9 @@ impl WireMessage {
             | Self::DeviceList { request_id, .. }
             | Self::DeviceCapabilities { request_id, .. }
             | Self::VideoCapabilities { request_id, .. }
+            | Self::DecoderCreated { request_id, .. }
+            | Self::DecodeOutput { request_id, .. }
+            | Self::DecoderDestroyed { request_id, .. }
             | Self::BufferCreated { request_id, .. }
             | Self::ImageCreated { request_id, .. }
             | Self::ResourceDestroyed { request_id, .. }
@@ -1835,6 +2006,33 @@ pub fn encode_wire_message(message: &WireMessage) -> Vec<u8> {
             RequestOpcode::QueryVideoCapabilities.wire_value(),
             *request_id,
             encode_query_video_capabilities_payload(request),
+        ),
+        WireMessage::CreateDecoder {
+            request_id,
+            request,
+        } => (
+            MessageKind::Request,
+            RequestOpcode::CreateDecoder.wire_value(),
+            *request_id,
+            encode_create_decoder_payload(request),
+        ),
+        WireMessage::SubmitAccessUnit {
+            request_id,
+            request,
+        } => (
+            MessageKind::Request,
+            RequestOpcode::SubmitAccessUnit.wire_value(),
+            *request_id,
+            encode_submit_access_unit_payload(request),
+        ),
+        WireMessage::DestroyDecoder {
+            request_id,
+            request,
+        } => (
+            MessageKind::Request,
+            RequestOpcode::DestroyDecoder.wire_value(),
+            *request_id,
+            encode_destroy_decoder_payload(request),
         ),
         WireMessage::CreateBuffer {
             request_id,
@@ -1934,6 +2132,33 @@ pub fn encode_wire_message(message: &WireMessage) -> Vec<u8> {
             ResponseOpcode::VideoCapabilities.wire_value(),
             *request_id,
             encode_video_capabilities_payload(response),
+        ),
+        WireMessage::DecoderCreated {
+            request_id,
+            response,
+        } => (
+            MessageKind::Response,
+            ResponseOpcode::DecoderCreated.wire_value(),
+            *request_id,
+            encode_decoder_created_payload(response),
+        ),
+        WireMessage::DecodeOutput {
+            request_id,
+            response,
+        } => (
+            MessageKind::Response,
+            ResponseOpcode::DecodeOutput.wire_value(),
+            *request_id,
+            encode_decode_output_payload(response),
+        ),
+        WireMessage::DecoderDestroyed {
+            request_id,
+            response,
+        } => (
+            MessageKind::Response,
+            ResponseOpcode::DecoderDestroyed.wire_value(),
+            *request_id,
+            encode_decoder_destroyed_payload(response),
         ),
         WireMessage::BufferCreated {
             request_id,
@@ -2135,6 +2360,18 @@ pub fn decode_wire_message_parts(
             request_id: header.request_id,
             request: decode_query_video_capabilities_payload(payload)?,
         }),
+        (MessageKind::Request, 11) => Ok(WireMessage::CreateDecoder {
+            request_id: header.request_id,
+            request: decode_create_decoder_payload(payload)?,
+        }),
+        (MessageKind::Request, 12) => Ok(WireMessage::SubmitAccessUnit {
+            request_id: header.request_id,
+            request: decode_submit_access_unit_payload(payload)?,
+        }),
+        (MessageKind::Request, 13) => Ok(WireMessage::DestroyDecoder {
+            request_id: header.request_id,
+            request: decode_destroy_decoder_payload(payload)?,
+        }),
         (MessageKind::Response, 1) => Ok(WireMessage::Welcome {
             request_id: header.request_id,
             response: decode_welcome_payload(payload)?,
@@ -2178,6 +2415,18 @@ pub fn decode_wire_message_parts(
         (MessageKind::Response, 11) => Ok(WireMessage::VideoCapabilities {
             request_id: header.request_id,
             response: decode_video_capabilities_payload(payload)?,
+        }),
+        (MessageKind::Response, 12) => Ok(WireMessage::DecoderCreated {
+            request_id: header.request_id,
+            response: decode_decoder_created_payload(payload)?,
+        }),
+        (MessageKind::Response, 13) => Ok(WireMessage::DecodeOutput {
+            request_id: header.request_id,
+            response: decode_decode_output_payload(payload)?,
+        }),
+        (MessageKind::Response, 14) => Ok(WireMessage::DecoderDestroyed {
+            request_id: header.request_id,
+            response: decode_decoder_destroyed_payload(payload)?,
         }),
         _ => Err(ProtocolError::UnknownOpcode {
             kind: header.kind,
@@ -2239,7 +2488,7 @@ fn encode_wire_header(header: &WireHeader, bytes: &mut Vec<u8>) {
 
 fn validate_opcode(kind: MessageKind, opcode: u8) -> Result<(), ProtocolError> {
     match (kind, opcode) {
-        (MessageKind::Request, 1..=10) | (MessageKind::Response, 1..=11) => Ok(()),
+        (MessageKind::Request, 1..=13) | (MessageKind::Response, 1..=14) => Ok(()),
         _ => Err(ProtocolError::UnknownOpcode { kind, opcode }),
     }
 }
@@ -2344,6 +2593,100 @@ fn decode_query_video_capabilities_payload(
 
     Ok(QueryVideoCapabilitiesRequest {
         device_id: DeviceId::new(read_u64(bytes, 0))?,
+    })
+}
+
+fn encode_create_decoder_payload(request: &CreateDecoderRequest) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(CREATE_DECODER_PAYLOAD_LEN);
+    encode_decoder_config(&request.config, &mut bytes);
+    bytes
+}
+
+fn decode_create_decoder_payload(bytes: &[u8]) -> Result<CreateDecoderRequest, ProtocolError> {
+    if bytes.len() != CREATE_DECODER_PAYLOAD_LEN {
+        return if bytes.len() < CREATE_DECODER_PAYLOAD_LEN {
+            Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len(),
+                expected: CREATE_DECODER_PAYLOAD_LEN,
+            })
+        } else {
+            Err(ProtocolError::TrailingPayload {
+                len: bytes.len() - CREATE_DECODER_PAYLOAD_LEN,
+            })
+        };
+    }
+
+    let config = decode_decoder_config(bytes)?;
+    config.validate()?;
+    Ok(CreateDecoderRequest { config })
+}
+
+fn encode_submit_access_unit_payload(request: &SubmitAccessUnitRequest) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(12 + request.data.len());
+    write_u64(request.decoder_id.get(), &mut bytes);
+    write_u32(request.data.len() as u32, &mut bytes);
+    bytes.extend_from_slice(&request.data);
+    bytes
+}
+
+fn decode_submit_access_unit_payload(
+    bytes: &[u8],
+) -> Result<SubmitAccessUnitRequest, ProtocolError> {
+    if bytes.len() < 12 {
+        return Err(ProtocolError::TruncatedPayload {
+            actual: bytes.len(),
+            expected: 12,
+        });
+    }
+    let decoder_id = DecoderId::new(read_u64(bytes, 0))?;
+    let len = read_u32(bytes, 8) as usize;
+    if len > MAX_COMPRESSED_DECODE_PACKET_BYTES {
+        return Err(ProtocolError::CompressedPacketTooLarge {
+            len,
+            max: MAX_COMPRESSED_DECODE_PACKET_BYTES,
+        });
+    }
+    let payload = &bytes[12..];
+    if payload.len() != len {
+        return if payload.len() < len {
+            Err(ProtocolError::TruncatedPayload {
+                actual: payload.len(),
+                expected: len,
+            })
+        } else {
+            Err(ProtocolError::TrailingPayload {
+                len: payload.len() - len,
+            })
+        };
+    }
+
+    Ok(SubmitAccessUnitRequest {
+        decoder_id,
+        data: payload.to_vec(),
+    })
+}
+
+fn encode_destroy_decoder_payload(request: &DestroyDecoderRequest) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(DESTROY_DECODER_PAYLOAD_LEN);
+    write_u64(request.decoder_id.get(), &mut bytes);
+    bytes
+}
+
+fn decode_destroy_decoder_payload(bytes: &[u8]) -> Result<DestroyDecoderRequest, ProtocolError> {
+    if bytes.len() != DESTROY_DECODER_PAYLOAD_LEN {
+        return if bytes.len() < DESTROY_DECODER_PAYLOAD_LEN {
+            Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len(),
+                expected: DESTROY_DECODER_PAYLOAD_LEN,
+            })
+        } else {
+            Err(ProtocolError::TrailingPayload {
+                len: bytes.len() - DESTROY_DECODER_PAYLOAD_LEN,
+            })
+        };
+    }
+    Ok(DestroyDecoderRequest {
+        decoder_id: DecoderId::new(read_u64(bytes, 0))?,
     })
 }
 
@@ -3006,6 +3349,87 @@ fn decode_image_created_payload(bytes: &[u8]) -> Result<ImageCreatedResponse, Pr
     })
 }
 
+fn encode_decoder_created_payload(response: &DecoderCreatedResponse) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(DECODER_CREATED_PAYLOAD_LEN);
+    write_u64(response.decoder_id.get(), &mut bytes);
+    bytes
+}
+
+fn decode_decoder_created_payload(bytes: &[u8]) -> Result<DecoderCreatedResponse, ProtocolError> {
+    if bytes.len() != DECODER_CREATED_PAYLOAD_LEN {
+        return if bytes.len() < DECODER_CREATED_PAYLOAD_LEN {
+            Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len(),
+                expected: DECODER_CREATED_PAYLOAD_LEN,
+            })
+        } else {
+            Err(ProtocolError::TrailingPayload {
+                len: bytes.len() - DECODER_CREATED_PAYLOAD_LEN,
+            })
+        };
+    }
+    Ok(DecoderCreatedResponse {
+        decoder_id: DecoderId::new(read_u64(bytes, 0))?,
+    })
+}
+
+fn encode_decode_output_payload(response: &DecodeOutputResponse) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(DECODE_OUTPUT_FIXED_LEN);
+    write_u64(response.decoder_id.get(), &mut bytes);
+    write_u64(response.resource_id.get(), &mut bytes);
+    encode_video_surface_desc(&response.surface, &mut bytes);
+    bytes
+}
+
+fn decode_decode_output_payload(bytes: &[u8]) -> Result<DecodeOutputResponse, ProtocolError> {
+    if bytes.len() != DECODE_OUTPUT_FIXED_LEN {
+        return if bytes.len() < DECODE_OUTPUT_FIXED_LEN {
+            Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len(),
+                expected: DECODE_OUTPUT_FIXED_LEN,
+            })
+        } else {
+            Err(ProtocolError::TrailingPayload {
+                len: bytes.len() - DECODE_OUTPUT_FIXED_LEN,
+            })
+        };
+    }
+
+    let surface = decode_video_surface_desc(&bytes[16..])?;
+    surface.validate()?;
+    Ok(DecodeOutputResponse {
+        decoder_id: DecoderId::new(read_u64(bytes, 0))?,
+        resource_id: ResourceId::new(read_u64(bytes, 8))?,
+        surface,
+    })
+}
+
+fn encode_decoder_destroyed_payload(response: &DecoderDestroyedResponse) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(DECODER_DESTROYED_PAYLOAD_LEN);
+    write_u64(response.decoder_id.get(), &mut bytes);
+    bytes
+}
+
+fn decode_decoder_destroyed_payload(
+    bytes: &[u8],
+) -> Result<DecoderDestroyedResponse, ProtocolError> {
+    if bytes.len() != DECODER_DESTROYED_PAYLOAD_LEN {
+        return if bytes.len() < DECODER_DESTROYED_PAYLOAD_LEN {
+            Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len(),
+                expected: DECODER_DESTROYED_PAYLOAD_LEN,
+            })
+        } else {
+            Err(ProtocolError::TrailingPayload {
+                len: bytes.len() - DECODER_DESTROYED_PAYLOAD_LEN,
+            })
+        };
+    }
+    Ok(DecoderDestroyedResponse {
+        decoder_id: DecoderId::new(read_u64(bytes, 0))?,
+    })
+}
+
 fn encode_resource_destroyed_payload(response: &ResourceDestroyedResponse) -> Vec<u8> {
     response.resource_id.get().to_le_bytes().to_vec()
 }
@@ -3252,6 +3676,71 @@ fn decode_video_profile(codec: VideoCodec, value: u8) -> Result<VideoProfile, Pr
     }
 }
 
+fn encode_decoder_config(config: &DecoderConfig, bytes: &mut Vec<u8>) {
+    write_u64(config.device_id.get(), bytes);
+    bytes.push(config.codec.wire_value());
+    bytes.push(config.profile.wire_value());
+    bytes.push(config.bit_depth.get());
+    bytes.push(config.chroma.wire_value());
+    write_u32(config.coded_width, bytes);
+    write_u32(config.coded_height, bytes);
+    bytes.push(config.scan_mode.wire_value());
+    bytes.extend_from_slice(&[0_u8; 7]);
+}
+
+fn decode_decoder_config(bytes: &[u8]) -> Result<DecoderConfig, ProtocolError> {
+    if bytes[21..28].iter().any(|value| *value != 0) {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    let codec = VideoCodec::try_from(bytes[8])?;
+    Ok(DecoderConfig {
+        device_id: DeviceId::new(read_u64(bytes, 0))?,
+        codec,
+        profile: decode_video_profile(codec, bytes[9])?,
+        bit_depth: BitDepth::new(bytes[10])?,
+        chroma: ChromaSubsampling::try_from(bytes[11])?,
+        coded_width: read_u32(bytes, 12),
+        coded_height: read_u32(bytes, 16),
+        scan_mode: ScanMode::try_from(bytes[20])?,
+    })
+}
+
+fn encode_video_surface_desc(surface: &VideoSurfaceDesc, bytes: &mut Vec<u8>) {
+    write_u32(surface.coded_width, bytes);
+    write_u32(surface.coded_height, bytes);
+    write_u32(surface.visible_region.x, bytes);
+    write_u32(surface.visible_region.y, bytes);
+    write_u32(surface.visible_region.width, bytes);
+    write_u32(surface.visible_region.height, bytes);
+    bytes.push(surface.format.wire_value());
+    bytes.push(surface.bit_depth.get());
+    bytes.push(surface.chroma.wire_value());
+    bytes.push(surface.scan_mode.wire_value());
+    bytes.push(surface.field_order.wire_value());
+    bytes.extend_from_slice(&[0_u8; 3]);
+}
+
+fn decode_video_surface_desc(bytes: &[u8]) -> Result<VideoSurfaceDesc, ProtocolError> {
+    if bytes.len() != 32 || bytes[29..32].iter().any(|value| *value != 0) {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    Ok(VideoSurfaceDesc {
+        coded_width: read_u32(bytes, 0),
+        coded_height: read_u32(bytes, 4),
+        visible_region: VisibleRegion {
+            x: read_u32(bytes, 8),
+            y: read_u32(bytes, 12),
+            width: read_u32(bytes, 16),
+            height: read_u32(bytes, 20),
+        },
+        format: VideoSurfaceFormat::try_from(bytes[24])?,
+        bit_depth: BitDepth::new(bytes[25])?,
+        chroma: ChromaSubsampling::try_from(bytes[26])?,
+        scan_mode: ScanMode::try_from(bytes[27])?,
+        field_order: FieldOrder::try_from(bytes[28])?,
+    })
+}
+
 pub fn validate_image_dimensions(width: u32, height: u32) -> Result<(), ProtocolError> {
     if width == 0 || height == 0 || width > MAX_IMAGE_WIDTH || height > MAX_IMAGE_HEIGHT {
         return Err(ProtocolError::InvalidImageDimensions { width, height });
@@ -3359,6 +3848,14 @@ fn read_bool(value: u8) -> Result<bool, ProtocolError> {
 
 fn read_u16(bytes: &[u8], start: usize) -> u16 {
     u16::from_le_bytes([bytes[start], bytes[start + 1]])
+}
+
+fn write_u32(value: u32, bytes: &mut Vec<u8>) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64(value: u64, bytes: &mut Vec<u8>) {
+    bytes.extend_from_slice(&value.to_le_bytes());
 }
 
 fn read_u32(bytes: &[u8], start: usize) -> u32 {
@@ -5193,6 +5690,165 @@ mod tests {
         }
     }
 
+    #[test]
+    fn decoder_id_rejects_zero() {
+        assert_eq!(DecoderId::new(0), Err(ProtocolError::InvalidDecoderId));
+        assert_eq!(DecoderId::new(1).expect("decoder id").get(), 1);
+    }
+
+    #[test]
+    fn create_decoder_request_round_trip() {
+        let message = WireMessage::CreateDecoder {
+            request_id: 601,
+            request: CreateDecoderRequest {
+                config: sample_decoder_config(),
+            },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn submit_access_unit_request_round_trip() {
+        let message = WireMessage::SubmitAccessUnit {
+            request_id: 602,
+            request: SubmitAccessUnitRequest {
+                decoder_id: DecoderId::new(5).expect("decoder id"),
+                data: vec![0, 0, 1, 0x65, 0x88],
+            },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_compressed_access_unit() {
+        let message = WireMessage::SubmitAccessUnit {
+            request_id: 603,
+            request: SubmitAccessUnitRequest {
+                decoder_id: DecoderId::new(5).expect("decoder id"),
+                data: vec![0; MAX_COMPRESSED_DECODE_PACKET_BYTES + 1],
+            },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Err(ProtocolError::CompressedPacketTooLarge {
+                len: MAX_COMPRESSED_DECODE_PACKET_BYTES + 1,
+                max: MAX_COMPRESSED_DECODE_PACKET_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_compressed_access_unit_payload() {
+        let mut bytes = encode_wire_message(&WireMessage::SubmitAccessUnit {
+            request_id: 604,
+            request: SubmitAccessUnitRequest {
+                decoder_id: DecoderId::new(5).expect("decoder id"),
+                data: vec![1, 2, 3, 4],
+            },
+        });
+        bytes.pop();
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::TruncatedPayload {
+                actual: 15,
+                expected: 16,
+            })
+        );
+    }
+
+    #[test]
+    fn decode_output_response_round_trip() {
+        let message = WireMessage::DecodeOutput {
+            request_id: 605,
+            response: DecodeOutputResponse {
+                decoder_id: DecoderId::new(5).expect("decoder id"),
+                resource_id: ResourceId::new(6).expect("resource id"),
+                surface: sample_video_surface_desc(),
+            },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn destroy_decoder_request_round_trip() {
+        let message = WireMessage::DestroyDecoder {
+            request_id: 606,
+            request: DestroyDecoderRequest {
+                decoder_id: DecoderId::new(5).expect("decoder id"),
+            },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn decoder_request_ids_are_preserved() {
+        let messages = [
+            WireMessage::CreateDecoder {
+                request_id: 607,
+                request: CreateDecoderRequest {
+                    config: sample_decoder_config(),
+                },
+            },
+            WireMessage::SubmitAccessUnit {
+                request_id: 608,
+                request: SubmitAccessUnitRequest {
+                    decoder_id: DecoderId::new(5).expect("decoder id"),
+                    data: vec![0, 0, 1, 0x65],
+                },
+            },
+            WireMessage::DestroyDecoder {
+                request_id: 609,
+                request: DestroyDecoderRequest {
+                    decoder_id: DecoderId::new(5).expect("decoder id"),
+                },
+            },
+            WireMessage::DecoderCreated {
+                request_id: 610,
+                response: DecoderCreatedResponse {
+                    decoder_id: DecoderId::new(5).expect("decoder id"),
+                },
+            },
+            WireMessage::DecodeOutput {
+                request_id: 611,
+                response: DecodeOutputResponse {
+                    decoder_id: DecoderId::new(5).expect("decoder id"),
+                    resource_id: ResourceId::new(6).expect("resource id"),
+                    surface: sample_video_surface_desc(),
+                },
+            },
+            WireMessage::DecoderDestroyed {
+                request_id: 612,
+                response: DecoderDestroyedResponse {
+                    decoder_id: DecoderId::new(5).expect("decoder id"),
+                },
+            },
+        ];
+
+        for message in messages {
+            let decoded = decode_wire_message(&encode_wire_message(&message))
+                .expect("decode decoder lifecycle message");
+            assert_eq!(decoded.request_id(), message.request_id());
+        }
+    }
+
     fn sample_video_surface_desc() -> VideoSurfaceDesc {
         VideoSurfaceDesc {
             coded_width: 1920,
@@ -5208,6 +5864,19 @@ mod tests {
             chroma: ChromaSubsampling::Cs420,
             scan_mode: ScanMode::Progressive,
             field_order: FieldOrder::Unknown,
+        }
+    }
+
+    fn sample_decoder_config() -> DecoderConfig {
+        DecoderConfig {
+            device_id: DeviceId::new(1).expect("device id"),
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264(H264Profile::Baseline),
+            bit_depth: BitDepth::new(8).expect("bit depth"),
+            chroma: ChromaSubsampling::Cs420,
+            coded_width: 64,
+            coded_height: 64,
+            scan_mode: ScanMode::Progressive,
         }
     }
 

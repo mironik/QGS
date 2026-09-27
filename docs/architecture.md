@@ -211,6 +211,42 @@ The M2 video backend abstraction is intentionally small. Backends such as
 VA-API, Vulkan Video, or another vendor-neutral path translate their native
 profile and surface information into QGS-owned capability entries.
 
+## H.264 Decode Frontend Boundary
+
+M2 Step 3B adds the first narrow hardware decode proof:
+
+```text
+compressed H.264 Annex B access unit
+    |
+qgs-codec-h264
+    |
+QGS-owned parsed H.264 picture/slice description
+    |
+qgs-vaapi
+    |
+VA-API H.264 VLD
+    |
+VA NV12 surface
+    |
+QGS VideoSurface ResourceId
+```
+
+`qgs-codec-h264` owns H.264 syntax parsing and unsupported-stream detection.
+Parser-library types do not escape that crate. `qgs-vaapi` owns VA display,
+config, context, decode surface, VA parameter buffer translation, VA decode
+submission, completion, validation-only readback, and VA surface export probing.
+VA types do not escape `qgs-vaapi`.
+
+M2 Step 3B supports only the deliberately narrow proof stream: H.264
+Constrained Baseline/Baseline-compatible 8-bit 4:2:0 progressive Annex B with
+IDR/I slices. It does not claim general H.264 support, MPEG-2 support, XDCAM,
+XAVC, interlaced decode, P/B frames, Vulkan import of decoded NV12 surfaces, or
+video scheduling.
+
+Compressed access units may travel through bounded normal QGS IPC for this M2
+proof. Raw decoded frames remain backend-owned VideoSurface resources and do
+not travel through normal protocol messages.
+
 M2 Step 2 adds real VA-API decode capability discovery through a backend
 boundary:
 

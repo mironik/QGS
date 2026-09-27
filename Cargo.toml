@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/qgs-codec-h264",
     "crates/qgs-core",
     "crates/qgs-linux",
     "crates/qgs-protocol",

@@ -5,11 +5,13 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use qgs_protocol::{
-    handle_hello, BufferCreatedResponse, BufferDesc, CreateSyncRequest, DeviceCapabilities,
-    DeviceDesc, DeviceId, ExportResourceRequest, ExportSyncRequest, ExportedResourceMetadata,
-    ExportedSyncMetadata, HelloRequest, ImageCreatedResponse, ImageDesc, ProtocolError,
-    ResourceDestroyedResponse, ResourceId, ResourceKind, SelectedMemoryProperties, SessionId,
-    SyncCreatedResponse, SyncId, VideoCapabilities, WelcomeResponse,
+    handle_hello, BufferCreatedResponse, BufferDesc, CreateDecoderRequest, CreateSyncRequest,
+    DecodeOutputResponse, DecoderCreatedResponse, DecoderDestroyedResponse, DecoderId,
+    DestroyDecoderRequest, DeviceCapabilities, DeviceDesc, DeviceId, ExportResourceRequest,
+    ExportSyncRequest, ExportedResourceMetadata, ExportedSyncMetadata, HelloRequest,
+    ImageCreatedResponse, ImageDesc, ProtocolError, ResourceDestroyedResponse, ResourceId,
+    ResourceKind, SelectedMemoryProperties, SessionId, SubmitAccessUnitRequest,
+    SyncCreatedResponse, SyncId, VideoCapabilities, VideoSurfaceDesc, WelcomeResponse,
 };
 
 pub trait DeviceDiscovery {
@@ -95,7 +97,7 @@ pub trait ResourceBackend {
     fn create_image(&self, desc: &ImageDesc) -> Result<BackendImageAllocation, ResourceError>;
 }
 
-pub trait BackendResource: Send {
+pub trait BackendResource {
     fn as_any(&self) -> &dyn Any;
 
     fn export(
@@ -110,7 +112,14 @@ pub trait SyncBackend {
     fn create_sync(&self, request: &CreateSyncRequest) -> Result<Box<dyn BackendSync>, SyncError>;
 }
 
-pub trait BackendSync: Send {
+pub trait DecoderBackend {
+    fn create_decoder(
+        &self,
+        request: &CreateDecoderRequest,
+    ) -> Result<Box<dyn BackendDecoder>, DecoderError>;
+}
+
+pub trait BackendSync {
     fn export_for_resource(
         &self,
         _request: &ExportSyncRequest,
@@ -118,6 +127,13 @@ pub trait BackendSync: Send {
     ) -> Result<BackendSyncExport, SyncError> {
         Err(SyncError::SyncExportFailed)
     }
+}
+
+pub trait BackendDecoder {
+    fn submit_access_unit(
+        &mut self,
+        request: &SubmitAccessUnitRequest,
+    ) -> Result<BackendDecodedSurface, DecoderError>;
 }
 
 pub struct BackendBufferAllocation {
@@ -140,6 +156,11 @@ pub struct BackendResourceExport {
 pub struct BackendSyncExport {
     pub metadata: ExportedSyncMetadata,
     pub handle: std::fs::File,
+}
+
+pub struct BackendDecodedSurface {
+    pub resource: Box<dyn BackendResource>,
+    pub desc: VideoSurfaceDesc,
 }
 
 #[derive(Debug)]
@@ -169,6 +190,18 @@ pub enum SyncError {
     Protocol(ProtocolError),
 }
 
+#[derive(Debug)]
+pub enum DecoderError {
+    UnknownDecoder,
+    UnknownDeviceId,
+    UnsupportedDecodeConfiguration,
+    MalformedCompressedData,
+    CompressedPacketTooLarge,
+    UnsupportedH264StreamFeature,
+    DecodeFailed,
+    Protocol(ProtocolError),
+}
+
 impl std::fmt::Display for SyncError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -192,6 +225,38 @@ impl From<ProtocolError> for SyncError {
             ProtocolError::UnknownDeviceId => Self::UnknownDeviceId,
             ProtocolError::UnsupportedSyncHandleType => Self::UnsupportedSyncHandleType,
             ProtocolError::SyncExportFailed => Self::SyncExportFailed,
+            err => Self::Protocol(err),
+        }
+    }
+}
+
+impl std::fmt::Display for DecoderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownDecoder => write!(f, "unknown decoder"),
+            Self::UnknownDeviceId => write!(f, "unknown device id"),
+            Self::UnsupportedDecodeConfiguration => write!(f, "unsupported decode configuration"),
+            Self::MalformedCompressedData => write!(f, "malformed compressed data"),
+            Self::CompressedPacketTooLarge => write!(f, "compressed packet too large"),
+            Self::UnsupportedH264StreamFeature => write!(f, "unsupported H.264 stream feature"),
+            Self::DecodeFailed => write!(f, "decode failed"),
+            Self::Protocol(err) => write!(f, "invalid decoder protocol data: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for DecoderError {}
+
+impl From<ProtocolError> for DecoderError {
+    fn from(value: ProtocolError) -> Self {
+        match value {
+            ProtocolError::UnknownDecoder => Self::UnknownDecoder,
+            ProtocolError::UnknownDeviceId => Self::UnknownDeviceId,
+            ProtocolError::UnsupportedDecodeConfiguration => Self::UnsupportedDecodeConfiguration,
+            ProtocolError::MalformedCompressedData => Self::MalformedCompressedData,
+            ProtocolError::CompressedPacketTooLarge { .. } => Self::CompressedPacketTooLarge,
+            ProtocolError::UnsupportedH264StreamFeature => Self::UnsupportedH264StreamFeature,
+            ProtocolError::DecodeFailed => Self::DecodeFailed,
             err => Self::Protocol(err),
         }
     }
@@ -271,6 +336,7 @@ impl SessionManager {
             id,
             resources: ResourceRegistry::new(),
             syncs: SyncRegistry::new(),
+            decoders: DecoderRegistry::new(),
         })
     }
 
@@ -284,6 +350,7 @@ pub struct Session {
     id: SessionId,
     resources: ResourceRegistry,
     syncs: SyncRegistry,
+    decoders: DecoderRegistry,
 }
 
 impl Session {
@@ -380,12 +447,69 @@ impl Session {
             .export_for_resource(request, resource.resource.as_ref())
     }
 
+    pub fn create_decoder(
+        &mut self,
+        backend: &impl DecoderBackend,
+        request: &CreateDecoderRequest,
+    ) -> Result<DecoderCreatedResponse, DecoderError> {
+        request.config.validate()?;
+        let id = self.decoders.allocate_id()?;
+        let decoder = backend.create_decoder(request)?;
+        self.decoders.insert(id, DecoderEntry { decoder });
+        Ok(DecoderCreatedResponse { decoder_id: id })
+    }
+
+    pub fn submit_access_unit(
+        &mut self,
+        request: &SubmitAccessUnitRequest,
+    ) -> Result<DecodeOutputResponse, DecoderError> {
+        if request.data.len() > qgs_protocol::MAX_COMPRESSED_DECODE_PACKET_BYTES {
+            return Err(DecoderError::CompressedPacketTooLarge);
+        }
+        let decoded = self
+            .decoders
+            .get_mut(request.decoder_id)?
+            .decoder
+            .submit_access_unit(request)?;
+        decoded.desc.validate()?;
+        let resource_id = self
+            .resources
+            .allocate_id()
+            .map_err(|_| DecoderError::DecodeFailed)?;
+        self.resources.insert(
+            resource_id,
+            ResourceEntry {
+                kind: ResourceKind::VideoSurface,
+                resource: decoded.resource,
+            },
+        );
+        Ok(DecodeOutputResponse {
+            decoder_id: request.decoder_id,
+            resource_id,
+            surface: decoded.desc,
+        })
+    }
+
+    pub fn destroy_decoder(
+        &mut self,
+        request: &DestroyDecoderRequest,
+    ) -> Result<DecoderDestroyedResponse, DecoderError> {
+        self.decoders.remove(request.decoder_id)?;
+        Ok(DecoderDestroyedResponse {
+            decoder_id: request.decoder_id,
+        })
+    }
+
     pub fn resource_count(&self) -> usize {
         self.resources.len()
     }
 
     pub fn sync_count(&self) -> usize {
         self.syncs.len()
+    }
+
+    pub fn decoder_count(&self) -> usize {
+        self.decoders.len()
     }
 }
 
@@ -498,6 +622,64 @@ impl Drop for SyncRegistry {
 
 struct SyncEntry {
     sync: Box<dyn BackendSync>,
+}
+
+struct DecoderRegistry {
+    next_decoder_id: u64,
+    decoders: BTreeMap<DecoderId, DecoderEntry>,
+}
+
+impl DecoderRegistry {
+    fn new() -> Self {
+        Self {
+            next_decoder_id: 1,
+            decoders: BTreeMap::new(),
+        }
+    }
+
+    fn allocate_id(&mut self) -> Result<DecoderId, DecoderError> {
+        let id = DecoderId::new(self.next_decoder_id)?;
+        self.next_decoder_id = self
+            .next_decoder_id
+            .checked_add(1)
+            .ok_or(DecoderError::DecodeFailed)?;
+        Ok(id)
+    }
+
+    fn insert(&mut self, id: DecoderId, entry: DecoderEntry) {
+        self.decoders.insert(id, entry);
+    }
+
+    fn get_mut(&mut self, id: DecoderId) -> Result<&mut DecoderEntry, DecoderError> {
+        self.decoders
+            .get_mut(&id)
+            .ok_or(DecoderError::UnknownDecoder)
+    }
+
+    fn remove(&mut self, id: DecoderId) -> Result<DecoderEntry, DecoderError> {
+        self.decoders
+            .remove(&id)
+            .ok_or(DecoderError::UnknownDecoder)
+    }
+
+    fn len(&self) -> usize {
+        self.decoders.len()
+    }
+}
+
+impl Drop for DecoderRegistry {
+    fn drop(&mut self) {
+        if !self.decoders.is_empty() {
+            eprintln!(
+                "qgs-core: releasing {} decoder(s) owned by session",
+                self.decoders.len()
+            );
+        }
+    }
+}
+
+struct DecoderEntry {
+    decoder: Box<dyn BackendDecoder>,
 }
 
 #[cfg(test)]

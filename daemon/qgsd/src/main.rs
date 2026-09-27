@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use qgs_core::{
-    DeviceDiscovery, ResourceBackend, ResourceError, Session, SessionManager, SyncBackend,
-    SyncError, VideoCapabilityDiscovery,
+    DecoderBackend, DecoderError, DeviceDiscovery, ResourceBackend, ResourceError, Session,
+    SessionManager, SyncBackend, SyncError, VideoCapabilityDiscovery,
 };
 use qgs_linux::{
     bind_socket, default_socket_path, receive_message, remove_socket_file, send_message,
@@ -108,10 +108,23 @@ impl SyncBackend for QgsBackends {
     }
 }
 
+impl DecoderBackend for QgsBackends {
+    fn create_decoder(
+        &self,
+        request: &qgs_protocol::CreateDecoderRequest,
+    ) -> Result<Box<dyn qgs_core::BackendDecoder>, DecoderError> {
+        self.vaapi.create_decoder(request)
+    }
+}
+
 fn handle_client(
     stream: &mut std::os::unix::net::UnixStream,
     sessions: &SessionManager,
-    discovery: &(impl DeviceDiscovery + ResourceBackend + SyncBackend + VideoCapabilityDiscovery),
+    discovery: &(impl DeviceDiscovery
+          + ResourceBackend
+          + SyncBackend
+          + VideoCapabilityDiscovery
+          + DecoderBackend),
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut session: Option<Session> = None;
 
@@ -120,11 +133,15 @@ fn handle_client(
             Ok(message) => message,
             Err(TransportError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
                 if let Some(session) = &session {
-                    if session.resource_count() > 0 || session.sync_count() > 0 {
+                    if session.resource_count() > 0
+                        || session.sync_count() > 0
+                        || session.decoder_count() > 0
+                    {
                         eprintln!(
-                            "client disconnected; releasing {} resource(s) and {} sync object(s) for session {}",
+                            "client disconnected; releasing {} resource(s), {} sync object(s), and {} decoder(s) for session {}",
                             session.resource_count(),
                             session.sync_count(),
+                            session.decoder_count(),
                             session.id().get()
                         );
                     }
@@ -264,6 +281,81 @@ fn handle_client(
                                 },
                             }
                         }
+                    }
+                }
+            }
+            WireMessage::CreateDecoder { request, .. } => {
+                if let Some(session) = &mut session {
+                    match session.create_decoder(discovery, &request) {
+                        Ok(response) => WireMessage::DecoderCreated {
+                            request_id,
+                            response,
+                        },
+                        Err(err) => {
+                            eprintln!("decoder creation failed: {err}");
+                            WireMessage::Error {
+                                request_id,
+                                response: ErrorResponse {
+                                    code: protocol_code_from_decoder_error(&err),
+                                },
+                            }
+                        }
+                    }
+                } else {
+                    WireMessage::Error {
+                        request_id,
+                        response: ErrorResponse {
+                            code: ProtocolErrorCode::SessionRequired,
+                        },
+                    }
+                }
+            }
+            WireMessage::SubmitAccessUnit { request, .. } => {
+                if let Some(session) = &mut session {
+                    match session.submit_access_unit(&request) {
+                        Ok(response) => WireMessage::DecodeOutput {
+                            request_id,
+                            response,
+                        },
+                        Err(err) => {
+                            eprintln!("decode submission failed: {err}");
+                            WireMessage::Error {
+                                request_id,
+                                response: ErrorResponse {
+                                    code: protocol_code_from_decoder_error(&err),
+                                },
+                            }
+                        }
+                    }
+                } else {
+                    WireMessage::Error {
+                        request_id,
+                        response: ErrorResponse {
+                            code: ProtocolErrorCode::SessionRequired,
+                        },
+                    }
+                }
+            }
+            WireMessage::DestroyDecoder { request, .. } => {
+                if let Some(session) = &mut session {
+                    match session.destroy_decoder(&request) {
+                        Ok(response) => WireMessage::DecoderDestroyed {
+                            request_id,
+                            response,
+                        },
+                        Err(err) => WireMessage::Error {
+                            request_id,
+                            response: ErrorResponse {
+                                code: protocol_code_from_decoder_error(&err),
+                            },
+                        },
+                    }
+                } else {
+                    WireMessage::Error {
+                        request_id,
+                        response: ErrorResponse {
+                            code: ProtocolErrorCode::SessionRequired,
+                        },
                     }
                 }
             }
@@ -437,6 +529,9 @@ fn handle_client(
             | WireMessage::DeviceList { .. }
             | WireMessage::DeviceCapabilities { .. }
             | WireMessage::VideoCapabilities { .. }
+            | WireMessage::DecoderCreated { .. }
+            | WireMessage::DecodeOutput { .. }
+            | WireMessage::DecoderDestroyed { .. }
             | WireMessage::BufferCreated { .. }
             | WireMessage::ImageCreated { .. }
             | WireMessage::ResourceDestroyed { .. }
@@ -462,6 +557,23 @@ fn protocol_code_from_sync_error(err: &SyncError) -> ProtocolErrorCode {
         SyncError::UnsupportedSyncHandleType => ProtocolErrorCode::UnsupportedSyncHandleType,
         SyncError::SyncExportFailed => ProtocolErrorCode::SyncExportFailed,
         SyncError::Protocol(err) => ProtocolErrorCode::from(err),
+    }
+}
+
+fn protocol_code_from_decoder_error(err: &DecoderError) -> ProtocolErrorCode {
+    match err {
+        DecoderError::UnknownDecoder => ProtocolErrorCode::UnknownDecoder,
+        DecoderError::UnknownDeviceId => ProtocolErrorCode::UnknownDeviceId,
+        DecoderError::UnsupportedDecodeConfiguration => {
+            ProtocolErrorCode::UnsupportedDecodeConfiguration
+        }
+        DecoderError::MalformedCompressedData => ProtocolErrorCode::MalformedCompressedData,
+        DecoderError::CompressedPacketTooLarge => ProtocolErrorCode::CompressedPacketTooLarge,
+        DecoderError::UnsupportedH264StreamFeature => {
+            ProtocolErrorCode::UnsupportedH264StreamFeature
+        }
+        DecoderError::DecodeFailed => ProtocolErrorCode::DecodeFailed,
+        DecoderError::Protocol(err) => ProtocolErrorCode::from(err),
     }
 }
 
