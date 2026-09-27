@@ -1234,7 +1234,7 @@ fn proxy_throughput(
         .map(|sample| sample.annex_b.clone())
         .collect::<Vec<_>>();
 
-    println!("QGS Step 13 proxy throughput audit:");
+    println!("QGS proxy VA throughput audit:");
     println!("  original: {}", case.original_label);
     println!("  proxy: {}", case.proxy_label);
     println!("  hashes: verified");
@@ -1326,6 +1326,7 @@ fn proxy_throughput(
         normal_elapsed,
     );
     print_va_observation(&normal);
+    print_va_timing(&normal.timing);
     if normal.frames != proxy_video.samples.len() {
         return Err(format!(
             "clean VA decode expected {} frames, got {}",
@@ -1333,6 +1334,41 @@ fn proxy_throughput(
             normal.frames
         )
         .into());
+    }
+
+    println!("Clean VA pool-size experiment:");
+    for pool_size in [8_usize, 12, 16, 24, 32] {
+        let pool_start = Instant::now();
+        let observation = qgs_vaapi::decode_h264_access_units_for_observation_with_pool_size(
+            &devices,
+            device.id,
+            &proxy_config,
+            &access_units,
+            qgs_vaapi::VaapiDecodeMode::Normal,
+            &[],
+            pool_size,
+        )?;
+        let elapsed = pool_start.elapsed();
+        let seconds = elapsed.as_secs_f64().max(0.000_001);
+        println!(
+            "  pool={pool_size}: frames={} {:.3}s {:.2} fps recycle_sync={} peak_pending_recycle={} peak_unsynced={} min_free={} client_held={}",
+            observation.frames,
+            seconds,
+            observation.frames as f64 / seconds,
+            observation.pool_stats.recycle_sync_count,
+            observation.pool_stats.peak_pending_recycle_surfaces,
+            observation.peak_submitted_unsynced_surfaces,
+            observation.pool_stats.minimum_free_surfaces,
+            observation.max_client_held_outputs
+        );
+        if observation.frames != proxy_video.samples.len() {
+            return Err(format!(
+                "pool-size experiment {pool_size} expected {} frames, got {}",
+                proxy_video.samples.len(),
+                observation.frames
+            )
+            .into());
+        }
     }
 
     let diagnostic_start = Instant::now();
@@ -1352,6 +1388,7 @@ fn proxy_throughput(
         diagnostic_elapsed,
     );
     print_va_observation(&diagnostic);
+    print_va_timing(&diagnostic.timing);
     println!(
         "  selected diagnostic checksums: {:?}",
         diagnostic.selected_output_checksums
@@ -1426,24 +1463,54 @@ fn print_decode_timing(
 
 fn print_va_observation(observation: &qgs_vaapi::VaapiDecodeObservation) {
     println!(
-        "  pool: allocated={} reused={} recycled={} recycle_sync={} deferred={} peak_checked_out={}",
+        "  pool: allocated={} reused={} recycled={} recycle_sync={} deferred={} peak_checked_out={} peak_pending_recycle={} min_free={}",
         observation.pool_stats.surfaces_allocated,
         observation.pool_stats.surface_reuse_count,
         observation.pool_stats.surfaces_recycled,
         observation.pool_stats.recycle_sync_count,
         observation.pool_stats.deferred_recycle_count,
-        observation.pool_stats.peak_checked_out_surfaces
+        observation.pool_stats.peak_checked_out_surfaces,
+        observation.pool_stats.peak_pending_recycle_surfaces,
+        observation.pool_stats.minimum_free_surfaces
     );
     println!(
-        "  peaks: DPB={} output_pending={} live_va_surfaces={}",
+        "  peaks: DPB={} output_pending={} live_va_surfaces={} submitted_unsynced={} client_held_outputs={}",
         observation.peak_dpb_occupancy,
         observation.peak_output_pending,
-        observation.peak_live_surfaces
+        observation.peak_live_surfaces,
+        observation.peak_submitted_unsynced_surfaces,
+        observation.max_client_held_outputs
     );
     println!(
         "  diagnostics: frames={} export_probes={}",
         observation.diagnostic_frames, observation.diagnostic_export_probes
     );
+}
+
+fn print_va_timing(timing: &qgs_vaapi::VaapiDecodeTiming) {
+    let total = timing.submit_total_ns.max(1);
+    println!("  aggregate VA/backend timing:");
+    print_timing_bucket("surface acquisition", timing.surface_acquire_ns, total);
+    print_timing_bucket("H.264 frontend parse", timing.h264_parse_ns, total);
+    print_timing_bucket("parameter/list build", timing.parameter_build_ns, total);
+    print_timing_bucket("VA buffer creation", timing.buffer_create_ns, total);
+    print_timing_bucket("vaBeginPicture", timing.begin_picture_ns, total);
+    print_timing_bucket("vaRenderPicture", timing.render_picture_ns, total);
+    print_timing_bucket("vaEndPicture", timing.end_picture_ns, total);
+    print_timing_bucket("inline surface sync", timing.inline_sync_ns, total);
+    print_timing_bucket("reclaim surface sync", timing.reclaim_sync_ns, total);
+    print_timing_bucket("diagnostics", timing.diagnostics_ns, total);
+    print_timing_bucket("finish picture", timing.finish_picture_ns, total);
+    print_timing_bucket("output mapping", timing.output_mapping_ns, total);
+    print_timing_bucket("release/drop", timing.release_ns, total);
+    print_timing_bucket("flush", timing.flush_ns, total);
+    print_timing_bucket("submit total", timing.submit_total_ns, total);
+}
+
+fn print_timing_bucket(label: &str, ns: u128, total_ns: u128) {
+    let ms = ns as f64 / 1_000_000.0;
+    let pct = (ns as f64 / total_ns as f64) * 100.0;
+    println!("    {label}: {ms:.3} ms ({pct:.1}%)");
 }
 
 fn run_software_gpu_sequence_proof(

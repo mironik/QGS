@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Instant;
 
 use libva::{
     BorrowedBufferType, BufferType, Context, Display, H264PicFields, H264SeqFields, IQMatrix,
@@ -113,14 +114,19 @@ impl DecoderBackend for VaapiVideoDiscovery {
         &self,
         request: &CreateDecoderRequest,
     ) -> Result<Box<dyn BackendDecoder>, DecoderError> {
-        Ok(Box::new(self.create_h264_decoder(request)?))
+        Ok(Box::new(self.create_h264_decoder(
+            &VaapiCreateDecoderRequest {
+                config: request.config.clone(),
+                surface_pool_size: 24,
+            },
+        )?))
     }
 }
 
 impl VaapiVideoDiscovery {
     fn create_h264_decoder(
         &self,
-        request: &CreateDecoderRequest,
+        request: &VaapiCreateDecoderRequest,
     ) -> Result<VaapiH264Decoder, DecoderError> {
         request.config.validate()?;
         if request.config.codec != VideoCodec::H264
@@ -171,7 +177,7 @@ impl VaapiVideoDiscovery {
                 request.config.coded_width,
                 request.config.coded_height,
                 None,
-                vec![(); 24],
+                vec![(); request.surface_pool_size],
             )
             .map_err(|_| DecoderError::UnsupportedDecodeConfiguration)?;
         let context = display
@@ -192,11 +198,18 @@ impl VaapiVideoDiscovery {
             device_id: request.config.device_id,
             config: request.config.clone(),
             max_live_surfaces: 0,
+            max_submitted_unsynced_surfaces: 0,
+            timing: VaapiDecodeTiming::default(),
             mode: self.decode_mode,
             diagnostic_frames: 0,
             diagnostic_export_probes: 0,
         })
     }
+}
+
+struct VaapiCreateDecoderRequest {
+    config: DecoderConfig,
+    surface_pool_size: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -219,6 +232,8 @@ pub struct VaapiSurfacePoolStats {
     pub recycle_sync_count: usize,
     pub deferred_recycle_count: usize,
     pub peak_checked_out_surfaces: usize,
+    pub peak_pending_recycle_surfaces: usize,
+    pub minimum_free_surfaces: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -232,11 +247,39 @@ pub struct VaapiDecodeObservation {
     pub frames: usize,
     pub selected_output_checksums: Vec<(usize, Option<u32>)>,
     pub pool_stats: VaapiSurfacePoolStats,
+    pub timing: VaapiDecodeTiming,
     pub peak_dpb_occupancy: usize,
     pub peak_output_pending: usize,
     pub peak_live_surfaces: usize,
+    pub peak_submitted_unsynced_surfaces: usize,
+    pub max_client_held_outputs: usize,
     pub diagnostic_frames: usize,
     pub diagnostic_export_probes: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VaapiDecodeTiming {
+    pub surface_acquire_ns: u128,
+    pub h264_parse_ns: u128,
+    pub parameter_build_ns: u128,
+    pub buffer_create_ns: u128,
+    pub begin_picture_ns: u128,
+    pub render_picture_ns: u128,
+    pub end_picture_ns: u128,
+    pub inline_sync_ns: u128,
+    pub reclaim_sync_ns: u128,
+    pub diagnostics_ns: u128,
+    pub finish_picture_ns: u128,
+    pub output_mapping_ns: u128,
+    pub release_ns: u128,
+    pub flush_ns: u128,
+    pub submit_total_ns: u128,
+}
+
+impl VaapiDecodeTiming {
+    fn add_elapsed(bucket: &mut u128, start: Instant) {
+        *bucket = bucket.saturating_add(start.elapsed().as_nanos());
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -319,7 +362,15 @@ pub fn decode_h264_drm_prime_for_diagnostic(
         .into_iter()
         .next()
         .ok_or(DecoderError::DecodeFailed)?;
-    let surface = decode_h264_access_unit(context, surface, &parsed, &BTreeMap::new(), true)?;
+    let mut timing = VaapiDecodeTiming::default();
+    let surface = decode_h264_access_unit(
+        context,
+        surface,
+        &parsed,
+        &BTreeMap::new(),
+        true,
+        &mut timing,
+    )?;
     let DecodedVaSurface::Ready(surface) = surface else {
         return Err(DecoderError::DecodeFailed);
     };
@@ -369,19 +420,44 @@ pub fn decode_h264_access_units_for_observation(
     mode: VaapiDecodeMode,
     selected_output_ordinals: &[usize],
 ) -> Result<VaapiDecodeObservation, DecoderError> {
+    decode_h264_access_units_for_observation_with_pool_size(
+        qgs_devices,
+        device_id,
+        config,
+        access_units,
+        mode,
+        selected_output_ordinals,
+        24,
+    )
+}
+
+pub fn decode_h264_access_units_for_observation_with_pool_size(
+    qgs_devices: &[DeviceDesc],
+    device_id: DeviceId,
+    config: &DecoderConfig,
+    access_units: &[Vec<u8>],
+    mode: VaapiDecodeMode,
+    selected_output_ordinals: &[usize],
+    surface_pool_size: usize,
+) -> Result<VaapiDecodeObservation, DecoderError> {
     let discovery = VaapiVideoDiscovery::with_decode_mode(qgs_devices, mode);
     let mut config = config.clone();
     config.device_id = device_id;
-    let mut decoder = discovery.create_h264_decoder(&CreateDecoderRequest { config })?;
+    let mut decoder = discovery.create_h264_decoder(&VaapiCreateDecoderRequest {
+        config,
+        surface_pool_size,
+    })?;
     let decoder_id = DecoderId::new(1).map_err(DecoderError::from)?;
     let mut frames = 0_usize;
     let mut selected_output_checksums = Vec::new();
+    let mut max_client_held_outputs = 0_usize;
 
     for access_unit in access_units {
         let outputs = decoder.submit_access_unit(&SubmitAccessUnitRequest {
             decoder_id,
             data: access_unit.clone(),
         })?;
+        max_client_held_outputs = max_client_held_outputs.max(outputs.len());
         collect_observation_outputs(
             outputs,
             &mut frames,
@@ -391,6 +467,7 @@ pub fn decode_h264_access_units_for_observation(
     }
 
     let outputs = decoder.flush(&FlushDecoderRequest { decoder_id })?;
+    max_client_held_outputs = max_client_held_outputs.max(outputs.len());
     collect_observation_outputs(
         outputs,
         &mut frames,
@@ -403,9 +480,12 @@ pub fn decode_h264_access_units_for_observation(
         frames,
         selected_output_checksums,
         pool_stats,
+        timing: decoder.timing.clone(),
         peak_dpb_occupancy: decoder.frontend.max_dpb_occupancy(),
         peak_output_pending: decoder.frontend.max_output_pending(),
         peak_live_surfaces: decoder.max_live_surfaces,
+        peak_submitted_unsynced_surfaces: decoder.max_submitted_unsynced_surfaces,
+        max_client_held_outputs,
         diagnostic_frames: decoder.diagnostic_frames,
         diagnostic_export_probes: decoder.diagnostic_export_probes,
     })
@@ -461,6 +541,8 @@ struct VaapiH264Decoder {
     device_id: DeviceId,
     config: DecoderConfig,
     max_live_surfaces: usize,
+    max_submitted_unsynced_surfaces: usize,
+    timing: VaapiDecodeTiming,
     mode: VaapiDecodeMode,
     diagnostic_frames: usize,
     diagnostic_export_probes: usize,
@@ -471,31 +553,39 @@ impl BackendDecoder for VaapiH264Decoder {
         &mut self,
         request: &SubmitAccessUnitRequest,
     ) -> Result<Vec<BackendDecodedSurface>, DecoderError> {
+        let submit_start = Instant::now();
+        let parse_start = Instant::now();
         let parsed = self
             .frontend
             .parse_access_unit(&request.data)
             .map_err(decoder_error_from_h264)?;
+        VaapiDecodeTiming::add_elapsed(&mut self.timing.h264_parse_ns, parse_start);
         if !parsed_access_unit_matches_config(&parsed, &self.config) {
             return Err(DecoderError::UnsupportedDecodeConfiguration);
         }
+        let acquire_start = Instant::now();
         let surface = self
             .pool
             .borrow_mut()
-            .acquire()
+            .acquire(&mut self.timing)
             .ok_or(DecoderError::DecodeFailed)?;
+        VaapiDecodeTiming::add_elapsed(&mut self.timing.surface_acquire_ns, acquire_start);
         let surface = decode_h264_access_unit(
             Rc::clone(&self.context),
             surface,
             &parsed,
             &self.decoded_surfaces,
             self.mode.diagnostics_enabled(),
+            &mut self.timing,
         )?;
         let diagnostics = if self.mode.diagnostics_enabled() {
+            let diagnostics_start = Instant::now();
             let diagnostics = collect_surface_diagnostics(
                 surface.as_surface(),
                 parsed.desc.coded_width,
                 parsed.desc.coded_height,
             )?;
+            VaapiDecodeTiming::add_elapsed(&mut self.timing.diagnostics_ns, diagnostics_start);
             self.diagnostic_frames = self.diagnostic_frames.saturating_add(1);
             if diagnostics.export_probe.is_some() {
                 self.diagnostic_export_probes = self.diagnostic_export_probes.saturating_add(1);
@@ -539,10 +629,13 @@ impl BackendDecoder for VaapiH264Decoder {
             }),
         );
         self.max_live_surfaces = self.max_live_surfaces.max(self.decoded_surfaces.len());
+        self.update_submitted_unsynced_peak();
+        let finish_start = Instant::now();
         let update = self
             .frontend
             .finish_picture(&parsed)
             .map_err(decoder_error_from_h264)?;
+        VaapiDecodeTiming::add_elapsed(&mut self.timing.finish_picture_ns, finish_start);
         if self.mode.diagnostics_enabled() {
             eprintln!(
                 "qgs-vaapi diagnostic: H.264 DPB occupancy={} output_pending={} live_va_surfaces={}",
@@ -551,8 +644,14 @@ impl BackendDecoder for VaapiH264Decoder {
                 self.decoded_surfaces.len()
             );
         }
+        let output_start = Instant::now();
         let outputs = self.outputs_from_ids(&update.output_ready)?;
+        VaapiDecodeTiming::add_elapsed(&mut self.timing.output_mapping_ns, output_start);
+        let release_start = Instant::now();
         self.release_decoded_surfaces(&update.released);
+        VaapiDecodeTiming::add_elapsed(&mut self.timing.release_ns, release_start);
+        self.update_submitted_unsynced_peak();
+        VaapiDecodeTiming::add_elapsed(&mut self.timing.submit_total_ns, submit_start);
         Ok(outputs)
     }
 
@@ -560,6 +659,7 @@ impl BackendDecoder for VaapiH264Decoder {
         &mut self,
         _request: &qgs_protocol::FlushDecoderRequest,
     ) -> Result<Vec<BackendDecodedSurface>, DecoderError> {
+        let flush_start = Instant::now();
         let update = self.frontend.flush();
         if self.mode.diagnostics_enabled() {
             eprintln!(
@@ -569,6 +669,8 @@ impl BackendDecoder for VaapiH264Decoder {
         }
         let outputs = self.outputs_from_ids(&update.output_ready)?;
         self.release_decoded_surfaces(&update.released);
+        self.update_submitted_unsynced_peak();
+        VaapiDecodeTiming::add_elapsed(&mut self.timing.flush_ns, flush_start);
         Ok(outputs)
     }
 }
@@ -608,6 +710,18 @@ impl VaapiH264Decoder {
             })
             .collect()
     }
+
+    fn update_submitted_unsynced_peak(&mut self) {
+        let live_submitted = self
+            .decoded_surfaces
+            .values()
+            .filter(|surface| surface.is_submitted_unsynced())
+            .count();
+        let pending_submitted = self.pool.borrow().pending_submitted_unsynced();
+        self.max_submitted_unsynced_surfaces = self
+            .max_submitted_unsynced_surfaces
+            .max(live_submitted.saturating_add(pending_submitted));
+    }
 }
 
 struct DecodedSurfaceState {
@@ -625,6 +739,13 @@ impl DecodedSurfaceState {
             .as_ref()
             .map(DecodedVaSurface::surface_id)
             .ok_or(DecoderError::DecodeFailed)
+    }
+
+    fn is_submitted_unsynced(&self) -> bool {
+        self.surface
+            .borrow()
+            .as_ref()
+            .is_some_and(DecodedVaSurface::is_submitted)
     }
 
     fn recycle_if_released(&self) {
@@ -740,11 +861,26 @@ impl DecodedVaSurface {
         }
     }
 
-    fn reclaim_for_reuse(self) -> Option<Surface<()>> {
+    fn is_submitted(&self) -> bool {
+        matches!(self, Self::Submitted(_))
+    }
+
+    fn reclaim_for_reuse(self, timing: Option<&mut VaapiDecodeTiming>) -> Option<Surface<()>> {
         match self {
-            Self::Submitted(picture) => picture.sync().ok()?.take_surface().ok(),
+            Self::Submitted(picture) => {
+                let sync_start = Instant::now();
+                let synced = picture.sync().ok()?;
+                if let Some(timing) = timing {
+                    VaapiDecodeTiming::add_elapsed(&mut timing.reclaim_sync_ns, sync_start);
+                }
+                synced.take_surface().ok()
+            }
             Self::Ready(surface) => {
+                let sync_start = Instant::now();
                 surface.sync().ok()?;
+                if let Some(timing) = timing {
+                    VaapiDecodeTiming::add_elapsed(&mut timing.reclaim_sync_ns, sync_start);
+                }
                 Some(surface)
             }
         }
@@ -765,15 +901,16 @@ impl VaapiSurfacePool {
             pending_recycle: Vec::new(),
             stats: VaapiSurfacePoolStats {
                 surfaces_allocated,
+                minimum_free_surfaces: surfaces_allocated,
                 ..VaapiSurfacePoolStats::default()
             },
         }
     }
 
-    fn acquire(&mut self) -> Option<Surface<()>> {
+    fn acquire(&mut self, timing: &mut VaapiDecodeTiming) -> Option<Surface<()>> {
         let surface = match self.available.pop() {
             Some(surface) => surface,
-            None => self.reclaim_one_pending()?,
+            None => self.reclaim_one_pending(Some(timing))?,
         };
         let was_recycled = self.stats.surfaces_recycled > 0;
         if was_recycled {
@@ -785,17 +922,26 @@ impl VaapiSurfacePool {
             .saturating_sub(self.available.len());
         self.stats.peak_checked_out_surfaces =
             self.stats.peak_checked_out_surfaces.max(checked_out);
+        self.stats.minimum_free_surfaces =
+            self.stats.minimum_free_surfaces.min(self.available.len());
         Some(surface)
     }
 
     fn defer_recycle(&mut self, surface: DecodedVaSurface) {
         self.stats.deferred_recycle_count = self.stats.deferred_recycle_count.saturating_add(1);
         self.pending_recycle.push(surface);
+        self.stats.peak_pending_recycle_surfaces = self
+            .stats
+            .peak_pending_recycle_surfaces
+            .max(self.pending_recycle.len());
     }
 
-    fn reclaim_one_pending(&mut self) -> Option<Surface<()>> {
+    fn reclaim_one_pending(
+        &mut self,
+        timing: Option<&mut VaapiDecodeTiming>,
+    ) -> Option<Surface<()>> {
         let surface = self.pending_recycle.pop()?;
-        if let Some(surface) = surface.reclaim_for_reuse() {
+        if let Some(surface) = surface.reclaim_for_reuse(timing) {
             self.stats.recycle_sync_count = self.stats.recycle_sync_count.saturating_add(1);
             self.stats.surfaces_recycled = self.stats.surfaces_recycled.saturating_add(1);
             Some(surface)
@@ -807,11 +953,18 @@ impl VaapiSurfacePool {
     fn record_deferred_recycle(&mut self) {
         self.stats.deferred_recycle_count = self.stats.deferred_recycle_count.saturating_add(1);
     }
+
+    fn pending_submitted_unsynced(&self) -> usize {
+        self.pending_recycle
+            .iter()
+            .filter(|surface| surface.is_submitted())
+            .count()
+    }
 }
 
 impl Drop for VaapiSurfacePool {
     fn drop(&mut self) {
-        while self.reclaim_one_pending().is_some() {}
+        while self.reclaim_one_pending(None).is_some() {}
     }
 }
 
@@ -821,9 +974,18 @@ fn decode_h264_access_unit(
     parsed: &ParsedH264AccessUnit,
     decoded_surfaces: &BTreeMap<(u16, i32), Rc<DecodedSurfaceState>>,
     sync_after_end: bool,
+    timing: &mut VaapiDecodeTiming,
 ) -> Result<DecodedVaSurface, DecoderError> {
     let mut picture = Picture::new(0, Rc::clone(&context), surface);
+    let parameter_start = Instant::now();
     let pic_param = picture_parameter(parsed, picture.surface().id(), decoded_surfaces)?;
+    let slice_param = slice_parameters(parsed, decoded_surfaces)?;
+    let mut slice_data = Vec::new();
+    for slice in &parsed.slices {
+        slice_data.extend_from_slice(&slice.nal_bytes);
+    }
+    VaapiDecodeTiming::add_elapsed(&mut timing.parameter_build_ns, parameter_start);
+    let buffer_start = Instant::now();
     picture.add_buffer(
         context
             .create_buffer(BufferType::PictureParameter(PictureParameter::H264(
@@ -841,7 +1003,6 @@ fn decode_h264_access_unit(
             )))
             .map_err(|_| DecoderError::DecodeFailed)?,
     );
-    let slice_param = slice_parameters(parsed, decoded_surfaces)?;
     picture.add_buffer(
         context
             .create_buffer(BufferType::SliceParameter(SliceParameter::H264(
@@ -849,25 +1010,30 @@ fn decode_h264_access_unit(
             )))
             .map_err(|_| DecoderError::DecodeFailed)?,
     );
-    let mut slice_data = Vec::new();
-    for slice in &parsed.slices {
-        slice_data.extend_from_slice(&slice.nal_bytes);
-    }
     picture.add_buffer(
         context
             .create_buffer_borrowed(BorrowedBufferType::SliceData(&slice_data))
             .map_err(|_| DecoderError::DecodeFailed)?,
     );
+    VaapiDecodeTiming::add_elapsed(&mut timing.buffer_create_ns, buffer_start);
 
+    let begin_start = Instant::now();
     let picture = picture.begin().map_err(|_| DecoderError::DecodeFailed)?;
+    VaapiDecodeTiming::add_elapsed(&mut timing.begin_picture_ns, begin_start);
+    let render_start = Instant::now();
     let picture = picture.render().map_err(|_| DecoderError::DecodeFailed)?;
+    VaapiDecodeTiming::add_elapsed(&mut timing.render_picture_ns, render_start);
+    let end_start = Instant::now();
     let picture = picture.end().map_err(|_| DecoderError::DecodeFailed)?;
+    VaapiDecodeTiming::add_elapsed(&mut timing.end_picture_ns, end_start);
     if sync_after_end {
+        let sync_start = Instant::now();
         let surface = picture
             .sync()
             .map_err(|_| DecoderError::DecodeFailed)?
             .take_surface()
             .map_err(|_| DecoderError::DecodeFailed)?;
+        VaapiDecodeTiming::add_elapsed(&mut timing.inline_sync_ns, sync_start);
         Ok(DecodedVaSurface::Ready(surface))
     } else {
         Ok(DecodedVaSurface::Submitted(picture))
@@ -1346,6 +1512,8 @@ mod tests {
         assert_eq!(stats.recycle_sync_count, 0);
         assert_eq!(stats.deferred_recycle_count, 0);
         assert_eq!(stats.peak_checked_out_surfaces, 0);
+        assert_eq!(stats.peak_pending_recycle_surfaces, 0);
+        assert_eq!(stats.minimum_free_surfaces, 0);
     }
 
     #[test]
