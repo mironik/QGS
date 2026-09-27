@@ -1089,17 +1089,18 @@ fn parsed_picture(
 fn surface_desc_from_sps(
     sps: &h264_reader::nal::sps::SeqParameterSet,
 ) -> Result<VideoSurfaceDesc, H264Error> {
-    let (width, height) = sps
+    let (visible_width, visible_height) = sps
         .pixel_dimensions()
         .map_err(|error| H264Error::Parser(format!("{error:?}")))?;
+    let (coded_width, coded_height) = coded_dimensions_from_sps(sps)?;
     let desc = VideoSurfaceDesc {
-        coded_width: width,
-        coded_height: height,
+        coded_width,
+        coded_height,
         visible_region: VisibleRegion {
             x: 0,
             y: 0,
-            width,
-            height,
+            width: visible_width,
+            height: visible_height,
         },
         format: surface_format_from_sps(sps)?,
         bit_depth: bit_depth_from_sps(sps)?,
@@ -1110,6 +1111,32 @@ fn surface_desc_from_sps(
     desc.validate()
         .map_err(|error| H264Error::Parser(error.to_string()))?;
     Ok(desc)
+}
+
+fn coded_dimensions_from_sps(
+    sps: &h264_reader::nal::sps::SeqParameterSet,
+) -> Result<(u32, u32), H264Error> {
+    let coded_width = sps
+        .pic_width_in_mbs_minus1
+        .checked_add(1)
+        .and_then(|width_in_mbs| width_in_mbs.checked_mul(16))
+        .ok_or(H264Error::UnsupportedFeature("coded width overflow"))?;
+    let height_multiplier = match sps.frame_mbs_flags {
+        FrameMbsFlags::Frames => 1,
+        FrameMbsFlags::Fields { .. } => {
+            return Err(H264Error::UnsupportedFeature("interlaced or MBAFF stream"));
+        }
+    };
+    let coded_height = sps
+        .pic_height_in_map_units_minus1
+        .checked_add(1)
+        .and_then(|height_in_map_units| {
+            height_in_map_units
+                .checked_mul(height_multiplier)
+                .and_then(|height_in_mbs| height_in_mbs.checked_mul(16))
+        })
+        .ok_or(H264Error::UnsupportedFeature("coded height overflow"))?;
+    Ok((coded_width, coded_height))
 }
 
 fn bit_depth_from_sps(sps: &h264_reader::nal::sps::SeqParameterSet) -> Result<BitDepth, H264Error> {
@@ -1386,7 +1413,11 @@ mod tests {
 
         assert_eq!(parsed.profile, H264Profile::High422Intra);
         assert_eq!(parsed.desc.coded_width, 128);
-        assert_eq!(parsed.desc.coded_height, 72);
+        assert_eq!(parsed.desc.coded_height, 80);
+        assert_eq!(parsed.desc.visible_region.width, 128);
+        assert_eq!(parsed.desc.visible_region.height, 72);
+        assert_eq!(parsed.picture.picture_width_in_mbs_minus1, 7);
+        assert_eq!(parsed.picture.picture_height_in_mbs_minus1, 4);
         assert_eq!(parsed.desc.format, VideoSurfaceFormat::Yuv422_10);
         assert_eq!(parsed.desc.bit_depth.get(), 10);
         assert_eq!(parsed.desc.chroma, ChromaSubsampling::Cs422);

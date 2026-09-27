@@ -979,11 +979,7 @@ fn decode_h264_access_unit(
     let mut picture = Picture::new(0, Rc::clone(&context), surface);
     let parameter_start = Instant::now();
     let pic_param = picture_parameter(parsed, picture.surface().id(), decoded_surfaces)?;
-    let slice_param = slice_parameters(parsed, decoded_surfaces)?;
-    let mut slice_data = Vec::new();
-    for slice in &parsed.slices {
-        slice_data.extend_from_slice(&slice.nal_bytes);
-    }
+    let slice_params = slice_parameters(parsed, decoded_surfaces)?;
     VaapiDecodeTiming::add_elapsed(&mut timing.parameter_build_ns, parameter_start);
     let buffer_start = Instant::now();
     picture.add_buffer(
@@ -1003,18 +999,20 @@ fn decode_h264_access_unit(
             )))
             .map_err(|_| DecoderError::DecodeFailed)?,
     );
-    picture.add_buffer(
-        context
-            .create_buffer(BufferType::SliceParameter(SliceParameter::H264(
-                slice_param,
-            )))
-            .map_err(|_| DecoderError::DecodeFailed)?,
-    );
-    picture.add_buffer(
-        context
-            .create_buffer_borrowed(BorrowedBufferType::SliceData(&slice_data))
-            .map_err(|_| DecoderError::DecodeFailed)?,
-    );
+    for (slice_param, slice) in slice_params.into_iter().zip(&parsed.slices) {
+        picture.add_buffer(
+            context
+                .create_buffer(BufferType::SliceParameter(SliceParameter::H264(
+                    slice_param,
+                )))
+                .map_err(|_| DecoderError::DecodeFailed)?,
+        );
+        picture.add_buffer(
+            context
+                .create_buffer_borrowed(BorrowedBufferType::SliceData(&slice.nal_bytes))
+                .map_err(|_| DecoderError::DecodeFailed)?,
+        );
+    }
     VaapiDecodeTiming::add_elapsed(&mut timing.buffer_create_ns, buffer_start);
 
     let begin_start = Instant::now();
@@ -1103,15 +1101,15 @@ fn picture_parameter(
 fn slice_parameters(
     parsed: &ParsedH264AccessUnit,
     decoded_surfaces: &BTreeMap<(u16, i32), Rc<DecodedSurfaceState>>,
-) -> Result<SliceParameterBufferH264, DecoderError> {
-    let mut params = SliceParameterBufferH264::new_array();
-    let mut offset = 0_u32;
+) -> Result<Vec<SliceParameterBufferH264>, DecoderError> {
+    let mut buffers = Vec::with_capacity(parsed.slices.len());
     for slice in &parsed.slices {
+        let mut params = SliceParameterBufferH264::new_array();
         let ref_list0 = reference_list_array(&slice.ref_pic_list0, decoded_surfaces)?;
         let ref_list1 = reference_list_array(&slice.ref_pic_list1, decoded_surfaces)?;
         params.add_slice_parameter(
             slice.nal_bytes.len() as u32,
-            offset,
+            0,
             0,
             slice.slice_data_bit_offset,
             slice.first_mb_in_slice,
@@ -1141,9 +1139,9 @@ fn slice_parameters(
             [[0; 2]; 32],
             [[0; 2]; 32],
         );
-        offset = offset.saturating_add(slice.nal_bytes.len() as u32);
+        buffers.push(params);
     }
-    Ok(params)
+    Ok(buffers)
 }
 
 fn reference_frames(
@@ -1613,6 +1611,30 @@ mod tests {
         };
 
         assert!(!parsed_access_unit_matches_config(&parsed, &config));
+    }
+
+    #[test]
+    fn h264_slice_parameters_are_one_buffer_per_slice() {
+        let mut parsed = qgs_codec_h264::parse_annex_b_access_unit(PROFESSIONAL_INTRA_FIXTURE)
+            .expect("professional H.264 stream parses");
+        let mut second_slice = parsed.slices[0].clone();
+        parsed.slices[0].nal_bytes = vec![0x65, 0x88, 0x84];
+        parsed.slices[0].slice_data_bit_offset = 9;
+        second_slice.nal_bytes = vec![0x65, 0x99, 0xaa, 0xbb, 0xcc];
+        second_slice.slice_data_bit_offset = 11;
+        parsed.slices.push(second_slice);
+
+        let params = slice_parameters(&parsed, &BTreeMap::new()).expect("slice params");
+
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].inner().len(), 1);
+        assert_eq!(params[0].inner()[0].slice_data_size, 3);
+        assert_eq!(params[0].inner()[0].slice_data_offset, 0);
+        assert_eq!(params[0].inner()[0].slice_data_bit_offset, 9);
+        assert_eq!(params[1].inner().len(), 1);
+        assert_eq!(params[1].inner()[0].slice_data_size, 5);
+        assert_eq!(params[1].inner()[0].slice_data_offset, 0);
+        assert_eq!(params[1].inner()[0].slice_data_bit_offset, 11);
     }
 
     #[test]

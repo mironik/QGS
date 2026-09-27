@@ -259,8 +259,10 @@ pub fn classify_video_track(video: &Mp4VideoTrack) -> Result<Mp4H264Summary, Mp4
         profile,
         bit_depth: desc.bit_depth.get(),
         chroma: desc.chroma,
-        width: desc.coded_width,
-        height: desc.coded_height,
+        width: desc.visible_region.width,
+        height: desc.visible_region.height,
+        coded_width: desc.coded_width,
+        coded_height: desc.coded_height,
         picture_counts,
         idr_positions,
     })
@@ -274,6 +276,8 @@ pub struct Mp4H264Summary {
     pub chroma: ChromaSubsampling,
     pub width: u32,
     pub height: u32,
+    pub coded_width: u32,
+    pub coded_height: u32,
     pub picture_counts: BTreeMap<String, usize>,
     pub idr_positions: Vec<u32>,
 }

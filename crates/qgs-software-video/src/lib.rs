@@ -311,7 +311,7 @@ impl SoftwareVideoSurface {
         }
         let width = u32::try_from(frame.width).map_err(|_| DecoderError::DecodeFailed)?;
         let height = u32::try_from(frame.height).map_err(|_| DecoderError::DecodeFailed)?;
-        if width != config.coded_width || height != config.coded_height {
+        if width == 0 || height == 0 || width > config.coded_width || height > config.coded_height {
             return Err(DecoderError::DecodeFailed);
         }
         if frame.format != storage_format.ffmpeg_format() {

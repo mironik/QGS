@@ -975,8 +975,8 @@ fn proxy_proof(
         proxy_h264.profile,
         BitDepth::new(proxy_h264.bit_depth)?,
         proxy_h264.chroma,
-        proxy_h264.width,
-        proxy_h264.height,
+        proxy_h264.coded_width,
+        proxy_h264.coded_height,
     );
     if !SoftwareVideoBackend::supports_config(&proxy_config) {
         return Err("software backend does not support proxy H.264 stream".into());
@@ -1286,8 +1286,8 @@ fn proxy_throughput(
         proxy_h264.profile,
         BitDepth::new(proxy_h264.bit_depth)?,
         proxy_h264.chroma,
-        proxy_h264.width,
-        proxy_h264.height,
+        proxy_h264.coded_width,
+        proxy_h264.coded_height,
     );
     let vaapi = qgs_vaapi::VaapiVideoDiscovery::new(&devices);
     let capabilities = vaapi.query_video_capabilities(device.id)?;
@@ -3882,6 +3882,11 @@ fn test_h264_long_gop_decode(
 
     let access_units = split_h264_annex_b_access_units(H264_LONG_GOP_FIXTURE)?;
     println!("  access units: {}", access_units.len());
+    let parsed = qgs_codec_h264::parse_annex_b_access_unit(
+        access_units
+            .first()
+            .ok_or("Long-GOP fixture did not contain access units")?,
+    )?;
     let supports_h264_main = query_h264_decode_support(
         stream,
         &mut request_id,
@@ -3896,11 +3901,11 @@ fn test_h264_long_gop_decode(
         device_id: device.id,
         codec: VideoCodec::H264,
         profile: VideoProfile::H264(H264Profile::Main),
-        bit_depth: BitDepth::new(8)?,
-        chroma: ChromaSubsampling::Cs420,
-        coded_width: 128,
-        coded_height: 72,
-        scan_mode: ScanMode::Progressive,
+        bit_depth: parsed.desc.bit_depth,
+        chroma: parsed.desc.chroma,
+        coded_width: parsed.desc.coded_width,
+        coded_height: parsed.desc.coded_height,
+        scan_mode: parsed.desc.scan_mode,
     };
     send_message(
         stream,
