@@ -35,9 +35,24 @@ pub const MAX_IMAGE_WIDTH: u32 = 8192;
 /// Conservative M1 maximum image height.
 pub const MAX_IMAGE_HEIGHT: u32 = 8192;
 
+/// Maximum number of decode capability entries in VIDEO_CAPABILITIES.
+pub const MAX_VIDEO_DECODE_CAPABILITY_COUNT: usize = 32;
+
+/// Maximum number of output surface formats per video decode capability.
+pub const MAX_VIDEO_OUTPUT_FORMAT_COUNT: usize = 8;
+
+/// Conservative M2 maximum coded VideoSurface width.
+pub const MAX_VIDEO_SURFACE_WIDTH: u32 = 8192;
+
+/// Conservative M2 maximum coded VideoSurface height.
+pub const MAX_VIDEO_SURFACE_HEIGHT: u32 = 8192;
+
 const DEVICE_ENTRY_FIXED_LEN: usize = 32;
 const DEVICE_CAPABILITIES_FIXED_PREFIX_LEN: usize = 52;
 const MEMORY_HEAP_ENTRY_LEN: usize = 16;
+const QUERY_VIDEO_CAPABILITIES_PAYLOAD_LEN: usize = 8;
+const VIDEO_CAPABILITIES_PREFIX_LEN: usize = 12;
+const VIDEO_DECODE_CAPABILITY_FIXED_LEN: usize = 16;
 const CREATE_BUFFER_PAYLOAD_LEN: usize = 24;
 const CREATE_IMAGE_PAYLOAD_LEN: usize = 24;
 const BUFFER_CREATED_PAYLOAD_LEN: usize = 24;
@@ -135,6 +150,7 @@ pub enum Request {
     Hello(HelloRequest),
     EnumerateDevices(EnumerateDevicesRequest),
     QueryDeviceCapabilities(QueryDeviceCapabilitiesRequest),
+    QueryVideoCapabilities(QueryVideoCapabilitiesRequest),
     CreateBuffer(CreateBufferRequest),
     CreateImage(CreateImageRequest),
     DestroyResource(DestroyResourceRequest),
@@ -163,6 +179,11 @@ pub struct EnumerateDevicesRequest;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryDeviceCapabilitiesRequest {
+    pub device_id: DeviceId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryVideoCapabilitiesRequest {
     pub device_id: DeviceId,
 }
 
@@ -207,6 +228,7 @@ pub enum Response {
     Error(ErrorResponse),
     DeviceList(DeviceListResponse),
     DeviceCapabilities(DeviceCapabilitiesResponse),
+    VideoCapabilities(VideoCapabilitiesResponse),
     BufferCreated(BufferCreatedResponse),
     ImageCreated(ImageCreatedResponse),
     ResourceDestroyed(ResourceDestroyedResponse),
@@ -374,6 +396,7 @@ impl ResourceId {
 pub enum ResourceKind {
     Buffer,
     Image,
+    VideoSurface,
 }
 
 impl ResourceKind {
@@ -381,6 +404,7 @@ impl ResourceKind {
         match self {
             Self::Buffer => 1,
             Self::Image => 2,
+            Self::VideoSurface => 3,
         }
     }
 }
@@ -392,6 +416,7 @@ impl TryFrom<u8> for ResourceKind {
         match value {
             1 => Ok(Self::Buffer),
             2 => Ok(Self::Image),
+            3 => Ok(Self::VideoSurface),
             _ => Err(ProtocolError::MalformedPayload),
         }
     }
@@ -590,6 +615,344 @@ pub struct ImageCreatedResponse {
     pub height: u32,
     pub format: PixelFormat,
     pub selected_memory: SelectedMemoryProperties,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoCodec {
+    H264,
+    Mpeg2,
+}
+
+impl VideoCodec {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::H264 => 1,
+            Self::Mpeg2 => 2,
+        }
+    }
+}
+
+impl TryFrom<u8> for VideoCodec {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::H264),
+            2 => Ok(Self::Mpeg2),
+            _ => Err(ProtocolError::UnsupportedVideoCodec),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum H264Profile {
+    Baseline,
+    Main,
+    High,
+    High422,
+}
+
+impl H264Profile {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::Baseline => 1,
+            Self::Main => 2,
+            Self::High => 3,
+            Self::High422 => 4,
+        }
+    }
+}
+
+impl TryFrom<u8> for H264Profile {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Baseline),
+            2 => Ok(Self::Main),
+            3 => Ok(Self::High),
+            4 => Ok(Self::High422),
+            _ => Err(ProtocolError::UnsupportedVideoProfile),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mpeg2Profile {
+    Main,
+    Profile422,
+}
+
+impl Mpeg2Profile {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::Main => 1,
+            Self::Profile422 => 2,
+        }
+    }
+}
+
+impl TryFrom<u8> for Mpeg2Profile {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Main),
+            2 => Ok(Self::Profile422),
+            _ => Err(ProtocolError::UnsupportedVideoProfile),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoProfile {
+    H264(H264Profile),
+    Mpeg2(Mpeg2Profile),
+}
+
+impl VideoProfile {
+    pub const fn codec(self) -> VideoCodec {
+        match self {
+            Self::H264(_) => VideoCodec::H264,
+            Self::Mpeg2(_) => VideoCodec::Mpeg2,
+        }
+    }
+
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::H264(profile) => profile.wire_value(),
+            Self::Mpeg2(profile) => profile.wire_value(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BitDepth(u8);
+
+impl BitDepth {
+    pub fn new(value: u8) -> Result<Self, ProtocolError> {
+        match value {
+            8 | 10 | 12 => Ok(Self(value)),
+            _ => Err(ProtocolError::InvalidVideoBitDepth { bit_depth: value }),
+        }
+    }
+
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChromaSubsampling {
+    Cs420,
+    Cs422,
+    Cs444,
+}
+
+impl ChromaSubsampling {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::Cs420 => 1,
+            Self::Cs422 => 2,
+            Self::Cs444 => 3,
+        }
+    }
+}
+
+impl TryFrom<u8> for ChromaSubsampling {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Cs420),
+            2 => Ok(Self::Cs422),
+            3 => Ok(Self::Cs444),
+            _ => Err(ProtocolError::UnsupportedChromaSubsampling),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScanMode {
+    Progressive,
+    Interlaced,
+}
+
+impl ScanMode {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::Progressive => 1,
+            Self::Interlaced => 2,
+        }
+    }
+}
+
+impl TryFrom<u8> for ScanMode {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Progressive),
+            2 => Ok(Self::Interlaced),
+            _ => Err(ProtocolError::UnsupportedScanMode),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FieldOrder {
+    Unknown,
+    TopFieldFirst,
+    BottomFieldFirst,
+}
+
+impl FieldOrder {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::Unknown => 0,
+            Self::TopFieldFirst => 1,
+            Self::BottomFieldFirst => 2,
+        }
+    }
+}
+
+impl TryFrom<u8> for FieldOrder {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Unknown),
+            1 => Ok(Self::TopFieldFirst),
+            2 => Ok(Self::BottomFieldFirst),
+            _ => Err(ProtocolError::UnsupportedFieldOrder),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoSurfaceFormat {
+    Nv12,
+    P010,
+    Yuv422_8,
+    Yuv422_10,
+}
+
+impl VideoSurfaceFormat {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::Nv12 => 1,
+            Self::P010 => 2,
+            Self::Yuv422_8 => 3,
+            Self::Yuv422_10 => 4,
+        }
+    }
+
+    pub const fn bit_depth(self) -> u8 {
+        match self {
+            Self::Nv12 | Self::Yuv422_8 => 8,
+            Self::P010 | Self::Yuv422_10 => 10,
+        }
+    }
+
+    pub const fn chroma(self) -> ChromaSubsampling {
+        match self {
+            Self::Nv12 | Self::P010 => ChromaSubsampling::Cs420,
+            Self::Yuv422_8 | Self::Yuv422_10 => ChromaSubsampling::Cs422,
+        }
+    }
+}
+
+impl TryFrom<u8> for VideoSurfaceFormat {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Nv12),
+            2 => Ok(Self::P010),
+            3 => Ok(Self::Yuv422_8),
+            4 => Ok(Self::Yuv422_10),
+            _ => Err(ProtocolError::UnsupportedVideoSurfaceFormat),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VisibleRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VideoSurfaceDesc {
+    pub coded_width: u32,
+    pub coded_height: u32,
+    pub visible_region: VisibleRegion,
+    pub format: VideoSurfaceFormat,
+    pub bit_depth: BitDepth,
+    pub chroma: ChromaSubsampling,
+    pub scan_mode: ScanMode,
+    pub field_order: FieldOrder,
+}
+
+impl VideoSurfaceDesc {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        validate_video_surface_dimensions(self.coded_width, self.coded_height)?;
+        validate_visible_region(self.visible_region, self.coded_width, self.coded_height)?;
+        if self.format.bit_depth() != self.bit_depth.get()
+            || self.format.chroma() != self.chroma
+            || (self.scan_mode == ScanMode::Progressive && self.field_order != FieldOrder::Unknown)
+        {
+            return Err(ProtocolError::MalformedPayload);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VideoDecodeCapability {
+    pub codec: VideoCodec,
+    pub profile: VideoProfile,
+    pub bit_depth: BitDepth,
+    pub chroma: ChromaSubsampling,
+    pub max_width: u32,
+    pub max_height: u32,
+    pub progressive_supported: bool,
+    pub interlaced_supported: bool,
+    pub output_surface_formats: Vec<VideoSurfaceFormat>,
+}
+
+impl VideoDecodeCapability {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.profile.codec() != self.codec {
+            return Err(ProtocolError::UnsupportedVideoProfile);
+        }
+        validate_video_surface_dimensions(self.max_width, self.max_height)?;
+        if !self.progressive_supported && !self.interlaced_supported {
+            return Err(ProtocolError::MalformedPayload);
+        }
+        if self.output_surface_formats.is_empty()
+            || self.output_surface_formats.len() > MAX_VIDEO_OUTPUT_FORMAT_COUNT
+        {
+            return Err(ProtocolError::VideoOutputFormatCountTooLarge {
+                count: self.output_surface_formats.len(),
+                max: MAX_VIDEO_OUTPUT_FORMAT_COUNT,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VideoCapabilities {
+    pub device_id: DeviceId,
+    pub decode: Vec<VideoDecodeCapability>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VideoCapabilitiesResponse {
+    pub capabilities: VideoCapabilities,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -862,6 +1225,17 @@ pub enum ProtocolErrorCode {
     UnsupportedPixelFormat = 36,
     UnsupportedImageUsage = 37,
     UnsupportedImageExternalSharing = 38,
+    UnsupportedVideoCodec = 39,
+    UnsupportedVideoProfile = 40,
+    InvalidVideoBitDepth = 41,
+    UnsupportedChromaSubsampling = 42,
+    UnsupportedScanMode = 43,
+    UnsupportedFieldOrder = 44,
+    UnsupportedVideoSurfaceFormat = 45,
+    InvalidVideoSurfaceDimensions = 46,
+    InvalidVideoVisibleRegion = 47,
+    VideoDecodeCapabilityCountTooLarge = 48,
+    VideoOutputFormatCountTooLarge = 49,
 }
 
 impl ProtocolErrorCode {
@@ -913,6 +1287,17 @@ impl TryFrom<u32> for ProtocolErrorCode {
             36 => Ok(Self::UnsupportedPixelFormat),
             37 => Ok(Self::UnsupportedImageUsage),
             38 => Ok(Self::UnsupportedImageExternalSharing),
+            39 => Ok(Self::UnsupportedVideoCodec),
+            40 => Ok(Self::UnsupportedVideoProfile),
+            41 => Ok(Self::InvalidVideoBitDepth),
+            42 => Ok(Self::UnsupportedChromaSubsampling),
+            43 => Ok(Self::UnsupportedScanMode),
+            44 => Ok(Self::UnsupportedFieldOrder),
+            45 => Ok(Self::UnsupportedVideoSurfaceFormat),
+            46 => Ok(Self::InvalidVideoSurfaceDimensions),
+            47 => Ok(Self::InvalidVideoVisibleRegion),
+            48 => Ok(Self::VideoDecodeCapabilityCountTooLarge),
+            49 => Ok(Self::VideoOutputFormatCountTooLarge),
             _ => Err(ProtocolError::MalformedPayload),
         }
     }
@@ -998,6 +1383,28 @@ pub enum ProtocolError {
         flags: u32,
     },
     UnsupportedImageExternalSharing,
+    UnsupportedVideoCodec,
+    UnsupportedVideoProfile,
+    InvalidVideoBitDepth {
+        bit_depth: u8,
+    },
+    UnsupportedChromaSubsampling,
+    UnsupportedScanMode,
+    UnsupportedFieldOrder,
+    UnsupportedVideoSurfaceFormat,
+    InvalidVideoSurfaceDimensions {
+        width: u32,
+        height: u32,
+    },
+    InvalidVideoVisibleRegion,
+    VideoDecodeCapabilityCountTooLarge {
+        count: usize,
+        max: usize,
+    },
+    VideoOutputFormatCountTooLarge {
+        count: usize,
+        max: usize,
+    },
     MalformedPayload,
     InvalidVersionRange {
         min: ProtocolVersion,
@@ -1087,6 +1494,32 @@ impl fmt::Display for ProtocolError {
             Self::UnsupportedImageExternalSharing => {
                 write!(f, "unsupported image external sharing")
             }
+            Self::UnsupportedVideoCodec => write!(f, "unsupported video codec"),
+            Self::UnsupportedVideoProfile => write!(f, "unsupported video profile"),
+            Self::InvalidVideoBitDepth { bit_depth } => {
+                write!(f, "invalid video bit depth {bit_depth}")
+            }
+            Self::UnsupportedChromaSubsampling => {
+                write!(f, "unsupported chroma subsampling")
+            }
+            Self::UnsupportedScanMode => write!(f, "unsupported scan mode"),
+            Self::UnsupportedFieldOrder => write!(f, "unsupported field order"),
+            Self::UnsupportedVideoSurfaceFormat => {
+                write!(f, "unsupported video surface format")
+            }
+            Self::InvalidVideoSurfaceDimensions { width, height } => {
+                write!(f, "invalid video surface dimensions {width}x{height}")
+            }
+            Self::InvalidVideoVisibleRegion => write!(f, "invalid video visible region"),
+            Self::VideoDecodeCapabilityCountTooLarge { count, max } => {
+                write!(
+                    f,
+                    "video decode capability count {count} exceeds maximum {max}"
+                )
+            }
+            Self::VideoOutputFormatCountTooLarge { count, max } => {
+                write!(f, "video output format count {count} exceeds maximum {max}")
+            }
             Self::MalformedPayload => write!(f, "malformed payload"),
             Self::InvalidVersionRange { min, max } => {
                 write!(f, "invalid protocol version range: {min}..={max}")
@@ -1146,6 +1579,23 @@ impl From<&ProtocolError> for ProtocolErrorCode {
             ProtocolError::UnsupportedPixelFormat => Self::UnsupportedPixelFormat,
             ProtocolError::UnsupportedImageUsage { .. } => Self::UnsupportedImageUsage,
             ProtocolError::UnsupportedImageExternalSharing => Self::UnsupportedImageExternalSharing,
+            ProtocolError::UnsupportedVideoCodec => Self::UnsupportedVideoCodec,
+            ProtocolError::UnsupportedVideoProfile => Self::UnsupportedVideoProfile,
+            ProtocolError::InvalidVideoBitDepth { .. } => Self::InvalidVideoBitDepth,
+            ProtocolError::UnsupportedChromaSubsampling => Self::UnsupportedChromaSubsampling,
+            ProtocolError::UnsupportedScanMode => Self::UnsupportedScanMode,
+            ProtocolError::UnsupportedFieldOrder => Self::UnsupportedFieldOrder,
+            ProtocolError::UnsupportedVideoSurfaceFormat => Self::UnsupportedVideoSurfaceFormat,
+            ProtocolError::InvalidVideoSurfaceDimensions { .. } => {
+                Self::InvalidVideoSurfaceDimensions
+            }
+            ProtocolError::InvalidVideoVisibleRegion => Self::InvalidVideoVisibleRegion,
+            ProtocolError::VideoDecodeCapabilityCountTooLarge { .. } => {
+                Self::VideoDecodeCapabilityCountTooLarge
+            }
+            ProtocolError::VideoOutputFormatCountTooLarge { .. } => {
+                Self::VideoOutputFormatCountTooLarge
+            }
             ProtocolError::InvalidVersionRange { .. } => Self::InvalidVersionRange,
             ProtocolError::UnsupportedVersion { .. } => Self::UnsupportedVersion,
         }
@@ -1173,6 +1623,7 @@ pub enum RequestOpcode {
     CreateSync,
     ExportSync,
     CreateImage,
+    QueryVideoCapabilities,
 }
 
 impl RequestOpcode {
@@ -1187,6 +1638,7 @@ impl RequestOpcode {
             Self::CreateSync => 7,
             Self::ExportSync => 8,
             Self::CreateImage => 9,
+            Self::QueryVideoCapabilities => 10,
         }
     }
 }
@@ -1203,6 +1655,7 @@ pub enum ResponseOpcode {
     SyncCreated,
     SyncExported,
     ImageCreated,
+    VideoCapabilities,
 }
 
 impl ResponseOpcode {
@@ -1218,6 +1671,7 @@ impl ResponseOpcode {
             Self::SyncCreated => 8,
             Self::SyncExported => 9,
             Self::ImageCreated => 10,
+            Self::VideoCapabilities => 11,
         }
     }
 }
@@ -1244,6 +1698,10 @@ pub enum WireMessage {
     QueryDeviceCapabilities {
         request_id: u64,
         request: QueryDeviceCapabilitiesRequest,
+    },
+    QueryVideoCapabilities {
+        request_id: u64,
+        request: QueryVideoCapabilitiesRequest,
     },
     CreateBuffer {
         request_id: u64,
@@ -1285,6 +1743,10 @@ pub enum WireMessage {
         request_id: u64,
         response: DeviceCapabilitiesResponse,
     },
+    VideoCapabilities {
+        request_id: u64,
+        response: VideoCapabilitiesResponse,
+    },
     BufferCreated {
         request_id: u64,
         response: BufferCreatedResponse,
@@ -1317,6 +1779,7 @@ impl WireMessage {
             Self::Hello { request_id, .. }
             | Self::EnumerateDevices { request_id }
             | Self::QueryDeviceCapabilities { request_id, .. }
+            | Self::QueryVideoCapabilities { request_id, .. }
             | Self::CreateBuffer { request_id, .. }
             | Self::CreateImage { request_id, .. }
             | Self::DestroyResource { request_id, .. }
@@ -1327,6 +1790,7 @@ impl WireMessage {
             | Self::Error { request_id, .. }
             | Self::DeviceList { request_id, .. }
             | Self::DeviceCapabilities { request_id, .. }
+            | Self::VideoCapabilities { request_id, .. }
             | Self::BufferCreated { request_id, .. }
             | Self::ImageCreated { request_id, .. }
             | Self::ResourceDestroyed { request_id, .. }
@@ -1362,6 +1826,15 @@ pub fn encode_wire_message(message: &WireMessage) -> Vec<u8> {
             RequestOpcode::QueryDeviceCapabilities.wire_value(),
             *request_id,
             encode_query_device_capabilities_payload(request),
+        ),
+        WireMessage::QueryVideoCapabilities {
+            request_id,
+            request,
+        } => (
+            MessageKind::Request,
+            RequestOpcode::QueryVideoCapabilities.wire_value(),
+            *request_id,
+            encode_query_video_capabilities_payload(request),
         ),
         WireMessage::CreateBuffer {
             request_id,
@@ -1452,6 +1925,15 @@ pub fn encode_wire_message(message: &WireMessage) -> Vec<u8> {
             ResponseOpcode::DeviceCapabilities.wire_value(),
             *request_id,
             encode_device_capabilities_payload(response),
+        ),
+        WireMessage::VideoCapabilities {
+            request_id,
+            response,
+        } => (
+            MessageKind::Response,
+            ResponseOpcode::VideoCapabilities.wire_value(),
+            *request_id,
+            encode_video_capabilities_payload(response),
         ),
         WireMessage::BufferCreated {
             request_id,
@@ -1649,6 +2131,10 @@ pub fn decode_wire_message_parts(
             request_id: header.request_id,
             request: decode_create_image_payload(payload)?,
         }),
+        (MessageKind::Request, 10) => Ok(WireMessage::QueryVideoCapabilities {
+            request_id: header.request_id,
+            request: decode_query_video_capabilities_payload(payload)?,
+        }),
         (MessageKind::Response, 1) => Ok(WireMessage::Welcome {
             request_id: header.request_id,
             response: decode_welcome_payload(payload)?,
@@ -1688,6 +2174,10 @@ pub fn decode_wire_message_parts(
         (MessageKind::Response, 10) => Ok(WireMessage::ImageCreated {
             request_id: header.request_id,
             response: decode_image_created_payload(payload)?,
+        }),
+        (MessageKind::Response, 11) => Ok(WireMessage::VideoCapabilities {
+            request_id: header.request_id,
+            response: decode_video_capabilities_payload(payload)?,
         }),
         _ => Err(ProtocolError::UnknownOpcode {
             kind: header.kind,
@@ -1749,7 +2239,7 @@ fn encode_wire_header(header: &WireHeader, bytes: &mut Vec<u8>) {
 
 fn validate_opcode(kind: MessageKind, opcode: u8) -> Result<(), ProtocolError> {
     match (kind, opcode) {
-        (MessageKind::Request, 1..=9) | (MessageKind::Response, 1..=10) => Ok(()),
+        (MessageKind::Request, 1..=10) | (MessageKind::Response, 1..=11) => Ok(()),
         _ => Err(ProtocolError::UnknownOpcode { kind, opcode }),
     }
 }
@@ -1828,6 +2318,31 @@ fn decode_query_device_capabilities_payload(
     }
 
     Ok(QueryDeviceCapabilitiesRequest {
+        device_id: DeviceId::new(read_u64(bytes, 0))?,
+    })
+}
+
+fn encode_query_video_capabilities_payload(request: &QueryVideoCapabilitiesRequest) -> Vec<u8> {
+    request.device_id.get().to_le_bytes().to_vec()
+}
+
+fn decode_query_video_capabilities_payload(
+    bytes: &[u8],
+) -> Result<QueryVideoCapabilitiesRequest, ProtocolError> {
+    if bytes.len() != QUERY_VIDEO_CAPABILITIES_PAYLOAD_LEN {
+        return if bytes.len() < QUERY_VIDEO_CAPABILITIES_PAYLOAD_LEN {
+            Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len(),
+                expected: QUERY_VIDEO_CAPABILITIES_PAYLOAD_LEN,
+            })
+        } else {
+            Err(ProtocolError::TrailingPayload {
+                len: bytes.len() - QUERY_VIDEO_CAPABILITIES_PAYLOAD_LEN,
+            })
+        };
+    }
+
+    Ok(QueryVideoCapabilitiesRequest {
         device_id: DeviceId::new(read_u64(bytes, 0))?,
     })
 }
@@ -2290,6 +2805,134 @@ fn decode_device_capabilities_payload(
     })
 }
 
+fn encode_video_capabilities_payload(response: &VideoCapabilitiesResponse) -> Vec<u8> {
+    let capabilities = &response.capabilities;
+    let count = capabilities.decode.len();
+    assert!(count <= MAX_VIDEO_DECODE_CAPABILITY_COUNT);
+
+    let mut bytes = Vec::with_capacity(VIDEO_CAPABILITIES_PREFIX_LEN);
+    bytes.extend_from_slice(&capabilities.device_id.get().to_le_bytes());
+    bytes.extend_from_slice(&(count as u16).to_le_bytes());
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+
+    for capability in &capabilities.decode {
+        capability
+            .validate()
+            .expect("video capability must be valid before encoding");
+        let format_count = capability.output_surface_formats.len();
+        bytes.push(capability.codec.wire_value());
+        bytes.push(capability.profile.wire_value());
+        bytes.push(capability.bit_depth.get());
+        bytes.push(capability.chroma.wire_value());
+        bytes.extend_from_slice(&capability.max_width.to_le_bytes());
+        bytes.extend_from_slice(&capability.max_height.to_le_bytes());
+        bytes.push(bool_to_u8(capability.progressive_supported));
+        bytes.push(bool_to_u8(capability.interlaced_supported));
+        bytes.push(format_count as u8);
+        bytes.push(0);
+        for format in &capability.output_surface_formats {
+            bytes.push(format.wire_value());
+        }
+    }
+
+    bytes
+}
+
+fn decode_video_capabilities_payload(
+    bytes: &[u8],
+) -> Result<VideoCapabilitiesResponse, ProtocolError> {
+    if bytes.len() < VIDEO_CAPABILITIES_PREFIX_LEN {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    if bytes[10..12].iter().any(|value| *value != 0) {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    let count = read_u16(bytes, 8) as usize;
+    if count > MAX_VIDEO_DECODE_CAPABILITY_COUNT {
+        return Err(ProtocolError::VideoDecodeCapabilityCountTooLarge {
+            count,
+            max: MAX_VIDEO_DECODE_CAPABILITY_COUNT,
+        });
+    }
+
+    let mut offset = VIDEO_CAPABILITIES_PREFIX_LEN;
+    let mut decode = Vec::with_capacity(count);
+    for _ in 0..count {
+        let fixed_end = offset
+            .checked_add(VIDEO_DECODE_CAPABILITY_FIXED_LEN)
+            .ok_or(ProtocolError::MalformedPayload)?;
+        if fixed_end > bytes.len() {
+            return Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len().saturating_sub(offset),
+                expected: VIDEO_DECODE_CAPABILITY_FIXED_LEN,
+            });
+        }
+
+        let codec = VideoCodec::try_from(bytes[offset])?;
+        let profile = decode_video_profile(codec, bytes[offset + 1])?;
+        let bit_depth = BitDepth::new(bytes[offset + 2])?;
+        let chroma = ChromaSubsampling::try_from(bytes[offset + 3])?;
+        let max_width = read_u32(bytes, offset + 4);
+        let max_height = read_u32(bytes, offset + 8);
+        let progressive_supported = read_bool(bytes[offset + 12])?;
+        let interlaced_supported = read_bool(bytes[offset + 13])?;
+        let format_count = bytes[offset + 14] as usize;
+        if bytes[offset + 15] != 0 {
+            return Err(ProtocolError::MalformedPayload);
+        }
+        if format_count > MAX_VIDEO_OUTPUT_FORMAT_COUNT {
+            return Err(ProtocolError::VideoOutputFormatCountTooLarge {
+                count: format_count,
+                max: MAX_VIDEO_OUTPUT_FORMAT_COUNT,
+            });
+        }
+
+        let formats_end = fixed_end
+            .checked_add(format_count)
+            .ok_or(ProtocolError::MalformedPayload)?;
+        if formats_end > bytes.len() {
+            return Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len().saturating_sub(fixed_end),
+                expected: format_count,
+            });
+        }
+
+        let mut output_surface_formats = Vec::with_capacity(format_count);
+        for value in &bytes[fixed_end..formats_end] {
+            output_surface_formats.push(VideoSurfaceFormat::try_from(*value)?);
+        }
+
+        let capability = VideoDecodeCapability {
+            codec,
+            profile,
+            bit_depth,
+            chroma,
+            max_width,
+            max_height,
+            progressive_supported,
+            interlaced_supported,
+            output_surface_formats,
+        };
+        capability.validate()?;
+        decode.push(capability);
+        offset = formats_end;
+    }
+
+    if offset != bytes.len() {
+        return Err(ProtocolError::TrailingPayload {
+            len: bytes.len() - offset,
+        });
+    }
+
+    Ok(VideoCapabilitiesResponse {
+        capabilities: VideoCapabilities {
+            device_id: DeviceId::new(read_u64(bytes, 0))?,
+            decode,
+        },
+    })
+}
+
 fn encode_buffer_created_payload(response: &BufferCreatedResponse) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(BUFFER_CREATED_PAYLOAD_LEN);
     bytes.extend_from_slice(&response.resource_id.get().to_le_bytes());
@@ -2498,6 +3141,7 @@ fn decode_resource_exported_payload(
                 Some(format),
             )
         }
+        ResourceKind::VideoSurface => return Err(ProtocolError::MalformedPayload),
     };
     let allocation_size_bytes = read_u64(bytes, 24);
     if allocation_size_bytes < size_bytes {
@@ -2601,12 +3245,54 @@ fn validate_buffer_size(size: u64) -> Result<u64, ProtocolError> {
     }
 }
 
+fn decode_video_profile(codec: VideoCodec, value: u8) -> Result<VideoProfile, ProtocolError> {
+    match codec {
+        VideoCodec::H264 => Ok(VideoProfile::H264(H264Profile::try_from(value)?)),
+        VideoCodec::Mpeg2 => Ok(VideoProfile::Mpeg2(Mpeg2Profile::try_from(value)?)),
+    }
+}
+
 pub fn validate_image_dimensions(width: u32, height: u32) -> Result<(), ProtocolError> {
     if width == 0 || height == 0 || width > MAX_IMAGE_WIDTH || height > MAX_IMAGE_HEIGHT {
         return Err(ProtocolError::InvalidImageDimensions { width, height });
     }
     image_byte_len(width, height, PixelFormat::Rgba8Unorm)?;
     Ok(())
+}
+
+pub fn validate_video_surface_dimensions(width: u32, height: u32) -> Result<(), ProtocolError> {
+    if width == 0
+        || height == 0
+        || width > MAX_VIDEO_SURFACE_WIDTH
+        || height > MAX_VIDEO_SURFACE_HEIGHT
+    {
+        Err(ProtocolError::InvalidVideoSurfaceDimensions { width, height })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_visible_region(
+    region: VisibleRegion,
+    coded_width: u32,
+    coded_height: u32,
+) -> Result<(), ProtocolError> {
+    if region.width == 0 || region.height == 0 {
+        return Err(ProtocolError::InvalidVideoVisibleRegion);
+    }
+    let end_x = region
+        .x
+        .checked_add(region.width)
+        .ok_or(ProtocolError::InvalidVideoVisibleRegion)?;
+    let end_y = region
+        .y
+        .checked_add(region.height)
+        .ok_or(ProtocolError::InvalidVideoVisibleRegion)?;
+    if end_x > coded_width || end_y > coded_height {
+        Err(ProtocolError::InvalidVideoVisibleRegion)
+    } else {
+        Ok(())
+    }
 }
 
 pub fn image_byte_len(width: u32, height: u32, format: PixelFormat) -> Result<u64, ProtocolError> {
@@ -3666,9 +4352,10 @@ mod tests {
     }
 
     #[test]
-    fn image_resource_kind_wire_round_trip() {
+    fn resource_kind_wire_round_trip() {
         assert_eq!(ResourceKind::try_from(1), Ok(ResourceKind::Buffer));
         assert_eq!(ResourceKind::try_from(2), Ok(ResourceKind::Image));
+        assert_eq!(ResourceKind::try_from(3), Ok(ResourceKind::VideoSurface));
     }
 
     #[test]
@@ -4129,6 +4816,440 @@ mod tests {
         ] {
             assert_eq!(ProtocolErrorCode::from(&error), code);
             assert_eq!(ProtocolErrorCode::try_from(code.wire_value()), Ok(code));
+        }
+    }
+
+    #[test]
+    fn video_codec_profile_and_surface_enums_round_trip() {
+        for codec in [VideoCodec::H264, VideoCodec::Mpeg2] {
+            assert_eq!(VideoCodec::try_from(codec.wire_value()), Ok(codec));
+        }
+        for profile in [
+            H264Profile::Baseline,
+            H264Profile::Main,
+            H264Profile::High,
+            H264Profile::High422,
+        ] {
+            assert_eq!(H264Profile::try_from(profile.wire_value()), Ok(profile));
+        }
+        for profile in [Mpeg2Profile::Main, Mpeg2Profile::Profile422] {
+            assert_eq!(Mpeg2Profile::try_from(profile.wire_value()), Ok(profile));
+        }
+        for chroma in [
+            ChromaSubsampling::Cs420,
+            ChromaSubsampling::Cs422,
+            ChromaSubsampling::Cs444,
+        ] {
+            assert_eq!(ChromaSubsampling::try_from(chroma.wire_value()), Ok(chroma));
+        }
+        for scan in [ScanMode::Progressive, ScanMode::Interlaced] {
+            assert_eq!(ScanMode::try_from(scan.wire_value()), Ok(scan));
+        }
+        for field_order in [
+            FieldOrder::Unknown,
+            FieldOrder::TopFieldFirst,
+            FieldOrder::BottomFieldFirst,
+        ] {
+            assert_eq!(
+                FieldOrder::try_from(field_order.wire_value()),
+                Ok(field_order)
+            );
+        }
+        for format in [
+            VideoSurfaceFormat::Nv12,
+            VideoSurfaceFormat::P010,
+            VideoSurfaceFormat::Yuv422_8,
+            VideoSurfaceFormat::Yuv422_10,
+        ] {
+            assert_eq!(
+                VideoSurfaceFormat::try_from(format.wire_value()),
+                Ok(format)
+            );
+        }
+    }
+
+    #[test]
+    fn video_unknown_enum_values_are_rejected() {
+        assert_eq!(
+            VideoCodec::try_from(99),
+            Err(ProtocolError::UnsupportedVideoCodec)
+        );
+        assert_eq!(
+            H264Profile::try_from(99),
+            Err(ProtocolError::UnsupportedVideoProfile)
+        );
+        assert_eq!(
+            ChromaSubsampling::try_from(99),
+            Err(ProtocolError::UnsupportedChromaSubsampling)
+        );
+        assert_eq!(
+            ScanMode::try_from(99),
+            Err(ProtocolError::UnsupportedScanMode)
+        );
+        assert_eq!(
+            FieldOrder::try_from(99),
+            Err(ProtocolError::UnsupportedFieldOrder)
+        );
+        assert_eq!(
+            VideoSurfaceFormat::try_from(99),
+            Err(ProtocolError::UnsupportedVideoSurfaceFormat)
+        );
+    }
+
+    #[test]
+    fn bit_depth_validates_supported_values() {
+        assert_eq!(BitDepth::new(8).expect("8-bit").get(), 8);
+        assert_eq!(BitDepth::new(10).expect("10-bit").get(), 10);
+        assert_eq!(BitDepth::new(12).expect("12-bit").get(), 12);
+        assert_eq!(
+            BitDepth::new(9),
+            Err(ProtocolError::InvalidVideoBitDepth { bit_depth: 9 })
+        );
+    }
+
+    #[test]
+    fn video_surface_desc_validates_dimensions_and_crop() {
+        let desc = sample_video_surface_desc();
+        assert_eq!(desc.validate(), Ok(()));
+
+        let mut zero_width = desc.clone();
+        zero_width.coded_width = 0;
+        assert_eq!(
+            zero_width.validate(),
+            Err(ProtocolError::InvalidVideoSurfaceDimensions {
+                width: 0,
+                height: 1080,
+            })
+        );
+
+        let mut oversized = desc.clone();
+        oversized.coded_height = MAX_VIDEO_SURFACE_HEIGHT + 1;
+        assert_eq!(
+            oversized.validate(),
+            Err(ProtocolError::InvalidVideoSurfaceDimensions {
+                width: 1920,
+                height: MAX_VIDEO_SURFACE_HEIGHT + 1,
+            })
+        );
+
+        let mut invalid_crop = desc.clone();
+        invalid_crop.visible_region.x = 1900;
+        invalid_crop.visible_region.width = 64;
+        assert_eq!(
+            invalid_crop.validate(),
+            Err(ProtocolError::InvalidVideoVisibleRegion)
+        );
+    }
+
+    #[test]
+    fn video_surface_desc_rejects_inconsistent_format_semantics() {
+        let mut desc = sample_video_surface_desc();
+        desc.bit_depth = BitDepth::new(10).expect("10-bit");
+
+        assert_eq!(desc.validate(), Err(ProtocolError::MalformedPayload));
+
+        let mut progressive_with_field_order = sample_video_surface_desc();
+        progressive_with_field_order.field_order = FieldOrder::TopFieldFirst;
+        assert_eq!(
+            progressive_with_field_order.validate(),
+            Err(ProtocolError::MalformedPayload)
+        );
+    }
+
+    #[test]
+    fn resource_kind_video_surface_round_trips() {
+        assert_eq!(ResourceKind::try_from(1), Ok(ResourceKind::Buffer));
+        assert_eq!(ResourceKind::try_from(2), Ok(ResourceKind::Image));
+        assert_eq!(ResourceKind::try_from(3), Ok(ResourceKind::VideoSurface));
+    }
+
+    #[test]
+    fn video_capability_entry_and_list_round_trip() {
+        let message = WireMessage::VideoCapabilities {
+            request_id: 901,
+            response: VideoCapabilitiesResponse {
+                capabilities: VideoCapabilities {
+                    device_id: DeviceId::new(1).expect("device id"),
+                    decode: vec![sample_h264_8bit_420_capability()],
+                },
+            },
+        };
+
+        let decoded = decode_wire_message(&encode_wire_message(&message)).expect("decode video");
+        assert_eq!(decoded, message);
+        assert_eq!(decoded.request_id(), 901);
+    }
+
+    #[test]
+    fn empty_video_capability_list_round_trips() {
+        let message = WireMessage::VideoCapabilities {
+            request_id: 902,
+            response: VideoCapabilitiesResponse {
+                capabilities: VideoCapabilities {
+                    device_id: DeviceId::new(2).expect("device id"),
+                    decode: Vec::new(),
+                },
+            },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn query_video_capabilities_request_round_trips() {
+        let message = WireMessage::QueryVideoCapabilities {
+            request_id: 903,
+            request: QueryVideoCapabilitiesRequest {
+                device_id: DeviceId::new(5).expect("device id"),
+            },
+        };
+
+        let decoded =
+            decode_wire_message(&encode_wire_message(&message)).expect("decode video query");
+        assert_eq!(decoded, message);
+        assert_eq!(decoded.request_id(), 903);
+    }
+
+    #[test]
+    fn video_capability_reference_models_are_representable() {
+        assert_eq!(sample_h264_8bit_420_capability().validate(), Ok(()));
+        assert_eq!(
+            sample_mpeg2_8bit_422_interlaced_capability().validate(),
+            Ok(())
+        );
+        assert_eq!(sample_h264_10bit_422_capability().validate(), Ok(()));
+    }
+
+    #[test]
+    fn video_capability_rejects_mismatched_profile() {
+        let mut capability = sample_h264_8bit_420_capability();
+        capability.profile = VideoProfile::Mpeg2(Mpeg2Profile::Main);
+
+        assert_eq!(
+            capability.validate(),
+            Err(ProtocolError::UnsupportedVideoProfile)
+        );
+    }
+
+    #[test]
+    fn video_capability_rejects_empty_output_formats() {
+        let mut capability = sample_h264_8bit_420_capability();
+        capability.output_surface_formats.clear();
+
+        assert_eq!(
+            capability.validate(),
+            Err(ProtocolError::VideoOutputFormatCountTooLarge {
+                count: 0,
+                max: MAX_VIDEO_OUTPUT_FORMAT_COUNT,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_excessive_video_capability_count() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1_u64.to_le_bytes());
+        payload.extend_from_slice(&((MAX_VIDEO_DECODE_CAPABILITY_COUNT as u16) + 1).to_le_bytes());
+        payload.extend_from_slice(&0_u16.to_le_bytes());
+
+        assert_eq!(
+            decode_video_capabilities_payload(&payload),
+            Err(ProtocolError::VideoDecodeCapabilityCountTooLarge {
+                count: MAX_VIDEO_DECODE_CAPABILITY_COUNT + 1,
+                max: MAX_VIDEO_DECODE_CAPABILITY_COUNT,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_excessive_video_output_format_count() {
+        let mut payload = encode_video_capabilities_payload(&VideoCapabilitiesResponse {
+            capabilities: VideoCapabilities {
+                device_id: DeviceId::new(1).expect("device id"),
+                decode: vec![sample_h264_8bit_420_capability()],
+            },
+        });
+        payload[VIDEO_CAPABILITIES_PREFIX_LEN + 14] = (MAX_VIDEO_OUTPUT_FORMAT_COUNT as u8) + 1;
+
+        assert_eq!(
+            decode_video_capabilities_payload(&payload),
+            Err(ProtocolError::VideoOutputFormatCountTooLarge {
+                count: MAX_VIDEO_OUTPUT_FORMAT_COUNT + 1,
+                max: MAX_VIDEO_OUTPUT_FORMAT_COUNT,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_video_capability_entry() {
+        let mut payload = encode_video_capabilities_payload(&VideoCapabilitiesResponse {
+            capabilities: VideoCapabilities {
+                device_id: DeviceId::new(1).expect("device id"),
+                decode: vec![sample_h264_8bit_420_capability()],
+            },
+        });
+        payload.truncate(payload.len() - 1);
+
+        assert!(matches!(
+            decode_video_capabilities_payload(&payload),
+            Err(ProtocolError::TruncatedPayload { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_trailing_video_capability_payload() {
+        let mut payload = encode_video_capabilities_payload(&VideoCapabilitiesResponse {
+            capabilities: VideoCapabilities {
+                device_id: DeviceId::new(1).expect("device id"),
+                decode: Vec::new(),
+            },
+        });
+        payload.push(0);
+
+        assert_eq!(
+            decode_video_capabilities_payload(&payload),
+            Err(ProtocolError::TrailingPayload { len: 1 })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_video_capability_bit_depth_from_wire() {
+        let mut payload = encode_video_capabilities_payload(&VideoCapabilitiesResponse {
+            capabilities: VideoCapabilities {
+                device_id: DeviceId::new(1).expect("device id"),
+                decode: vec![sample_h264_8bit_420_capability()],
+            },
+        });
+        payload[VIDEO_CAPABILITIES_PREFIX_LEN + 2] = 9;
+
+        assert_eq!(
+            decode_video_capabilities_payload(&payload),
+            Err(ProtocolError::InvalidVideoBitDepth { bit_depth: 9 })
+        );
+    }
+
+    #[test]
+    fn video_error_codes_are_stable() {
+        for (error, code) in [
+            (
+                ProtocolError::UnsupportedVideoCodec,
+                ProtocolErrorCode::UnsupportedVideoCodec,
+            ),
+            (
+                ProtocolError::UnsupportedVideoProfile,
+                ProtocolErrorCode::UnsupportedVideoProfile,
+            ),
+            (
+                ProtocolError::InvalidVideoBitDepth { bit_depth: 9 },
+                ProtocolErrorCode::InvalidVideoBitDepth,
+            ),
+            (
+                ProtocolError::UnsupportedChromaSubsampling,
+                ProtocolErrorCode::UnsupportedChromaSubsampling,
+            ),
+            (
+                ProtocolError::UnsupportedScanMode,
+                ProtocolErrorCode::UnsupportedScanMode,
+            ),
+            (
+                ProtocolError::UnsupportedFieldOrder,
+                ProtocolErrorCode::UnsupportedFieldOrder,
+            ),
+            (
+                ProtocolError::UnsupportedVideoSurfaceFormat,
+                ProtocolErrorCode::UnsupportedVideoSurfaceFormat,
+            ),
+            (
+                ProtocolError::InvalidVideoSurfaceDimensions {
+                    width: 0,
+                    height: 1080,
+                },
+                ProtocolErrorCode::InvalidVideoSurfaceDimensions,
+            ),
+            (
+                ProtocolError::InvalidVideoVisibleRegion,
+                ProtocolErrorCode::InvalidVideoVisibleRegion,
+            ),
+            (
+                ProtocolError::VideoDecodeCapabilityCountTooLarge {
+                    count: MAX_VIDEO_DECODE_CAPABILITY_COUNT + 1,
+                    max: MAX_VIDEO_DECODE_CAPABILITY_COUNT,
+                },
+                ProtocolErrorCode::VideoDecodeCapabilityCountTooLarge,
+            ),
+            (
+                ProtocolError::VideoOutputFormatCountTooLarge {
+                    count: MAX_VIDEO_OUTPUT_FORMAT_COUNT + 1,
+                    max: MAX_VIDEO_OUTPUT_FORMAT_COUNT,
+                },
+                ProtocolErrorCode::VideoOutputFormatCountTooLarge,
+            ),
+        ] {
+            assert_eq!(ProtocolErrorCode::from(&error), code);
+            assert_eq!(ProtocolErrorCode::try_from(code.wire_value()), Ok(code));
+        }
+    }
+
+    fn sample_video_surface_desc() -> VideoSurfaceDesc {
+        VideoSurfaceDesc {
+            coded_width: 1920,
+            coded_height: 1080,
+            visible_region: VisibleRegion {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            format: VideoSurfaceFormat::Nv12,
+            bit_depth: BitDepth::new(8).expect("bit depth"),
+            chroma: ChromaSubsampling::Cs420,
+            scan_mode: ScanMode::Progressive,
+            field_order: FieldOrder::Unknown,
+        }
+    }
+
+    fn sample_h264_8bit_420_capability() -> VideoDecodeCapability {
+        VideoDecodeCapability {
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264(H264Profile::High),
+            bit_depth: BitDepth::new(8).expect("bit depth"),
+            chroma: ChromaSubsampling::Cs420,
+            max_width: 1920,
+            max_height: 1080,
+            progressive_supported: true,
+            interlaced_supported: false,
+            output_surface_formats: vec![VideoSurfaceFormat::Nv12],
+        }
+    }
+
+    fn sample_mpeg2_8bit_422_interlaced_capability() -> VideoDecodeCapability {
+        VideoDecodeCapability {
+            codec: VideoCodec::Mpeg2,
+            profile: VideoProfile::Mpeg2(Mpeg2Profile::Profile422),
+            bit_depth: BitDepth::new(8).expect("bit depth"),
+            chroma: ChromaSubsampling::Cs422,
+            max_width: 1920,
+            max_height: 1080,
+            progressive_supported: true,
+            interlaced_supported: true,
+            output_surface_formats: vec![VideoSurfaceFormat::Yuv422_8],
+        }
+    }
+
+    fn sample_h264_10bit_422_capability() -> VideoDecodeCapability {
+        VideoDecodeCapability {
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264(H264Profile::High422),
+            bit_depth: BitDepth::new(10).expect("bit depth"),
+            chroma: ChromaSubsampling::Cs422,
+            max_width: 3840,
+            max_height: 2160,
+            progressive_supported: true,
+            interlaced_supported: false,
+            output_surface_formats: vec![VideoSurfaceFormat::Yuv422_10],
         }
     }
 

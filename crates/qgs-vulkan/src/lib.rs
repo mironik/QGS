@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use qgs_core::{
     BackendBufferAllocation, BackendImageAllocation, BackendResource, BackendResourceExport,
     BackendSync, BackendSyncExport, DeviceDiscovery, DeviceDiscoveryError, ResourceBackend,
-    ResourceError, SyncBackend, SyncError,
+    ResourceError, SyncBackend, SyncError, VideoCapabilityDiscovery, VideoCapabilityDiscoveryError,
 };
 use qgs_protocol::{
     ApiVersion, BackendApi, BufferDesc, BufferUsageFlags, ComputeCapabilities, CreateSyncRequest,
@@ -15,7 +15,8 @@ use qgs_protocol::{
     ExportSyncRequest, ExportedResourceMetadata, ExportedSyncMetadata, ExternalHandleType,
     ExternalSharing, ImageDesc, ImageUsageFlags, InteropCapabilities, MemoryCapabilities,
     MemoryHeapDesc, PixelFormat, ResourceKind, SelectedMemoryProperties, SyncExportHandleType,
-    SyncKind, MAX_DEVICE_COUNT, MAX_DEVICE_NAME_LEN, MAX_MEMORY_HEAP_COUNT, MAX_MEMORY_TYPE_COUNT,
+    SyncKind, VideoCapabilities, MAX_DEVICE_COUNT, MAX_DEVICE_NAME_LEN, MAX_MEMORY_HEAP_COUNT,
+    MAX_MEMORY_TYPE_COUNT,
 };
 use vulkano::buffer::{
     Buffer, BufferCreateInfo, BufferMemory, BufferUsage, ExternalBufferInfo, RawBuffer, Subbuffer,
@@ -588,6 +589,26 @@ impl DeviceDiscovery for VulkanDeviceDiscovery {
             device.desc.id,
             &device.physical_device,
         ))
+    }
+}
+
+impl VideoCapabilityDiscovery for VulkanDeviceDiscovery {
+    fn query_video_capabilities(
+        &self,
+        device_id: DeviceId,
+    ) -> Result<VideoCapabilities, VideoCapabilityDiscoveryError> {
+        self.devices
+            .iter()
+            .find(|device| device.desc.id == device_id)
+            .ok_or(VideoCapabilityDiscoveryError::UnknownDeviceId)?;
+
+        // M2 Step 1 defines the QGS-owned model but does not implement a video
+        // decode backend. Return an honest empty set rather than inferring
+        // decode support from GPU identity or generic Vulkan capability.
+        Ok(VideoCapabilities {
+            device_id,
+            decode: Vec::new(),
+        })
     }
 }
 

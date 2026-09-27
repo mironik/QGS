@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use qgs_core::{
     DeviceDiscovery, ResourceBackend, ResourceError, Session, SessionManager, SyncBackend,
-    SyncError,
+    SyncError, VideoCapabilityDiscovery,
 };
 use qgs_linux::{
     bind_socket, default_socket_path, receive_message, remove_socket_file, send_message,
@@ -12,7 +12,8 @@ use qgs_linux::{
 };
 use qgs_protocol::{
     DeviceCapabilitiesResponse, DeviceListResponse, ErrorResponse, ProtocolError,
-    ProtocolErrorCode, ResourceExportedResponse, SyncExportedResponse, WireMessage,
+    ProtocolErrorCode, ResourceExportedResponse, SyncExportedResponse, VideoCapabilitiesResponse,
+    WireMessage,
 };
 use qgs_vulkan::VulkanDeviceDiscovery;
 
@@ -37,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn handle_client(
     stream: &mut std::os::unix::net::UnixStream,
     sessions: &SessionManager,
-    discovery: &(impl DeviceDiscovery + ResourceBackend + SyncBackend),
+    discovery: &(impl DeviceDiscovery + ResourceBackend + SyncBackend + VideoCapabilityDiscovery),
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut session: Option<Session> = None;
 
@@ -149,6 +150,40 @@ fn handle_client(
                         }
                         Err(err) => {
                             eprintln!("device capability discovery failed: {err}");
+                            WireMessage::Error {
+                                request_id,
+                                response: ErrorResponse {
+                                    code: ProtocolErrorCode::DiscoveryFailed,
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+            WireMessage::QueryVideoCapabilities { request, .. } => {
+                if session.is_none() {
+                    WireMessage::Error {
+                        request_id,
+                        response: ErrorResponse {
+                            code: ProtocolErrorCode::SessionRequired,
+                        },
+                    }
+                } else {
+                    match discovery.query_video_capabilities(request.device_id) {
+                        Ok(capabilities) => WireMessage::VideoCapabilities {
+                            request_id,
+                            response: VideoCapabilitiesResponse { capabilities },
+                        },
+                        Err(qgs_core::VideoCapabilityDiscoveryError::UnknownDeviceId) => {
+                            WireMessage::Error {
+                                request_id,
+                                response: ErrorResponse {
+                                    code: ProtocolErrorCode::UnknownDeviceId,
+                                },
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("video capability discovery failed: {err}");
                             WireMessage::Error {
                                 request_id,
                                 response: ErrorResponse {
@@ -328,6 +363,7 @@ fn handle_client(
             | WireMessage::Error { .. }
             | WireMessage::DeviceList { .. }
             | WireMessage::DeviceCapabilities { .. }
+            | WireMessage::VideoCapabilities { .. }
             | WireMessage::BufferCreated { .. }
             | WireMessage::ImageCreated { .. }
             | WireMessage::ResourceDestroyed { .. }

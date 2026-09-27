@@ -65,6 +65,7 @@ ResourceId
 Resource
     +-- Buffer
     +-- Image
+    +-- VideoSurface
     backed by
 backend resource
 ```
@@ -81,9 +82,10 @@ images. Vulkan buffers, images, memory objects, layouts, tiling details, and
 handles do not escape `qgs-vulkan`. `qgs-protocol` owns only the protocol
 representation.
 
-M1 Step 9 supports buffers and simple single-plane RGBA images. VideoSurface is
-still future work. The maximum single buffer size is 64 MiB as a conservative
-M1 safety limit, not as a final product limit.
+M1 Step 9 supports buffers and simple single-plane RGBA images. M2 Step 1 adds
+the vendor-neutral `VideoSurface` model, but does not allocate real video
+surfaces or decode video yet. The maximum single buffer size is 64 MiB as a
+conservative M1 safety limit, not as a final product limit.
 
 M1 Step 6 adds Linux external-memory sharing for buffers that were created as
 exportable. Exporting a resource does not transfer QGS ownership: the
@@ -173,6 +175,45 @@ expose image layouts, Vulkan tiling, DRM format modifiers, shader modules,
 SPIR-V blobs, descriptor binding, pipeline creation, dispatch commands, color
 management, video formats, or presentation/display operations.
 
+## Video Capability And Surface Model
+
+M2 begins video/media support by defining semantics before implementing a
+decoder backend. The intended layering is:
+
+```text
+Media application
+    |
+container / demux layer
+    |
+elementary compressed stream
+    |
+QGS video decoder abstraction
+    |
+VideoSurface
+    |
+GPU processing
+```
+
+QGS models technical codec and surface properties: codec, codec-specific
+profile, bit depth, chroma subsampling, coded and visible dimensions, scan
+structure, field order, and output surface format. Product or workflow labels
+such as XDCAM and XAVC are not low-level QGS API concepts. A media application
+or demux/container layer may interpret MXF/container metadata and choose how to
+use QGS, but QGS does not parse MXF and does not encode Sony product semantics.
+
+`VideoSurface` is distinct from `Image`. A video surface describes
+decoder/media-oriented storage and frame semantics; it must not be assumed to
+be `Rgba8Unorm`, NV12, a Vulkan image, or a generic byte buffer. M2 Step 1 does
+not add timestamps, timeline/project concepts, deinterlacing, color conversion,
+or real decoder allocation.
+
+The M2 Step 1 video backend abstraction is intentionally small. A future backend
+such as VA-API, Vulkan Video, or another vendor-neutral path will translate its
+native profile and surface information into QGS-owned capability entries. Until
+such a backend is implemented, `qgsd` reports an honest empty video capability
+set for known devices rather than inferring support from GPU vendor, name, or
+generic graphics capability.
+
 ## Current Scope
 
 The initial workspace contains an explicit v0.1 protocol wire encoding, minimal
@@ -184,10 +225,12 @@ destroy session-owned Vulkan-backed buffer and RGBA image resources and can
 export/import external-memory FDs for explicitly exportable resources on
 supported drivers. It can also prove one-shot external GPU synchronization with
 Linux sync FDs on supported drivers. It can run private built-in compute and
-image-processing proofs against imported shared resources. It does not include
-an async runtime, daemonization, DRM/KMS, video surfaces, video decode, video
-encode, a public compute or shader API, reusable semaphore workflows, workload
-scheduling, performance benchmarking, telemetry, or free-memory reporting.
+image-processing proofs against imported shared resources. It also defines the
+initial video capability and `VideoSurface` model, but it does not implement
+video decode or allocate video surfaces. It does not include an async runtime,
+daemonization, DRM/KMS, video decode, video encode, a public compute or shader
+API, reusable semaphore workflows, workload scheduling, performance
+benchmarking, telemetry, or free-memory reporting.
 
 Capability discovery is static information reported by the backend. It is not a
 measurement of current load, available/free VRAM, throughput, or scheduling

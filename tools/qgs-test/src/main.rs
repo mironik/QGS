@@ -13,8 +13,8 @@ use qgs_protocol::{
     DestroyResourceRequest, DeviceCapabilities, DeviceClass, DeviceDesc, ErrorResponse,
     ExportResourceRequest, ExportSyncRequest, ExternalHandleType, ExternalSharing, HelloRequest,
     ImageDesc, ImageUsageFlags, MemoryPreference, PixelFormat, QueryDeviceCapabilitiesRequest,
-    ResourceId, SelectedMemoryProperties, SyncExportHandleType, SyncId, SyncKind, WireMessage,
-    CURRENT_PROTOCOL_VERSION,
+    QueryVideoCapabilitiesRequest, ResourceId, SelectedMemoryProperties, SyncExportHandleType,
+    SyncId, SyncKind, VideoCapabilities, WireMessage, CURRENT_PROTOCOL_VERSION,
 };
 use qgs_vulkan::VulkanDeviceDiscovery;
 
@@ -107,6 +107,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         print_capabilities(&response.capabilities);
+
+        request_id += 1;
+        send_message(
+            &mut stream,
+            &WireMessage::QueryVideoCapabilities {
+                request_id,
+                request: QueryVideoCapabilitiesRequest {
+                    device_id: device.id,
+                },
+            },
+        )?;
+
+        let video_response = receive_message(&mut stream)?;
+        let WireMessage::VideoCapabilities {
+            request_id: response_request_id,
+            response,
+        } = video_response
+        else {
+            return Err("expected VIDEO_CAPABILITIES response".into());
+        };
+
+        if response_request_id != request_id {
+            return Err("video capability response request_id did not match request".into());
+        }
+        if response.capabilities.device_id != device.id {
+            return Err("video capability response device_id did not match request".into());
+        }
+
+        print_video_capabilities(&response.capabilities);
     }
 
     println!();
@@ -264,6 +293,14 @@ fn print_capabilities(capabilities: &DeviceCapabilities) {
         "    fence-fd: {}",
         yes_no(capabilities.interop.external_fence_fd)
     );
+}
+
+fn print_video_capabilities(capabilities: &VideoCapabilities) {
+    println!("  Video decode:");
+    println!("    advertised capabilities: {}", capabilities.decode.len());
+    if capabilities.decode.is_empty() {
+        println!("    backend: not implemented in M2 Step 1");
+    }
 }
 
 fn create_buffer(

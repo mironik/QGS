@@ -9,7 +9,7 @@ use qgs_protocol::{
     DeviceDesc, DeviceId, ExportResourceRequest, ExportSyncRequest, ExportedResourceMetadata,
     ExportedSyncMetadata, HelloRequest, ImageCreatedResponse, ImageDesc, ProtocolError,
     ResourceDestroyedResponse, ResourceId, ResourceKind, SelectedMemoryProperties, SessionId,
-    SyncCreatedResponse, SyncId, WelcomeResponse,
+    SyncCreatedResponse, SyncId, VideoCapabilities, WelcomeResponse,
 };
 
 pub trait DeviceDiscovery {
@@ -19,6 +19,45 @@ pub trait DeviceDiscovery {
         &self,
         device_id: DeviceId,
     ) -> Result<DeviceCapabilities, DeviceDiscoveryError>;
+}
+
+pub trait VideoCapabilityDiscovery {
+    fn query_video_capabilities(
+        &self,
+        device_id: DeviceId,
+    ) -> Result<VideoCapabilities, VideoCapabilityDiscoveryError>;
+}
+
+#[derive(Debug)]
+pub enum VideoCapabilityDiscoveryError {
+    BackendUnavailable,
+    BackendFailed,
+    UnknownDeviceId,
+    Protocol(ProtocolError),
+}
+
+impl std::fmt::Display for VideoCapabilityDiscoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BackendUnavailable => write!(f, "video capability backend is unavailable"),
+            Self::BackendFailed => write!(f, "video capability backend failed"),
+            Self::UnknownDeviceId => write!(f, "unknown device id"),
+            Self::Protocol(err) => {
+                write!(
+                    f,
+                    "video capability backend produced invalid protocol data: {err}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VideoCapabilityDiscoveryError {}
+
+impl From<ProtocolError> for VideoCapabilityDiscoveryError {
+    fn from(value: ProtocolError) -> Self {
+        Self::Protocol(value)
+    }
 }
 
 #[derive(Debug)]
@@ -754,6 +793,29 @@ mod tests {
         }
 
         assert_eq!(backend.drop_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn video_surface_resource_kind_uses_session_registry_model() {
+        let backend = MockBackend::default();
+        let mut registry = ResourceRegistry::new();
+        let id = registry.allocate_id().expect("resource id");
+
+        registry.insert(
+            id,
+            ResourceEntry {
+                kind: ResourceKind::VideoSurface,
+                resource: Box::new(MockResource {
+                    drop_count: Arc::clone(&backend.drop_count),
+                }),
+            },
+        );
+
+        assert_eq!(registry.len(), 1);
+        let removed = registry.remove(id).expect("resource removed");
+        assert_eq!(removed.kind, ResourceKind::VideoSurface);
+        drop(removed);
+        assert_eq!(backend.drop_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]

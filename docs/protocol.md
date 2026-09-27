@@ -185,6 +185,17 @@ non-empty, and unknown usage bits or pixel formats are rejected. Vulkan image
 tiling and layout transitions are backend implementation details and are not
 exposed in the QGS protocol.
 
+QUERY_VIDEO_CAPABILITIES is request kind `1`, opcode `10`. It is a session
+operation and must be sent after HELLO/WELCOME. Its payload is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `DeviceId` from the current `qgsd` process/session |
+
+M2 Step 1 defines the video model and wire representation. It does not claim
+real decode hardware support unless a future video backend proves it. Current
+`qgsd` behavior for a known device is a valid empty capability list.
+
 WELCOME is response kind `2`, opcode `1`. Its payload is:
 
 | Offset | Width | Field |
@@ -336,6 +347,7 @@ Resource kind values are:
 | ---: | --- |
 | 1 | Buffer |
 | 2 | Image |
+| 3 | VideoSurface |
 
 The backend memory type index and backend image layout token are backend import
 metadata. Normal clients treat them as opaque. They are interpreted only by the
@@ -370,6 +382,87 @@ IMAGE_CREATED is response kind `2`, opcode `10`. Its payload is:
 | 17 | u8 | selected memory property flags |
 | 18 | 6 bytes | reserved, currently `0` |
 
+VIDEO_CAPABILITIES is response kind `2`, opcode `11`. Its payload starts with:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `DeviceId` |
+| 8 | u16 | decode capability count |
+| 10 | 2 bytes | reserved, currently `0` |
+
+Each decode capability entry is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u8 | video codec |
+| 1 | u8 | codec-specific profile value |
+| 2 | u8 | bit depth |
+| 3 | u8 | chroma subsampling |
+| 4 | u32 | maximum coded width |
+| 8 | u32 | maximum coded height |
+| 12 | u8 | progressive supported, boolean |
+| 13 | u8 | interlaced supported, boolean |
+| 14 | u8 | output surface format count |
+| 15 | u8 | reserved, currently `0` |
+| 16 | variable | one u8 per output surface format |
+
+Video codec values are:
+
+| Value | Codec |
+| ---: | --- |
+| 1 | H264 |
+| 2 | Mpeg2 |
+
+H.264 profile values are:
+
+| Value | Profile |
+| ---: | --- |
+| 1 | Baseline |
+| 2 | Main |
+| 3 | High |
+| 4 | High422 |
+
+MPEG-2 profile values are:
+
+| Value | Profile |
+| ---: | --- |
+| 1 | Main |
+| 2 | Profile422 |
+
+Profile values are codec-specific. Receivers must reject a profile value that
+is not defined for the entry's codec.
+
+Valid bit depths are `8`, `10`, and `12`.
+
+Chroma subsampling values are:
+
+| Value | Chroma |
+| ---: | --- |
+| 1 | 4:2:0 |
+| 2 | 4:2:2 |
+| 3 | 4:4:4 |
+
+Video surface format values are:
+
+| Value | Format |
+| ---: | --- |
+| 1 | Nv12 |
+| 2 | P010 |
+| 3 | Yuv422_8 |
+| 4 | Yuv422_10 |
+
+`VideoSurface` model fields are not currently sent in a CREATE message because
+M2 Step 1 does not allocate real video surfaces. The QGS-owned
+`VideoSurfaceDesc` model contains coded width and height, a visible region,
+surface format, explicit bit depth, chroma subsampling, scan mode, and field
+order. Scan mode values are progressive `1` and interlaced `2`. Field order
+values are unknown `0`, top-field-first `1`, and bottom-field-first `2`.
+
+M2 Step 1 limits VIDEO_CAPABILITIES to 32 decode entries and 8 output surface
+formats per entry. VideoSurface coded dimensions are limited to 8192 x 8192,
+must be non-zero, and visible regions must be non-empty and contained inside
+the coded dimensions.
+
 `SyncId` is a non-zero, opaque, QGS-owned identifier. It represents an ordering
 primitive, not resource memory. For M1 Step 7, a `SyncId` is unique within its
 owning session/lifetime and is not persistent across sessions or daemon
@@ -386,10 +479,12 @@ For M1 Step 5, a `ResourceId` is unique within its owning session/lifetime and
 is not persistent across sessions or daemon restarts. A resource belongs to
 exactly one session. Another session cannot use or destroy it.
 
-M1 Step 9 supports `Buffer` and `Image` resources. The maximum single buffer
-size is 64 MiB. This is an M1 safety limit to prevent unbounded allocation
-requests; it is not a final product limit. Image dimensions are limited as
-documented above.
+M1 Step 9 supports allocated `Buffer` and `Image` resources. M2 Step 1 adds
+`VideoSurface` as a protocol/model resource kind, but real VideoSurface
+allocation and export are not implemented yet. The maximum single buffer size
+is 64 MiB. This is an M1 safety limit to prevent unbounded allocation requests;
+it is not a final product limit. Image dimensions are limited as documented
+above.
 
 ## Validation
 
@@ -416,11 +511,18 @@ oversized dimensions, unsupported pixel formats, invalid usage flags, nonzero
 reserved bytes, truncated payloads, and trailing payload bytes. Exported image
 metadata must be internally consistent with the resource kind, dimensions,
 format, logical byte size, and attachment count.
+QUERY_VIDEO_CAPABILITIES receivers must reject zero `DeviceId` values.
+VIDEO_CAPABILITIES receivers must reject excessive capability counts, excessive
+output format counts, unknown video codecs, unknown codec-specific profiles,
+invalid bit depths, unknown chroma values, unknown output surface formats,
+invalid dimensions, malformed boolean or reserved fields, truncated entries,
+and trailing payload bytes. VideoSurface model validation rejects zero or
+oversized coded dimensions and visible regions outside the coded frame.
 
 Major protocol versions are incompatible. Minor versions are backward-compatible
 only within the same major version. A server selects the highest protocol
 version it supports that is inside the client's supported range. The
-implementation through M1 Step 9 supports only server version `0.1`.
+implementation through M2 Step 1 supports only server version `0.1`.
 
 ## Transport
 
