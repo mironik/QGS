@@ -1,23 +1,39 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
+use std::fs::File;
 use std::sync::Arc;
 
 use qgs_core::{
-    BackendBufferAllocation, DeviceDiscovery, DeviceDiscoveryError, ResourceBackend, ResourceError,
+    BackendBufferAllocation, BackendResource, BackendResourceExport, DeviceDiscovery,
+    DeviceDiscoveryError, ResourceBackend, ResourceError,
 };
 use qgs_protocol::{
     ApiVersion, BackendApi, BufferDesc, BufferUsageFlags, ComputeCapabilities, DeviceCapabilities,
-    DeviceClass, DeviceDesc, DeviceId, InteropCapabilities, MemoryCapabilities, MemoryHeapDesc,
+    DeviceClass, DeviceDesc, DeviceId, ExportResourceRequest, ExportedResourceMetadata,
+    ExternalHandleType, ExternalSharing, InteropCapabilities, MemoryCapabilities, MemoryHeapDesc,
     SelectedMemoryProperties, MAX_DEVICE_COUNT, MAX_DEVICE_NAME_LEN, MAX_MEMORY_HEAP_COUNT,
     MAX_MEMORY_TYPE_COUNT,
 };
-use vulkano::buffer::{Buffer, BufferCreateInfo, BufferMemory, BufferUsage, Subbuffer};
+use vulkano::buffer::{
+    Buffer, BufferCreateInfo, BufferMemory, BufferUsage, ExternalBufferInfo, RawBuffer, Subbuffer,
+};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
-use vulkano::device::{Device, DeviceCreateInfo, QueueCreateInfo, QueueFlags};
+use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo, QueueFlags};
 use vulkano::instance::{Instance, InstanceCreateInfo};
-use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
-use vulkano::memory::{MemoryHeapFlags, MemoryPropertyFlags};
+use vulkano::memory::allocator::{
+    AllocationCreateInfo, GenericMemoryAllocatorCreateInfo, MemoryAllocatePreference,
+    MemoryTypeFilter, StandardMemoryAllocator,
+};
+use vulkano::memory::{
+    DedicatedAllocation, ExternalMemoryHandleType, ExternalMemoryHandleTypes, MemoryAllocateInfo,
+    MemoryHeapFlags, MemoryImportInfo, MemoryMapInfo, MemoryPropertyFlags, ResourceMemory,
+};
 use vulkano::{Version, VulkanLibrary};
+
+#[allow(unsafe_code)]
+mod external_memory;
+
+const SHARED_VALIDATION_MARKER: &[u8] = b"QGS-M1S6";
 
 #[derive(Debug)]
 pub struct VulkanDeviceDiscovery {
@@ -46,9 +62,18 @@ impl VulkanDeviceDiscovery {
                 .position(|queue| queue.queue_count > 0)
                 .ok_or(DeviceDiscoveryError::BackendFailed)?
                 as u32;
+            let supported_extensions = physical_device.supported_extensions();
+            let enabled_extensions = DeviceExtensions {
+                khr_external_memory: supported_extensions.khr_external_memory,
+                khr_external_memory_fd: supported_extensions.khr_external_memory_fd,
+                ext_external_memory_dma_buf: supported_extensions.ext_external_memory_dma_buf,
+                khr_dedicated_allocation: supported_extensions.khr_dedicated_allocation,
+                ..DeviceExtensions::empty()
+            };
             let (logical_device, _) = Device::new(
                 physical_device.clone(),
                 DeviceCreateInfo {
+                    enabled_extensions,
                     queue_create_infos: vec![QueueCreateInfo {
                         queue_family_index,
                         ..Default::default()
@@ -69,6 +94,96 @@ impl VulkanDeviceDiscovery {
         }
 
         Ok(Self { devices })
+    }
+
+    pub fn import_and_validate_external_buffer(
+        &self,
+        source_device: &DeviceDesc,
+        metadata: &ExportedResourceMetadata,
+        handle: File,
+    ) -> Result<(), ResourceError> {
+        if metadata.device_id != source_device.id
+            || metadata.size_bytes == 0
+            || metadata.allocation_size_bytes < metadata.size_bytes
+            || metadata.attachment_count != 1
+            || !metadata.selected_memory.host_visible
+            || !metadata.selected_memory.host_coherent
+        {
+            return Err(ResourceError::ExportFailed);
+        }
+
+        let device = self
+            .devices
+            .iter()
+            .find(|device| device_matches_export_source(&device.desc, source_device))
+            .ok_or(ResourceError::UnknownDeviceId)?;
+
+        let usage = map_buffer_usage(metadata.usage)?;
+        let handle_type = map_external_handle_type(metadata.handle_type)?;
+        validate_external_buffer_support(device, usage, handle_type)?;
+
+        let raw_buffer = RawBuffer::new(
+            device.logical_device.clone(),
+            BufferCreateInfo {
+                size: metadata.size_bytes,
+                usage,
+                external_memory_handle_types: ExternalMemoryHandleTypes::from(handle_type),
+                ..Default::default()
+            },
+        )
+        .map_err(|err| {
+            eprintln!("vulkan import raw-buffer creation failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+
+        let dedicated_allocation = metadata
+            .dedicated_allocation
+            .then_some(DedicatedAllocation::Buffer(&raw_buffer));
+        let mut imported_memory = external_memory::import_device_memory(
+            device.logical_device.clone(),
+            MemoryAllocateInfo {
+                allocation_size: metadata.allocation_size_bytes,
+                memory_type_index: metadata.backend_memory_type_index,
+                dedicated_allocation,
+                ..Default::default()
+            },
+            MemoryImportInfo::Fd {
+                handle_type,
+                file: handle,
+            },
+        )
+        .map_err(|err| {
+            eprintln!("vulkan external memory import failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+        imported_memory
+            .map(MemoryMapInfo {
+                offset: 0,
+                size: metadata.allocation_size_bytes,
+                ..Default::default()
+            })
+            .map_err(|err| {
+                eprintln!("vulkan imported memory map failed: {err}");
+                ResourceError::ExportFailed
+            })?;
+
+        let imported_buffer = raw_buffer
+            .bind_memory(ResourceMemory::new_dedicated(imported_memory))
+            .map_err(|(err, _, _)| {
+                eprintln!("vulkan imported memory bind failed: {err}");
+                ResourceError::ExportFailed
+            })?;
+        let imported_subbuffer: Subbuffer<[u8]> = Subbuffer::from(Arc::new(imported_buffer));
+        let read = imported_subbuffer.read().map_err(|err| {
+            eprintln!("vulkan imported memory read failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+
+        if read.get(..SHARED_VALIDATION_MARKER.len()) == Some(SHARED_VALIDATION_MARKER) {
+            Ok(())
+        } else {
+            Err(ResourceError::ExportFailed)
+        }
     }
 }
 
@@ -108,14 +223,36 @@ impl ResourceBackend for VulkanDeviceDiscovery {
 
         let usage = map_buffer_usage(desc.usage)?;
         let memory_type_filter = map_memory_preference(desc);
+        let external_handle_types = match desc.external_sharing {
+            ExternalSharing::None => ExternalMemoryHandleTypes::empty(),
+            ExternalSharing::Required { handle_type } => {
+                let handle_type = map_external_handle_type(handle_type)?;
+                validate_external_buffer_support(device, usage, handle_type)?;
+                ExternalMemoryHandleTypes::from(handle_type)
+            }
+        };
+        let allocator = if external_handle_types.is_empty() {
+            device.memory_allocator.clone()
+        } else {
+            Arc::new(export_memory_allocator(
+                device.logical_device.clone(),
+                external_handle_types,
+            ))
+        };
         let buffer = Buffer::new_slice::<u8>(
-            device.memory_allocator.clone(),
+            allocator,
             BufferCreateInfo {
                 usage,
+                external_memory_handle_types: external_handle_types,
                 ..Default::default()
             },
             AllocationCreateInfo {
                 memory_type_filter,
+                allocate_preference: if external_handle_types.is_empty() {
+                    MemoryAllocatePreference::Unknown
+                } else {
+                    MemoryAllocatePreference::AlwaysAllocate
+                },
                 ..Default::default()
             },
             desc.size_bytes,
@@ -128,7 +265,11 @@ impl ResourceBackend for VulkanDeviceDiscovery {
         let selected_memory = selected_memory_properties(&device.physical_device, &buffer)?;
 
         Ok(BackendBufferAllocation {
-            resource: Box::new(VulkanBufferResource { buffer }),
+            resource: Box::new(VulkanBufferResource {
+                buffer,
+                desc: desc.clone(),
+                selected_memory,
+            }),
             selected_memory,
         })
     }
@@ -145,8 +286,57 @@ struct RegisteredDevice {
 
 #[derive(Debug)]
 struct VulkanBufferResource {
-    #[allow(dead_code)]
     buffer: Subbuffer<[u8]>,
+    desc: BufferDesc,
+    selected_memory: SelectedMemoryProperties,
+}
+
+impl BackendResource for VulkanBufferResource {
+    fn export(
+        &self,
+        request: &ExportResourceRequest,
+    ) -> Result<BackendResourceExport, ResourceError> {
+        let ExternalSharing::Required { handle_type } = self.desc.external_sharing else {
+            return Err(ResourceError::ResourceNotExportable);
+        };
+        if request.handle_type != handle_type {
+            return Err(ResourceError::UnsupportedExternalHandleType);
+        }
+
+        write_validation_marker(&self.buffer)?;
+        let (memory_type_index, allocation_size_bytes, dedicated_allocation) =
+            buffer_memory_export_info(&self.buffer)?;
+        let vk_handle_type = map_external_handle_type(handle_type)?;
+        let handle = match self.buffer.buffer().memory() {
+            BufferMemory::Normal(memory) => memory
+                .device_memory()
+                .export_fd(vk_handle_type)
+                .map_err(|err| {
+                    eprintln!("vulkan memory export failed: {err}");
+                    ResourceError::ExportFailed
+                })?,
+            BufferMemory::Sparse | BufferMemory::External => {
+                return Err(ResourceError::ExportFailed)
+            }
+            _ => return Err(ResourceError::ExportFailed),
+        };
+
+        Ok(BackendResourceExport {
+            metadata: ExportedResourceMetadata {
+                resource_id: request.resource_id,
+                device_id: self.desc.device_id,
+                size_bytes: self.desc.size_bytes,
+                allocation_size_bytes,
+                usage: self.desc.usage,
+                backend_memory_type_index: memory_type_index,
+                handle_type,
+                selected_memory: self.selected_memory,
+                dedicated_allocation,
+                attachment_count: 1,
+            },
+            handle,
+        })
+    }
 }
 
 fn describe_device(
@@ -337,6 +527,126 @@ fn selected_memory_properties(
         host_visible: flags.intersects(MemoryPropertyFlags::HOST_VISIBLE),
         host_coherent: flags.intersects(MemoryPropertyFlags::HOST_COHERENT),
     })
+}
+
+fn map_external_handle_type(
+    handle_type: ExternalHandleType,
+) -> Result<ExternalMemoryHandleType, ResourceError> {
+    match handle_type {
+        ExternalHandleType::DmaBuf => Ok(ExternalMemoryHandleType::DmaBuf),
+        ExternalHandleType::OpaqueFd => Ok(ExternalMemoryHandleType::OpaqueFd),
+    }
+}
+
+fn validate_external_buffer_support(
+    device: &RegisteredDevice,
+    usage: BufferUsage,
+    handle_type: ExternalMemoryHandleType,
+) -> Result<(), ResourceError> {
+    let extensions = device.logical_device.enabled_extensions();
+    if !extensions.khr_external_memory_fd {
+        return Err(ResourceError::UnsupportedExternalHandleType);
+    }
+    if handle_type == ExternalMemoryHandleType::DmaBuf && !extensions.ext_external_memory_dma_buf {
+        return Err(ResourceError::UnsupportedExternalHandleType);
+    }
+
+    let mut external_buffer_info = ExternalBufferInfo::handle_type(handle_type);
+    external_buffer_info.usage = usage;
+
+    let properties = device
+        .physical_device
+        .external_buffer_properties(external_buffer_info)
+        .map_err(|err| {
+            eprintln!("vulkan external-buffer property query failed: {err}");
+            ResourceError::UnsupportedExternalHandleType
+        })?;
+
+    if !properties.external_memory_properties.exportable
+        || !properties.external_memory_properties.importable
+    {
+        return Err(ResourceError::ResourceNotExportable);
+    }
+
+    Ok(())
+}
+
+fn export_memory_allocator(
+    device: Arc<Device>,
+    handle_types: ExternalMemoryHandleTypes,
+) -> StandardMemoryAllocator {
+    let memory_properties = device.physical_device().memory_properties();
+    let mut block_sizes = Vec::with_capacity(memory_properties.memory_types.len());
+    let mut export_handle_types = Vec::with_capacity(memory_properties.memory_types.len());
+    let mut memory_type_bits = u32::MAX;
+
+    for (index, memory_type) in memory_properties.memory_types.iter().enumerate() {
+        let heap_size = memory_properties.memory_heaps[memory_type.heap_index as usize].size;
+        const LARGE_HEAP_THRESHOLD: u64 = 1024 * 1024 * 1024;
+        block_sizes.push(if heap_size >= LARGE_HEAP_THRESHOLD {
+            256 * 1024 * 1024
+        } else {
+            64 * 1024 * 1024
+        });
+        export_handle_types.push(handle_types);
+
+        if memory_type.property_flags.intersects(
+            MemoryPropertyFlags::LAZILY_ALLOCATED
+                | MemoryPropertyFlags::PROTECTED
+                | MemoryPropertyFlags::DEVICE_COHERENT
+                | MemoryPropertyFlags::RDMA_CAPABLE,
+        ) {
+            memory_type_bits &= !(1 << index);
+        }
+    }
+
+    StandardMemoryAllocator::new(
+        device,
+        GenericMemoryAllocatorCreateInfo {
+            block_sizes: &block_sizes,
+            memory_type_bits,
+            export_handle_types: &export_handle_types,
+            ..Default::default()
+        },
+    )
+}
+
+fn buffer_memory_export_info(buffer: &Subbuffer<[u8]>) -> Result<(u32, u64, bool), ResourceError> {
+    match buffer.buffer().memory() {
+        BufferMemory::Normal(memory) => Ok((
+            memory.device_memory().memory_type_index(),
+            memory.device_memory().allocation_size(),
+            memory.device_memory().is_dedicated(),
+        )),
+        BufferMemory::Sparse | BufferMemory::External => Err(ResourceError::ExportFailed),
+        _ => Err(ResourceError::ExportFailed),
+    }
+}
+
+fn write_validation_marker(buffer: &Subbuffer<[u8]>) -> Result<(), ResourceError> {
+    if buffer.size() < SHARED_VALIDATION_MARKER.len() as u64 {
+        return Err(ResourceError::InvalidBufferSize);
+    }
+
+    let mut write = buffer.write().map_err(|err| {
+        eprintln!("vulkan marker write failed: {err}");
+        ResourceError::UnsupportedMemoryRequirements
+    })?;
+    write[..SHARED_VALIDATION_MARKER.len()].copy_from_slice(SHARED_VALIDATION_MARKER);
+    Ok(())
+}
+
+fn device_matches_export_source(candidate: &DeviceDesc, source: &DeviceDesc) -> bool {
+    candidate.backend == source.backend
+        && candidate.vendor_id == source.vendor_id
+        && candidate.device_id == source.device_id
+        && candidate.name == source.name
+        && candidate.api_version == source.api_version
+        && candidate.driver_version == source.driver_version
+}
+
+pub fn validation_marker_len() -> usize {
+    SHARED_VALIDATION_MARKER.len()
 }
 
 #[cfg(test)]

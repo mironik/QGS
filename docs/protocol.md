@@ -59,7 +59,8 @@ must be sent after HELLO/WELCOME. Its payload is a fixed-size `BufferDesc`:
 | 8 | u64 | buffer size in bytes |
 | 16 | u32 | buffer usage flags |
 | 20 | u8 | memory preference flags |
-| 21 | 3 bytes | reserved, currently `0` |
+| 21 | u8 | external sharing selector |
+| 22 | 2 bytes | reserved, currently `0` |
 
 Buffer usage flag values are:
 
@@ -83,12 +84,39 @@ The memory model is preference/requirement based. It does not assume that GPU
 memory is split into simple RAM vs VRAM categories; integrated GPUs may select
 memory that is both device-local and host-visible.
 
+External sharing selector values are:
+
+| Value | Meaning |
+| ---: | --- |
+| 0 | no external sharing |
+| 1 | external sharing required with DMA-BUF FD |
+| 2 | external sharing required with opaque Vulkan external-memory FD |
+
+External sharing is a creation-time requirement. A resource not created with
+external sharing cannot later be retroactively exported.
+
 DESTROY_RESOURCE is request kind `1`, opcode `5`. It is a session operation and
 must be sent after HELLO/WELCOME. Its payload is:
 
 | Offset | Width | Field |
 | --- | ---: | --- |
 | 0 | u64 | QGS `ResourceId` owned by the current session |
+
+EXPORT_RESOURCE is request kind `1`, opcode `6`. It is a session operation and
+must be sent after HELLO/WELCOME. Its payload is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `ResourceId` owned by the current session |
+| 8 | u8 | requested external handle type |
+| 9 | 7 bytes | reserved, currently `0` |
+
+External handle type values are:
+
+| Value | Type |
+| ---: | --- |
+| 1 | DMA-BUF FD |
+| 2 | opaque Vulkan external-memory FD |
 
 WELCOME is response kind `2`, opcode `1`. Its payload is:
 
@@ -210,6 +238,28 @@ RESOURCE_DESTROYED is response kind `2`, opcode `6`. Its payload is:
 | --- | ---: | --- |
 | 0 | u64 | destroyed QGS `ResourceId` |
 
+RESOURCE_EXPORTED is response kind `2`, opcode `7`. Its payload contains only
+bounded metadata. The native FD is not encoded as an integer in this payload;
+it is carried as one Linux transport attachment.
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | exported QGS `ResourceId` |
+| 8 | u64 | QGS `DeviceId` |
+| 16 | u64 | buffer size in bytes |
+| 24 | u64 | backend allocation size in bytes |
+| 32 | u32 | buffer usage flags |
+| 36 | u32 | backend memory type index |
+| 40 | u8 | external handle type |
+| 41 | u8 | selected memory property flags |
+| 42 | u8 | dedicated allocation, boolean |
+| 43 | u8 | expected attachment count, currently `1` |
+| 44 | 4 bytes | reserved, currently `0` |
+
+The backend memory type index is backend import metadata. Normal clients treat
+it as opaque. It is interpreted only by the matching `qgs-vulkan` import helper
+for the same backend/device identity.
+
 `ResourceId` is a non-zero, opaque, QGS-owned identifier. It does not expose
 pointers, Vulkan handles, file descriptors, or any native resource handle.
 For M1 Step 5, a `ResourceId` is unique within its owning session/lifetime and
@@ -239,7 +289,7 @@ cross-session resource attempts return a stable UnknownResource error.
 Major protocol versions are incompatible. Minor versions are backward-compatible
 only within the same major version. A server selects the highest protocol
 version it supports that is inside the client's supported range. The
-implementation through M1 Step 5 supports only server version `0.1`.
+implementation through M1 Step 6 supports only server version `0.1`.
 
 ## Transport
 
@@ -249,3 +299,22 @@ wire encoding/decoding, but no Unix-specific code.
 For Linux M1, `qgsd` and `qgs-test` communicate over a Unix Domain Socket using
 synchronous blocking I/O. This is the first real IPC transport, but it does not
 change the protocol's transport independence.
+
+M1 Step 6 adds Linux transport attachments for external-memory FDs. The Linux
+transport uses Unix Domain Socket ancillary data (`SCM_RIGHTS`) and supports at
+most one attached FD per message. Missing or excessive attachments are rejected
+by the attachment receive path. FD ownership is represented with owned file
+descriptor types; descriptors are closed by RAII when dropped.
+
+These are three separate things:
+
+- QGS protocol payload metadata
+- native Linux transport attachments
+- shared GPU resource contents
+
+Large video/GPU data and buffer contents are not carried in normal QGS IPC
+messages. Step 6 transfers only a native reference to shared external memory.
+
+External memory sharing does not implement external GPU synchronization.
+M1 Step 6 uses a deliberately quiescent validation sequence. External semaphore
+or fence workflows are deferred until before concurrent GPU workloads.

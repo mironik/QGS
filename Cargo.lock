@@ -285,6 +285,7 @@ version = "0.1.0"
 dependencies = [
  "qgs-core",
  "qgs-protocol",
+ "unix-ancillary",
 ]
 
 [[package]]
@@ -297,6 +298,7 @@ version = "0.1.0"
 dependencies = [
  "qgs-linux",
  "qgs-protocol",
+ "qgs-vulkan",
 ]
 
 [[package]]
@@ -451,6 +453,15 @@ name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
+
+[[package]]
+name = "unix-ancillary"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98e8f31238fb806c3f74d77b5f33fb386b9bc24416b0cc4f6cef3fed5ad20a2e"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "vk-parse"

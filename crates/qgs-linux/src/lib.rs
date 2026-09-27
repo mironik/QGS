@@ -3,6 +3,7 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::FileTypeExt;
+use std::os::unix::io::{AsFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
@@ -10,6 +11,9 @@ use qgs_protocol::{
     decode_wire_header, decode_wire_message_parts, encode_wire_message, ProtocolError, WireMessage,
     MAX_PAYLOAD_LEN, WIRE_HEADER_LEN,
 };
+use unix_ancillary::UnixStreamExt;
+
+pub const MAX_ATTACHMENT_COUNT: usize = 1;
 
 pub fn default_socket_path() -> PathBuf {
     PathBuf::from("/tmp/qgsd.sock")
@@ -26,6 +30,43 @@ pub fn connect_socket(path: &Path) -> io::Result<UnixStream> {
 
 pub fn send_message(stream: &mut UnixStream, message: &WireMessage) -> io::Result<()> {
     stream.write_all(&encode_wire_message(message))
+}
+
+pub fn send_message_with_attachments(
+    stream: &mut UnixStream,
+    message: &WireMessage,
+    attachments: &[impl AsFd],
+) -> io::Result<()> {
+    if attachments.len() > MAX_ATTACHMENT_COUNT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many transport attachments",
+        ));
+    }
+
+    stream.send_fds_all(&encode_wire_message(message), attachments)
+}
+
+pub fn receive_message_with_attachments<const N: usize>(
+    stream: &mut UnixStream,
+) -> Result<ReceivedMessage, TransportError> {
+    if N > MAX_ATTACHMENT_COUNT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many expected transport attachments",
+        )
+        .into());
+    }
+
+    let mut bytes = vec![0_u8; WIRE_HEADER_LEN + MAX_PAYLOAD_LEN as usize];
+    let (len, attachments) = stream.recv_fds_exact_into::<N>(&mut bytes)?;
+    bytes.truncate(len);
+    let message = qgs_protocol::decode_wire_message(&bytes)?;
+
+    Ok(ReceivedMessage {
+        message,
+        attachments,
+    })
 }
 
 pub fn receive_message(stream: &mut UnixStream) -> Result<WireMessage, TransportError> {
@@ -46,6 +87,12 @@ pub fn receive_message(stream: &mut UnixStream) -> Result<WireMessage, Transport
     stream.read_exact(&mut payload)?;
 
     Ok(decode_wire_message_parts(header, &payload)?)
+}
+
+#[derive(Debug)]
+pub struct ReceivedMessage {
+    pub message: WireMessage,
+    pub attachments: Vec<OwnedFd>,
 }
 
 pub fn remove_socket_file(path: &Path) -> io::Result<()> {
@@ -102,6 +149,8 @@ impl From<ProtocolError> for TransportError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+    use std::os::unix::net::UnixStream;
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -166,6 +215,47 @@ mod tests {
         assert_eq!(response.session_id.get(), 1);
 
         server.join().expect("server thread");
+    }
+
+    #[test]
+    fn transfers_owned_fd_attachment_over_unix_socket() {
+        let (mut sender, mut receiver) = UnixStream::pair().expect("socket pair");
+        let file = File::open("/dev/null").expect("open /dev/null");
+        let message = WireMessage::EnumerateDevices { request_id: 77 };
+
+        let send_thread = thread::spawn(move || {
+            send_message_with_attachments(&mut sender, &message, &[&file]).expect("send fd");
+        });
+
+        let received =
+            receive_message_with_attachments::<1>(&mut receiver).expect("receive attached fd");
+
+        send_thread.join().expect("send thread");
+        assert_eq!(
+            received.message,
+            WireMessage::EnumerateDevices { request_id: 77 }
+        );
+        assert_eq!(received.attachments.len(), 1);
+
+        let mut received_file = File::from(received.attachments.into_iter().next().expect("fd"));
+        let mut sink = [0_u8; 1];
+        assert_eq!(received_file.read(&mut sink).expect("read fd"), 0);
+    }
+
+    #[test]
+    fn rejects_too_many_outgoing_attachments() {
+        let (mut sender, _receiver) = UnixStream::pair().expect("socket pair");
+        let first = File::open("/dev/null").expect("open /dev/null");
+        let second = File::open("/dev/null").expect("open /dev/null");
+
+        let err = send_message_with_attachments(
+            &mut sender,
+            &WireMessage::EnumerateDevices { request_id: 78 },
+            &[&first, &second],
+        )
+        .expect_err("too many attachments are rejected");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     fn unique_socket_path() -> PathBuf {

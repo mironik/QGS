@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use qgs_protocol::{
     handle_hello, BufferCreatedResponse, BufferDesc, DeviceCapabilities, DeviceDesc, DeviceId,
-    HelloRequest, ProtocolError, ResourceDestroyedResponse, ResourceId, ResourceKind,
-    SelectedMemoryProperties, SessionId, WelcomeResponse,
+    ExportResourceRequest, ExportedResourceMetadata, HelloRequest, ProtocolError,
+    ResourceDestroyedResponse, ResourceId, ResourceKind, SelectedMemoryProperties, SessionId,
+    WelcomeResponse,
 };
 
 pub trait DeviceDiscovery {
@@ -51,13 +52,24 @@ pub trait ResourceBackend {
     fn create_buffer(&self, desc: &BufferDesc) -> Result<BackendBufferAllocation, ResourceError>;
 }
 
-pub trait BackendResource: Send {}
-
-impl<T: Send> BackendResource for T {}
+pub trait BackendResource: Send {
+    fn export(
+        &self,
+        _request: &ExportResourceRequest,
+    ) -> Result<BackendResourceExport, ResourceError> {
+        Err(ResourceError::ResourceNotExportable)
+    }
+}
 
 pub struct BackendBufferAllocation {
     pub resource: Box<dyn BackendResource>,
     pub selected_memory: SelectedMemoryProperties,
+}
+
+#[derive(Debug)]
+pub struct BackendResourceExport {
+    pub metadata: ExportedResourceMetadata,
+    pub handle: std::fs::File,
 }
 
 #[derive(Debug)]
@@ -66,6 +78,9 @@ pub enum ResourceError {
     InvalidBufferSize,
     AllocationFailed,
     UnsupportedMemoryRequirements,
+    ResourceNotExportable,
+    UnsupportedExternalHandleType,
+    ExportFailed,
     UnknownDeviceId,
     Protocol(ProtocolError),
 }
@@ -77,6 +92,9 @@ impl std::fmt::Display for ResourceError {
             Self::InvalidBufferSize => write!(f, "invalid buffer size"),
             Self::AllocationFailed => write!(f, "resource allocation failed"),
             Self::UnsupportedMemoryRequirements => write!(f, "unsupported memory requirements"),
+            Self::ResourceNotExportable => write!(f, "resource is not exportable"),
+            Self::UnsupportedExternalHandleType => write!(f, "unsupported external handle type"),
+            Self::ExportFailed => write!(f, "resource export failed"),
             Self::UnknownDeviceId => write!(f, "unknown device id"),
             Self::Protocol(err) => write!(f, "invalid resource protocol data: {err}"),
         }
@@ -93,6 +111,9 @@ impl From<ProtocolError> for ResourceError {
             ProtocolError::UnknownResource => Self::UnknownResource,
             ProtocolError::AllocationFailed => Self::AllocationFailed,
             ProtocolError::UnsupportedMemoryRequirements => Self::UnsupportedMemoryRequirements,
+            ProtocolError::ResourceNotExportable => Self::ResourceNotExportable,
+            ProtocolError::UnsupportedExternalHandleType => Self::UnsupportedExternalHandleType,
+            ProtocolError::ExportFailed => Self::ExportFailed,
             err => Self::Protocol(err),
         }
     }
@@ -177,6 +198,16 @@ impl Session {
         Ok(ResourceDestroyedResponse { resource_id })
     }
 
+    pub fn export_resource(
+        &self,
+        request: &ExportResourceRequest,
+    ) -> Result<BackendResourceExport, ResourceError> {
+        self.resources
+            .get(request.resource_id)?
+            .resource
+            .export(request)
+    }
+
     pub fn resource_count(&self) -> usize {
         self.resources.len()
     }
@@ -214,6 +245,12 @@ impl ResourceRegistry {
             .ok_or(ResourceError::UnknownResource)
     }
 
+    fn get(&self, id: ResourceId) -> Result<&ResourceEntry, ResourceError> {
+        self.resources
+            .get(&id)
+            .ok_or(ResourceError::UnknownResource)
+    }
+
     fn len(&self) -> usize {
         self.resources.len()
     }
@@ -243,7 +280,10 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
-    use qgs_protocol::{BufferUsageFlags, DeviceId, MemoryPreference, MAX_BUFFER_SIZE_BYTES};
+    use qgs_protocol::{
+        BufferUsageFlags, DeviceId, ExportResourceRequest, ExternalHandleType, ExternalSharing,
+        MemoryPreference, MAX_BUFFER_SIZE_BYTES,
+    };
 
     #[test]
     fn creates_unique_sessions() {
@@ -395,6 +435,44 @@ mod tests {
     }
 
     #[test]
+    fn non_exportable_resource_export_is_rejected() {
+        let backend = MockBackend::default();
+        let mut session = SessionManager::new().create_session().expect("session");
+        let created = session
+            .create_buffer(&backend, &sample_buffer_desc())
+            .expect("buffer created");
+
+        let err = session
+            .export_resource(&ExportResourceRequest {
+                resource_id: created.resource_id,
+                handle_type: ExternalHandleType::DmaBuf,
+            })
+            .expect_err("mock resource is not exportable");
+
+        assert!(matches!(err, ResourceError::ResourceNotExportable));
+    }
+
+    #[test]
+    fn session_cannot_export_another_sessions_resource() {
+        let backend = MockBackend::default();
+        let sessions = SessionManager::new();
+        let mut first_session = sessions.create_session().expect("first session");
+        let second_session = sessions.create_session().expect("second session");
+        let created = first_session
+            .create_buffer(&backend, &sample_buffer_desc())
+            .expect("buffer created");
+
+        let err = second_session
+            .export_resource(&ExportResourceRequest {
+                resource_id: created.resource_id,
+                handle_type: ExternalHandleType::DmaBuf,
+            })
+            .expect_err("resource belongs to another session");
+
+        assert!(matches!(err, ResourceError::UnknownResource));
+    }
+
+    #[test]
     fn dropping_session_releases_all_owned_resources() {
         let backend = MockBackend::default();
         {
@@ -434,6 +512,7 @@ mod tests {
             size_bytes: 1024,
             usage: BufferUsageFlags::TRANSFER_SRC | BufferUsageFlags::TRANSFER_DST,
             memory_preference: MemoryPreference::device_preferred(),
+            external_sharing: ExternalSharing::None,
         }
     }
 
@@ -465,6 +544,8 @@ mod tests {
     struct MockResource {
         drop_count: Arc<AtomicUsize>,
     }
+
+    impl BackendResource for MockResource {}
 
     impl Drop for MockResource {
         fn drop(&mut self) {

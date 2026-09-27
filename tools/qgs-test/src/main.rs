@@ -1,13 +1,20 @@
 #![forbid(unsafe_code)]
 
+use std::fs::File;
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
-use qgs_linux::{connect_socket, default_socket_path, receive_message, send_message};
+use qgs_linux::{
+    connect_socket, default_socket_path, receive_message, receive_message_with_attachments,
+    send_message,
+};
 use qgs_protocol::{
     BufferDesc, BufferUsageFlags, CreateBufferRequest, DestroyResourceRequest, DeviceCapabilities,
-    DeviceClass, DeviceDesc, HelloRequest, MemoryPreference, QueryDeviceCapabilitiesRequest,
-    ResourceId, SelectedMemoryProperties, WireMessage, CURRENT_PROTOCOL_VERSION,
+    DeviceClass, DeviceDesc, ErrorResponse, ExportResourceRequest, ExternalHandleType,
+    ExternalSharing, HelloRequest, MemoryPreference, QueryDeviceCapabilitiesRequest, ResourceId,
+    SelectedMemoryProperties, WireMessage, CURRENT_PROTOCOL_VERSION,
 };
+use qgs_vulkan::VulkanDeviceDiscovery;
 
 const DEMO_BUFFER_SIZE: u64 = 1024 * 1024;
 
@@ -113,11 +120,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for device in &physical_devices {
         request_id += 1;
-        let resource_id = create_buffer(&mut stream, request_id, device, DEMO_BUFFER_SIZE)?;
+        let resource_id = create_buffer(
+            &mut stream,
+            request_id,
+            device,
+            DEMO_BUFFER_SIZE,
+            ExternalSharing::None,
+        )?;
 
         request_id += 1;
         destroy_resource(&mut stream, request_id, resource_id)?;
         println!("Resource destroyed successfully.");
+        println!();
+    }
+
+    println!("External memory sharing:");
+    for device in &physical_devices {
+        request_id = test_external_memory(&mut stream, request_id, device)?;
         println!();
     }
 
@@ -126,7 +145,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[{:?}] {}", device.class, device.name);
         for _ in 0..3 {
             request_id += 1;
-            let _ = create_buffer(&mut stream, request_id, device, 64 * 1024)?;
+            let _ = create_buffer(
+                &mut stream,
+                request_id,
+                device,
+                64 * 1024,
+                ExternalSharing::None,
+            )?;
         }
         println!("Leaving 3 transient buffers alive and disconnecting.");
     }
@@ -215,6 +240,7 @@ fn create_buffer(
     request_id: u64,
     device: &DeviceDesc,
     size_bytes: u64,
+    external_sharing: ExternalSharing,
 ) -> Result<ResourceId, Box<dyn std::error::Error>> {
     println!("Creating {} buffer on:", format_size(size_bytes));
     println!("[{:?}] {}", device.class, device.name);
@@ -234,6 +260,7 @@ fn create_buffer(
                         host_visible_required: false,
                         host_coherent_preferred: true,
                     },
+                    external_sharing,
                 },
             },
         },
@@ -258,6 +285,149 @@ fn create_buffer(
     print_selected_memory(response.selected_memory);
 
     Ok(response.resource_id)
+}
+
+fn create_host_visible_external_buffer(
+    stream: &mut std::os::unix::net::UnixStream,
+    request_id: u64,
+    device: &DeviceDesc,
+    handle_type: ExternalHandleType,
+) -> Result<Result<ResourceId, ErrorResponse>, Box<dyn std::error::Error>> {
+    println!("Testing external memory on:");
+    println!("[{:?}] {}", device.class, device.name);
+    println!("  requested handle: {handle_type}");
+    send_message(
+        stream,
+        &WireMessage::CreateBuffer {
+            request_id,
+            request: CreateBufferRequest {
+                desc: BufferDesc {
+                    device_id: device.id,
+                    size_bytes: DEMO_BUFFER_SIZE,
+                    usage: BufferUsageFlags::TRANSFER_SRC
+                        | BufferUsageFlags::TRANSFER_DST
+                        | BufferUsageFlags::STORAGE,
+                    memory_preference: MemoryPreference {
+                        device_preferred: true,
+                        host_visible_required: true,
+                        host_coherent_preferred: true,
+                    },
+                    external_sharing: ExternalSharing::Required { handle_type },
+                },
+            },
+        },
+    )?;
+
+    match receive_message(stream)? {
+        WireMessage::BufferCreated {
+            request_id: response_request_id,
+            response,
+        } => {
+            if response_request_id != request_id {
+                return Err("buffer created request_id did not match request".into());
+            }
+            println!("Created:");
+            println!("  ResourceId: {}", response.resource_id.get());
+            println!("  size: {}", response.size_bytes);
+            println!("  exportable: yes");
+            print_selected_memory(response.selected_memory);
+            Ok(Ok(response.resource_id))
+        }
+        WireMessage::Error {
+            request_id: response_request_id,
+            response,
+        } => {
+            if response_request_id != request_id {
+                return Err("buffer error request_id did not match request".into());
+            }
+            Ok(Err(response))
+        }
+        _ => Err("expected BUFFER_CREATED or ERROR response".into()),
+    }
+}
+
+fn test_external_memory(
+    stream: &mut std::os::unix::net::UnixStream,
+    mut request_id: u64,
+    device: &DeviceDesc,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    for handle_type in [ExternalHandleType::DmaBuf, ExternalHandleType::OpaqueFd] {
+        request_id += 1;
+        let resource_id =
+            match create_host_visible_external_buffer(stream, request_id, device, handle_type)? {
+                Ok(resource_id) => resource_id,
+                Err(error) => {
+                    println!("  create failed for {handle_type}: {:?}", error.code);
+                    continue;
+                }
+            };
+
+        request_id += 1;
+        send_message(
+            stream,
+            &WireMessage::ExportResource {
+                request_id,
+                request: ExportResourceRequest {
+                    resource_id,
+                    handle_type,
+                },
+            },
+        )?;
+        let received = receive_message_with_attachments::<1>(stream)?;
+        let WireMessage::ResourceExported {
+            request_id: response_request_id,
+            response,
+        } = received.message
+        else {
+            request_id += 1;
+            destroy_resource(stream, request_id, resource_id)?;
+            return Err("expected RESOURCE_EXPORTED response".into());
+        };
+        if response_request_id != request_id {
+            request_id += 1;
+            destroy_resource(stream, request_id, resource_id)?;
+            return Err("resource exported request_id did not match request".into());
+        }
+        if response.metadata.resource_id != resource_id || response.metadata.attachment_count != 1 {
+            request_id += 1;
+            destroy_resource(stream, request_id, resource_id)?;
+            return Err("resource export metadata did not match request".into());
+        }
+        let Some(handle) = received.attachments.into_iter().next() else {
+            request_id += 1;
+            destroy_resource(stream, request_id, resource_id)?;
+            return Err("missing exported FD attachment".into());
+        };
+
+        println!("Export:");
+        println!("  mechanism: {}", response.metadata.handle_type);
+        println!("  native FD received: yes");
+
+        validate_import(device, &response.metadata, handle)?;
+
+        request_id += 1;
+        destroy_resource(stream, request_id, resource_id)?;
+        println!("QGS resource cleanup: success");
+        return Ok(request_id);
+    }
+
+    println!("  external sharing unsupported on this device by current driver");
+    Ok(request_id)
+}
+
+fn validate_import(
+    device: &DeviceDesc,
+    metadata: &qgs_protocol::ExportedResourceMetadata,
+    handle: OwnedFd,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let importer = VulkanDeviceDiscovery::new()?;
+    importer.import_and_validate_external_buffer(device, metadata, File::from(handle))?;
+
+    println!("Import:");
+    println!("  second Vulkan context: success");
+    println!("  shared allocation validation: success");
+
+    Ok(())
 }
 
 fn destroy_resource(

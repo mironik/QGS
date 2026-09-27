@@ -5,11 +5,11 @@ use std::path::PathBuf;
 use qgs_core::{DeviceDiscovery, ResourceBackend, ResourceError, Session, SessionManager};
 use qgs_linux::{
     bind_socket, default_socket_path, receive_message, remove_socket_file, send_message,
-    TransportError,
+    send_message_with_attachments, TransportError,
 };
 use qgs_protocol::{
     DeviceCapabilitiesResponse, DeviceListResponse, ErrorResponse, ProtocolError,
-    ProtocolErrorCode, WireMessage,
+    ProtocolErrorCode, ResourceExportedResponse, WireMessage,
 };
 use qgs_vulkan::VulkanDeviceDiscovery;
 
@@ -204,12 +204,45 @@ fn handle_client(
                     }
                 }
             }
+            WireMessage::ExportResource { request, .. } => {
+                if let Some(session) = &session {
+                    match session.export_resource(&request) {
+                        Ok(export) => {
+                            let message = WireMessage::ResourceExported {
+                                request_id,
+                                response: ResourceExportedResponse {
+                                    metadata: export.metadata,
+                                },
+                            };
+                            send_message_with_attachments(stream, &message, &[&export.handle])?;
+                            continue;
+                        }
+                        Err(err) => {
+                            eprintln!("resource export failed: {err}");
+                            WireMessage::Error {
+                                request_id,
+                                response: ErrorResponse {
+                                    code: protocol_code_from_resource_error(&err),
+                                },
+                            }
+                        }
+                    }
+                } else {
+                    WireMessage::Error {
+                        request_id,
+                        response: ErrorResponse {
+                            code: ProtocolErrorCode::SessionRequired,
+                        },
+                    }
+                }
+            }
             WireMessage::Welcome { .. }
             | WireMessage::Error { .. }
             | WireMessage::DeviceList { .. }
             | WireMessage::DeviceCapabilities { .. }
             | WireMessage::BufferCreated { .. }
-            | WireMessage::ResourceDestroyed { .. } => WireMessage::Error {
+            | WireMessage::ResourceDestroyed { .. }
+            | WireMessage::ResourceExported { .. } => WireMessage::Error {
                 request_id,
                 response: ErrorResponse {
                     code: ProtocolErrorCode::from(&ProtocolError::MalformedPayload),
@@ -229,6 +262,11 @@ fn protocol_code_from_resource_error(err: &ResourceError) -> ProtocolErrorCode {
         ResourceError::UnsupportedMemoryRequirements => {
             ProtocolErrorCode::UnsupportedMemoryRequirements
         }
+        ResourceError::ResourceNotExportable => ProtocolErrorCode::ResourceNotExportable,
+        ResourceError::UnsupportedExternalHandleType => {
+            ProtocolErrorCode::UnsupportedExternalHandleType
+        }
+        ResourceError::ExportFailed => ProtocolErrorCode::ExportFailed,
         ResourceError::UnknownDeviceId => ProtocolErrorCode::UnknownDeviceId,
         ResourceError::Protocol(err) => ProtocolErrorCode::from(err),
     }

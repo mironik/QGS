@@ -81,6 +81,31 @@ Vulkan buffers, memory objects, and handles do not escape `qgs-vulkan`.
 M1 Step 5 implements buffers only. The maximum single buffer size is 64 MiB as
 a conservative M1 safety limit, not as a final product limit.
 
+M1 Step 6 adds Linux external-memory sharing for buffers that were created as
+exportable. Exporting a resource does not transfer QGS ownership: the
+`ResourceId` remains owned by its session, while the exported native FD is a
+duplicated OS/Vulkan reference transferred to the client. Client-side imported
+objects have their own lifetime after import according to OS and Vulkan
+external-memory semantics. QGS does not add distributed reference counting.
+
+The control/data/native-handle split is:
+
+```text
+QGS protocol payload metadata
+    !=
+native Linux transport attachment
+    !=
+shared GPU resource contents
+```
+
+Normal QGS protocol messages carry bounded metadata only. The Linux transport
+uses `SCM_RIGHTS` for the native FD attachment. Buffer contents are not copied
+through IPC.
+
+Unsafe Rust remains prohibited in all normal QGS crates. A narrowly scoped,
+documented unsafe boundary exists in `qgs-vulkan` only for Vulkano external
+memory import where no practical safe API is available. See `docs/safety.md`.
+
 ## Current Scope
 
 The initial workspace contains an explicit v0.1 protocol wire encoding, minimal
@@ -88,11 +113,12 @@ session management, Linux Unix Domain Socket transport, and Vulkan-backed
 device enumeration and static capability discovery through the `DeviceDiscovery`
 abstraction. It reports compute queue limits, memory heap/type summaries, and
 external-memory/synchronization mechanism availability. It can create and
-destroy session-owned Vulkan-backed buffer resources. It does not include an
-async runtime, daemonization, DRM, DMA-BUF transfer/export, external handle
-transfer, images, video surfaces, video decode, video encode, compute
-execution, workload scheduling, performance benchmarking, telemetry, or
-free-memory reporting.
+destroy session-owned Vulkan-backed buffer resources and can export/import
+external-memory FDs for explicitly exportable buffers on supported drivers. It
+does not include an async runtime, daemonization, DRM/KMS, image resources,
+video surfaces, video decode, video encode, compute execution, external
+semaphore workflows, workload scheduling, performance benchmarking, telemetry,
+or free-memory reporting.
 
 Capability discovery is static information reported by the backend. It is not a
 measurement of current load, available/free VRAM, throughput, or scheduling

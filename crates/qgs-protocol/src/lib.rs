@@ -36,6 +36,8 @@ const CREATE_BUFFER_PAYLOAD_LEN: usize = 24;
 const BUFFER_CREATED_PAYLOAD_LEN: usize = 24;
 const DESTROY_RESOURCE_PAYLOAD_LEN: usize = 8;
 const RESOURCE_DESTROYED_PAYLOAD_LEN: usize = 8;
+const EXPORT_RESOURCE_PAYLOAD_LEN: usize = 16;
+const RESOURCE_EXPORTED_PAYLOAD_LEN: usize = 48;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ProtocolVersion {
@@ -123,6 +125,7 @@ pub enum Request {
     QueryDeviceCapabilities(QueryDeviceCapabilitiesRequest),
     CreateBuffer(CreateBufferRequest),
     DestroyResource(DestroyResourceRequest),
+    ExportResource(ExportResourceRequest),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -159,6 +162,12 @@ pub struct DestroyResourceRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExportResourceRequest {
+    pub resource_id: ResourceId,
+    pub handle_type: ExternalHandleType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Response {
     Welcome(WelcomeResponse),
     Error(ErrorResponse),
@@ -166,6 +175,7 @@ pub enum Response {
     DeviceCapabilities(DeviceCapabilitiesResponse),
     BufferCreated(BufferCreatedResponse),
     ResourceDestroyed(ResourceDestroyedResponse),
+    ResourceExported(ResourceExportedResponse),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -408,6 +418,7 @@ pub struct BufferDesc {
     pub size_bytes: u64,
     pub usage: BufferUsageFlags,
     pub memory_preference: MemoryPreference,
+    pub external_sharing: ExternalSharing,
 }
 
 impl BufferDesc {
@@ -435,6 +446,90 @@ pub struct BufferCreatedResponse {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourceDestroyedResponse {
     pub resource_id: ResourceId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalHandleType {
+    DmaBuf,
+    OpaqueFd,
+}
+
+impl ExternalHandleType {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::DmaBuf => 1,
+            Self::OpaqueFd => 2,
+        }
+    }
+}
+
+impl TryFrom<u8> for ExternalHandleType {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::DmaBuf),
+            2 => Ok(Self::OpaqueFd),
+            _ => Err(ProtocolError::MalformedPayload),
+        }
+    }
+}
+
+impl fmt::Display for ExternalHandleType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DmaBuf => write!(f, "DMA-BUF"),
+            Self::OpaqueFd => write!(f, "opaque-fd"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalSharing {
+    None,
+    Required { handle_type: ExternalHandleType },
+}
+
+impl ExternalSharing {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Required { handle_type } => handle_type.wire_value(),
+        }
+    }
+}
+
+impl TryFrom<u8> for ExternalSharing {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::None),
+            1 | 2 => Ok(Self::Required {
+                handle_type: ExternalHandleType::try_from(value)?,
+            }),
+            _ => Err(ProtocolError::MalformedPayload),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResourceExportedResponse {
+    pub metadata: ExportedResourceMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExportedResourceMetadata {
+    pub resource_id: ResourceId,
+    pub device_id: DeviceId,
+    pub size_bytes: u64,
+    pub allocation_size_bytes: u64,
+    pub usage: BufferUsageFlags,
+    pub backend_memory_type_index: u32,
+    pub handle_type: ExternalHandleType,
+    pub selected_memory: SelectedMemoryProperties,
+    pub dedicated_allocation: bool,
+    pub attachment_count: u8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -510,6 +605,9 @@ pub enum ProtocolErrorCode {
     AllocationFailed = 25,
     UnsupportedMemoryRequirements = 26,
     InvalidBufferUsage = 27,
+    ResourceNotExportable = 28,
+    UnsupportedExternalHandleType = 29,
+    ExportFailed = 30,
 }
 
 impl ProtocolErrorCode {
@@ -550,6 +648,9 @@ impl TryFrom<u32> for ProtocolErrorCode {
             25 => Ok(Self::AllocationFailed),
             26 => Ok(Self::UnsupportedMemoryRequirements),
             27 => Ok(Self::InvalidBufferUsage),
+            28 => Ok(Self::ResourceNotExportable),
+            29 => Ok(Self::UnsupportedExternalHandleType),
+            30 => Ok(Self::ExportFailed),
             _ => Err(ProtocolError::MalformedPayload),
         }
     }
@@ -619,6 +720,9 @@ pub enum ProtocolError {
     InvalidBufferUsage {
         flags: u32,
     },
+    ResourceNotExportable,
+    UnsupportedExternalHandleType,
+    ExportFailed,
     MalformedPayload,
     InvalidVersionRange {
         min: ProtocolVersion,
@@ -689,6 +793,11 @@ impl fmt::Display for ProtocolError {
             Self::InvalidBufferUsage { flags } => {
                 write!(f, "invalid buffer usage flags: {flags:#010x}")
             }
+            Self::ResourceNotExportable => write!(f, "resource is not exportable"),
+            Self::UnsupportedExternalHandleType => {
+                write!(f, "unsupported external handle type")
+            }
+            Self::ExportFailed => write!(f, "resource export failed"),
             Self::MalformedPayload => write!(f, "malformed payload"),
             Self::InvalidVersionRange { min, max } => {
                 write!(f, "invalid protocol version range: {min}..={max}")
@@ -737,6 +846,9 @@ impl From<&ProtocolError> for ProtocolErrorCode {
             ProtocolError::AllocationFailed => Self::AllocationFailed,
             ProtocolError::UnsupportedMemoryRequirements => Self::UnsupportedMemoryRequirements,
             ProtocolError::InvalidBufferUsage { .. } => Self::InvalidBufferUsage,
+            ProtocolError::ResourceNotExportable => Self::ResourceNotExportable,
+            ProtocolError::UnsupportedExternalHandleType => Self::UnsupportedExternalHandleType,
+            ProtocolError::ExportFailed => Self::ExportFailed,
             ProtocolError::InvalidVersionRange { .. } => Self::InvalidVersionRange,
             ProtocolError::UnsupportedVersion { .. } => Self::UnsupportedVersion,
         }
@@ -760,6 +872,7 @@ pub enum RequestOpcode {
     QueryDeviceCapabilities,
     CreateBuffer,
     DestroyResource,
+    ExportResource,
 }
 
 impl RequestOpcode {
@@ -770,6 +883,7 @@ impl RequestOpcode {
             Self::QueryDeviceCapabilities => 3,
             Self::CreateBuffer => 4,
             Self::DestroyResource => 5,
+            Self::ExportResource => 6,
         }
     }
 }
@@ -782,6 +896,7 @@ pub enum ResponseOpcode {
     DeviceCapabilities,
     BufferCreated,
     ResourceDestroyed,
+    ResourceExported,
 }
 
 impl ResponseOpcode {
@@ -793,6 +908,7 @@ impl ResponseOpcode {
             Self::DeviceCapabilities => 4,
             Self::BufferCreated => 5,
             Self::ResourceDestroyed => 6,
+            Self::ResourceExported => 7,
         }
     }
 }
@@ -828,6 +944,10 @@ pub enum WireMessage {
         request_id: u64,
         request: DestroyResourceRequest,
     },
+    ExportResource {
+        request_id: u64,
+        request: ExportResourceRequest,
+    },
     Welcome {
         request_id: u64,
         response: WelcomeResponse,
@@ -852,6 +972,10 @@ pub enum WireMessage {
         request_id: u64,
         response: ResourceDestroyedResponse,
     },
+    ResourceExported {
+        request_id: u64,
+        response: ResourceExportedResponse,
+    },
 }
 
 impl WireMessage {
@@ -862,12 +986,14 @@ impl WireMessage {
             | Self::QueryDeviceCapabilities { request_id, .. }
             | Self::CreateBuffer { request_id, .. }
             | Self::DestroyResource { request_id, .. }
+            | Self::ExportResource { request_id, .. }
             | Self::Welcome { request_id, .. }
             | Self::Error { request_id, .. }
             | Self::DeviceList { request_id, .. }
             | Self::DeviceCapabilities { request_id, .. }
             | Self::BufferCreated { request_id, .. }
-            | Self::ResourceDestroyed { request_id, .. } => *request_id,
+            | Self::ResourceDestroyed { request_id, .. }
+            | Self::ResourceExported { request_id, .. } => *request_id,
         }
     }
 }
@@ -915,6 +1041,15 @@ pub fn encode_wire_message(message: &WireMessage) -> Vec<u8> {
             RequestOpcode::DestroyResource.wire_value(),
             *request_id,
             encode_destroy_resource_payload(request),
+        ),
+        WireMessage::ExportResource {
+            request_id,
+            request,
+        } => (
+            MessageKind::Request,
+            RequestOpcode::ExportResource.wire_value(),
+            *request_id,
+            encode_export_resource_payload(request),
         ),
         WireMessage::Welcome {
             request_id,
@@ -969,6 +1104,15 @@ pub fn encode_wire_message(message: &WireMessage) -> Vec<u8> {
             ResponseOpcode::ResourceDestroyed.wire_value(),
             *request_id,
             encode_resource_destroyed_payload(response),
+        ),
+        WireMessage::ResourceExported {
+            request_id,
+            response,
+        } => (
+            MessageKind::Response,
+            ResponseOpcode::ResourceExported.wire_value(),
+            *request_id,
+            encode_resource_exported_payload(response),
         ),
     };
 
@@ -1096,6 +1240,10 @@ pub fn decode_wire_message_parts(
             request_id: header.request_id,
             request: decode_destroy_resource_payload(payload)?,
         }),
+        (MessageKind::Request, 6) => Ok(WireMessage::ExportResource {
+            request_id: header.request_id,
+            request: decode_export_resource_payload(payload)?,
+        }),
         (MessageKind::Response, 1) => Ok(WireMessage::Welcome {
             request_id: header.request_id,
             response: decode_welcome_payload(payload)?,
@@ -1119,6 +1267,10 @@ pub fn decode_wire_message_parts(
         (MessageKind::Response, 6) => Ok(WireMessage::ResourceDestroyed {
             request_id: header.request_id,
             response: decode_resource_destroyed_payload(payload)?,
+        }),
+        (MessageKind::Response, 7) => Ok(WireMessage::ResourceExported {
+            request_id: header.request_id,
+            response: decode_resource_exported_payload(payload)?,
         }),
         _ => Err(ProtocolError::UnknownOpcode {
             kind: header.kind,
@@ -1180,7 +1332,7 @@ fn encode_wire_header(header: &WireHeader, bytes: &mut Vec<u8>) {
 
 fn validate_opcode(kind: MessageKind, opcode: u8) -> Result<(), ProtocolError> {
     match (kind, opcode) {
-        (MessageKind::Request, 1..=5) | (MessageKind::Response, 1..=6) => Ok(()),
+        (MessageKind::Request, 1..=6) | (MessageKind::Response, 1..=7) => Ok(()),
         _ => Err(ProtocolError::UnknownOpcode { kind, opcode }),
     }
 }
@@ -1269,7 +1421,8 @@ fn encode_create_buffer_payload(request: &CreateBufferRequest) -> Vec<u8> {
     bytes.extend_from_slice(&request.desc.size_bytes.to_le_bytes());
     bytes.extend_from_slice(&request.desc.usage.bits().to_le_bytes());
     bytes.push(encode_memory_preference(request.desc.memory_preference));
-    bytes.extend_from_slice(&[0_u8; 3]);
+    bytes.push(request.desc.external_sharing.wire_value());
+    bytes.extend_from_slice(&[0_u8; 2]);
     bytes
 }
 
@@ -1286,7 +1439,7 @@ fn decode_create_buffer_payload(bytes: &[u8]) -> Result<CreateBufferRequest, Pro
             })
         };
     }
-    if bytes[21..24].iter().any(|value| *value != 0) {
+    if bytes[22..24].iter().any(|value| *value != 0) {
         return Err(ProtocolError::MalformedPayload);
     }
 
@@ -1295,6 +1448,7 @@ fn decode_create_buffer_payload(bytes: &[u8]) -> Result<CreateBufferRequest, Pro
         size_bytes: read_u64(bytes, 8),
         usage: BufferUsageFlags::new(read_u32(bytes, 16))?,
         memory_preference: decode_memory_preference(bytes[20])?,
+        external_sharing: ExternalSharing::try_from(bytes[21])?,
     };
     desc.validate()?;
 
@@ -1321,6 +1475,37 @@ fn decode_destroy_resource_payload(bytes: &[u8]) -> Result<DestroyResourceReques
 
     Ok(DestroyResourceRequest {
         resource_id: ResourceId::new(read_u64(bytes, 0))?,
+    })
+}
+
+fn encode_export_resource_payload(request: &ExportResourceRequest) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(EXPORT_RESOURCE_PAYLOAD_LEN);
+    bytes.extend_from_slice(&request.resource_id.get().to_le_bytes());
+    bytes.push(request.handle_type.wire_value());
+    bytes.extend_from_slice(&[0_u8; 7]);
+    bytes
+}
+
+fn decode_export_resource_payload(bytes: &[u8]) -> Result<ExportResourceRequest, ProtocolError> {
+    if bytes.len() != EXPORT_RESOURCE_PAYLOAD_LEN {
+        return if bytes.len() < EXPORT_RESOURCE_PAYLOAD_LEN {
+            Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len(),
+                expected: EXPORT_RESOURCE_PAYLOAD_LEN,
+            })
+        } else {
+            Err(ProtocolError::TrailingPayload {
+                len: bytes.len() - EXPORT_RESOURCE_PAYLOAD_LEN,
+            })
+        };
+    }
+    if bytes[9..16].iter().any(|value| *value != 0) {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(ExportResourceRequest {
+        resource_id: ResourceId::new(read_u64(bytes, 0))?,
+        handle_type: ExternalHandleType::try_from(bytes[8])?,
     })
 }
 
@@ -1635,6 +1820,63 @@ fn decode_resource_destroyed_payload(
 
     Ok(ResourceDestroyedResponse {
         resource_id: ResourceId::new(read_u64(bytes, 0))?,
+    })
+}
+
+fn encode_resource_exported_payload(response: &ResourceExportedResponse) -> Vec<u8> {
+    let metadata = &response.metadata;
+    let mut bytes = Vec::with_capacity(RESOURCE_EXPORTED_PAYLOAD_LEN);
+    bytes.extend_from_slice(&metadata.resource_id.get().to_le_bytes());
+    bytes.extend_from_slice(&metadata.device_id.get().to_le_bytes());
+    bytes.extend_from_slice(&metadata.size_bytes.to_le_bytes());
+    bytes.extend_from_slice(&metadata.allocation_size_bytes.to_le_bytes());
+    bytes.extend_from_slice(&metadata.usage.bits().to_le_bytes());
+    bytes.extend_from_slice(&metadata.backend_memory_type_index.to_le_bytes());
+    bytes.push(metadata.handle_type.wire_value());
+    bytes.push(encode_selected_memory(metadata.selected_memory));
+    bytes.push(bool_to_u8(metadata.dedicated_allocation));
+    bytes.push(metadata.attachment_count);
+    bytes.extend_from_slice(&[0_u8; 4]);
+    bytes
+}
+
+fn decode_resource_exported_payload(
+    bytes: &[u8],
+) -> Result<ResourceExportedResponse, ProtocolError> {
+    if bytes.len() != RESOURCE_EXPORTED_PAYLOAD_LEN {
+        return if bytes.len() < RESOURCE_EXPORTED_PAYLOAD_LEN {
+            Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len(),
+                expected: RESOURCE_EXPORTED_PAYLOAD_LEN,
+            })
+        } else {
+            Err(ProtocolError::TrailingPayload {
+                len: bytes.len() - RESOURCE_EXPORTED_PAYLOAD_LEN,
+            })
+        };
+    }
+    if bytes[44..48].iter().any(|value| *value != 0) {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    let size_bytes = validate_buffer_size(read_u64(bytes, 16))?;
+    let allocation_size_bytes = read_u64(bytes, 24);
+    if allocation_size_bytes < size_bytes {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(ResourceExportedResponse {
+        metadata: ExportedResourceMetadata {
+            resource_id: ResourceId::new(read_u64(bytes, 0))?,
+            device_id: DeviceId::new(read_u64(bytes, 8))?,
+            size_bytes,
+            allocation_size_bytes,
+            usage: BufferUsageFlags::new(read_u32(bytes, 32))?,
+            backend_memory_type_index: read_u32(bytes, 36),
+            handle_type: ExternalHandleType::try_from(bytes[40])?,
+            selected_memory: decode_selected_memory(bytes[41])?,
+            dedicated_allocation: read_bool(bytes[42])?,
+            attachment_count: bytes[43],
+        },
     })
 }
 
@@ -2492,6 +2734,39 @@ mod tests {
     }
 
     #[test]
+    fn external_sharing_wire_round_trip() {
+        let mut desc = sample_buffer_desc();
+        desc.external_sharing = ExternalSharing::Required {
+            handle_type: ExternalHandleType::DmaBuf,
+        };
+        let message = WireMessage::CreateBuffer {
+            request_id: 347,
+            request: CreateBufferRequest { desc },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_external_sharing_value() {
+        let mut bytes = encode_wire_message(&WireMessage::CreateBuffer {
+            request_id: 348,
+            request: CreateBufferRequest {
+                desc: sample_buffer_desc(),
+            },
+        });
+        bytes[WIRE_HEADER_LEN + 21] = 99;
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::MalformedPayload)
+        );
+    }
+
+    #[test]
     fn buffer_created_response_round_trip() {
         let message = WireMessage::BufferCreated {
             request_id: 35,
@@ -2532,6 +2807,68 @@ mod tests {
             decode_wire_message(&encode_wire_message(&message)),
             Ok(message)
         );
+    }
+
+    #[test]
+    fn export_resource_request_round_trip() {
+        let message = WireMessage::ExportResource {
+            request_id: 371,
+            request: ExportResourceRequest {
+                resource_id: ResourceId::new(9).expect("resource id"),
+                handle_type: ExternalHandleType::OpaqueFd,
+            },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn resource_exported_response_round_trip() {
+        let message = WireMessage::ResourceExported {
+            request_id: 372,
+            response: sample_resource_exported(9),
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn rejects_zero_resource_id_in_export_request() {
+        let mut bytes = encode_wire_message(&WireMessage::ExportResource {
+            request_id: 373,
+            request: ExportResourceRequest {
+                resource_id: ResourceId::new(9).expect("resource id"),
+                handle_type: ExternalHandleType::DmaBuf,
+            },
+        });
+        bytes[WIRE_HEADER_LEN..WIRE_HEADER_LEN + 8].copy_from_slice(&0_u64.to_le_bytes());
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::InvalidResourceId)
+        );
+    }
+
+    #[test]
+    fn preserves_export_attachment_metadata() {
+        let mut response = sample_resource_exported(11);
+        response.metadata.attachment_count = 1;
+        let message = WireMessage::ResourceExported {
+            request_id: 374,
+            response,
+        };
+
+        let decoded = decode_wire_message(&encode_wire_message(&message)).expect("decode export");
+        let WireMessage::ResourceExported { response, .. } = decoded else {
+            panic!("expected RESOURCE_EXPORTED");
+        };
+        assert_eq!(response.metadata.attachment_count, 1);
     }
 
     #[test]
@@ -2698,6 +3035,15 @@ mod tests {
                 ProtocolError::UnsupportedMemoryRequirements,
                 ProtocolErrorCode::UnsupportedMemoryRequirements,
             ),
+            (
+                ProtocolError::ResourceNotExportable,
+                ProtocolErrorCode::ResourceNotExportable,
+            ),
+            (
+                ProtocolError::UnsupportedExternalHandleType,
+                ProtocolErrorCode::UnsupportedExternalHandleType,
+            ),
+            (ProtocolError::ExportFailed, ProtocolErrorCode::ExportFailed),
         ] {
             assert_eq!(ProtocolErrorCode::from(&error), code);
             assert_eq!(ProtocolErrorCode::try_from(code.wire_value()), Ok(code));
@@ -2757,6 +3103,7 @@ mod tests {
                 host_visible_required: false,
                 host_coherent_preferred: true,
             },
+            external_sharing: ExternalSharing::None,
         }
     }
 
@@ -2768,6 +3115,27 @@ mod tests {
                 device_local: true,
                 host_visible: true,
                 host_coherent: false,
+            },
+        }
+    }
+
+    fn sample_resource_exported(raw_id: u64) -> ResourceExportedResponse {
+        ResourceExportedResponse {
+            metadata: ExportedResourceMetadata {
+                resource_id: ResourceId::new(raw_id).expect("resource id"),
+                device_id: DeviceId::new(1).expect("device id"),
+                size_bytes: 1024 * 1024,
+                allocation_size_bytes: 1024 * 1024,
+                usage: BufferUsageFlags::TRANSFER_SRC | BufferUsageFlags::TRANSFER_DST,
+                backend_memory_type_index: 0,
+                handle_type: ExternalHandleType::DmaBuf,
+                selected_memory: SelectedMemoryProperties {
+                    device_local: true,
+                    host_visible: true,
+                    host_coherent: true,
+                },
+                dedicated_allocation: false,
+                attachment_count: 1,
             },
         }
     }
