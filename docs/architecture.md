@@ -198,8 +198,8 @@ QGS models technical codec and surface properties: codec, codec-specific
 profile, bit depth, chroma subsampling, coded and visible dimensions, scan
 structure, field order, and output surface format. Product or workflow labels
 such as XDCAM and XAVC are not low-level QGS API concepts. A media application
-or demux/container layer may interpret MXF/container metadata and choose how to
-use QGS, but QGS does not parse MXF and does not encode Sony product semantics.
+or higher container/workflow layer may interpret source metadata and choose how
+to use QGS, but QGS low-level APIs do not encode Sony product semantics.
 
 `VideoSurface` is distinct from `Image`. A video surface describes
 decoder/media-oriented storage and frame semantics; it must not be assumed to
@@ -210,6 +210,45 @@ or real decoder allocation.
 The M2 video backend abstraction is intentionally small. Backends such as
 VA-API, Vulkan Video, or another vendor-neutral path translate their native
 profile and surface information into QGS-owned capability entries.
+
+## MXF Demux And Media Index Boundary
+
+M2 Step 7 introduces a small QGS-owned MXF demux/index layer:
+
+```text
+MXF
+    |
+qgs-mxf
+    |\
+    | +-- Media Index
+    | +-- Tracks / Timecode / Descriptors
+    |
+compressed essence access units
+    |
+qgs-codec-h264
+    |
+decoder backend
+```
+
+Container semantics and codec semantics remain separate. `qgs-mxf` owns KLV/BER
+scanning, partition recognition, track/source-media modeling, edit-rate and
+timecode preservation, essence location, and media-index entries. It does not
+parse H.264 SPS/PPS/slice syntax. It exposes bounded compressed access-unit
+bytes to `qgs-codec-h264`, which remains the codec frontend and owns H.264
+classification, POC, DPB, and reference semantics.
+
+The MXF media index is source-media structure, not an editor timeline. It uses
+exact rational edit rates and source timecode metadata where available. MXF
+track IDs, track numbers, QGS track identifiers, and codec stream identity are
+separate concepts and must not be treated as array indices or Qnc clip/timeline
+IDs.
+
+The Step 7 parser is intentionally bounded and fixture-driven. It recognizes
+the generated OP1a H.264 MXF structure, safely skips unknown KLV triplets where
+permitted, derives a video index from H.264 essence KLVs, and records whether
+the index is QGS-derived rather than MXF-provided. It does not implement the
+complete SMPTE MXF ecosystem, persistent index caching, file-opening protocol
+messages, audio decoding, video decoding, or product/workflow classification.
 
 ## H.264 Decode Frontend Boundary
 

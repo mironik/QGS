@@ -8,6 +8,7 @@ use qgs_linux::{
     connect_socket, default_socket_path, receive_message, receive_message_with_attachments,
     send_message,
 };
+use qgs_mxf::{MediaSource, RandomAccess, TrackKind};
 use qgs_protocol::{
     BitDepth, BufferDesc, BufferUsageFlags, ChromaSubsampling, CreateBufferRequest,
     CreateDecoderRequest, CreateImageRequest, CreateSyncRequest, DecoderConfig,
@@ -30,14 +31,19 @@ const IMAGE_PROOF_HEIGHT: u32 = 64;
 const VIDEO_CAPABILITIES_ONLY_ARG: &str = "--video-capabilities-only";
 const H264_DECODE_ONLY_ARG: &str = "--h264-decode-only";
 const HASWELL_VIDEO_DIAGNOSTIC_ARG: &str = "--haswell-video-diagnostic";
+const MXF_INSPECT_ARG: &str = "--mxf-inspect";
 const H264_FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/h264/idr-64x64-baseline.h264");
 const H264_LONG_GOP_FIXTURE: &[u8] =
     include_bytes!("../../../tests/fixtures/h264/long-gop-128x72-main.h264");
+const DEFAULT_MXF_FIXTURE: &str = "tests/fixtures/mxf/h264-8bit-420-long-gop-128x72.mxf";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     if args.haswell_video_diagnostic {
         return run_haswell_video_diagnostic();
+    }
+    if let Some(path) = args.mxf_inspect_path {
+        return inspect_mxf(&path);
     }
 
     let socket_path = args.socket_path;
@@ -328,6 +334,105 @@ fn run_haswell_video_diagnostic() -> Result<(), Box<dyn std::error::Error>> {
 
     let report = diagnose_haswell_video_import(input)?;
     print_haswell_diagnostic_report(&report);
+    Ok(())
+}
+
+fn inspect_mxf(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    let source = MediaSource::parse(&bytes)?;
+
+    println!("MXF:");
+    println!("  path: {}", path.display());
+    if let Some(duration) = source.duration {
+        println!("  duration edit units: {duration}");
+    }
+    if let Some(rate) = source.edit_rate {
+        println!("  edit rate: {}/{}", rate.numerator, rate.denominator);
+    }
+    println!("  KLV triplets: {}", source.klv_count);
+    println!("  partitions: {}", source.partitions.len());
+    if let Some(timecode) = &source.timecode {
+        println!("Timecode:");
+        println!("  start frame: {}", timecode.start_frame);
+        println!(
+            "  rate: {}/{}",
+            timecode.edit_rate.numerator, timecode.edit_rate.denominator
+        );
+        println!("  drop-frame: {}", yes_no(timecode.drop_frame));
+    }
+
+    println!("Tracks:");
+    for track in &source.tracks {
+        println!("  {:?} track {}", track.kind, track.id.0);
+        if let Some(rate) = track.edit_rate {
+            println!("    edit rate: {}/{}", rate.numerator, rate.denominator);
+        }
+        match track.kind {
+            TrackKind::Video => {
+                if let Some(video) = &track.video {
+                    println!("    codec: {:?}", video.codec);
+                    println!(
+                        "    dimensions: {} x {}",
+                        video.coded_width, video.coded_height
+                    );
+                    println!("    bit depth: {}", video.bit_depth);
+                    println!("    chroma: {:?}", video.chroma);
+                }
+            }
+            TrackKind::Audio => {
+                if let Some(audio) = &track.audio {
+                    println!("    channels: {:?}", audio.channels);
+                    println!("    bit depth: {:?}", audio.bit_depth);
+                }
+            }
+            TrackKind::Timecode | TrackKind::Other => {}
+        }
+    }
+
+    let random_access_points = source
+        .index
+        .video
+        .iter()
+        .filter(|entry| entry.random_access == RandomAccess::Yes)
+        .count();
+    println!("Index:");
+    println!("  video entries: {}", source.index.video.len());
+    println!("  random access points: {random_access_points}");
+
+    let target = source.index.video.len().saturating_div(2);
+    let start = source
+        .index
+        .nearest_random_access_before(target as u64)
+        .map(|entry| entry.edit_unit as usize)
+        .unwrap_or(target);
+    println!("Random access proof:");
+    println!("  target edit unit: {target}");
+    println!("  nearest prior random access: {start}");
+
+    let mut state = qgs_codec_h264::H264DecoderState::new();
+    let mut parsed_target = None;
+    for index in start..=target {
+        let access_unit = source.extract_video_access_unit(&bytes, index)?;
+        let parsed = state.parse_access_unit(&access_unit)?;
+        state.finish_picture(&parsed)?;
+        if index == target {
+            parsed_target = Some(parsed);
+        }
+    }
+    let parsed = parsed_target.ok_or("no target access unit parsed")?;
+    println!("H.264 classification:");
+    println!("  profile: {:?}", parsed.profile);
+    println!(
+        "  dimensions: {} x {}",
+        parsed.desc.coded_width, parsed.desc.coded_height
+    );
+    println!("  bit depth: {}", parsed.desc.bit_depth.get());
+    println!("  chroma: {:?}", parsed.desc.chroma);
+    println!(
+        "  picture kind: {:?}",
+        parsed.slices.first().map(|slice| &slice.kind)
+    );
+
     Ok(())
 }
 
@@ -1856,6 +1961,7 @@ struct Args {
     video_capabilities_only: bool,
     h264_decode_only: bool,
     haswell_video_diagnostic: bool,
+    mxf_inspect_path: Option<PathBuf>,
 }
 
 impl Args {
@@ -1864,14 +1970,22 @@ impl Args {
         let mut video_capabilities_only = false;
         let mut h264_decode_only = false;
         let mut haswell_video_diagnostic = false;
+        let mut mxf_inspect_path = None;
+        let mut next_arg_is_mxf_path = false;
 
         for arg in std::env::args_os().skip(1) {
-            if arg == VIDEO_CAPABILITIES_ONLY_ARG {
+            if next_arg_is_mxf_path {
+                mxf_inspect_path = Some(PathBuf::from(arg));
+                next_arg_is_mxf_path = false;
+            } else if arg == VIDEO_CAPABILITIES_ONLY_ARG {
                 video_capabilities_only = true;
             } else if arg == H264_DECODE_ONLY_ARG {
                 h264_decode_only = true;
             } else if arg == HASWELL_VIDEO_DIAGNOSTIC_ARG {
                 haswell_video_diagnostic = true;
+            } else if arg == MXF_INSPECT_ARG {
+                mxf_inspect_path = Some(PathBuf::from(DEFAULT_MXF_FIXTURE));
+                next_arg_is_mxf_path = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -1882,6 +1996,7 @@ impl Args {
             video_capabilities_only,
             h264_decode_only,
             haswell_video_diagnostic,
+            mxf_inspect_path,
         }
     }
 }

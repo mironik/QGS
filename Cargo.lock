@@ -461,6 +461,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "qgs-mxf"
+version = "0.1.0"
+dependencies = [
+ "qgs-codec-h264",
+ "qgs-protocol",
+]
+
+[[package]]
 name = "qgs-protocol"
 version = "0.1.0"
 
@@ -468,7 +476,9 @@ version = "0.1.0"
 name = "qgs-test"
 version = "0.1.0"
 dependencies = [
+ "qgs-codec-h264",
  "qgs-linux",
+ "qgs-mxf",
  "qgs-protocol",
  "qgs-vaapi",
  "qgs-vulkan",

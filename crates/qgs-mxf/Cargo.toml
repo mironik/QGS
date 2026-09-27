@@ -1,0 +1,9 @@
+[package]
+name = "qgs-mxf"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+qgs-codec-h264 = { path = "../qgs-codec-h264" }
+qgs-protocol = { path = "../qgs-protocol" }
