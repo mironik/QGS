@@ -15,6 +15,7 @@ use qgs_protocol::{
     ProtocolError, ProtocolErrorCode, ResourceExportedResponse, SyncExportedResponse,
     VideoCapabilities, VideoCapabilitiesResponse, WireMessage,
 };
+use qgs_software_video::SoftwareVideoBackend;
 use qgs_vaapi::VaapiVideoDiscovery;
 use qgs_vulkan::VulkanDeviceDiscovery;
 
@@ -29,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vulkan,
         devices,
         vaapi,
+        software_video: SoftwareVideoBackend::new(),
     };
 
     println!("qgsd listening on {}", socket_path.display());
@@ -48,6 +50,7 @@ struct QgsBackends {
     vulkan: VulkanDeviceDiscovery,
     devices: Vec<DeviceDesc>,
     vaapi: VaapiVideoDiscovery,
+    software_video: SoftwareVideoBackend,
 }
 
 impl DeviceDiscovery for QgsBackends {
@@ -113,7 +116,19 @@ impl DecoderBackend for QgsBackends {
         &self,
         request: &qgs_protocol::CreateDecoderRequest,
     ) -> Result<Box<dyn qgs_core::BackendDecoder>, DecoderError> {
-        self.vaapi.create_decoder(request)
+        match self.vaapi.create_decoder(request) {
+            Ok(decoder) => {
+                eprintln!("decoder backend selected: vaapi");
+                Ok(decoder)
+            }
+            Err(DecoderError::UnsupportedDecodeConfiguration)
+                if SoftwareVideoBackend::supports_config(&request.config) =>
+            {
+                eprintln!("decoder backend selected: software-video");
+                self.software_video.create_decoder(request)
+            }
+            Err(err) => Err(err),
+        }
     }
 }
 

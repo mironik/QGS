@@ -368,6 +368,34 @@ Compressed access units may travel through bounded normal QGS IPC for this M2
 proof. Raw decoded frames remain backend-owned VideoSurface resources and do
 not travel through normal protocol messages.
 
+M2 Step 9 adds the first software pixel decoder fallback:
+
+```text
+MXF
+    |
+qgs-mxf
+    |
+bounded compressed H.264 access units
+    |
+QGS decoder selection
+   / \
+VA-API hardware    qgs-software-video
+when supported         |
+                       v
+                 rsmpeg / libavcodec
+                       |
+                       v
+              software-backed VideoSurface
+```
+
+The software backend is deliberately not a replacement for `qgs-mxf`.
+libavformat is not used to open, demux, seek, or index MXF files. qgs-mxf
+continues to own container structure and random access; qgs-software-video owns
+only software decoder lifecycle and QGS-owned CPU VideoSurface backing. Decoded
+software frames may be copied once from decoder-owned `AVFrame` memory into
+owned QGS planes so that no FFmpeg pointers escape the backend. This is CPU
+software decode, not zero-copy video processing and not a GPU upload path.
+
 M2 Step 2 adds real VA-API decode capability discovery through a backend
 boundary:
 

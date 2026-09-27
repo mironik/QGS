@@ -5,6 +5,7 @@ members = [
     "crates/qgs-linux",
     "crates/qgs-mxf",
     "crates/qgs-protocol",
+    "crates/qgs-software-video",
     "crates/qgs-vaapi",
     "crates/qgs-vulkan",
     "daemon/qgsd",

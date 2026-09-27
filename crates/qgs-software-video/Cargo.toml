@@ -1,0 +1,10 @@
+[package]
+name = "qgs-software-video"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+qgs-core = { path = "../qgs-core" }
+qgs-protocol = { path = "../qgs-protocol" }
+rsmpeg = { version = "0.18.0", default-features = false, features = ["ffmpeg8", "link_system_ffmpeg"] }

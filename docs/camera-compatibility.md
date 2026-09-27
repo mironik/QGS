@@ -64,6 +64,12 @@ QGS result:
 - Metadata, H.264 SPS, and sidecar XML agree on the core technical video shape.
 - Current Intel Haswell VA-API capability still does not support H.264 10-bit
   4:2:2 hardware decode. This is a capability mismatch, not malformed media.
+- Step 9 software fallback decodes all 106 presentation frames through
+  `rsmpeg`/libavcodec while preserving `yuv422p10le` 10-bit 4:2:2 software
+  VideoSurface semantics.
+- Random access to edit unit 53 starts from the MXF-derived random-access point
+  at edit unit 48 and produces the same decoded-frame checksum as sequential
+  decode.
 
 Privacy handling:
 

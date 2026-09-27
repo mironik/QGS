@@ -21,6 +21,9 @@ use qgs_protocol::{
     SyncId, SyncKind, VideoCapabilities, VideoCodec, VideoProfile, WireMessage,
     CURRENT_PROTOCOL_VERSION,
 };
+use qgs_software_video::{
+    decoder_config_for_surface, DecodeRunStats, SoftwareH264Decoder, SoftwareVideoBackend,
+};
 use qgs_vulkan::{
     diagnose_haswell_video_import, DiagnosticDrmLayer, DiagnosticDrmObject, DiagnosticDrmPlane,
     HaswellVideoDiagnosticInput, VulkanDeviceDiscovery,
@@ -33,6 +36,7 @@ const VIDEO_CAPABILITIES_ONLY_ARG: &str = "--video-capabilities-only";
 const H264_DECODE_ONLY_ARG: &str = "--h264-decode-only";
 const HASWELL_VIDEO_DIAGNOSTIC_ARG: &str = "--haswell-video-diagnostic";
 const MXF_INSPECT_ARG: &str = "--mxf-inspect";
+const SOFTWARE_DECODE_MXF_ARG: &str = "--software-decode-mxf";
 const H264_FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/h264/idr-64x64-baseline.h264");
 const H264_LONG_GOP_FIXTURE: &[u8] =
     include_bytes!("../../../tests/fixtures/h264/long-gop-128x72-main.h264");
@@ -45,6 +49,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(path) = args.mxf_inspect_path {
         return inspect_mxf(&path);
+    }
+    if let Some(path) = args.software_decode_mxf_path {
+        return software_decode_mxf(&path);
     }
 
     let socket_path = args.socket_path;
@@ -525,6 +532,153 @@ fn inspect_mxf(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn software_decode_mxf(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    let source = MediaSource::parse(&bytes)?;
+    let first_access_unit = source.extract_video_access_unit(&bytes, 0)?;
+    let parsed = qgs_codec_h264::parse_annex_b_access_unit(&first_access_unit)?;
+    let config = decoder_config_for_surface(
+        qgs_protocol::DeviceId::new(1)?,
+        parsed.profile,
+        parsed.desc.bit_depth,
+        parsed.desc.chroma,
+        parsed.desc.coded_width,
+        parsed.desc.coded_height,
+    );
+    if !SoftwareVideoBackend::supports_config(&config) {
+        return Err("software backend does not support parsed stream".into());
+    }
+
+    let positioned = source
+        .index
+        .video
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            Ok((
+                entry.edit_unit,
+                source.extract_video_access_unit(&bytes, index)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, qgs_mxf::MxfError>>()?;
+    let sequential = decode_positioned_access_units_with_context(config.clone(), &positioned)?;
+
+    let target = 53_u64.min(source.index.video.len().saturating_sub(1) as u64);
+    let start = source
+        .index
+        .nearest_random_access_before(target)
+        .map(|entry| entry.edit_unit)
+        .unwrap_or(target);
+    let random_positioned = (start..=target)
+        .map(|edit_unit| {
+            let index = usize::try_from(edit_unit)?;
+            Ok((edit_unit, source.extract_video_access_unit(&bytes, index)?))
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    let random = decode_positioned_access_units_with_context(config, &random_positioned)?;
+
+    let sequential_target = sequential
+        .frames
+        .iter()
+        .find(|frame| frame.presentation_index == target)
+        .ok_or("sequential target frame missing")?;
+    let random_target = random
+        .frames
+        .iter()
+        .find(|frame| frame.presentation_index == target)
+        .ok_or("random-access target frame missing")?;
+    if sequential_target.checksum != random_target.checksum {
+        return Err("random-access target checksum did not match sequential decode".into());
+    }
+
+    let first = sequential.frames.first().ok_or("no decoded frames")?;
+    let middle = sequential_target;
+    let final_frame = sequential.frames.last().ok_or("no final decoded frame")?;
+    let plane_count = first.planes.len();
+    let owned_bytes = first.owned_bytes();
+    let peak_owned = owned_bytes
+        .checked_mul(sequential.max_live_surfaces.max(1))
+        .ok_or("software surface memory overflow")?;
+    let fps = if sequential.elapsed.as_secs_f64() > 0.0 {
+        sequential.frames.len() as f64 / sequential.elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+
+    println!("Software H.264 decode proof:");
+    println!("  file: {}", mxf_file_label(path));
+    println!("  backend: rsmpeg/libavcodec");
+    println!("  parsed profile: {:?}", parsed.profile);
+    println!(
+        "  parsed format: {} x {}, {}-bit {:?}",
+        parsed.desc.coded_width,
+        parsed.desc.coded_height,
+        parsed.desc.bit_depth.get(),
+        parsed.desc.chroma
+    );
+    println!("  software fallback selected: yes");
+    println!("  decoded frames: {}", sequential.frames.len());
+    println!("  decoder pixel format: {}", first.decoder_pixel_format);
+    println!("  storage format: {:?}", first.storage_format);
+    println!("  plane count: {plane_count}");
+    for (index, plane) in first.planes.iter().enumerate() {
+        println!(
+            "  plane {index}: width_samples={} height={} stride={} source_stride={} bytes={}",
+            plane.width_samples,
+            plane.height,
+            plane.stride_bytes,
+            plane.source_stride_bytes,
+            plane.data.len()
+        );
+    }
+    println!("  first checksum: 0x{:016x}", first.checksum);
+    println!(
+        "  sequential target {} checksum: 0x{:016x}",
+        target, middle.checksum
+    );
+    println!(
+        "  random target {} checksum: 0x{:016x}",
+        target, random_target.checksum
+    );
+    println!("  final checksum: 0x{:016x}", final_frame.checksum);
+    println!("  random-access target: {target}");
+    println!("  nearest prior random access: {start}");
+    println!("  random-access checksum match: yes");
+    println!("  bytes per software surface: {owned_bytes}");
+    println!(
+        "  max simultaneously live QGS software surfaces: {}",
+        sequential.max_live_surfaces
+    );
+    println!("  approximate peak QGS-owned frame memory: {peak_owned} bytes");
+    println!(
+        "  DEVELOPMENT OBSERVATION - NOT A BENCHMARK: {:.3}s, {:.2} fps",
+        sequential.elapsed.as_secs_f64(),
+        fps
+    );
+
+    Ok(())
+}
+
+fn decode_positioned_access_units_with_context(
+    config: DecoderConfig,
+    access_units: &[(u64, Vec<u8>)],
+) -> Result<DecodeRunStats, Box<dyn std::error::Error>> {
+    let mut decoder = SoftwareH264Decoder::new(config)?;
+    let mut frames = Vec::new();
+    for (position, access_unit) in access_units {
+        let decoded = decoder
+            .decode_access_unit_at(access_unit, *position)
+            .map_err(|err| format!("software decode failed at edit unit {position}: {err}"))?;
+        frames.extend(decoded);
+    }
+    frames.extend(decoder.flush_surfaces()?);
+    Ok(DecodeRunStats {
+        frames,
+        max_live_surfaces: decoder.max_live_surfaces(),
+        elapsed: decoder.elapsed(),
+    })
 }
 
 fn print_h264_gop_summary(
@@ -1725,19 +1879,19 @@ fn validate_import(
     Ok(())
 }
 
-fn test_h264_decode(
+fn query_h264_decode_support(
     stream: &mut std::os::unix::net::UnixStream,
-    mut request_id: u64,
+    request_id: &mut u64,
     device: &DeviceDesc,
-) -> Result<u64, Box<dyn std::error::Error>> {
-    println!("H.264 decode proof:");
-    println!("[{:?}] {}", device.class, device.name);
-
-    request_id += 1;
+    profile: H264Profile,
+    chroma: ChromaSubsampling,
+    bit_depth: u8,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    *request_id += 1;
     send_message(
         stream,
         &WireMessage::QueryVideoCapabilities {
-            request_id,
+            request_id: *request_id,
             request: QueryVideoCapabilitiesRequest {
                 device_id: device.id,
             },
@@ -1751,18 +1905,36 @@ fn test_h264_decode(
     else {
         return Err("expected VIDEO_CAPABILITIES response".into());
     };
-    if response_request_id != request_id {
+    if response_request_id != *request_id {
         return Err("video capability response request_id did not match request".into());
     }
-    let supports_h264_baseline = response.capabilities.decode.iter().any(|capability| {
+    Ok(response.capabilities.decode.iter().any(|capability| {
         capability.codec == VideoCodec::H264
-            && capability.profile == VideoProfile::H264(H264Profile::Baseline)
-            && capability.bit_depth.get() == 8
-            && capability.chroma == ChromaSubsampling::Cs420
+            && capability.profile == VideoProfile::H264(profile)
+            && capability.bit_depth.get() == bit_depth
+            && capability.chroma == chroma
             && capability
                 .output_surface_formats
                 .contains(&qgs_protocol::VideoSurfaceFormat::Nv12)
-    });
+    }))
+}
+
+fn test_h264_decode(
+    stream: &mut std::os::unix::net::UnixStream,
+    mut request_id: u64,
+    device: &DeviceDesc,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    println!("H.264 decode proof:");
+    println!("[{:?}] {}", device.class, device.name);
+
+    let supports_h264_baseline = query_h264_decode_support(
+        stream,
+        &mut request_id,
+        device,
+        H264Profile::Baseline,
+        ChromaSubsampling::Cs420,
+        8,
+    )?;
 
     request_id += 1;
     let config = DecoderConfig {
@@ -1792,9 +1964,10 @@ fn test_h264_decode(
                 return Err("decoder created request_id did not match request".into());
             }
             if !supports_h264_baseline {
-                return Err("decoder succeeded on device without advertised H.264 support".into());
+                println!("Decoder created through software fallback:");
+            } else {
+                println!("Decoder created:");
             }
-            println!("Decoder created:");
             println!("  id: {}", response.decoder_id.get());
             response.decoder_id
         }
@@ -1848,21 +2021,48 @@ fn test_h264_decode(
     if response.decoder_id != decoder_id {
         return Err("decode output decoder_id did not match request".into());
     }
-    if response.outputs.len() != 1 {
+    let mut outputs = response.outputs;
+    if outputs.is_empty() && !supports_h264_baseline {
+        request_id += 1;
+        send_message(
+            stream,
+            &WireMessage::FlushDecoder {
+                request_id,
+                request: FlushDecoderRequest { decoder_id },
+            },
+        )?;
+        let response = receive_message(stream)?;
+        let WireMessage::DecodeOutput {
+            request_id: response_request_id,
+            response,
+        } = response
+        else {
+            return Err("expected software fallback flush DECODE_OUTPUT response".into());
+        };
+        if response_request_id != request_id || response.decoder_id != decoder_id {
+            return Err("software fallback flush response correlation failed".into());
+        }
+        outputs = response.outputs;
+    }
+    if outputs.len() != 1 {
         return Err(format!(
             "IDR decode expected one output surface, got {}",
-            response.outputs.len()
+            outputs.len()
         )
         .into());
     }
-    let output = &response.outputs[0];
+    let output = &outputs[0];
     println!("Decoded VideoSurface:");
     println!("  resource id: {}", output.resource_id.get());
     println!(
         "  {} x {} {:?}",
         output.surface.coded_width, output.surface.coded_height, output.surface.format
     );
-    println!("  validation: backend VA readback succeeded");
+    if supports_h264_baseline {
+        println!("  validation: backend VA readback succeeded");
+    } else {
+        println!("  validation: software fallback output succeeded");
+    }
 
     request_id += 1;
     destroy_resource(stream, request_id, output.resource_id)?;
@@ -1902,6 +2102,14 @@ fn test_h264_long_gop_decode(
 
     let access_units = split_h264_annex_b_access_units(H264_LONG_GOP_FIXTURE)?;
     println!("  access units: {}", access_units.len());
+    let supports_h264_main = query_h264_decode_support(
+        stream,
+        &mut request_id,
+        device,
+        H264Profile::Main,
+        ChromaSubsampling::Cs420,
+        8,
+    )?;
 
     request_id += 1;
     let config = DecoderConfig {
@@ -1929,6 +2137,9 @@ fn test_h264_long_gop_decode(
         } => {
             if response_request_id != request_id {
                 return Err("Long-GOP decoder request_id did not match".into());
+            }
+            if !supports_h264_main {
+                println!("  Long-GOP decoder created through software fallback.");
             }
             response.decoder_id
         }
@@ -2013,7 +2224,11 @@ fn test_h264_long_gop_decode(
     if output_count != 12 {
         return Err(format!("Long-GOP expected 12 output frames, got {output_count}").into());
     }
-    println!("  validation: backend VA readback succeeded for every decoded frame");
+    if supports_h264_main {
+        println!("  validation: backend VA readback succeeded for every decoded frame");
+    } else {
+        println!("  validation: software fallback output succeeded for every decoded frame");
+    }
 
     for resource_id in output_resources {
         request_id += 1;
@@ -2258,6 +2473,7 @@ struct Args {
     h264_decode_only: bool,
     haswell_video_diagnostic: bool,
     mxf_inspect_path: Option<PathBuf>,
+    software_decode_mxf_path: Option<PathBuf>,
 }
 
 impl Args {
@@ -2268,9 +2484,14 @@ impl Args {
         let mut haswell_video_diagnostic = false;
         let mut mxf_inspect_path = None;
         let mut next_arg_is_mxf_path = false;
+        let mut software_decode_mxf_path = None;
+        let mut next_arg_is_software_decode_mxf_path = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_mxf_path {
+            if next_arg_is_software_decode_mxf_path {
+                software_decode_mxf_path = Some(PathBuf::from(arg));
+                next_arg_is_software_decode_mxf_path = false;
+            } else if next_arg_is_mxf_path {
                 mxf_inspect_path = Some(PathBuf::from(arg));
                 next_arg_is_mxf_path = false;
             } else if arg == VIDEO_CAPABILITIES_ONLY_ARG {
@@ -2282,6 +2503,8 @@ impl Args {
             } else if arg == MXF_INSPECT_ARG {
                 mxf_inspect_path = Some(PathBuf::from(DEFAULT_MXF_FIXTURE));
                 next_arg_is_mxf_path = true;
+            } else if arg == SOFTWARE_DECODE_MXF_ARG {
+                next_arg_is_software_decode_mxf_path = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -2293,6 +2516,7 @@ impl Args {
             h264_decode_only,
             haswell_video_diagnostic,
             mxf_inspect_path,
+            software_decode_mxf_path,
         }
     }
 }
