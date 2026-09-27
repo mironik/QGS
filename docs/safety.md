@@ -169,3 +169,19 @@ treating them as padding.
 
 M2 Step 12 does not add unsafe Rust and does not change the Vulkan unsafe
 inventory.
+
+## M2 Step 13 VA decode safety note
+
+`qgs-vaapi` remains safe Rust and uses `#![forbid(unsafe_code)]`.
+
+Step 13 separates normal VA decode from explicit diagnostic decode. The normal
+path no longer performs automatic per-frame CPU checksum readback, DRM PRIME
+export probing, or diagnostic logging. Diagnostic mode remains available for
+validation and interop investigation.
+
+The safe libva picture typestate only allows QGS to reclaim a decoded surface
+after synchronization. To keep this safe without adding raw VA-API FFI, the
+production path retains ended pictures in a bounded pending-recycle pool and
+reclaims them only when the free surface pool is exhausted or when the decoder
+is dropped. No unsafe Rust was added and the Vulkan unsafe inventory is
+unchanged.

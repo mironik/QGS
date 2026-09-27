@@ -6,7 +6,7 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use qgs_core::DeviceDiscovery;
+use qgs_core::{DeviceDiscovery, VideoCapabilityDiscovery};
 use qgs_linux::{
     connect_socket, default_socket_path, receive_message, receive_message_with_attachments,
     send_message,
@@ -48,6 +48,7 @@ const MXF_INSPECT_ARG: &str = "--mxf-inspect";
 const SOFTWARE_DECODE_MXF_ARG: &str = "--software-decode-mxf";
 const SOFTWARE_GPU_MXF_ARG: &str = "--software-gpu-mxf";
 const PROXY_PROOF_ARG: &str = "--proxy-proof";
+const PROXY_THROUGHPUT_ARG: &str = "--proxy-throughput";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -77,6 +78,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.proxy_proof_paths {
         return proxy_proof(&args.socket_path, &original, &proxy);
+    }
+    if let Some((original, proxy)) = args.proxy_throughput_paths {
+        return proxy_throughput(&original, &proxy);
     }
 
     let socket_path = args.socket_path;
@@ -1201,6 +1205,245 @@ fn diagnose_damaged_proxy_case(
             Ok(())
         }
     }
+}
+
+fn proxy_throughput(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let original_sha256 = sha256_hex(original_path)?;
+    let proxy_sha256 = sha256_hex(proxy_path)?;
+    let case = identify_camera_case(&original_sha256, &proxy_sha256)?;
+    if case.damaged_proxy {
+        return diagnose_damaged_proxy_case(case, proxy_path);
+    }
+
+    let original_bytes = std::fs::read(original_path)?;
+    let original = MediaSource::parse(&original_bytes)?;
+    let proxy = Mp4Source::open(proxy_path)?;
+    let proxy_video = proxy
+        .video
+        .as_ref()
+        .ok_or("proxy has no H.264 video track")?;
+    let proxy_h264 = classify_video_track(proxy_video)?;
+    let source_seconds = proxy_video.samples.len() as f64
+        / (proxy_video.frame_rate.numerator as f64 / proxy_video.frame_rate.denominator as f64);
+    let access_units = proxy_video
+        .samples
+        .iter()
+        .map(|sample| sample.annex_b.clone())
+        .collect::<Vec<_>>();
+
+    println!("QGS Step 13 proxy throughput audit:");
+    println!("  original: {}", case.original_label);
+    println!("  proxy: {}", case.proxy_label);
+    println!("  hashes: verified");
+    println!("  original edit units: {}", original.index.video.len());
+    println!("  proxy samples: {}", proxy_video.samples.len());
+    println!(
+        "  proxy: H.264 {:?}, {}-bit {:?}, {} x {}, {}/{} fps",
+        proxy_h264.profile,
+        proxy_h264.bit_depth,
+        proxy_h264.chroma,
+        proxy_h264.width,
+        proxy_h264.height,
+        proxy_video.frame_rate.numerator,
+        proxy_video.frame_rate.denominator
+    );
+
+    let frontend_start = Instant::now();
+    let frontend = run_proxy_frontend_only(proxy_video)?;
+    let frontend_elapsed = frontend_start.elapsed();
+    print_decode_timing(
+        "Container + H.264 frontend only",
+        frontend.frames,
+        source_seconds,
+        frontend_elapsed,
+    );
+    println!(
+        "  frontend peak DPB={} peak output_pending={}",
+        frontend.peak_dpb_occupancy, frontend.peak_output_pending
+    );
+
+    let discovery = VulkanDeviceDiscovery::new()?;
+    let devices = discovery.enumerate_devices()?;
+    let Some(device) = devices
+        .iter()
+        .find(|device| {
+            device.vendor_id == 0x8086 && matches!(device.class, DeviceClass::IntegratedGpu)
+        })
+        .or_else(|| {
+            devices
+                .iter()
+                .find(|device| matches!(device.class, DeviceClass::IntegratedGpu))
+        })
+    else {
+        println!("Intel VA proxy decode: no integrated GPU advertised");
+        return Ok(());
+    };
+    let proxy_config = decoder_config_for_surface(
+        device.id,
+        proxy_h264.profile,
+        BitDepth::new(proxy_h264.bit_depth)?,
+        proxy_h264.chroma,
+        proxy_h264.width,
+        proxy_h264.height,
+    );
+    let vaapi = qgs_vaapi::VaapiVideoDiscovery::new(&devices);
+    let capabilities = vaapi.query_video_capabilities(device.id)?;
+    let supports_proxy = capabilities
+        .decode
+        .iter()
+        .any(|capability| proxy_config.is_satisfied_by(capability));
+    println!("Intel proxy capability:");
+    println!("  device: {}", device.name);
+    println!(
+        "  H.264 {:?} {}-bit {:?}: {}",
+        proxy_h264.profile,
+        proxy_h264.bit_depth,
+        proxy_h264.chroma,
+        yes_no(supports_proxy)
+    );
+    if !supports_proxy {
+        return Ok(());
+    }
+
+    let selected = selected_proxy_ordinals(proxy_video.samples.len());
+    let normal_start = Instant::now();
+    let normal = qgs_vaapi::decode_h264_access_units_for_observation(
+        &devices,
+        device.id,
+        &proxy_config,
+        &access_units,
+        qgs_vaapi::VaapiDecodeMode::Normal,
+        &selected,
+    )?;
+    let normal_elapsed = normal_start.elapsed();
+    print_decode_timing(
+        "Clean VA hardware decode",
+        normal.frames,
+        source_seconds,
+        normal_elapsed,
+    );
+    print_va_observation(&normal);
+    if normal.frames != proxy_video.samples.len() {
+        return Err(format!(
+            "clean VA decode expected {} frames, got {}",
+            proxy_video.samples.len(),
+            normal.frames
+        )
+        .into());
+    }
+
+    let diagnostic_start = Instant::now();
+    let diagnostic = qgs_vaapi::decode_h264_access_units_for_observation(
+        &devices,
+        device.id,
+        &proxy_config,
+        &access_units,
+        qgs_vaapi::VaapiDecodeMode::Diagnostic,
+        &selected,
+    )?;
+    let diagnostic_elapsed = diagnostic_start.elapsed();
+    print_decode_timing(
+        "Diagnostic VA hardware decode",
+        diagnostic.frames,
+        source_seconds,
+        diagnostic_elapsed,
+    );
+    print_va_observation(&diagnostic);
+    println!(
+        "  selected diagnostic checksums: {:?}",
+        diagnostic.selected_output_checksums
+    );
+    if diagnostic.frames != proxy_video.samples.len() {
+        return Err(format!(
+            "diagnostic VA decode expected {} frames, got {}",
+            proxy_video.samples.len(),
+            diagnostic.frames
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+struct FrontendOnlyObservation {
+    frames: usize,
+    peak_dpb_occupancy: usize,
+    peak_output_pending: usize,
+}
+
+fn run_proxy_frontend_only(
+    video: &qgs_mp4::Mp4VideoTrack,
+) -> Result<FrontendOnlyObservation, Box<dyn std::error::Error>> {
+    let mut state = qgs_codec_h264::H264DecoderState::new();
+    let mut frames = 0_usize;
+    for sample in &video.samples {
+        let parsed = state.parse_access_unit(&sample.annex_b)?;
+        let update = state.finish_picture(&parsed)?;
+        frames = frames.saturating_add(update.output_ready.len());
+    }
+    let update = state.flush();
+    frames = frames.saturating_add(update.output_ready.len());
+    Ok(FrontendOnlyObservation {
+        frames,
+        peak_dpb_occupancy: state.max_dpb_occupancy(),
+        peak_output_pending: state.max_output_pending(),
+    })
+}
+
+fn selected_proxy_ordinals(frame_count: usize) -> Vec<usize> {
+    if frame_count == 0 {
+        return Vec::new();
+    }
+    let mut selected = vec![0, 53.min(frame_count - 1), frame_count - 1];
+    selected.sort_unstable();
+    selected.dedup();
+    selected
+}
+
+fn print_decode_timing(
+    label: &str,
+    frames: usize,
+    source_seconds: f64,
+    elapsed: std::time::Duration,
+) {
+    let seconds = elapsed.as_secs_f64().max(0.000_001);
+    let fps = frames as f64 / seconds;
+    let realtime = if source_seconds > 0.0 {
+        source_seconds / seconds
+    } else {
+        0.0
+    };
+    println!("{label}:");
+    println!("  frames: {frames}");
+    println!(
+        "  DEVELOPMENT OBSERVATION - NOT A BENCHMARK: {:.3}s, {:.2} fps, {:.2}x realtime",
+        seconds, fps, realtime
+    );
+}
+
+fn print_va_observation(observation: &qgs_vaapi::VaapiDecodeObservation) {
+    println!(
+        "  pool: allocated={} reused={} recycled={} recycle_sync={} deferred={} peak_checked_out={}",
+        observation.pool_stats.surfaces_allocated,
+        observation.pool_stats.surface_reuse_count,
+        observation.pool_stats.surfaces_recycled,
+        observation.pool_stats.recycle_sync_count,
+        observation.pool_stats.deferred_recycle_count,
+        observation.pool_stats.peak_checked_out_surfaces
+    );
+    println!(
+        "  peaks: DPB={} output_pending={} live_va_surfaces={}",
+        observation.peak_dpb_occupancy,
+        observation.peak_output_pending,
+        observation.peak_live_surfaces
+    );
+    println!(
+        "  diagnostics: frames={} export_probes={}",
+        observation.diagnostic_frames, observation.diagnostic_export_probes
+    );
 }
 
 fn run_software_gpu_sequence_proof(
@@ -3946,6 +4189,7 @@ struct Args {
     software_decode_mxf_path: Option<PathBuf>,
     software_gpu_mxf_path: Option<PathBuf>,
     proxy_proof_paths: Option<(PathBuf, PathBuf)>,
+    proxy_throughput_paths: Option<(PathBuf, PathBuf)>,
 }
 
 impl Args {
@@ -3962,11 +4206,26 @@ impl Args {
         let mut next_arg_is_software_gpu_mxf_path = false;
         let mut proxy_proof_original = None;
         let mut proxy_proof_paths = None;
+        let mut proxy_throughput_original = None;
+        let mut proxy_throughput_paths = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
+        let mut next_arg_is_proxy_throughput_original = false;
+        let mut next_arg_is_proxy_throughput_proxy = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_proxy_proxy {
+            if next_arg_is_proxy_throughput_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = proxy_throughput_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                proxy_throughput_paths = Some((original, proxy));
+                next_arg_is_proxy_throughput_proxy = false;
+            } else if next_arg_is_proxy_throughput_original {
+                proxy_throughput_original = Some(PathBuf::from(arg));
+                next_arg_is_proxy_throughput_original = false;
+                next_arg_is_proxy_throughput_proxy = true;
+            } else if next_arg_is_proxy_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = proxy_proof_original
                     .take()
@@ -4001,6 +4260,8 @@ impl Args {
                 next_arg_is_software_gpu_mxf_path = true;
             } else if arg == PROXY_PROOF_ARG {
                 next_arg_is_proxy_original = true;
+            } else if arg == PROXY_THROUGHPUT_ARG {
+                next_arg_is_proxy_throughput_original = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -4015,13 +4276,16 @@ impl Args {
             software_decode_mxf_path,
             software_gpu_mxf_path,
             proxy_proof_paths,
+            proxy_throughput_paths,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{mxf_file_label, proxy_presentation_ordinals, SonyXmlSummary};
+    use super::{
+        mxf_file_label, proxy_presentation_ordinals, selected_proxy_ordinals, SonyXmlSummary,
+    };
     use qgs_mp4::{Mp4VideoSample, Mp4VideoTrack, Rational};
     use std::path::PathBuf;
 
@@ -4100,6 +4364,14 @@ mod tests {
         assert_eq!(ordinals.get(&0), Some(&0));
         assert_eq!(ordinals.get(&2), Some(&1));
         assert_eq!(ordinals.get(&1), Some(&2));
+    }
+
+    #[test]
+    fn selected_proxy_ordinals_are_bounded_and_deduplicated() {
+        assert_eq!(selected_proxy_ordinals(0), Vec::<usize>::new());
+        assert_eq!(selected_proxy_ordinals(1), vec![0]);
+        assert_eq!(selected_proxy_ordinals(12), vec![0, 11]);
+        assert_eq!(selected_proxy_ordinals(106), vec![0, 53, 105]);
     }
 
     fn sample(sample_index: u32, pts: i64) -> Mp4VideoSample {

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::any::Any;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -8,11 +9,11 @@ use std::rc::Rc;
 
 use libva::{
     BorrowedBufferType, BufferType, Context, Display, H264PicFields, H264SeqFields, IQMatrix,
-    IQMatrixBufferH264, Image, Picture, PictureH264, PictureParameter, PictureParameterBufferH264,
-    SliceParameter, SliceParameterBufferH264, Surface, VAConfigAttrib, VAConfigAttribType,
-    VAEntrypoint, VAProfile, VA_ATTRIB_NOT_SUPPORTED, VA_FOURCC_NV12, VA_FOURCC_P010,
-    VA_FOURCC_UYVY, VA_FOURCC_Y210, VA_FOURCC_YUY2, VA_RT_FORMAT_YUV420, VA_RT_FORMAT_YUV420_10,
-    VA_RT_FORMAT_YUV422, VA_RT_FORMAT_YUV422_10,
+    IQMatrixBufferH264, Image, Picture, PictureEnd, PictureH264, PictureParameter,
+    PictureParameterBufferH264, SliceParameter, SliceParameterBufferH264, Surface, VAConfigAttrib,
+    VAConfigAttribType, VAEntrypoint, VAProfile, VA_ATTRIB_NOT_SUPPORTED, VA_FOURCC_NV12,
+    VA_FOURCC_P010, VA_FOURCC_UYVY, VA_FOURCC_Y210, VA_FOURCC_YUY2, VA_RT_FORMAT_YUV420,
+    VA_RT_FORMAT_YUV420_10, VA_RT_FORMAT_YUV422, VA_RT_FORMAT_YUV422_10,
 };
 use qgs_codec_h264::{
     parse_annex_b_access_unit, H264DecoderState, H264Error, H264PictureId, ParsedH264AccessUnit,
@@ -23,10 +24,10 @@ use qgs_core::{
     VideoCapabilityDiscovery, VideoCapabilityDiscoveryError,
 };
 use qgs_protocol::{
-    BitDepth, ChromaSubsampling, CreateDecoderRequest, DecoderConfig, DeviceDesc, DeviceId,
-    H264Profile, Mpeg2Profile, SubmitAccessUnitRequest, VideoCapabilities, VideoCodec,
-    VideoDecodeCapability, VideoProfile, VideoSurfaceDesc, VideoSurfaceFormat,
-    MAX_VIDEO_SURFACE_HEIGHT, MAX_VIDEO_SURFACE_WIDTH,
+    BitDepth, ChromaSubsampling, CreateDecoderRequest, DecoderConfig, DecoderId, DeviceDesc,
+    DeviceId, FlushDecoderRequest, H264Profile, Mpeg2Profile, SubmitAccessUnitRequest,
+    VideoCapabilities, VideoCodec, VideoDecodeCapability, VideoProfile, VideoSurfaceDesc,
+    VideoSurfaceFormat, MAX_VIDEO_SURFACE_HEIGHT, MAX_VIDEO_SURFACE_WIDTH,
 };
 
 const DEFAULT_MAX_WIDTH: u32 = MAX_VIDEO_SURFACE_WIDTH;
@@ -35,10 +36,15 @@ const DEFAULT_MAX_HEIGHT: u32 = MAX_VIDEO_SURFACE_HEIGHT;
 #[derive(Debug)]
 pub struct VaapiVideoDiscovery {
     devices: BTreeMap<DeviceId, VaapiDevice>,
+    decode_mode: VaapiDecodeMode,
 }
 
 impl VaapiVideoDiscovery {
     pub fn new(qgs_devices: &[DeviceDesc]) -> Self {
+        Self::with_decode_mode(qgs_devices, VaapiDecodeMode::Normal)
+    }
+
+    pub fn with_decode_mode(qgs_devices: &[DeviceDesc], decode_mode: VaapiDecodeMode) -> Self {
         let render_nodes = enumerate_render_nodes();
         let mut devices = BTreeMap::new();
 
@@ -60,7 +66,10 @@ impl VaapiVideoDiscovery {
             );
         }
 
-        Self { devices }
+        Self {
+            devices,
+            decode_mode,
+        }
     }
 
     pub fn devices(&self) -> Vec<VaapiDeviceInfo> {
@@ -104,6 +113,15 @@ impl DecoderBackend for VaapiVideoDiscovery {
         &self,
         request: &CreateDecoderRequest,
     ) -> Result<Box<dyn BackendDecoder>, DecoderError> {
+        Ok(Box::new(self.create_h264_decoder(request)?))
+    }
+}
+
+impl VaapiVideoDiscovery {
+    fn create_h264_decoder(
+        &self,
+        request: &CreateDecoderRequest,
+    ) -> Result<VaapiH264Decoder, DecoderError> {
         request.config.validate()?;
         if request.config.codec != VideoCodec::H264
             || request.config.bit_depth.get() != 8
@@ -166,16 +184,59 @@ impl DecoderBackend for VaapiVideoDiscovery {
             )
             .map_err(|_| DecoderError::UnsupportedDecodeConfiguration)?;
 
-        Ok(Box::new(VaapiH264Decoder {
+        Ok(VaapiH264Decoder {
             context,
-            available_surfaces: surfaces,
+            pool: Rc::new(RefCell::new(VaapiSurfacePool::new(surfaces))),
             decoded_surfaces: BTreeMap::new(),
             frontend: H264DecoderState::new(),
             device_id: request.config.device_id,
             config: request.config.clone(),
             max_live_surfaces: 0,
-        }))
+            mode: self.decode_mode,
+            diagnostic_frames: 0,
+            diagnostic_export_probes: 0,
+        })
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VaapiDecodeMode {
+    Normal,
+    Diagnostic,
+}
+
+impl VaapiDecodeMode {
+    const fn diagnostics_enabled(self) -> bool {
+        matches!(self, Self::Diagnostic)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VaapiSurfacePoolStats {
+    pub surfaces_allocated: usize,
+    pub surface_reuse_count: usize,
+    pub surfaces_recycled: usize,
+    pub recycle_sync_count: usize,
+    pub deferred_recycle_count: usize,
+    pub peak_checked_out_surfaces: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct VaapiSurfaceDiagnostics {
+    pub validation_checksum: Option<u32>,
+    pub export_probe: Option<VaapiExportProbe>,
+}
+
+#[derive(Clone, Debug)]
+pub struct VaapiDecodeObservation {
+    pub frames: usize,
+    pub selected_output_checksums: Vec<(usize, Option<u32>)>,
+    pub pool_stats: VaapiSurfacePoolStats,
+    pub peak_dpb_occupancy: usize,
+    pub peak_output_pending: usize,
+    pub peak_live_surfaces: usize,
+    pub diagnostic_frames: usize,
+    pub diagnostic_export_probes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -258,7 +319,10 @@ pub fn decode_h264_drm_prime_for_diagnostic(
         .into_iter()
         .next()
         .ok_or(DecoderError::DecodeFailed)?;
-    let surface = decode_h264_access_unit(context, surface, &parsed, &BTreeMap::new())?;
+    let surface = decode_h264_access_unit(context, surface, &parsed, &BTreeMap::new(), true)?;
+    let DecodedVaSurface::Ready(surface) = surface else {
+        return Err(DecoderError::DecodeFailed);
+    };
     let validation_checksum =
         validation_checksum(&surface, parsed.desc.coded_width, parsed.desc.coded_height)
             .map_err(|_| DecoderError::DecodeFailed)?;
@@ -297,6 +361,73 @@ pub fn decode_h264_drm_prime_for_diagnostic(
     })
 }
 
+pub fn decode_h264_access_units_for_observation(
+    qgs_devices: &[DeviceDesc],
+    device_id: DeviceId,
+    config: &DecoderConfig,
+    access_units: &[Vec<u8>],
+    mode: VaapiDecodeMode,
+    selected_output_ordinals: &[usize],
+) -> Result<VaapiDecodeObservation, DecoderError> {
+    let discovery = VaapiVideoDiscovery::with_decode_mode(qgs_devices, mode);
+    let mut config = config.clone();
+    config.device_id = device_id;
+    let mut decoder = discovery.create_h264_decoder(&CreateDecoderRequest { config })?;
+    let decoder_id = DecoderId::new(1).map_err(DecoderError::from)?;
+    let mut frames = 0_usize;
+    let mut selected_output_checksums = Vec::new();
+
+    for access_unit in access_units {
+        let outputs = decoder.submit_access_unit(&SubmitAccessUnitRequest {
+            decoder_id,
+            data: access_unit.clone(),
+        })?;
+        collect_observation_outputs(
+            outputs,
+            &mut frames,
+            selected_output_ordinals,
+            &mut selected_output_checksums,
+        );
+    }
+
+    let outputs = decoder.flush(&FlushDecoderRequest { decoder_id })?;
+    collect_observation_outputs(
+        outputs,
+        &mut frames,
+        selected_output_ordinals,
+        &mut selected_output_checksums,
+    );
+
+    let pool_stats = decoder.pool.borrow().stats.clone();
+    Ok(VaapiDecodeObservation {
+        frames,
+        selected_output_checksums,
+        pool_stats,
+        peak_dpb_occupancy: decoder.frontend.max_dpb_occupancy(),
+        peak_output_pending: decoder.frontend.max_output_pending(),
+        peak_live_surfaces: decoder.max_live_surfaces,
+        diagnostic_frames: decoder.diagnostic_frames,
+        diagnostic_export_probes: decoder.diagnostic_export_probes,
+    })
+}
+
+fn collect_observation_outputs(
+    outputs: Vec<BackendDecodedSurface>,
+    frames: &mut usize,
+    selected_output_ordinals: &[usize],
+    selected_output_checksums: &mut Vec<(usize, Option<u32>)>,
+) {
+    for output in outputs {
+        let ordinal = *frames;
+        if selected_output_ordinals.contains(&ordinal) {
+            let checksum = surface_diagnostics(output.resource.as_ref())
+                .and_then(|diagnostics| diagnostics.validation_checksum);
+            selected_output_checksums.push((ordinal, checksum));
+        }
+        *frames = frames.saturating_add(1);
+    }
+}
+
 #[derive(Debug)]
 struct VaapiDevice {
     path: PathBuf,
@@ -324,12 +455,15 @@ fn parsed_access_unit_matches_config(
 
 struct VaapiH264Decoder {
     context: Rc<Context>,
-    available_surfaces: Vec<Surface<()>>,
-    decoded_surfaces: BTreeMap<(u16, i32), DecodedSurfaceState>,
+    pool: Rc<RefCell<VaapiSurfacePool>>,
+    decoded_surfaces: BTreeMap<(u16, i32), Rc<DecodedSurfaceState>>,
     frontend: H264DecoderState,
     device_id: DeviceId,
     config: DecoderConfig,
     max_live_surfaces: usize,
+    mode: VaapiDecodeMode,
+    diagnostic_frames: usize,
+    diagnostic_export_probes: usize,
 }
 
 impl BackendDecoder for VaapiH264Decoder {
@@ -345,87 +479,78 @@ impl BackendDecoder for VaapiH264Decoder {
             return Err(DecoderError::UnsupportedDecodeConfiguration);
         }
         let surface = self
-            .available_surfaces
-            .pop()
+            .pool
+            .borrow_mut()
+            .acquire()
             .ok_or(DecoderError::DecodeFailed)?;
         let surface = decode_h264_access_unit(
             Rc::clone(&self.context),
             surface,
             &parsed,
             &self.decoded_surfaces,
+            self.mode.diagnostics_enabled(),
         )?;
-        let validation_checksum =
-            validation_checksum(&surface, parsed.desc.coded_width, parsed.desc.coded_height)
-                .map_err(|_| DecoderError::DecodeFailed)?;
-        let export_probe = surface
-            .export_prime()
-            .ok()
-            .map(|descriptor| VaapiExportProbe {
-                object_count: descriptor.objects.len(),
-                layer_count: descriptor.layers.len(),
-                fourcc: descriptor.fourcc,
-                width: descriptor.width,
-                height: descriptor.height,
-                object_sizes: descriptor
-                    .objects
-                    .iter()
-                    .map(|object| object.size)
-                    .collect(),
-                modifiers: descriptor
-                    .objects
-                    .iter()
-                    .map(|object| object.drm_format_modifier)
-                    .collect(),
-                layer_formats: descriptor
-                    .layers
-                    .iter()
-                    .map(|layer| layer.drm_format)
-                    .collect(),
-                pitches: descriptor.layers.iter().map(|layer| layer.pitch).collect(),
-                offsets: descriptor.layers.iter().map(|layer| layer.offset).collect(),
-            });
-        eprintln!(
-            "qgs-vaapi: decoded H.264 frame on device {} validation checksum=0x{validation_checksum:08x}",
-            self.device_id.get()
-        );
-        if let Some(probe) = &export_probe {
-            eprintln!(
-                "qgs-vaapi: VA surface DRM PRIME export probe succeeded: fourcc=0x{:08x} size={}x{} objects={} layers={} object_sizes={:?} modifiers={:?} layer_formats={:?} pitches={:?} offsets={:?}",
-                probe.fourcc,
-                probe.width,
-                probe.height,
-                probe.object_count,
-                probe.layer_count,
-                probe.object_sizes,
-                probe.modifiers,
-                probe.layer_formats,
-                probe.pitches,
-                probe.offsets
-            );
+        let diagnostics = if self.mode.diagnostics_enabled() {
+            let diagnostics = collect_surface_diagnostics(
+                surface.as_surface(),
+                parsed.desc.coded_width,
+                parsed.desc.coded_height,
+            )?;
+            self.diagnostic_frames = self.diagnostic_frames.saturating_add(1);
+            if diagnostics.export_probe.is_some() {
+                self.diagnostic_export_probes = self.diagnostic_export_probes.saturating_add(1);
+            }
+            if let Some(validation_checksum) = diagnostics.validation_checksum {
+                eprintln!(
+                    "qgs-vaapi diagnostic: decoded H.264 frame on device {} validation checksum=0x{validation_checksum:08x}",
+                    self.device_id.get()
+                );
+            }
+            if let Some(probe) = &diagnostics.export_probe {
+                eprintln!(
+                    "qgs-vaapi diagnostic: VA surface DRM PRIME export probe succeeded: fourcc=0x{:08x} size={}x{} objects={} layers={} object_sizes={:?} modifiers={:?} layer_formats={:?} pitches={:?} offsets={:?}",
+                    probe.fourcc,
+                    probe.width,
+                    probe.height,
+                    probe.object_count,
+                    probe.layer_count,
+                    probe.object_sizes,
+                    probe.modifiers,
+                    probe.layer_formats,
+                    probe.pitches,
+                    probe.offsets
+                );
+            } else {
+                eprintln!("qgs-vaapi diagnostic: VA surface DRM PRIME export probe failed");
+            }
+            diagnostics
         } else {
-            eprintln!("qgs-vaapi: VA surface DRM PRIME export probe failed");
-        }
+            VaapiSurfaceDiagnostics::default()
+        };
         let id = parsed.picture.id();
         self.decoded_surfaces.insert(
             surface_key(&id),
-            DecodedSurfaceState {
-                surface: Rc::new(surface),
+            Rc::new(DecodedSurfaceState {
+                pool: Rc::clone(&self.pool),
+                codec_released: Cell::new(false),
+                surface: RefCell::new(Some(surface)),
                 desc: parsed.desc.clone(),
-                validation_checksum,
-                export_probe: export_probe.clone(),
-            },
+                diagnostics,
+            }),
         );
         self.max_live_surfaces = self.max_live_surfaces.max(self.decoded_surfaces.len());
         let update = self
             .frontend
             .finish_picture(&parsed)
             .map_err(decoder_error_from_h264)?;
-        eprintln!(
-            "qgs-vaapi: H.264 DPB occupancy={} output_pending={} live_va_surfaces={}",
-            update.max_dpb_occupancy,
-            update.max_output_pending,
-            self.decoded_surfaces.len()
-        );
+        if self.mode.diagnostics_enabled() {
+            eprintln!(
+                "qgs-vaapi diagnostic: H.264 DPB occupancy={} output_pending={} live_va_surfaces={}",
+                update.max_dpb_occupancy,
+                update.max_output_pending,
+                self.decoded_surfaces.len()
+            );
+        }
         let outputs = self.outputs_from_ids(&update.output_ready)?;
         self.release_decoded_surfaces(&update.released);
         Ok(outputs)
@@ -436,10 +561,12 @@ impl BackendDecoder for VaapiH264Decoder {
         _request: &qgs_protocol::FlushDecoderRequest,
     ) -> Result<Vec<BackendDecodedSurface>, DecoderError> {
         let update = self.frontend.flush();
-        eprintln!(
-            "qgs-vaapi: H.264 flush DPB occupancy={} output_pending={} max_live_va_surfaces={}",
-            update.max_dpb_occupancy, update.max_output_pending, self.max_live_surfaces
-        );
+        if self.mode.diagnostics_enabled() {
+            eprintln!(
+                "qgs-vaapi diagnostic: H.264 flush DPB occupancy={} output_pending={} max_live_va_surfaces={}",
+                update.max_dpb_occupancy, update.max_output_pending, self.max_live_surfaces
+            );
+        }
         let outputs = self.outputs_from_ids(&update.output_ready)?;
         self.release_decoded_surfaces(&update.released);
         Ok(outputs)
@@ -452,8 +579,11 @@ impl VaapiH264Decoder {
             let Some(state) = self.decoded_surfaces.remove(&surface_key(id)) else {
                 continue;
             };
-            if let Ok(surface) = Rc::try_unwrap(state.surface) {
-                self.available_surfaces.push(surface);
+            state.codec_released.set(true);
+            if Rc::strong_count(&state) == 1 {
+                state.recycle_if_released();
+            } else {
+                self.pool.borrow_mut().record_deferred_recycle();
             }
         }
     }
@@ -471,9 +601,7 @@ impl VaapiH264Decoder {
                     .ok_or(DecoderError::DecodeFailed)?;
                 Ok(BackendDecodedSurface {
                     resource: Box::new(VaapiVideoSurface {
-                        surface: Rc::clone(&surface.surface),
-                        validation_checksum: surface.validation_checksum,
-                        export_probe: surface.export_probe.clone(),
+                        state: Rc::clone(surface),
                     }),
                     desc: surface.desc.clone(),
                 })
@@ -483,19 +611,45 @@ impl VaapiH264Decoder {
 }
 
 struct DecodedSurfaceState {
-    surface: Rc<Surface<()>>,
+    pool: Rc<RefCell<VaapiSurfacePool>>,
+    codec_released: Cell<bool>,
+    surface: RefCell<Option<DecodedVaSurface>>,
     desc: VideoSurfaceDesc,
-    validation_checksum: u32,
-    export_probe: Option<VaapiExportProbe>,
+    diagnostics: VaapiSurfaceDiagnostics,
+}
+
+impl DecodedSurfaceState {
+    fn surface_id(&self) -> Result<u32, DecoderError> {
+        self.surface
+            .borrow()
+            .as_ref()
+            .map(DecodedVaSurface::surface_id)
+            .ok_or(DecoderError::DecodeFailed)
+    }
+
+    fn recycle_if_released(&self) {
+        if !self.codec_released.get() {
+            return;
+        }
+        if let Some(surface) = self.surface.borrow_mut().take() {
+            self.pool.borrow_mut().defer_recycle(surface);
+        }
+    }
+}
+
+impl Drop for DecodedSurfaceState {
+    fn drop(&mut self) {
+        if !self.codec_released.get() {
+            return;
+        }
+        if let Some(surface) = self.surface.get_mut().take() {
+            self.pool.borrow_mut().defer_recycle(surface);
+        }
+    }
 }
 
 struct VaapiVideoSurface {
-    #[allow(dead_code)]
-    surface: Rc<Surface<()>>,
-    #[allow(dead_code)]
-    validation_checksum: u32,
-    #[allow(dead_code)]
-    export_probe: Option<VaapiExportProbe>,
+    state: Rc<DecodedSurfaceState>,
 }
 
 impl BackendResource for VaapiVideoSurface {
@@ -504,27 +658,170 @@ impl BackendResource for VaapiVideoSurface {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Clone)]
-struct VaapiExportProbe {
-    object_count: usize,
-    layer_count: usize,
-    fourcc: u32,
+pub fn surface_diagnostics(resource: &dyn BackendResource) -> Option<VaapiSurfaceDiagnostics> {
+    resource
+        .as_any()
+        .downcast_ref::<VaapiVideoSurface>()
+        .map(|surface| surface.state.diagnostics.clone())
+}
+
+fn collect_surface_diagnostics(
+    surface: &Surface<()>,
     width: u32,
     height: u32,
-    object_sizes: Vec<u32>,
-    modifiers: Vec<u64>,
-    layer_formats: Vec<u32>,
-    pitches: Vec<[u32; 4]>,
-    offsets: Vec<[u32; 4]>,
+) -> Result<VaapiSurfaceDiagnostics, DecoderError> {
+    let validation_checksum =
+        validation_checksum(surface, width, height).map_err(|_| DecoderError::DecodeFailed)?;
+    let export_probe = surface
+        .export_prime()
+        .ok()
+        .map(|descriptor| VaapiExportProbe {
+            object_count: descriptor.objects.len(),
+            layer_count: descriptor.layers.len(),
+            fourcc: descriptor.fourcc,
+            width: descriptor.width,
+            height: descriptor.height,
+            object_sizes: descriptor
+                .objects
+                .iter()
+                .map(|object| object.size)
+                .collect(),
+            modifiers: descriptor
+                .objects
+                .iter()
+                .map(|object| object.drm_format_modifier)
+                .collect(),
+            layer_formats: descriptor
+                .layers
+                .iter()
+                .map(|layer| layer.drm_format)
+                .collect(),
+            pitches: descriptor.layers.iter().map(|layer| layer.pitch).collect(),
+            offsets: descriptor.layers.iter().map(|layer| layer.offset).collect(),
+        });
+
+    Ok(VaapiSurfaceDiagnostics {
+        validation_checksum: Some(validation_checksum),
+        export_probe,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VaapiExportProbe {
+    pub object_count: usize,
+    pub layer_count: usize,
+    pub fourcc: u32,
+    pub width: u32,
+    pub height: u32,
+    pub object_sizes: Vec<u32>,
+    pub modifiers: Vec<u64>,
+    pub layer_formats: Vec<u32>,
+    pub pitches: Vec<[u32; 4]>,
+    pub offsets: Vec<[u32; 4]>,
+}
+
+enum DecodedVaSurface {
+    Submitted(Picture<PictureEnd, Surface<()>>),
+    Ready(Surface<()>),
+}
+
+impl DecodedVaSurface {
+    fn surface_id(&self) -> u32 {
+        match self {
+            Self::Submitted(picture) => picture.surface().id(),
+            Self::Ready(surface) => surface.id(),
+        }
+    }
+
+    fn as_surface(&self) -> &Surface<()> {
+        match self {
+            Self::Submitted(picture) => picture.surface(),
+            Self::Ready(surface) => surface,
+        }
+    }
+
+    fn reclaim_for_reuse(self) -> Option<Surface<()>> {
+        match self {
+            Self::Submitted(picture) => picture.sync().ok()?.take_surface().ok(),
+            Self::Ready(surface) => {
+                surface.sync().ok()?;
+                Some(surface)
+            }
+        }
+    }
+}
+
+struct VaapiSurfacePool {
+    available: Vec<Surface<()>>,
+    pending_recycle: Vec<DecodedVaSurface>,
+    stats: VaapiSurfacePoolStats,
+}
+
+impl VaapiSurfacePool {
+    fn new(surfaces: Vec<Surface<()>>) -> Self {
+        let surfaces_allocated = surfaces.len();
+        Self {
+            available: surfaces,
+            pending_recycle: Vec::new(),
+            stats: VaapiSurfacePoolStats {
+                surfaces_allocated,
+                ..VaapiSurfacePoolStats::default()
+            },
+        }
+    }
+
+    fn acquire(&mut self) -> Option<Surface<()>> {
+        let surface = match self.available.pop() {
+            Some(surface) => surface,
+            None => self.reclaim_one_pending()?,
+        };
+        let was_recycled = self.stats.surfaces_recycled > 0;
+        if was_recycled {
+            self.stats.surface_reuse_count = self.stats.surface_reuse_count.saturating_add(1);
+        }
+        let checked_out = self
+            .stats
+            .surfaces_allocated
+            .saturating_sub(self.available.len());
+        self.stats.peak_checked_out_surfaces =
+            self.stats.peak_checked_out_surfaces.max(checked_out);
+        Some(surface)
+    }
+
+    fn defer_recycle(&mut self, surface: DecodedVaSurface) {
+        self.stats.deferred_recycle_count = self.stats.deferred_recycle_count.saturating_add(1);
+        self.pending_recycle.push(surface);
+    }
+
+    fn reclaim_one_pending(&mut self) -> Option<Surface<()>> {
+        let surface = self.pending_recycle.pop()?;
+        if let Some(surface) = surface.reclaim_for_reuse() {
+            self.stats.recycle_sync_count = self.stats.recycle_sync_count.saturating_add(1);
+            self.stats.surfaces_recycled = self.stats.surfaces_recycled.saturating_add(1);
+            Some(surface)
+        } else {
+            None
+        }
+    }
+
+    fn record_deferred_recycle(&mut self) {
+        self.stats.deferred_recycle_count = self.stats.deferred_recycle_count.saturating_add(1);
+    }
+}
+
+impl Drop for VaapiSurfacePool {
+    fn drop(&mut self) {
+        while self.reclaim_one_pending().is_some() {}
+    }
 }
 
 fn decode_h264_access_unit(
     context: Rc<Context>,
     surface: Surface<()>,
     parsed: &ParsedH264AccessUnit,
-    decoded_surfaces: &BTreeMap<(u16, i32), DecodedSurfaceState>,
-) -> Result<Surface<()>, DecoderError> {
+    decoded_surfaces: &BTreeMap<(u16, i32), Rc<DecodedSurfaceState>>,
+    sync_after_end: bool,
+) -> Result<DecodedVaSurface, DecoderError> {
     let mut picture = Picture::new(0, Rc::clone(&context), surface);
     let pic_param = picture_parameter(parsed, picture.surface().id(), decoded_surfaces)?;
     picture.add_buffer(
@@ -565,16 +862,22 @@ fn decode_h264_access_unit(
     let picture = picture.begin().map_err(|_| DecoderError::DecodeFailed)?;
     let picture = picture.render().map_err(|_| DecoderError::DecodeFailed)?;
     let picture = picture.end().map_err(|_| DecoderError::DecodeFailed)?;
-    let picture = picture.sync().map_err(|_| DecoderError::DecodeFailed)?;
-    picture
-        .take_surface()
-        .map_err(|_| DecoderError::DecodeFailed)
+    if sync_after_end {
+        let surface = picture
+            .sync()
+            .map_err(|_| DecoderError::DecodeFailed)?
+            .take_surface()
+            .map_err(|_| DecoderError::DecodeFailed)?;
+        Ok(DecodedVaSurface::Ready(surface))
+    } else {
+        Ok(DecodedVaSurface::Submitted(picture))
+    }
 }
 
 fn picture_parameter(
     parsed: &ParsedH264AccessUnit,
     surface_id: u32,
-    decoded_surfaces: &BTreeMap<(u16, i32), DecodedSurfaceState>,
+    decoded_surfaces: &BTreeMap<(u16, i32), Rc<DecodedSurfaceState>>,
 ) -> Result<PictureParameterBufferH264, DecoderError> {
     let picture = &parsed.picture;
     let current = PictureH264::new(
@@ -633,7 +936,7 @@ fn picture_parameter(
 
 fn slice_parameters(
     parsed: &ParsedH264AccessUnit,
-    decoded_surfaces: &BTreeMap<(u16, i32), DecodedSurfaceState>,
+    decoded_surfaces: &BTreeMap<(u16, i32), Rc<DecodedSurfaceState>>,
 ) -> Result<SliceParameterBufferH264, DecoderError> {
     let mut params = SliceParameterBufferH264::new_array();
     let mut offset = 0_u32;
@@ -679,7 +982,7 @@ fn slice_parameters(
 
 fn reference_frames(
     parsed: &ParsedH264AccessUnit,
-    decoded_surfaces: &BTreeMap<(u16, i32), DecodedSurfaceState>,
+    decoded_surfaces: &BTreeMap<(u16, i32), Rc<DecodedSurfaceState>>,
 ) -> Result<[PictureH264; 16], DecoderError> {
     let mut references = invalid_picture_array_16();
     for (index, reference) in parsed.reference_frames.iter().take(16).enumerate() {
@@ -690,7 +993,7 @@ fn reference_frames(
 
 fn reference_list_array(
     refs: &[H264PictureId],
-    decoded_surfaces: &BTreeMap<(u16, i32), DecodedSurfaceState>,
+    decoded_surfaces: &BTreeMap<(u16, i32), Rc<DecodedSurfaceState>>,
 ) -> Result<[PictureH264; 32], DecoderError> {
     let mut pictures = invalid_picture_array_32();
     for (index, id) in refs.iter().take(32).enumerate() {
@@ -698,7 +1001,7 @@ fn reference_list_array(
             return Err(DecoderError::DecodeFailed);
         };
         pictures[index] = PictureH264::new(
-            surface.surface.id(),
+            surface.surface_id()?,
             u32::from(id.frame_num),
             h264_picture_flags(true),
             id.poc,
@@ -710,13 +1013,13 @@ fn reference_list_array(
 
 fn picture_from_reference(
     reference: &ParsedH264Reference,
-    decoded_surfaces: &BTreeMap<(u16, i32), DecodedSurfaceState>,
+    decoded_surfaces: &BTreeMap<(u16, i32), Rc<DecodedSurfaceState>>,
 ) -> Result<PictureH264, DecoderError> {
     let Some(surface) = decoded_surfaces.get(&surface_key(&reference.id)) else {
         return Err(DecoderError::DecodeFailed);
     };
     Ok(PictureH264::new(
-        surface.surface.id(),
+        surface.surface_id()?,
         u32::from(reference.frame_num),
         h264_picture_flags(true),
         reference.top_field_order_cnt,
@@ -1027,6 +1330,23 @@ mod tests {
 
     const PROFESSIONAL_INTRA_FIXTURE: &[u8] =
         include_bytes!("../../../tests/fixtures/h264/professional-422-10bit-idr-128x72.h264");
+
+    #[test]
+    fn normal_decode_mode_disables_diagnostics() {
+        assert!(!VaapiDecodeMode::Normal.diagnostics_enabled());
+        assert!(VaapiDecodeMode::Diagnostic.diagnostics_enabled());
+    }
+
+    #[test]
+    fn surface_pool_stats_start_empty() {
+        let stats = VaapiSurfacePoolStats::default();
+        assert_eq!(stats.surfaces_allocated, 0);
+        assert_eq!(stats.surface_reuse_count, 0);
+        assert_eq!(stats.surfaces_recycled, 0);
+        assert_eq!(stats.recycle_sync_count, 0);
+        assert_eq!(stats.deferred_recycle_count, 0);
+        assert_eq!(stats.peak_checked_out_surfaces, 0);
+    }
 
     #[test]
     fn maps_va_h264_profiles_to_qgs_profiles() {

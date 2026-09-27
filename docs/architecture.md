@@ -373,6 +373,20 @@ config, context, decode surface, VA parameter buffer translation, VA decode
 submission, completion, validation-only readback, and VA surface export probing.
 VA types do not escape `qgs-vaapi`.
 
+The VA backend now distinguishes the production decode path from explicit
+diagnostic/validation work. Normal decode submits H.264 pictures, tracks
+backend surface lifetime, emits QGS `VideoSurface` resources, and reuses a
+bounded surface pool. It does not automatically calculate per-frame CPU
+checksums, export DRM PRIME descriptors, or print per-frame diagnostic state.
+Diagnostic mode is opt-in and may perform `vaSyncSurface`, CPU validation
+readback, DRM PRIME export probing, and detailed logging.
+
+The current safe libva wrapper only returns ownership of an ended picture's
+surface after synchronization, so qgs-vaapi keeps DPB-released pictures in a
+pending recycle list and reclaims them only when the bounded pool needs another
+surface or during decoder cleanup. This keeps diagnostics out of the hot path
+and avoids immediate sync on every release, while preserving safe surface reuse.
+
 M2 Step 5 extends the frontend to stateful H.264 Long-GOP behavior:
 
 ```text

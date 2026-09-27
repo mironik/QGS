@@ -167,6 +167,11 @@ QGS result:
 - Selected proxy frames feed the reusable GPU processing path on Intel HD
   Graphics 4600 and NVIDIA GTX 950M / NVK. VA -> Vulkan zero-copy remains
   frozen and is not used.
+- Step 13 separates qgs-vaapi production decode from explicit diagnostics. On
+  the current Haswell/i965 machine, the clean VA proxy path decodes all 106
+  frames with diagnostics disabled; the measured development observation is
+  still below realtime, so proxy playback scheduling remains future work rather
+  than a claimed interactive playback feature.
 
 Privacy handling:
 
