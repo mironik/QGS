@@ -693,7 +693,10 @@ pub enum H264Profile {
     Baseline,
     Main,
     High,
+    High10,
+    High10Intra,
     High422,
+    High422Intra,
 }
 
 impl H264Profile {
@@ -702,7 +705,10 @@ impl H264Profile {
             Self::Baseline => 1,
             Self::Main => 2,
             Self::High => 3,
-            Self::High422 => 4,
+            Self::High10 => 4,
+            Self::High10Intra => 5,
+            Self::High422 => 6,
+            Self::High422Intra => 7,
         }
     }
 }
@@ -715,7 +721,10 @@ impl TryFrom<u8> for H264Profile {
             1 => Ok(Self::Baseline),
             2 => Ok(Self::Main),
             3 => Ok(Self::High),
-            4 => Ok(Self::High422),
+            4 => Ok(Self::High10),
+            5 => Ok(Self::High10Intra),
+            6 => Ok(Self::High422),
+            7 => Ok(Self::High422Intra),
             _ => Err(ProtocolError::UnsupportedVideoProfile),
         }
     }
@@ -1038,6 +1047,22 @@ impl DecoderConfig {
             return Err(ProtocolError::UnsupportedScanMode);
         }
         Ok(())
+    }
+
+    pub fn is_satisfied_by(&self, capability: &VideoDecodeCapability) -> bool {
+        self.codec == capability.codec
+            && self.profile == capability.profile
+            && self.bit_depth == capability.bit_depth
+            && self.chroma == capability.chroma
+            && self.coded_width <= capability.max_width
+            && self.coded_height <= capability.max_height
+            && match self.scan_mode {
+                ScanMode::Progressive => capability.progressive_supported,
+                ScanMode::Interlaced => capability.interlaced_supported,
+            }
+            && capability.output_surface_formats.iter().any(|format| {
+                format.bit_depth() == self.bit_depth.get() && format.chroma() == self.chroma
+            })
     }
 }
 
@@ -5439,7 +5464,10 @@ mod tests {
             H264Profile::Baseline,
             H264Profile::Main,
             H264Profile::High,
+            H264Profile::High10,
+            H264Profile::High10Intra,
             H264Profile::High422,
+            H264Profile::High422Intra,
         ] {
             assert_eq!(H264Profile::try_from(profile.wire_value()), Ok(profile));
         }
@@ -5568,6 +5596,27 @@ mod tests {
     }
 
     #[test]
+    fn video_surface_desc_represents_10bit_422_semantics() {
+        let desc = VideoSurfaceDesc {
+            coded_width: 1920,
+            coded_height: 1080,
+            visible_region: VisibleRegion {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            format: VideoSurfaceFormat::Yuv422_10,
+            bit_depth: BitDepth::new(10).expect("10-bit"),
+            chroma: ChromaSubsampling::Cs422,
+            scan_mode: ScanMode::Progressive,
+            field_order: FieldOrder::Unknown,
+        };
+
+        assert_eq!(desc.validate(), Ok(()));
+    }
+
+    #[test]
     fn resource_kind_video_surface_round_trips() {
         assert_eq!(ResourceKind::try_from(1), Ok(ResourceKind::Buffer));
         assert_eq!(ResourceKind::try_from(2), Ok(ResourceKind::Image));
@@ -5657,6 +5706,54 @@ mod tests {
                 max: MAX_VIDEO_OUTPUT_FORMAT_COUNT,
             })
         );
+    }
+
+    #[test]
+    fn decoder_config_matches_exact_8bit_420_capability() {
+        let config = DecoderConfig {
+            device_id: DeviceId::new(1).expect("device id"),
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264(H264Profile::High),
+            bit_depth: BitDepth::new(8).expect("8-bit"),
+            chroma: ChromaSubsampling::Cs420,
+            coded_width: 128,
+            coded_height: 72,
+            scan_mode: ScanMode::Progressive,
+        };
+
+        assert!(config.is_satisfied_by(&sample_h264_8bit_420_capability()));
+    }
+
+    #[test]
+    fn decoder_config_rejects_10bit_422_against_8bit_420_capability() {
+        let config = DecoderConfig {
+            device_id: DeviceId::new(1).expect("device id"),
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264(H264Profile::High422),
+            bit_depth: BitDepth::new(10).expect("10-bit"),
+            chroma: ChromaSubsampling::Cs422,
+            coded_width: 128,
+            coded_height: 72,
+            scan_mode: ScanMode::Progressive,
+        };
+
+        assert!(!config.is_satisfied_by(&sample_h264_8bit_420_capability()));
+    }
+
+    #[test]
+    fn decoder_config_matches_professional_10bit_422_capability() {
+        let config = DecoderConfig {
+            device_id: DeviceId::new(1).expect("device id"),
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264(H264Profile::High422),
+            bit_depth: BitDepth::new(10).expect("10-bit"),
+            chroma: ChromaSubsampling::Cs422,
+            coded_width: 1920,
+            coded_height: 1080,
+            scan_mode: ScanMode::Progressive,
+        };
+
+        assert!(config.is_satisfied_by(&sample_h264_10bit_422_capability()));
     }
 
     #[test]

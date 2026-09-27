@@ -706,20 +706,33 @@ fn validate_supported_sps_pps(
     pps: &PicParameterSet,
 ) -> Result<(), H264Error> {
     match sps.profile() {
-        Profile::Baseline | Profile::ConstrainedBaseline | Profile::Main | Profile::High => {}
-        Profile::High422 | Profile::High422Intra => {
-            return Err(H264Error::UnsupportedFeature("H.264 4:2:2 profile"));
-        }
-        Profile::High10 | Profile::High10Intra => {
-            return Err(H264Error::UnsupportedFeature("H.264 10-bit profile"));
-        }
+        Profile::Baseline
+        | Profile::ConstrainedBaseline
+        | Profile::Main
+        | Profile::High
+        | Profile::ProgressiveHigh
+        | Profile::ConstrainedHigh
+        | Profile::High10
+        | Profile::High10Intra
+        | Profile::High422
+        | Profile::High422Intra => {}
         _ => return Err(H264Error::UnsupportedFeature("H.264 profile")),
     }
-    if sps.chroma_info.bit_depth_luma_minus8 != 0 || sps.chroma_info.bit_depth_chroma_minus8 != 0 {
-        return Err(H264Error::UnsupportedFeature("bit depth greater than 8"));
+    if sps.chroma_info.bit_depth_luma_minus8 != sps.chroma_info.bit_depth_chroma_minus8 {
+        return Err(H264Error::UnsupportedFeature(
+            "different luma/chroma bit depths",
+        ));
     }
-    if sps.chroma_info.chroma_format != ChromaFormat::YUV420 {
-        return Err(H264Error::UnsupportedFeature("non-4:2:0 chroma"));
+    if !matches!(sps.chroma_info.bit_depth_luma_minus8, 0 | 2) {
+        return Err(H264Error::UnsupportedFeature("unsupported H.264 bit depth"));
+    }
+    if !matches!(
+        sps.chroma_info.chroma_format,
+        ChromaFormat::YUV420 | ChromaFormat::YUV422
+    ) {
+        return Err(H264Error::UnsupportedFeature(
+            "unsupported H.264 chroma format",
+        ));
     }
     if sps.chroma_info.separate_colour_plane_flag {
         return Err(H264Error::UnsupportedFeature("separate colour plane"));
@@ -1052,15 +1065,57 @@ fn surface_desc_from_sps(
             width,
             height,
         },
-        format: VideoSurfaceFormat::Nv12,
-        bit_depth: BitDepth::new(8).map_err(|error| H264Error::Parser(error.to_string()))?,
-        chroma: ChromaSubsampling::Cs420,
+        format: surface_format_from_sps(sps)?,
+        bit_depth: bit_depth_from_sps(sps)?,
+        chroma: chroma_from_sps(sps)?,
         scan_mode: ScanMode::Progressive,
         field_order: FieldOrder::Unknown,
     };
     desc.validate()
         .map_err(|error| H264Error::Parser(error.to_string()))?;
     Ok(desc)
+}
+
+fn bit_depth_from_sps(sps: &h264_reader::nal::sps::SeqParameterSet) -> Result<BitDepth, H264Error> {
+    let value = sps
+        .chroma_info
+        .bit_depth_luma_minus8
+        .checked_add(8)
+        .ok_or(H264Error::UnsupportedFeature("H.264 bit depth overflow"))?;
+    BitDepth::new(value).map_err(|error| H264Error::Parser(error.to_string()))
+}
+
+fn chroma_from_sps(
+    sps: &h264_reader::nal::sps::SeqParameterSet,
+) -> Result<ChromaSubsampling, H264Error> {
+    match sps.chroma_info.chroma_format {
+        ChromaFormat::YUV420 => Ok(ChromaSubsampling::Cs420),
+        ChromaFormat::YUV422 => Ok(ChromaSubsampling::Cs422),
+        ChromaFormat::YUV444 => Ok(ChromaSubsampling::Cs444),
+        ChromaFormat::Monochrome | ChromaFormat::Invalid(_) => Err(H264Error::UnsupportedFeature(
+            "unsupported H.264 chroma format",
+        )),
+    }
+}
+
+fn surface_format_from_sps(
+    sps: &h264_reader::nal::sps::SeqParameterSet,
+) -> Result<VideoSurfaceFormat, H264Error> {
+    match (
+        sps.chroma_info.chroma_format,
+        sps.chroma_info.bit_depth_luma_minus8,
+    ) {
+        (ChromaFormat::YUV420, 0) => Ok(VideoSurfaceFormat::Nv12),
+        (ChromaFormat::YUV420, 2) => Ok(VideoSurfaceFormat::P010),
+        (ChromaFormat::YUV422, 0) => Ok(VideoSurfaceFormat::Yuv422_8),
+        (ChromaFormat::YUV422, 2) => Ok(VideoSurfaceFormat::Yuv422_10),
+        (ChromaFormat::YUV444, _) => Err(H264Error::UnsupportedFeature(
+            "4:4:4 VideoSurface storage representation",
+        )),
+        _ => Err(H264Error::UnsupportedFeature(
+            "unsupported H.264 surface representation",
+        )),
+    }
 }
 
 fn map_profile(profile: Profile) -> Result<H264Profile, H264Error> {
@@ -1070,10 +1125,10 @@ fn map_profile(profile: Profile) -> Result<H264Profile, H264Error> {
         Profile::High | Profile::ProgressiveHigh | Profile::ConstrainedHigh => {
             Ok(H264Profile::High)
         }
-        Profile::High422 | Profile::High422Intra => Ok(H264Profile::High422),
-        Profile::High10 | Profile::High10Intra => {
-            Err(H264Error::UnsupportedFeature("H.264 10-bit profile"))
-        }
+        Profile::High10 => Ok(H264Profile::High10),
+        Profile::High10Intra => Ok(H264Profile::High10Intra),
+        Profile::High422 => Ok(H264Profile::High422),
+        Profile::High422Intra => Ok(H264Profile::High422Intra),
         _ => Err(H264Error::UnsupportedFeature("H.264 profile")),
     }
 }
@@ -1237,6 +1292,10 @@ mod tests {
     const FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/h264/idr-64x64-baseline.h264");
     const LONG_GOP_FIXTURE: &[u8] =
         include_bytes!("../../../tests/fixtures/h264/long-gop-128x72-main.h264");
+    const PROFESSIONAL_INTRA_FIXTURE: &[u8] =
+        include_bytes!("../../../tests/fixtures/h264/professional-422-10bit-idr-128x72.h264");
+    const PROFESSIONAL_LONG_GOP_FIXTURE: &[u8] =
+        include_bytes!("../../../tests/fixtures/h264/professional-422-10bit-long-gop-128x72.h264");
 
     #[test]
     fn parses_fixture_access_unit() {
@@ -1282,6 +1341,50 @@ mod tests {
         assert!(kinds.contains(&H264SliceKind::I));
         assert!(kinds.contains(&H264SliceKind::P));
         assert!(kinds.contains(&H264SliceKind::B));
+    }
+
+    #[test]
+    fn parses_professional_high422_10bit_intra_fixture() {
+        let parsed =
+            parse_annex_b_access_unit(PROFESSIONAL_INTRA_FIXTURE).expect("professional AU parses");
+
+        assert_eq!(parsed.profile, H264Profile::High422Intra);
+        assert_eq!(parsed.desc.coded_width, 128);
+        assert_eq!(parsed.desc.coded_height, 72);
+        assert_eq!(parsed.desc.format, VideoSurfaceFormat::Yuv422_10);
+        assert_eq!(parsed.desc.bit_depth.get(), 10);
+        assert_eq!(parsed.desc.chroma, ChromaSubsampling::Cs422);
+        assert_eq!(parsed.picture.bit_depth_luma_minus8, 2);
+        assert_eq!(parsed.picture.bit_depth_chroma_minus8, 2);
+        assert_eq!(parsed.picture.chroma_format_idc, 2);
+        assert_eq!(parsed.slices[0].kind, H264SliceKind::I);
+    }
+
+    #[test]
+    fn parses_professional_high422_10bit_long_gop_fixture() {
+        let access_units = split_access_units_for_test(PROFESSIONAL_LONG_GOP_FIXTURE);
+        assert_eq!(access_units.len(), 12);
+
+        let mut state = H264DecoderState::new();
+        let mut kinds = Vec::new();
+        for access_unit in access_units {
+            let parsed = state
+                .parse_access_unit(&access_unit)
+                .expect("professional Long-GOP AU parses");
+            assert_eq!(parsed.profile, H264Profile::High422);
+            assert_eq!(parsed.desc.format, VideoSurfaceFormat::Yuv422_10);
+            assert_eq!(parsed.desc.bit_depth.get(), 10);
+            assert_eq!(parsed.desc.chroma, ChromaSubsampling::Cs422);
+            kinds.push(parsed.slices[0].kind.clone());
+            state
+                .finish_picture(&parsed)
+                .expect("professional Long-GOP DPB update succeeds");
+        }
+
+        assert!(kinds.contains(&H264SliceKind::I));
+        assert!(kinds.contains(&H264SliceKind::P));
+        assert!(kinds.contains(&H264SliceKind::B));
+        assert!(state.max_dpb_occupancy() > 1);
     }
 
     #[test]

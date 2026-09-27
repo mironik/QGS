@@ -23,10 +23,10 @@ use qgs_core::{
     VideoCapabilityDiscovery, VideoCapabilityDiscoveryError,
 };
 use qgs_protocol::{
-    BitDepth, ChromaSubsampling, CreateDecoderRequest, DeviceDesc, DeviceId, H264Profile,
-    Mpeg2Profile, SubmitAccessUnitRequest, VideoCapabilities, VideoCodec, VideoDecodeCapability,
-    VideoProfile, VideoSurfaceDesc, VideoSurfaceFormat, MAX_VIDEO_SURFACE_HEIGHT,
-    MAX_VIDEO_SURFACE_WIDTH,
+    BitDepth, ChromaSubsampling, CreateDecoderRequest, DecoderConfig, DeviceDesc, DeviceId,
+    H264Profile, Mpeg2Profile, SubmitAccessUnitRequest, VideoCapabilities, VideoCodec,
+    VideoDecodeCapability, VideoProfile, VideoSurfaceDesc, VideoSurfaceFormat,
+    MAX_VIDEO_SURFACE_HEIGHT, MAX_VIDEO_SURFACE_WIDTH,
 };
 
 const DEFAULT_MAX_WIDTH: u32 = MAX_VIDEO_SURFACE_WIDTH;
@@ -124,6 +124,14 @@ impl DecoderBackend for VaapiVideoDiscovery {
             .ok_or(DecoderError::UnknownDeviceId)?;
         let display = Display::open_drm_display(&device.path)
             .map_err(|_| DecoderError::UnsupportedDecodeConfiguration)?;
+        let capabilities = query_decode_capabilities(&display)
+            .map_err(|_| DecoderError::UnsupportedDecodeConfiguration)?;
+        if !capabilities
+            .iter()
+            .any(|capability| request.config.is_satisfied_by(capability))
+        {
+            return Err(DecoderError::UnsupportedDecodeConfiguration);
+        }
         let profile = va_profile_from_h264(request.config.profile)?;
         let entrypoints = display
             .query_config_entrypoints(profile)
@@ -164,6 +172,7 @@ impl DecoderBackend for VaapiVideoDiscovery {
             decoded_surfaces: BTreeMap::new(),
             frontend: H264DecoderState::new(),
             device_id: request.config.device_id,
+            config: request.config.clone(),
             max_live_surfaces: 0,
         }))
     }
@@ -300,12 +309,26 @@ fn decoder_profile_from_parsed(parsed: &ParsedH264AccessUnit) -> VideoProfile {
     qgs_codec_h264::decoder_profile(parsed)
 }
 
+fn parsed_access_unit_matches_config(
+    parsed: &ParsedH264AccessUnit,
+    config: &DecoderConfig,
+) -> bool {
+    config.codec == qgs_codec_h264::decoder_codec()
+        && config.profile == qgs_codec_h264::decoder_profile(parsed)
+        && config.bit_depth == parsed.desc.bit_depth
+        && config.chroma == parsed.desc.chroma
+        && config.coded_width == parsed.desc.coded_width
+        && config.coded_height == parsed.desc.coded_height
+        && config.scan_mode == parsed.desc.scan_mode
+}
+
 struct VaapiH264Decoder {
     context: Rc<Context>,
     available_surfaces: Vec<Surface<()>>,
     decoded_surfaces: BTreeMap<(u16, i32), DecodedSurfaceState>,
     frontend: H264DecoderState,
     device_id: DeviceId,
+    config: DecoderConfig,
     max_live_surfaces: usize,
 }
 
@@ -318,6 +341,9 @@ impl BackendDecoder for VaapiH264Decoder {
             .frontend
             .parse_access_unit(&request.data)
             .map_err(decoder_error_from_h264)?;
+        if !parsed_access_unit_matches_config(&parsed, &self.config) {
+            return Err(DecoderError::UnsupportedDecodeConfiguration);
+        }
         let surface = self
             .available_surfaces
             .pop()
@@ -984,6 +1010,9 @@ fn map_profile(profile: VAProfile::Type) -> Option<MappedProfile> {
 mod tests {
     use super::*;
 
+    const PROFESSIONAL_INTRA_FIXTURE: &[u8] =
+        include_bytes!("../../../tests/fixtures/h264/professional-422-10bit-idr-128x72.h264");
+
     #[test]
     fn maps_va_h264_profiles_to_qgs_profiles() {
         assert_eq!(
@@ -1063,6 +1092,24 @@ mod tests {
         push_unique_capability(&mut capabilities, capability);
 
         assert_eq!(capabilities.len(), 1);
+    }
+
+    #[test]
+    fn professional_h264_stream_does_not_match_8bit_420_decoder_config() {
+        let parsed = qgs_codec_h264::parse_annex_b_access_unit(PROFESSIONAL_INTRA_FIXTURE)
+            .expect("professional H.264 stream parses");
+        let config = DecoderConfig {
+            device_id: DeviceId::new(1).expect("device id"),
+            codec: VideoCodec::H264,
+            profile: VideoProfile::H264(H264Profile::High),
+            bit_depth: BitDepth::new(8).expect("8-bit"),
+            chroma: ChromaSubsampling::Cs420,
+            coded_width: 128,
+            coded_height: 72,
+            scan_mode: qgs_protocol::ScanMode::Progressive,
+        };
+
+        assert!(!parsed_access_unit_matches_config(&parsed, &config));
     }
 
     #[test]

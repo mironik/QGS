@@ -463,7 +463,10 @@ H.264 profile values are:
 | 1 | Baseline |
 | 2 | Main |
 | 3 | High |
-| 4 | High422 |
+| 4 | High10 |
+| 5 | High10Intra |
+| 6 | High422 |
+| 7 | High422Intra |
 
 MPEG-2 profile values are:
 
@@ -494,12 +497,14 @@ Video surface format values are:
 | 3 | Yuv422_8 |
 | 4 | Yuv422_10 |
 
-`VideoSurface` model fields are not currently sent in a CREATE message because
-M2 Step 1 does not allocate real video surfaces. The QGS-owned
-`VideoSurfaceDesc` model contains coded width and height, a visible region,
-surface format, explicit bit depth, chroma subsampling, scan mode, and field
-order. Scan mode values are progressive `1` and interlaced `2`. Field order
-values are unknown `0`, top-field-first `1`, and bottom-field-first `2`.
+The QGS-owned `VideoSurfaceDesc` model contains coded width and height, a
+visible region, surface format, explicit bit depth, chroma subsampling, scan
+mode, and field order. Scan mode values are progressive `1` and interlaced
+`2`. Field order values are unknown `0`, top-field-first `1`, and
+bottom-field-first `2`. The semantic surface format is separate from the
+backend storage representation; `Yuv422_10` represents a 10-bit 4:2:2 decoded
+surface without committing the public QGS model to one VA fourcc, Vulkan
+format, packing, or plane layout.
 
 M2 limits VIDEO_CAPABILITIES to 32 decode entries and 8 output surface formats
 per entry. VideoSurface coded dimensions are limited to 8192 x 8192, must be
@@ -617,9 +622,12 @@ truncated payloads, and trailing payload bytes. SUBMIT_ACCESS_UNIT receivers
 must reject zero `DecoderId` values, compressed payloads larger than 4 MiB,
 truncated compressed payloads, and trailing payload bytes. Unsupported
 H.264 syntax returns a stable UnsupportedH264StreamFeature error rather than
-being silently interpreted as the current M2 subset. FLUSH_DECODER and
-DESTROY_DECODER receivers must reject zero `DecoderId` values. Unknown decoder
-IDs and cross-session decoder attempts return a stable UnknownDecoder error.
+being silently interpreted as the current M2 subset. A valid stream whose
+technical requirements do not match backend capabilities returns
+UnsupportedDecodeConfiguration rather than MalformedCompressedData.
+FLUSH_DECODER and DESTROY_DECODER receivers must reject zero `DecoderId`
+values. Unknown decoder IDs and cross-session decoder attempts return a stable
+UnknownDecoder error.
 
 Major protocol versions are incompatible. Minor versions are backward-compatible
 only within the same major version. A server selects the highest protocol

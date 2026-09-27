@@ -273,6 +273,29 @@ MMCO, and short-term reference-list modifications. It does not claim general
 H.264 support, MPEG-2 support, XDCAM, XAVC, 10-bit, 4:2:2, interlaced decode,
 Vulkan import of decoded NV12 surfaces, or video scheduling.
 
+M2 Step 6 establishes the professional H.264 representation boundary. A valid
+codec stream is not the same thing as a hardware-decodable stream:
+
+```text
+H.264 access unit
+    |
+qgs-codec-h264 parses/classifies profile + bit depth + chroma + GOP syntax
+    |
+decoder capability matcher
+    |
+supported by backend?
+   / \
+ yes no
+  |   |
+hardware decode     future fallback / clean unsupported result
+```
+
+For example, QGS can parse and classify valid H.264 High 4:2:2 10-bit Intra
+and Long-GOP syntax while the current Intel i965 VA backend cleanly rejects
+that configuration because it advertises only H.264 8-bit 4:2:0 decode. This
+distinction keeps malformed compressed data, unsupported parser features, and
+valid-but-unsupported backend configurations separate.
+
 Compressed access units may travel through bounded normal QGS IPC for this M2
 proof. Raw decoded frames remain backend-owned VideoSurface resources and do
 not travel through normal protocol messages.
@@ -312,11 +335,12 @@ export/import external-memory FDs for explicitly exportable resources on
 supported drivers. It can also prove one-shot external GPU synchronization with
 Linux sync FDs on supported drivers. It can run private built-in compute and
 image-processing proofs against imported shared resources. It also defines the
-initial video capability and `VideoSurface` model, but it does not implement
-video decode or allocate video surfaces. It does not include an async runtime,
-daemonization, DRM/KMS, video decode, video encode, a public compute or shader
+video capability and `VideoSurface` model and can perform narrow H.264
+VA-API hardware decode proofs on supported hardware. It does not include an
+async runtime, daemonization, DRM/KMS, video encode, a public compute or shader
 API, reusable semaphore workflows, workload scheduling, performance
-benchmarking, telemetry, or free-memory reporting.
+benchmarking, telemetry, free-memory reporting, or resumed VA -> Vulkan
+zero-copy video processing.
 
 Capability discovery is static information reported by the backend. It is not a
 measurement of current load, available/free VRAM, throughput, or scheduling
