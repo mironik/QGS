@@ -11,17 +11,25 @@ use qgs_linux::{
     send_message_with_attachments, TransportError,
 };
 use qgs_protocol::{
-    DeviceCapabilitiesResponse, DeviceListResponse, ErrorResponse, ProtocolError,
-    ProtocolErrorCode, ResourceExportedResponse, SyncExportedResponse, VideoCapabilitiesResponse,
-    WireMessage,
+    DeviceCapabilities, DeviceCapabilitiesResponse, DeviceDesc, DeviceListResponse, ErrorResponse,
+    ProtocolError, ProtocolErrorCode, ResourceExportedResponse, SyncExportedResponse,
+    VideoCapabilities, VideoCapabilitiesResponse, WireMessage,
 };
+use qgs_vaapi::VaapiVideoDiscovery;
 use qgs_vulkan::VulkanDeviceDiscovery;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = socket_path_from_args();
     let listener = bind_socket(&socket_path)?;
     let sessions = SessionManager::new();
-    let discovery = VulkanDeviceDiscovery::new()?;
+    let vulkan = VulkanDeviceDiscovery::new()?;
+    let devices = vulkan.enumerate_devices()?;
+    let vaapi = VaapiVideoDiscovery::new(&devices);
+    let discovery = QgsBackends {
+        vulkan,
+        devices,
+        vaapi,
+    };
 
     println!("qgsd listening on {}", socket_path.display());
 
@@ -33,6 +41,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     remove_socket_file(&socket_path)?;
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct QgsBackends {
+    vulkan: VulkanDeviceDiscovery,
+    devices: Vec<DeviceDesc>,
+    vaapi: VaapiVideoDiscovery,
+}
+
+impl DeviceDiscovery for QgsBackends {
+    fn enumerate_devices(&self) -> Result<Vec<DeviceDesc>, qgs_core::DeviceDiscoveryError> {
+        Ok(self.devices.clone())
+    }
+
+    fn query_device_capabilities(
+        &self,
+        device_id: qgs_protocol::DeviceId,
+    ) -> Result<DeviceCapabilities, qgs_core::DeviceDiscoveryError> {
+        self.vulkan.query_device_capabilities(device_id)
+    }
+}
+
+impl VideoCapabilityDiscovery for QgsBackends {
+    fn query_video_capabilities(
+        &self,
+        device_id: qgs_protocol::DeviceId,
+    ) -> Result<VideoCapabilities, qgs_core::VideoCapabilityDiscoveryError> {
+        match self.vaapi.query_video_capabilities(device_id) {
+            Ok(capabilities) => Ok(capabilities),
+            Err(qgs_core::VideoCapabilityDiscoveryError::UnknownDeviceId)
+                if self.devices.iter().any(|device| device.id == device_id) =>
+            {
+                Ok(VideoCapabilities {
+                    device_id,
+                    decode: Vec::new(),
+                })
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+impl ResourceBackend for QgsBackends {
+    fn create_buffer(
+        &self,
+        desc: &qgs_protocol::BufferDesc,
+    ) -> Result<qgs_core::BackendBufferAllocation, ResourceError> {
+        self.vulkan.create_buffer(desc)
+    }
+
+    fn create_image(
+        &self,
+        desc: &qgs_protocol::ImageDesc,
+    ) -> Result<qgs_core::BackendImageAllocation, ResourceError> {
+        self.vulkan.create_image(desc)
+    }
+}
+
+impl SyncBackend for QgsBackends {
+    fn create_sync(
+        &self,
+        request: &qgs_protocol::CreateSyncRequest,
+    ) -> Result<Box<dyn qgs_core::BackendSync>, SyncError> {
+        self.vulkan.create_sync(request)
+    }
 }
 
 fn handle_client(

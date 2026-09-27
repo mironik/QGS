@@ -21,9 +21,11 @@ use qgs_vulkan::VulkanDeviceDiscovery;
 const DEMO_BUFFER_SIZE: u64 = 1024 * 1024;
 const IMAGE_PROOF_WIDTH: u32 = 64;
 const IMAGE_PROOF_HEIGHT: u32 = 64;
+const VIDEO_CAPABILITIES_ONLY_ARG: &str = "--video-capabilities-only";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let socket_path = socket_path_from_args();
+    let args = Args::parse();
+    let socket_path = args.socket_path;
     let mut stream = connect_socket(&socket_path)?;
     let mut request_id = 1;
 
@@ -136,6 +138,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         print_video_capabilities(&response.capabilities);
+    }
+
+    if args.video_capabilities_only {
+        return Ok(());
     }
 
     println!();
@@ -297,9 +303,37 @@ fn print_capabilities(capabilities: &DeviceCapabilities) {
 
 fn print_video_capabilities(capabilities: &VideoCapabilities) {
     println!("  Video decode:");
-    println!("    advertised capabilities: {}", capabilities.decode.len());
     if capabilities.decode.is_empty() {
-        println!("    backend: not implemented in M2 Step 1");
+        println!("    advertised capabilities: 0");
+        println!("    backend: no decode capabilities reported");
+        return;
+    }
+
+    println!("    advertised capabilities: {}", capabilities.decode.len());
+    for capability in &capabilities.decode {
+        println!(
+            "    - {:?} {:?}, {}-bit {:?}",
+            capability.codec,
+            capability.profile,
+            capability.bit_depth.get(),
+            capability.chroma
+        );
+        println!(
+            "      max: {} x {}",
+            capability.max_width, capability.max_height
+        );
+        println!(
+            "      progressive: {}",
+            yes_no(capability.progressive_supported)
+        );
+        println!(
+            "      interlaced: {}",
+            yes_no(capability.interlaced_supported)
+        );
+        println!(
+            "      output formats: {:?}",
+            capability.output_surface_formats
+        );
     }
 }
 
@@ -1131,9 +1165,27 @@ const fn yes_no(value: bool) -> &'static str {
     }
 }
 
-fn socket_path_from_args() -> PathBuf {
-    std::env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(default_socket_path)
+struct Args {
+    socket_path: PathBuf,
+    video_capabilities_only: bool,
+}
+
+impl Args {
+    fn parse() -> Self {
+        let mut socket_path = None;
+        let mut video_capabilities_only = false;
+
+        for arg in std::env::args_os().skip(1) {
+            if arg == VIDEO_CAPABILITIES_ONLY_ARG {
+                video_capabilities_only = true;
+            } else if socket_path.is_none() {
+                socket_path = Some(PathBuf::from(arg));
+            }
+        }
+
+        Self {
+            socket_path: socket_path.unwrap_or_else(default_socket_path),
+            video_capabilities_only,
+        }
+    }
 }

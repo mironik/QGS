@@ -207,12 +207,32 @@ be `Rgba8Unorm`, NV12, a Vulkan image, or a generic byte buffer. M2 Step 1 does
 not add timestamps, timeline/project concepts, deinterlacing, color conversion,
 or real decoder allocation.
 
-The M2 Step 1 video backend abstraction is intentionally small. A future backend
-such as VA-API, Vulkan Video, or another vendor-neutral path will translate its
-native profile and surface information into QGS-owned capability entries. Until
-such a backend is implemented, `qgsd` reports an honest empty video capability
-set for known devices rather than inferring support from GPU vendor, name, or
-generic graphics capability.
+The M2 video backend abstraction is intentionally small. Backends such as
+VA-API, Vulkan Video, or another vendor-neutral path translate their native
+profile and surface information into QGS-owned capability entries.
+
+M2 Step 2 adds real VA-API decode capability discovery through a backend
+boundary:
+
+```text
+QGS video capability model
+    ^
+    |
+qgs-vaapi
+    |
+VA-API
+    |
+DRM render node
+    |
+hardware
+```
+
+VA-API types, profiles, entrypoints, display handles, and driver details stop
+at `qgs-vaapi`. `qgs-core`, `qgs-protocol`, and ordinary clients see only
+QGS-owned `VideoDecodeCapability` entries. `qgs-vaapi` binds a QGS device to a
+Linux render node using sysfs PCI vendor/device identity; it does not rely on
+enumeration order. A known device with no usable VA decode backend reports an
+empty video capability list rather than inferred or fabricated decode support.
 
 ## Current Scope
 

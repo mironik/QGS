@@ -1,0 +1,10 @@
+[package]
+name = "qgs-vaapi"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+libva = { version = "0.1.4", default-features = false, features = ["linked"] }
+qgs-core = { path = "../qgs-core" }
+qgs-protocol = { path = "../qgs-protocol" }

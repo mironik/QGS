@@ -192,9 +192,11 @@ operation and must be sent after HELLO/WELCOME. Its payload is:
 | --- | ---: | --- |
 | 0 | u64 | QGS `DeviceId` from the current `qgsd` process/session |
 
-M2 Step 1 defines the video model and wire representation. It does not claim
-real decode hardware support unless a future video backend proves it. Current
-`qgsd` behavior for a known device is a valid empty capability list.
+The response is backend-neutral. Real decode capabilities may be supplied by a
+backend such as VA-API after it translates native profiles, entrypoints, and
+surface formats into QGS-owned values. A known device with no proven decode
+backend or no supported decode entrypoints returns a valid empty capability
+list rather than inferred support.
 
 WELCOME is response kind `2`, opcode `1`. Its payload is:
 
@@ -458,10 +460,13 @@ surface format, explicit bit depth, chroma subsampling, scan mode, and field
 order. Scan mode values are progressive `1` and interlaced `2`. Field order
 values are unknown `0`, top-field-first `1`, and bottom-field-first `2`.
 
-M2 Step 1 limits VIDEO_CAPABILITIES to 32 decode entries and 8 output surface
-formats per entry. VideoSurface coded dimensions are limited to 8192 x 8192,
-must be non-zero, and visible regions must be non-empty and contained inside
-the coded dimensions.
+M2 limits VIDEO_CAPABILITIES to 32 decode entries and 8 output surface formats
+per entry. VideoSurface coded dimensions are limited to 8192 x 8192, must be
+non-zero, and visible regions must be non-empty and contained inside the coded
+dimensions. If a real backend reports profile/surface support but does not
+expose exact maximum coded dimensions through the queried capability interface,
+QGS reports its bounded M2 model ceiling in the max-width/max-height fields and
+documents that backend limitation in the milestone report.
 
 `SyncId` is a non-zero, opaque, QGS-owned identifier. It represents an ordering
 primitive, not resource memory. For M1 Step 7, a `SyncId` is unique within its

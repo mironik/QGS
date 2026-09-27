@@ -8,4 +8,5 @@ version.workspace = true
 qgs-core = { path = "../../crates/qgs-core" }
 qgs-linux = { path = "../../crates/qgs-linux" }
 qgs-protocol = { path = "../../crates/qgs-protocol" }
+qgs-vaapi = { path = "../../crates/qgs-vaapi" }
 qgs-vulkan = { path = "../../crates/qgs-vulkan" }
