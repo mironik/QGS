@@ -13,10 +13,11 @@ use qgs_protocol::{
     CreateDecoderRequest, CreateImageRequest, CreateSyncRequest, DecoderConfig,
     DestroyDecoderRequest, DestroyResourceRequest, DeviceCapabilities, DeviceClass, DeviceDesc,
     ErrorResponse, ExportResourceRequest, ExportSyncRequest, ExternalHandleType, ExternalSharing,
-    H264Profile, HelloRequest, ImageDesc, ImageUsageFlags, MemoryPreference, PixelFormat,
-    ProtocolErrorCode, QueryDeviceCapabilitiesRequest, QueryVideoCapabilitiesRequest, ResourceId,
-    ScanMode, SelectedMemoryProperties, SubmitAccessUnitRequest, SyncExportHandleType, SyncId,
-    SyncKind, VideoCapabilities, VideoCodec, VideoProfile, WireMessage, CURRENT_PROTOCOL_VERSION,
+    FlushDecoderRequest, H264Profile, HelloRequest, ImageDesc, ImageUsageFlags, MemoryPreference,
+    PixelFormat, ProtocolErrorCode, QueryDeviceCapabilitiesRequest, QueryVideoCapabilitiesRequest,
+    ResourceId, ScanMode, SelectedMemoryProperties, SubmitAccessUnitRequest, SyncExportHandleType,
+    SyncId, SyncKind, VideoCapabilities, VideoCodec, VideoProfile, WireMessage,
+    CURRENT_PROTOCOL_VERSION,
 };
 use qgs_vulkan::{
     diagnose_haswell_video_import, DiagnosticDrmLayer, DiagnosticDrmObject, DiagnosticDrmPlane,
@@ -30,6 +31,8 @@ const VIDEO_CAPABILITIES_ONLY_ARG: &str = "--video-capabilities-only";
 const H264_DECODE_ONLY_ARG: &str = "--h264-decode-only";
 const HASWELL_VIDEO_DIAGNOSTIC_ARG: &str = "--haswell-video-diagnostic";
 const H264_FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/h264/idr-64x64-baseline.h264");
+const H264_LONG_GOP_FIXTURE: &[u8] =
+    include_bytes!("../../../tests/fixtures/h264/long-gop-128x72-main.h264");
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -172,6 +175,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("H.264 VA-API decode proof:");
         for device in &physical_devices {
             request_id = test_h264_decode(&mut stream, request_id, device)?;
+            request_id = test_h264_long_gop_decode(&mut stream, request_id, device)?;
             println!();
         }
         request_id = leave_h264_decoder_for_disconnect(&mut stream, request_id, &physical_devices)?;
@@ -1443,16 +1447,24 @@ fn test_h264_decode(
     if response.decoder_id != decoder_id {
         return Err("decode output decoder_id did not match request".into());
     }
+    if response.outputs.len() != 1 {
+        return Err(format!(
+            "IDR decode expected one output surface, got {}",
+            response.outputs.len()
+        )
+        .into());
+    }
+    let output = &response.outputs[0];
     println!("Decoded VideoSurface:");
-    println!("  resource id: {}", response.resource_id.get());
+    println!("  resource id: {}", output.resource_id.get());
     println!(
         "  {} x {} {:?}",
-        response.surface.coded_width, response.surface.coded_height, response.surface.format
+        output.surface.coded_width, output.surface.coded_height, output.surface.format
     );
     println!("  validation: backend VA readback succeeded");
 
     request_id += 1;
-    destroy_resource(stream, request_id, response.resource_id)?;
+    destroy_resource(stream, request_id, output.resource_id)?;
     println!("Decoded VideoSurface destroyed successfully.");
 
     request_id += 1;
@@ -1477,6 +1489,207 @@ fn test_h264_decode(
     println!("Decoder destroyed successfully.");
 
     Ok(request_id)
+}
+
+fn test_h264_long_gop_decode(
+    stream: &mut std::os::unix::net::UnixStream,
+    mut request_id: u64,
+    device: &DeviceDesc,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    println!("H.264 Long-GOP decode proof:");
+    println!("[{:?}] {}", device.class, device.name);
+
+    let access_units = split_h264_annex_b_access_units(H264_LONG_GOP_FIXTURE)?;
+    println!("  access units: {}", access_units.len());
+
+    request_id += 1;
+    let config = DecoderConfig {
+        device_id: device.id,
+        codec: VideoCodec::H264,
+        profile: VideoProfile::H264(H264Profile::Main),
+        bit_depth: BitDepth::new(8)?,
+        chroma: ChromaSubsampling::Cs420,
+        coded_width: 128,
+        coded_height: 72,
+        scan_mode: ScanMode::Progressive,
+    };
+    send_message(
+        stream,
+        &WireMessage::CreateDecoder {
+            request_id,
+            request: CreateDecoderRequest { config },
+        },
+    )?;
+    let response = receive_message(stream)?;
+    let decoder_id = match response {
+        WireMessage::DecoderCreated {
+            request_id: response_request_id,
+            response,
+        } => {
+            if response_request_id != request_id {
+                return Err("Long-GOP decoder request_id did not match".into());
+            }
+            response.decoder_id
+        }
+        WireMessage::Error { response, .. }
+            if response.code == ProtocolErrorCode::UnsupportedDecodeConfiguration =>
+        {
+            println!("  Long-GOP decoder unsupported as expected for this device.");
+            return Ok(request_id);
+        }
+        other => {
+            return Err(format!("unexpected Long-GOP decoder response: {other:?}").into());
+        }
+    };
+
+    let mut output_count = 0_usize;
+    let mut output_resources = Vec::new();
+    for (index, access_unit) in access_units.iter().enumerate() {
+        request_id += 1;
+        send_message(
+            stream,
+            &WireMessage::SubmitAccessUnit {
+                request_id,
+                request: SubmitAccessUnitRequest {
+                    decoder_id,
+                    data: access_unit.clone(),
+                },
+            },
+        )?;
+        let response = receive_message(stream)?;
+        let WireMessage::DecodeOutput {
+            request_id: response_request_id,
+            response,
+        } = response
+        else {
+            return Err("expected Long-GOP DECODE_OUTPUT response".into());
+        };
+        if response_request_id != request_id || response.decoder_id != decoder_id {
+            return Err("Long-GOP decode response correlation failed".into());
+        }
+        println!(
+            "  submitted AU {:02}: {} output surface(s)",
+            index,
+            response.outputs.len()
+        );
+        output_count += response.outputs.len();
+        output_resources.extend(
+            response
+                .outputs
+                .into_iter()
+                .map(|output| output.resource_id),
+        );
+    }
+
+    request_id += 1;
+    send_message(
+        stream,
+        &WireMessage::FlushDecoder {
+            request_id,
+            request: FlushDecoderRequest { decoder_id },
+        },
+    )?;
+    let response = receive_message(stream)?;
+    let WireMessage::DecodeOutput {
+        request_id: response_request_id,
+        response,
+    } = response
+    else {
+        return Err("expected Long-GOP flush DECODE_OUTPUT response".into());
+    };
+    if response_request_id != request_id || response.decoder_id != decoder_id {
+        return Err("Long-GOP flush response correlation failed".into());
+    }
+    println!("  flush output surface(s): {}", response.outputs.len());
+    output_count += response.outputs.len();
+    output_resources.extend(
+        response
+            .outputs
+            .into_iter()
+            .map(|output| output.resource_id),
+    );
+
+    if output_count != 12 {
+        return Err(format!("Long-GOP expected 12 output frames, got {output_count}").into());
+    }
+    println!("  validation: backend VA readback succeeded for every decoded frame");
+
+    for resource_id in output_resources {
+        request_id += 1;
+        destroy_resource(stream, request_id, resource_id)?;
+    }
+
+    request_id += 1;
+    send_message(
+        stream,
+        &WireMessage::DestroyDecoder {
+            request_id,
+            request: DestroyDecoderRequest { decoder_id },
+        },
+    )?;
+    let response = receive_message(stream)?;
+    let WireMessage::DecoderDestroyed {
+        request_id: response_request_id,
+        response,
+    } = response
+    else {
+        return Err("expected Long-GOP DECODER_DESTROYED response".into());
+    };
+    if response_request_id != request_id || response.decoder_id != decoder_id {
+        return Err("Long-GOP decoder destroyed response did not match".into());
+    }
+    println!("  decoded frames: {output_count}");
+    println!("  decoder destroyed successfully");
+
+    Ok(request_id)
+}
+
+fn split_h264_annex_b_access_units(
+    data: &[u8],
+) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        if data[i..].starts_with(&[0, 0, 1]) {
+            starts.push((i, 3));
+            i += 3;
+        } else if i + 4 <= data.len() && data[i..].starts_with(&[0, 0, 0, 1]) {
+            starts.push((i, 4));
+            i += 4;
+        } else {
+            i += 1;
+        }
+    }
+    if starts.is_empty() {
+        return Err("Long-GOP fixture is not Annex B".into());
+    }
+
+    let mut access_units = Vec::new();
+    let mut current = Vec::new();
+    let mut seen_vcl = false;
+    for (index, (start, prefix_len)) in starts.iter().copied().enumerate() {
+        let nal_start = start + prefix_len;
+        let nal_end = starts
+            .get(index + 1)
+            .map(|(next, _)| *next)
+            .unwrap_or(data.len());
+        if nal_start >= nal_end {
+            return Err("malformed Annex B NAL in Long-GOP fixture".into());
+        }
+        let nal_type = data[nal_start] & 0x1f;
+        let is_vcl = nal_type == 1 || nal_type == 5;
+        if is_vcl && seen_vcl && !current.is_empty() {
+            access_units.push(std::mem::take(&mut current));
+        }
+        current.extend_from_slice(&data[start..nal_end]);
+        if is_vcl {
+            seen_vcl = true;
+        }
+    }
+    if !current.is_empty() {
+        access_units.push(current);
+    }
+    Ok(access_units)
 }
 
 fn leave_h264_decoder_for_disconnect(
@@ -1550,7 +1763,11 @@ fn leave_h264_decoder_for_disconnect(
         println!(
             "  decoder id: {} resource id: {}",
             decoder_id.get(),
-            response.resource_id.get()
+            response
+                .outputs
+                .first()
+                .map(|output| output.resource_id.get())
+                .unwrap_or(0)
         );
         return Ok(request_id);
     }

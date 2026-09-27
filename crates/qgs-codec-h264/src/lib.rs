@@ -4,7 +4,10 @@ use std::fmt;
 use std::io;
 
 use h264_reader::nal::pps::{PicParameterSet, SliceGroup};
-use h264_reader::nal::slice::{FieldPic, SliceFamily, SliceHeader};
+use h264_reader::nal::slice::{
+    DecRefPicMarking, FieldPic, MemoryManagementControlOperation, ModificationOfPicNums,
+    NumRefIdxActive, PicOrderCountLsb, RefPicListModifications, SliceFamily, SliceHeader,
+};
 use h264_reader::nal::sps::{ChromaFormat, FrameMbsFlags, PicOrderCntType, Profile};
 use h264_reader::nal::{Nal, RefNal, UnitType};
 use h264_reader::rbsp::{BitRead, BitReaderError, Integer, Primitive};
@@ -21,6 +24,38 @@ pub struct ParsedH264AccessUnit {
     pub level_idc: u8,
     pub picture: ParsedH264Picture,
     pub slices: Vec<ParsedH264Slice>,
+    pub reference_frames: Vec<ParsedH264Reference>,
+    pub max_dpb_frames: usize,
+    pub max_num_reorder_frames: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct H264PictureId {
+    pub frame_num: u16,
+    pub poc: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedH264Reference {
+    pub id: H264PictureId,
+    pub frame_num: u16,
+    pub top_field_order_cnt: i32,
+    pub bottom_field_order_cnt: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct H264DecodeUpdate {
+    pub output_ready: Vec<H264PictureId>,
+    pub released: Vec<H264PictureId>,
+    pub max_dpb_occupancy: usize,
+    pub max_output_pending: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum H264SliceKind {
+    I,
+    P,
+    B,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,6 +87,10 @@ pub struct ParsedH264Picture {
     pub deblocking_filter_control_present_flag: bool,
     pub redundant_pic_cnt_present_flag: bool,
     pub reference_pic_flag: bool,
+    pub idr_pic_flag: bool,
+    pub no_output_of_prior_pics_flag: bool,
+    pub long_term_reference_flag: bool,
+    dec_ref_pic_marking: Option<ParsedDecRefPicMarking>,
     pub pic_init_qp_minus26: i8,
     pub pic_init_qs_minus26: i8,
     pub chroma_qp_index_offset: i8,
@@ -68,6 +107,7 @@ pub struct ParsedH264Slice {
     pub nal_bytes: Vec<u8>,
     pub nal_ref_idc: u8,
     pub idr: bool,
+    pub kind: H264SliceKind,
     pub slice_data_bit_offset: u16,
     pub first_mb_in_slice: u16,
     pub slice_type: u8,
@@ -79,6 +119,193 @@ pub struct ParsedH264Slice {
     pub disable_deblocking_filter_idc: u8,
     pub slice_alpha_c0_offset_div2: i8,
     pub slice_beta_offset_div2: i8,
+    pub ref_pic_list0: Vec<H264PictureId>,
+    pub ref_pic_list1: Vec<H264PictureId>,
+}
+
+#[derive(Clone, Debug)]
+struct DpbPicture {
+    id: H264PictureId,
+    frame_num: u16,
+    top_field_order_cnt: i32,
+    bottom_field_order_cnt: i32,
+    reference: bool,
+    output_needed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedSliceHeaderForState {
+    frame_num: u16,
+    idr_pic_id: Option<u32>,
+    pic_order_cnt_lsb: u32,
+    delta_pic_order_cnt_bottom: i32,
+    dec_ref_pic_marking: Option<ParsedDecRefPicMarking>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ParsedDecRefPicMarking {
+    Idr {
+        no_output_of_prior_pics_flag: bool,
+        long_term_reference_flag: bool,
+    },
+    SlidingWindow,
+    Adaptive(Vec<ParsedMemoryManagementControlOperation>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ParsedMemoryManagementControlOperation {
+    ShortTermUnusedForRef { difference_of_pic_nums_minus1: u32 },
+    Unsupported,
+    AllRefPicturesUnused,
+}
+
+#[derive(Debug)]
+pub struct H264DecoderState {
+    context: Context,
+    pic_order_cnt_type: u32,
+    max_pic_order_cnt_lsb: i32,
+    max_frame_num: u32,
+    prev_pic_order_cnt_msb: i32,
+    prev_pic_order_cnt_lsb: i32,
+    max_num_ref_frames: usize,
+    max_num_reorder_frames: usize,
+    dpb: Vec<DpbPicture>,
+    max_dpb_occupancy: usize,
+    max_output_pending: usize,
+}
+
+impl Default for H264DecoderState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl H264DecoderState {
+    pub fn new() -> Self {
+        Self {
+            context: Context::new(),
+            pic_order_cnt_type: 0,
+            max_pic_order_cnt_lsb: 0,
+            max_frame_num: 0,
+            prev_pic_order_cnt_msb: 0,
+            prev_pic_order_cnt_lsb: 0,
+            max_num_ref_frames: 0,
+            max_num_reorder_frames: 0,
+            dpb: Vec::new(),
+            max_dpb_occupancy: 0,
+            max_output_pending: 0,
+        }
+    }
+
+    pub fn parse_access_unit(&mut self, data: &[u8]) -> Result<ParsedH264AccessUnit, H264Error> {
+        parse_annex_b_access_unit_with_state(data, self)
+    }
+
+    pub fn finish_picture(
+        &mut self,
+        parsed: &ParsedH264AccessUnit,
+    ) -> Result<H264DecodeUpdate, H264Error> {
+        if parsed.picture.idr_pic_flag {
+            let mut released = self
+                .dpb
+                .iter()
+                .map(|picture| picture.id.clone())
+                .collect::<Vec<_>>();
+            self.dpb.clear();
+            if parsed.picture.no_output_of_prior_pics_flag {
+                released.clear();
+            }
+        }
+
+        apply_reference_marking(self, parsed)?;
+        self.dpb.push(DpbPicture {
+            id: parsed.picture.id(),
+            frame_num: parsed.picture.frame_num,
+            top_field_order_cnt: parsed.picture.top_field_order_cnt,
+            bottom_field_order_cnt: parsed.picture.bottom_field_order_cnt,
+            reference: parsed.picture.reference_pic_flag,
+            output_needed: true,
+        });
+        self.max_dpb_occupancy = self.max_dpb_occupancy.max(self.dpb.len());
+        self.max_output_pending = self.max_output_pending.max(
+            self.dpb
+                .iter()
+                .filter(|picture| picture.output_needed)
+                .count(),
+        );
+        let (output_ready, released) = self.drain_ready(false);
+        Ok(H264DecodeUpdate {
+            output_ready,
+            released,
+            max_dpb_occupancy: self.max_dpb_occupancy,
+            max_output_pending: self.max_output_pending,
+        })
+    }
+
+    pub fn flush(&mut self) -> H264DecodeUpdate {
+        let (output_ready, released) = self.drain_ready(true);
+        H264DecodeUpdate {
+            output_ready,
+            released,
+            max_dpb_occupancy: self.max_dpb_occupancy,
+            max_output_pending: self.max_output_pending,
+        }
+    }
+
+    pub fn max_dpb_occupancy(&self) -> usize {
+        self.max_dpb_occupancy
+    }
+
+    pub fn max_output_pending(&self) -> usize {
+        self.max_output_pending
+    }
+
+    fn drain_ready(&mut self, flush: bool) -> (Vec<H264PictureId>, Vec<H264PictureId>) {
+        let mut output_ready = Vec::new();
+        loop {
+            let pending = self
+                .dpb
+                .iter()
+                .filter(|picture| picture.output_needed)
+                .count();
+            if pending == 0 || (!flush && pending <= self.max_num_reorder_frames) {
+                break;
+            }
+            let Some(index) = self
+                .dpb
+                .iter()
+                .enumerate()
+                .filter(|(_, picture)| picture.output_needed)
+                .min_by_key(|(_, picture)| picture.id.poc)
+                .map(|(index, _)| index)
+            else {
+                break;
+            };
+            self.dpb[index].output_needed = false;
+            output_ready.push(self.dpb[index].id.clone());
+        }
+
+        let mut released = Vec::new();
+        let mut index = 0;
+        while index < self.dpb.len() {
+            if !self.dpb[index].reference && !self.dpb[index].output_needed {
+                released.push(self.dpb[index].id.clone());
+                self.dpb.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        (output_ready, released)
+    }
+}
+
+impl ParsedH264Picture {
+    pub fn id(&self) -> H264PictureId {
+        H264PictureId {
+            frame_num: self.frame_num,
+            poc: self.top_field_order_cnt,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -107,11 +334,21 @@ impl fmt::Display for H264Error {
 impl std::error::Error for H264Error {}
 
 pub fn parse_annex_b_access_unit(data: &[u8]) -> Result<ParsedH264AccessUnit, H264Error> {
+    let mut state = H264DecoderState::new();
+    state.parse_access_unit(data)
+}
+
+fn parse_annex_b_access_unit_with_state(
+    data: &[u8],
+    state: &mut H264DecoderState,
+) -> Result<ParsedH264AccessUnit, H264Error> {
     let nals = split_annex_b(data)?;
-    let mut context = Context::new();
     let mut parsed_sps = None;
     let mut parsed_pps = None;
     let mut slices = Vec::new();
+    let mut first_slice_header = None;
+    let mut first_slice_sps = None;
+    let mut first_slice_pps = None;
 
     for nal_bytes in nals {
         let nal = RefNal::new(nal_bytes, &[], true);
@@ -122,25 +359,32 @@ pub fn parse_annex_b_access_unit(data: &[u8]) -> Result<ParsedH264AccessUnit, H2
             UnitType::SeqParameterSet => {
                 let sps = h264_reader::nal::sps::SeqParameterSet::from_bits(nal.rbsp_bits())
                     .map_err(|error| H264Error::Parser(format!("{error:?}")))?;
-                context.put_seq_param_set(sps.clone());
+                state.context.put_seq_param_set(sps.clone());
                 parsed_sps = Some(sps);
             }
             UnitType::PicParameterSet => {
-                let pps = PicParameterSet::from_bits(&context, nal.rbsp_bits())
+                let pps = PicParameterSet::from_bits(&state.context, nal.rbsp_bits())
                     .map_err(|error| H264Error::Parser(format!("{error:?}")))?;
-                context.put_pic_param_set(pps.clone());
+                state.context.put_pic_param_set(pps.clone());
                 parsed_pps = Some(pps);
             }
             UnitType::SliceLayerWithoutPartitioningIdr
             | UnitType::SliceLayerWithoutPartitioningNonIdr => {
                 let mut reader = CountingBitReader::new(nal.rbsp_bits());
-                let (slice_header, _, _) =
-                    SliceHeader::from_bits(&context, &mut reader, header, None)
+                let (slice_header, sps, pps) =
+                    SliceHeader::from_bits(&state.context, &mut reader, header, None)
                         .map_err(|error| H264Error::Parser(format!("{error:?}")))?;
+                if first_slice_header.is_none() {
+                    first_slice_header = Some(slice_header_for_state(&slice_header));
+                    first_slice_sps = Some(sps.clone());
+                    first_slice_pps = Some(pps.clone());
+                }
                 slices.push(parsed_slice(
                     nal_bytes,
                     header.nal_ref_idc(),
                     &slice_header,
+                    &state.dpb,
+                    1_u32 << u32::from(sps.log2_max_frame_num()),
                     reader.bits_read(),
                 )?);
             }
@@ -152,18 +396,41 @@ pub fn parse_annex_b_access_unit(data: &[u8]) -> Result<ParsedH264AccessUnit, H2
         }
     }
 
-    let sps = parsed_sps.ok_or(H264Error::MissingSps)?;
-    let pps = parsed_pps.ok_or(H264Error::MissingPps)?;
+    let sps = parsed_sps
+        .or(first_slice_sps)
+        .ok_or(H264Error::MissingSps)?;
+    let pps = parsed_pps
+        .or(first_slice_pps)
+        .ok_or(H264Error::MissingPps)?;
+    let first_header = first_slice_header.ok_or(H264Error::MissingSlice)?;
     if slices.is_empty() {
         return Err(H264Error::MissingSlice);
-    }
-    if slices.iter().any(|slice| !slice.idr) {
-        return Err(H264Error::UnsupportedFeature("non-IDR slices"));
     }
 
     validate_supported_sps_pps(&sps, &pps)?;
     let desc = surface_desc_from_sps(&sps)?;
-    let picture = parsed_picture(&sps, &pps, &slices[0])?;
+    update_state_from_sps(state, &sps)?;
+    let (top_field_order_cnt, bottom_field_order_cnt) =
+        calculate_poc(state, &sps, &pps, &first_header, slices[0].nal_ref_idc)?;
+    let picture = parsed_picture(
+        &sps,
+        &pps,
+        &slices[0],
+        &first_header,
+        top_field_order_cnt,
+        bottom_field_order_cnt,
+    )?;
+    let reference_frames = state
+        .dpb
+        .iter()
+        .filter(|picture| picture.reference)
+        .map(|picture| ParsedH264Reference {
+            id: picture.id.clone(),
+            frame_num: picture.frame_num,
+            top_field_order_cnt: picture.top_field_order_cnt,
+            bottom_field_order_cnt: picture.bottom_field_order_cnt,
+        })
+        .collect();
 
     Ok(ParsedH264AccessUnit {
         desc,
@@ -171,6 +438,9 @@ pub fn parse_annex_b_access_unit(data: &[u8]) -> Result<ParsedH264AccessUnit, H2
         level_idc: sps.level_idc,
         picture,
         slices,
+        reference_frames,
+        max_dpb_frames: state.max_num_ref_frames,
+        max_num_reorder_frames: state.max_num_reorder_frames,
     })
 }
 
@@ -178,29 +448,49 @@ fn parsed_slice(
     nal_bytes: &[u8],
     nal_ref_idc: u8,
     header: &SliceHeader,
+    dpb: &[DpbPicture],
+    max_frame_num: u32,
     bits_after_nal_header: u32,
 ) -> Result<ParsedH264Slice, H264Error> {
     if header.field_pic != FieldPic::Frame {
         return Err(H264Error::UnsupportedFeature("field pictures"));
     }
-    if header.slice_type.family != SliceFamily::I {
-        return Err(H264Error::UnsupportedFeature("P/B/SP/SI slices"));
-    }
+    let kind = match header.slice_type.family {
+        SliceFamily::I => H264SliceKind::I,
+        SliceFamily::P => H264SliceKind::P,
+        SliceFamily::B => H264SliceKind::B,
+        SliceFamily::SP | SliceFamily::SI => {
+            return Err(H264Error::UnsupportedFeature("SP/SI slices"));
+        }
+    };
     let offset = 8_u32
         .checked_add(bits_after_nal_header)
         .ok_or(H264Error::UnsupportedFeature("oversized slice header"))?;
+    let (num_ref_idx_l0_active_minus1, num_ref_idx_l1_active_minus1) =
+        num_ref_indices(header, &kind)?;
+    let current_poc = match header.pic_order_cnt_lsb {
+        Some(PicOrderCountLsb::Frame(value))
+        | Some(PicOrderCountLsb::FieldsAbsolute {
+            pic_order_cnt_lsb: value,
+            ..
+        }) => i32::try_from(value).unwrap_or(i32::MAX),
+        Some(PicOrderCountLsb::FieldsDelta(_)) | None => 0,
+    };
+    let (ref_pic_list0, ref_pic_list1) =
+        reference_lists(dpb, &kind, current_poc, header, max_frame_num)?;
     Ok(ParsedH264Slice {
         nal_bytes: nal_bytes.to_vec(),
         nal_ref_idc,
         idr: header.idr_pic_id.is_some(),
+        kind,
         slice_data_bit_offset: u16::try_from(offset)
             .map_err(|_| H264Error::UnsupportedFeature("oversized slice header"))?,
         first_mb_in_slice: u16::try_from(header.first_mb_in_slice)
             .map_err(|_| H264Error::UnsupportedFeature("large first_mb_in_slice"))?,
-        slice_type: 2,
+        slice_type: va_slice_type(&header.slice_type.family)?,
         direct_spatial_mv_pred_flag: header.direct_spatial_mv_pred_flag.unwrap_or(false) as u8,
-        num_ref_idx_l0_active_minus1: 0,
-        num_ref_idx_l1_active_minus1: 0,
+        num_ref_idx_l0_active_minus1,
+        num_ref_idx_l1_active_minus1,
         cabac_init_idc: header.cabac_init_idc.unwrap_or(0) as u8,
         slice_qp_delta: i8::try_from(header.slice_qp_delta)
             .map_err(|_| H264Error::UnsupportedFeature("slice_qp_delta out of range"))?,
@@ -209,7 +499,206 @@ fn parsed_slice(
             .map_err(|_| H264Error::UnsupportedFeature("deblocking alpha out of range"))?,
         slice_beta_offset_div2: i8::try_from(header.slice_beta_offset_div2.unwrap_or(0))
             .map_err(|_| H264Error::UnsupportedFeature("deblocking beta out of range"))?,
+        ref_pic_list0,
+        ref_pic_list1,
     })
+}
+
+fn va_slice_type(family: &SliceFamily) -> Result<u8, H264Error> {
+    match family {
+        SliceFamily::P => Ok(0),
+        SliceFamily::B => Ok(1),
+        SliceFamily::I => Ok(2),
+        SliceFamily::SP | SliceFamily::SI => Err(H264Error::UnsupportedFeature("SP/SI slices")),
+    }
+}
+
+fn num_ref_indices(header: &SliceHeader, kind: &H264SliceKind) -> Result<(u8, u8), H264Error> {
+    let (l0, l1) = match (&header.num_ref_idx_active, kind) {
+        (
+            Some(NumRefIdxActive::P {
+                num_ref_idx_l0_active_minus1,
+            }),
+            H264SliceKind::P,
+        ) => (*num_ref_idx_l0_active_minus1, 0),
+        (
+            Some(NumRefIdxActive::B {
+                num_ref_idx_l0_active_minus1,
+                num_ref_idx_l1_active_minus1,
+            }),
+            H264SliceKind::B,
+        ) => (*num_ref_idx_l0_active_minus1, *num_ref_idx_l1_active_minus1),
+        (_, H264SliceKind::I) => (0, 0),
+        (None, H264SliceKind::P) => (0, 0),
+        (None, H264SliceKind::B) => (0, 0),
+        _ => return Err(H264Error::UnsupportedFeature("reference index syntax")),
+    };
+    Ok((
+        u8::try_from(l0).map_err(|_| H264Error::UnsupportedFeature("too many L0 references"))?,
+        u8::try_from(l1).map_err(|_| H264Error::UnsupportedFeature("too many L1 references"))?,
+    ))
+}
+
+fn reference_lists(
+    dpb: &[DpbPicture],
+    kind: &H264SliceKind,
+    current_poc_lsb_only: i32,
+    header: &SliceHeader,
+    max_frame_num: u32,
+) -> Result<(Vec<H264PictureId>, Vec<H264PictureId>), H264Error> {
+    let mut refs = dpb
+        .iter()
+        .filter(|picture| picture.reference)
+        .cloned()
+        .collect::<Vec<_>>();
+    let lists = match kind {
+        H264SliceKind::I => (Vec::new(), Vec::new()),
+        H264SliceKind::P => {
+            refs.sort_by_key(|picture| std::cmp::Reverse(picture.frame_num));
+            let mut list0 = refs.into_iter().map(|picture| picture.id).collect();
+            apply_ref_modifications_l0(&mut list0, dpb, header, max_frame_num, header.frame_num)?;
+            (list0, Vec::new())
+        }
+        H264SliceKind::B => {
+            let mut l0 = refs.clone();
+            l0.sort_by(|left, right| {
+                match (
+                    left.id.poc < current_poc_lsb_only,
+                    right.id.poc < current_poc_lsb_only,
+                ) {
+                    (true, true) => right.id.poc.cmp(&left.id.poc),
+                    (false, false) => left.id.poc.cmp(&right.id.poc),
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                }
+            });
+            refs.sort_by(|left, right| {
+                match (
+                    left.id.poc > current_poc_lsb_only,
+                    right.id.poc > current_poc_lsb_only,
+                ) {
+                    (true, true) => left.id.poc.cmp(&right.id.poc),
+                    (false, false) => right.id.poc.cmp(&left.id.poc),
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                }
+            });
+            let mut list0 = l0.into_iter().map(|picture| picture.id).collect::<Vec<_>>();
+            let mut list1 = refs
+                .into_iter()
+                .map(|picture| picture.id)
+                .collect::<Vec<_>>();
+            if list0 == list1 && list1.len() > 1 {
+                list1.swap(0, 1);
+            }
+            apply_ref_modifications_l0(&mut list0, dpb, header, max_frame_num, header.frame_num)?;
+            apply_ref_modifications_l1(&mut list1, dpb, header, max_frame_num, header.frame_num)?;
+            (std::mem::take(&mut list0), list1)
+        }
+    };
+    Ok(lists)
+}
+
+fn apply_ref_modifications_l0(
+    list: &mut Vec<H264PictureId>,
+    dpb: &[DpbPicture],
+    header: &SliceHeader,
+    max_frame_num: u32,
+    curr_pic_num: u16,
+) -> Result<(), H264Error> {
+    match &header.ref_pic_list_modification {
+        Some(RefPicListModifications::P {
+            ref_pic_list_modification_l0,
+        })
+        | Some(RefPicListModifications::B {
+            ref_pic_list_modification_l0,
+            ..
+        }) => apply_short_term_modifications(
+            list,
+            dpb,
+            ref_pic_list_modification_l0,
+            max_frame_num,
+            curr_pic_num,
+        ),
+        Some(RefPicListModifications::I) | None => Ok(()),
+    }
+}
+
+fn apply_ref_modifications_l1(
+    list: &mut Vec<H264PictureId>,
+    dpb: &[DpbPicture],
+    header: &SliceHeader,
+    max_frame_num: u32,
+    curr_pic_num: u16,
+) -> Result<(), H264Error> {
+    match &header.ref_pic_list_modification {
+        Some(RefPicListModifications::B {
+            ref_pic_list_modification_l1,
+            ..
+        }) => apply_short_term_modifications(
+            list,
+            dpb,
+            ref_pic_list_modification_l1,
+            max_frame_num,
+            curr_pic_num,
+        ),
+        Some(RefPicListModifications::P { .. }) | Some(RefPicListModifications::I) | None => Ok(()),
+    }
+}
+
+fn apply_short_term_modifications(
+    list: &mut Vec<H264PictureId>,
+    dpb: &[DpbPicture],
+    modifications: &[ModificationOfPicNums],
+    max_frame_num: u32,
+    curr_pic_num: u16,
+) -> Result<(), H264Error> {
+    let mut pic_num_pred = i32::from(curr_pic_num);
+    let max_pic_num = i32::try_from(max_frame_num)
+        .map_err(|_| H264Error::UnsupportedFeature("large MaxFrameNum"))?;
+    for (ref_idx, modification) in modifications.iter().enumerate() {
+        let pic_num = match modification {
+            ModificationOfPicNums::Subtract(abs_diff_pic_num_minus1) => {
+                let diff = i32::try_from(abs_diff_pic_num_minus1 + 1)
+                    .map_err(|_| H264Error::UnsupportedFeature("large ref list modification"))?;
+                let mut value = pic_num_pred - diff;
+                if value < 0 {
+                    value += max_pic_num;
+                }
+                value
+            }
+            ModificationOfPicNums::Add(abs_diff_pic_num_minus1) => {
+                let diff = i32::try_from(abs_diff_pic_num_minus1 + 1)
+                    .map_err(|_| H264Error::UnsupportedFeature("large ref list modification"))?;
+                let mut value = pic_num_pred + diff;
+                if value >= max_pic_num {
+                    value -= max_pic_num;
+                }
+                value
+            }
+            ModificationOfPicNums::LongTermRef(_)
+            | ModificationOfPicNums::SubtractViewIdx(_)
+            | ModificationOfPicNums::AddViewIdx(_) => {
+                return Err(H264Error::UnsupportedFeature(
+                    "long-term or MVC reference list modification",
+                ));
+            }
+        };
+        pic_num_pred = pic_num;
+        let Some(reference) = dpb
+            .iter()
+            .filter(|picture| picture.reference)
+            .find(|picture| i32::from(picture.frame_num) == pic_num)
+            .map(|picture| picture.id.clone())
+        else {
+            return Err(H264Error::UnsupportedFeature(
+                "reference list modification target not in DPB",
+            ));
+        };
+        list.retain(|id| id != &reference);
+        list.insert(ref_idx.min(list.len()), reference);
+    }
+    Ok(())
 }
 
 fn validate_supported_sps_pps(
@@ -244,10 +733,215 @@ fn validate_supported_sps_pps(
     Ok(())
 }
 
+fn update_state_from_sps(
+    state: &mut H264DecoderState,
+    sps: &h264_reader::nal::sps::SeqParameterSet,
+) -> Result<(), H264Error> {
+    let log2_max_pic_order_cnt_lsb_minus4 = match sps.pic_order_cnt {
+        PicOrderCntType::TypeZero {
+            log2_max_pic_order_cnt_lsb_minus4,
+        } => {
+            state.pic_order_cnt_type = 0;
+            log2_max_pic_order_cnt_lsb_minus4
+        }
+        PicOrderCntType::TypeOne { .. } => {
+            return Err(H264Error::UnsupportedFeature("POC type 1"));
+        }
+        PicOrderCntType::TypeTwo => {
+            state.pic_order_cnt_type = 2;
+            0
+        }
+    };
+    state.max_pic_order_cnt_lsb = 1_i32
+        .checked_shl(u32::from(log2_max_pic_order_cnt_lsb_minus4) + 4)
+        .ok_or(H264Error::UnsupportedFeature("POC LSB range"))?;
+    state.max_num_ref_frames = usize::try_from(sps.max_num_ref_frames)
+        .map_err(|_| H264Error::UnsupportedFeature("too many reference frames"))?;
+    state.max_frame_num = 1_u32 << u32::from(sps.log2_max_frame_num());
+    state.max_num_reorder_frames = sps
+        .vui_parameters
+        .as_ref()
+        .and_then(|vui| vui.bitstream_restrictions.as_ref())
+        .map(|restrictions| restrictions.max_num_reorder_frames as usize)
+        .unwrap_or(0);
+    Ok(())
+}
+
+fn slice_header_for_state(header: &SliceHeader) -> ParsedSliceHeaderForState {
+    let (pic_order_cnt_lsb, delta_pic_order_cnt_bottom) = match header.pic_order_cnt_lsb {
+        Some(PicOrderCountLsb::Frame(value)) => (value, 0),
+        Some(PicOrderCountLsb::FieldsAbsolute {
+            pic_order_cnt_lsb,
+            delta_pic_order_cnt_bottom,
+        }) => (pic_order_cnt_lsb, delta_pic_order_cnt_bottom),
+        Some(PicOrderCountLsb::FieldsDelta(_)) | None => (0, 0),
+    };
+    ParsedSliceHeaderForState {
+        frame_num: header.frame_num,
+        idr_pic_id: header.idr_pic_id,
+        pic_order_cnt_lsb,
+        delta_pic_order_cnt_bottom,
+        dec_ref_pic_marking: header
+            .dec_ref_pic_marking
+            .as_ref()
+            .map(map_dec_ref_pic_marking),
+    }
+}
+
+fn map_dec_ref_pic_marking(marking: &DecRefPicMarking) -> ParsedDecRefPicMarking {
+    match marking {
+        DecRefPicMarking::Idr {
+            no_output_of_prior_pics_flag,
+            long_term_reference_flag,
+        } => ParsedDecRefPicMarking::Idr {
+            no_output_of_prior_pics_flag: *no_output_of_prior_pics_flag,
+            long_term_reference_flag: *long_term_reference_flag,
+        },
+        DecRefPicMarking::SlidingWindow => ParsedDecRefPicMarking::SlidingWindow,
+        DecRefPicMarking::Adaptive(ops) => ParsedDecRefPicMarking::Adaptive(
+            ops.iter()
+                .map(|op| match op {
+                    MemoryManagementControlOperation::ShortTermUnusedForRef {
+                        difference_of_pic_nums_minus1,
+                    } => ParsedMemoryManagementControlOperation::ShortTermUnusedForRef {
+                        difference_of_pic_nums_minus1: *difference_of_pic_nums_minus1,
+                    },
+                    MemoryManagementControlOperation::AllRefPicturesUnused => {
+                        ParsedMemoryManagementControlOperation::AllRefPicturesUnused
+                    }
+                    _ => ParsedMemoryManagementControlOperation::Unsupported,
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn calculate_poc(
+    state: &mut H264DecoderState,
+    _sps: &h264_reader::nal::sps::SeqParameterSet,
+    _pps: &PicParameterSet,
+    header: &ParsedSliceHeaderForState,
+    nal_ref_idc: u8,
+) -> Result<(i32, i32), H264Error> {
+    if state.pic_order_cnt_type == 2 {
+        let poc = if header.idr_pic_id.is_some() {
+            0
+        } else if nal_ref_idc == 0 {
+            2_i32
+                .checked_mul(i32::from(header.frame_num))
+                .and_then(|value| value.checked_sub(1))
+                .ok_or(H264Error::UnsupportedFeature("POC type 2 overflow"))?
+        } else {
+            2_i32
+                .checked_mul(i32::from(header.frame_num))
+                .ok_or(H264Error::UnsupportedFeature("POC type 2 overflow"))?
+        };
+        return Ok((poc, poc));
+    }
+    if state.max_pic_order_cnt_lsb == 0 {
+        return Err(H264Error::UnsupportedFeature("missing POC type 0 state"));
+    }
+    if header.idr_pic_id.is_some() {
+        state.prev_pic_order_cnt_msb = 0;
+        state.prev_pic_order_cnt_lsb = 0;
+    }
+    let pic_order_cnt_lsb = i32::try_from(header.pic_order_cnt_lsb)
+        .map_err(|_| H264Error::UnsupportedFeature("large POC LSB"))?;
+    let half = state.max_pic_order_cnt_lsb / 2;
+    let pic_order_cnt_msb = if pic_order_cnt_lsb < state.prev_pic_order_cnt_lsb
+        && state.prev_pic_order_cnt_lsb - pic_order_cnt_lsb >= half
+    {
+        state.prev_pic_order_cnt_msb + state.max_pic_order_cnt_lsb
+    } else if pic_order_cnt_lsb > state.prev_pic_order_cnt_lsb
+        && pic_order_cnt_lsb - state.prev_pic_order_cnt_lsb > half
+    {
+        state.prev_pic_order_cnt_msb - state.max_pic_order_cnt_lsb
+    } else {
+        state.prev_pic_order_cnt_msb
+    };
+    let top = pic_order_cnt_msb + pic_order_cnt_lsb;
+    let bottom = top + header.delta_pic_order_cnt_bottom;
+    if nal_ref_idc != 0 {
+        state.prev_pic_order_cnt_msb = pic_order_cnt_msb;
+        state.prev_pic_order_cnt_lsb = pic_order_cnt_lsb;
+    }
+    Ok((top, bottom))
+}
+
+fn apply_reference_marking(
+    state: &mut H264DecoderState,
+    parsed: &ParsedH264AccessUnit,
+) -> Result<(), H264Error> {
+    if parsed.picture.idr_pic_flag {
+        if parsed.picture.long_term_reference_flag {
+            return Err(H264Error::UnsupportedFeature("long-term IDR reference"));
+        }
+        return Ok(());
+    }
+
+    match &parsed.picture.dec_ref_pic_marking {
+        Some(ParsedDecRefPicMarking::SlidingWindow) | None => {
+            if parsed.picture.reference_pic_flag {
+                let ref_count = state.dpb.iter().filter(|picture| picture.reference).count();
+                if state.max_num_ref_frames > 0 && ref_count >= state.max_num_ref_frames {
+                    if let Some(index) = state
+                        .dpb
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, picture)| picture.reference)
+                        .min_by_key(|(_, picture)| picture.frame_num)
+                        .map(|(index, _)| index)
+                    {
+                        state.dpb[index].reference = false;
+                    }
+                }
+            }
+        }
+        Some(ParsedDecRefPicMarking::Adaptive(ops)) => {
+            for op in ops {
+                match op {
+                    ParsedMemoryManagementControlOperation::ShortTermUnusedForRef {
+                        difference_of_pic_nums_minus1,
+                    } => {
+                        let diff = i32::try_from(*difference_of_pic_nums_minus1 + 1)
+                            .map_err(|_| H264Error::UnsupportedFeature("large MMCO diff"))?;
+                        let max_frame_num = i32::try_from(state.max_frame_num)
+                            .map_err(|_| H264Error::UnsupportedFeature("large MaxFrameNum"))?;
+                        let mut pic_num = i32::from(parsed.picture.frame_num) - diff;
+                        if pic_num < 0 {
+                            pic_num += max_frame_num;
+                        }
+                        if let Some(picture) = state
+                            .dpb
+                            .iter_mut()
+                            .find(|picture| i32::from(picture.frame_num) == pic_num)
+                        {
+                            picture.reference = false;
+                        }
+                    }
+                    ParsedMemoryManagementControlOperation::AllRefPicturesUnused => {
+                        for picture in &mut state.dpb {
+                            picture.reference = false;
+                        }
+                    }
+                    ParsedMemoryManagementControlOperation::Unsupported => {
+                        return Err(H264Error::UnsupportedFeature("adaptive reference marking"));
+                    }
+                }
+            }
+        }
+        Some(ParsedDecRefPicMarking::Idr { .. }) => {}
+    }
+    Ok(())
+}
+
 fn parsed_picture(
     sps: &h264_reader::nal::sps::SeqParameterSet,
     pps: &PicParameterSet,
     first_slice: &ParsedH264Slice,
+    first_header: &ParsedSliceHeaderForState,
+    top_field_order_cnt: i32,
+    bottom_field_order_cnt: i32,
 ) -> Result<ParsedH264Picture, H264Error> {
     let (pic_order_cnt_type, log2_max_pic_order_cnt_lsb_minus4, delta_pic_order_always_zero_flag) =
         match sps.pic_order_cnt {
@@ -311,6 +1005,22 @@ fn parsed_picture(
         deblocking_filter_control_present_flag: pps.deblocking_filter_control_present_flag,
         redundant_pic_cnt_present_flag: pps.redundant_pic_cnt_present_flag,
         reference_pic_flag: first_slice.nal_ref_idc != 0,
+        idr_pic_flag: first_slice.idr,
+        no_output_of_prior_pics_flag: matches!(
+            &first_header.dec_ref_pic_marking,
+            Some(ParsedDecRefPicMarking::Idr {
+                no_output_of_prior_pics_flag: true,
+                ..
+            })
+        ),
+        long_term_reference_flag: matches!(
+            &first_header.dec_ref_pic_marking,
+            Some(ParsedDecRefPicMarking::Idr {
+                long_term_reference_flag: true,
+                ..
+            })
+        ),
+        dec_ref_pic_marking: first_header.dec_ref_pic_marking.clone(),
         pic_init_qp_minus26: i8::try_from(pps.pic_init_qp_minus26)
             .map_err(|_| H264Error::UnsupportedFeature("pic_init_qp_minus26 out of range"))?,
         pic_init_qs_minus26: i8::try_from(pps.pic_init_qs_minus26)
@@ -319,9 +1029,9 @@ fn parsed_picture(
             .map_err(|_| H264Error::UnsupportedFeature("chroma qp offset out of range"))?,
         second_chroma_qp_index_offset: i8::try_from(second_chroma_qp_index_offset)
             .map_err(|_| H264Error::UnsupportedFeature("second chroma qp offset out of range"))?,
-        frame_num: 0,
-        top_field_order_cnt: 0,
-        bottom_field_order_cnt: 0,
+        frame_num: first_header.frame_num,
+        top_field_order_cnt,
+        bottom_field_order_cnt,
         scaling_list4x4: [[16; 16]; 6],
         scaling_list8x8: [[16; 64]; 2],
     })
@@ -525,6 +1235,8 @@ mod tests {
     use super::*;
 
     const FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/h264/idr-64x64-baseline.h264");
+    const LONG_GOP_FIXTURE: &[u8] =
+        include_bytes!("../../../tests/fixtures/h264/long-gop-128x72-main.h264");
 
     #[test]
     fn parses_fixture_access_unit() {
@@ -548,5 +1260,77 @@ mod tests {
             parse_annex_b_access_unit(&[1, 2, 3]),
             Err(H264Error::MalformedAnnexB)
         ));
+    }
+
+    #[test]
+    fn parses_long_gop_p_and_b_slices() {
+        let access_units = split_access_units_for_test(LONG_GOP_FIXTURE);
+        assert_eq!(access_units.len(), 12);
+
+        let mut state = H264DecoderState::new();
+        let mut kinds = Vec::new();
+        for access_unit in access_units {
+            let parsed = state
+                .parse_access_unit(&access_unit)
+                .expect("Long-GOP AU parses");
+            kinds.push(parsed.slices[0].kind.clone());
+            state
+                .finish_picture(&parsed)
+                .expect("Long-GOP DPB update succeeds");
+        }
+
+        assert!(kinds.contains(&H264SliceKind::I));
+        assert!(kinds.contains(&H264SliceKind::P));
+        assert!(kinds.contains(&H264SliceKind::B));
+    }
+
+    #[test]
+    fn long_gop_decode_order_differs_from_presentation_order() {
+        let access_units = split_access_units_for_test(LONG_GOP_FIXTURE);
+        let mut state = H264DecoderState::new();
+        let mut decode_pocs = Vec::new();
+        let mut output_pocs = Vec::new();
+
+        for access_unit in access_units {
+            let parsed = state
+                .parse_access_unit(&access_unit)
+                .expect("Long-GOP AU parses");
+            decode_pocs.push(parsed.picture.top_field_order_cnt);
+            let update = state
+                .finish_picture(&parsed)
+                .expect("Long-GOP DPB update succeeds");
+            output_pocs.extend(update.output_ready.into_iter().map(|id| id.poc));
+        }
+        output_pocs.extend(state.flush().output_ready.into_iter().map(|id| id.poc));
+
+        assert_eq!(decode_pocs.len(), 12);
+        assert_eq!(output_pocs.len(), 12);
+        assert_ne!(decode_pocs, output_pocs);
+        assert!(output_pocs.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(state.max_dpb_occupancy() > 1);
+        assert!(state.max_output_pending() > 0);
+    }
+
+    fn split_access_units_for_test(data: &[u8]) -> Vec<Vec<u8>> {
+        let nals = split_annex_b(data).expect("Annex B fixture");
+        let mut access_units = Vec::new();
+        let mut current = Vec::new();
+        let mut seen_vcl = false;
+        for nal in nals {
+            let nal_type = nal[0] & 0x1f;
+            let is_vcl = nal_type == 1 || nal_type == 5;
+            if is_vcl && seen_vcl && !current.is_empty() {
+                access_units.push(std::mem::take(&mut current));
+            }
+            current.extend_from_slice(&[0, 0, 0, 1]);
+            current.extend_from_slice(nal);
+            if is_vcl {
+                seen_vcl = true;
+            }
+        }
+        if !current.is_empty() {
+            access_units.push(current);
+        }
+        access_units
     }
 }

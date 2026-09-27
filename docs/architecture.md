@@ -237,11 +237,41 @@ config, context, decode surface, VA parameter buffer translation, VA decode
 submission, completion, validation-only readback, and VA surface export probing.
 VA types do not escape `qgs-vaapi`.
 
-M2 Step 3B supports only the deliberately narrow proof stream: H.264
-Constrained Baseline/Baseline-compatible 8-bit 4:2:0 progressive Annex B with
-IDR/I slices. It does not claim general H.264 support, MPEG-2 support, XDCAM,
-XAVC, interlaced decode, P/B frames, Vulkan import of decoded NV12 surfaces, or
-video scheduling.
+M2 Step 5 extends the frontend to stateful H.264 Long-GOP behavior:
+
+```text
+compressed access units
+    |
+qgs-codec-h264
+    |
+SPS/PPS + POC + DPB + reference lists
+    |
+backend-neutral decoded-picture description
+    |
+qgs-vaapi
+    |
+VA hardware decoder
+```
+
+`qgs-codec-h264` owns picture identity, POC calculation, short-term reference
+tracking, reference-list construction, DPB output ordering, IDR reset, and
+flush/drain behavior. `qgs-vaapi` maps those QGS-owned picture identities to VA
+surfaces and VA H.264 parameter buffers; it must not invent H.264 reference
+ordering.
+
+Decode order is not presentation order for B-frame GOPs. A successful access
+unit submission may produce no display-ready surface yet, and an end-of-stream
+flush may produce multiple delayed surfaces. `VideoSurface` display lifetime is
+also distinct from reference lifetime: a decoded surface may remain retained by
+the decoder as a future reference even after the corresponding display output
+has been handed to the session resource registry.
+
+M2 Step 5 supports a bounded subset: H.264 8-bit 4:2:0 progressive Annex B with
+IDR/I, P, and B pictures, POC type 0 for the Long-GOP proof, short-term
+references, sliding-window reference marking, short-term unused-for-reference
+MMCO, and short-term reference-list modifications. It does not claim general
+H.264 support, MPEG-2 support, XDCAM, XAVC, 10-bit, 4:2:2, interlaced decode,
+Vulkan import of decoded NV12 surfaces, or video scheduling.
 
 Compressed access units may travel through bounded normal QGS IPC for this M2
 proof. Raw decoded frames remain backend-owned VideoSurface resources and do

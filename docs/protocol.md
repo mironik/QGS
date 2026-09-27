@@ -18,9 +18,9 @@ Every v0.1 message starts with a fixed 24-byte header:
 | 12 | u32 | payload length in bytes |
 | 16 | u64 | request id |
 
-All integer fields are little-endian. The maximum payload size is 4096 bytes.
-Decoders must reject oversized payload lengths before allocating payload
-storage.
+All integer fields are little-endian. The maximum payload size is 4 MiB plus a
+small framing margin for M2 Step 5 compressed access-unit transport. Decoders
+must reject oversized payload lengths before allocating payload storage.
 
 `request_id` correlates a response with a request. `request_id` 0 is reserved
 for messages that do not correlate to a request. Normal request/response
@@ -221,11 +221,19 @@ SUBMIT_ACCESS_UNIT is request kind `1`, opcode `12`. Its payload is:
 | 8 | u32 | compressed access-unit byte length |
 | 12 | variable | compressed access-unit bytes |
 
-The maximum compressed access-unit payload is 4000 bytes. M2 Step 3B permits
-bounded compressed H.264 access units through normal QGS IPC. Raw decoded video
-pixels must not travel through normal protocol messages.
+The maximum compressed access-unit payload is 4 MiB. M2 Step 5 permits bounded
+compressed H.264 access units through normal QGS IPC as a temporary development
+transport. Raw decoded video pixels must not travel through normal protocol
+messages. Future high-throughput ingest may use a dedicated bulk-data plane.
 
-DESTROY_DECODER is request kind `1`, opcode `13`. Its payload is:
+FLUSH_DECODER is request kind `1`, opcode `13`. It drains presentation-ready
+frames that remain pending because of codec reordering. Its payload is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `DecoderId` owned by the current session |
+
+DESTROY_DECODER is request kind `1`, opcode `14`. Its payload is:
 
 | Offset | Width | Field |
 | --- | ---: | --- |
@@ -512,19 +520,29 @@ DECODE_OUTPUT is response kind `2`, opcode `13`. Its payload is:
 | Offset | Width | Field |
 | --- | ---: | --- |
 | 0 | u64 | QGS `DecoderId` |
-| 8 | u64 | QGS `ResourceId` for the decoded `VideoSurface` |
-| 16 | u32 | coded width |
-| 20 | u32 | coded height |
-| 24 | u32 | visible x |
-| 28 | u32 | visible y |
-| 32 | u32 | visible width |
-| 36 | u32 | visible height |
-| 40 | u8 | `VideoSurfaceFormat` |
-| 41 | u8 | bit depth |
-| 42 | u8 | chroma subsampling |
-| 43 | u8 | scan mode |
-| 44 | u8 | field order |
-| 45 | 3 bytes | reserved, currently `0` |
+| 8 | u16 | output surface count |
+
+Each output surface entry is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `ResourceId` for the decoded `VideoSurface` |
+| 8 | u32 | coded width |
+| 12 | u32 | coded height |
+| 16 | u32 | visible x |
+| 20 | u32 | visible y |
+| 24 | u32 | visible width |
+| 28 | u32 | visible height |
+| 32 | u8 | `VideoSurfaceFormat` |
+| 33 | u8 | bit depth |
+| 34 | u8 | chroma subsampling |
+| 35 | u8 | scan mode |
+| 36 | u8 | field order |
+| 37 | 3 bytes | reserved, currently `0` |
+
+The output count is bounded to 16. A successful `SUBMIT_ACCESS_UNIT` may return
+zero outputs when the decoded picture is still waiting for reference pictures
+or presentation reordering. A flush may return multiple output-ready surfaces.
 
 DECODER_DESTROYED is response kind `2`, opcode `14`. Its payload is:
 
@@ -596,12 +614,12 @@ CREATE_DECODER receivers must reject zero `DeviceId` values, unknown codecs,
 unknown codec-specific profiles, invalid bit depths, unsupported chroma values,
 unsupported scan modes, invalid coded dimensions, nonzero reserved bytes,
 truncated payloads, and trailing payload bytes. SUBMIT_ACCESS_UNIT receivers
-must reject zero `DecoderId` values, compressed payloads larger than 4000
-bytes, truncated compressed payloads, and trailing payload bytes. Unsupported
+must reject zero `DecoderId` values, compressed payloads larger than 4 MiB,
+truncated compressed payloads, and trailing payload bytes. Unsupported
 H.264 syntax returns a stable UnsupportedH264StreamFeature error rather than
-being silently interpreted as the Step 3B subset. DESTROY_DECODER receivers
-must reject zero `DecoderId` values. Unknown decoder IDs and cross-session
-decoder attempts return a stable UnknownDecoder error.
+being silently interpreted as the current M2 subset. FLUSH_DECODER and
+DESTROY_DECODER receivers must reject zero `DecoderId` values. Unknown decoder
+IDs and cross-session decoder attempts return a stable UnknownDecoder error.
 
 Major protocol versions are incompatible. Minor versions are backward-compatible
 only within the same major version. A server selects the highest protocol

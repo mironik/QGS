@@ -14,7 +14,10 @@ use libva::{
     VA_FOURCC_UYVY, VA_FOURCC_Y210, VA_FOURCC_YUY2, VA_RT_FORMAT_YUV420, VA_RT_FORMAT_YUV420_10,
     VA_RT_FORMAT_YUV422, VA_RT_FORMAT_YUV422_10,
 };
-use qgs_codec_h264::{parse_annex_b_access_unit, H264Error, ParsedH264AccessUnit};
+use qgs_codec_h264::{
+    parse_annex_b_access_unit, H264DecoderState, H264Error, H264PictureId, ParsedH264AccessUnit,
+    ParsedH264Reference,
+};
 use qgs_core::{
     BackendDecodedSurface, BackendDecoder, BackendResource, DecoderBackend, DecoderError,
     VideoCapabilityDiscovery, VideoCapabilityDiscoveryError,
@@ -22,7 +25,8 @@ use qgs_core::{
 use qgs_protocol::{
     BitDepth, ChromaSubsampling, CreateDecoderRequest, DeviceDesc, DeviceId, H264Profile,
     Mpeg2Profile, SubmitAccessUnitRequest, VideoCapabilities, VideoCodec, VideoDecodeCapability,
-    VideoProfile, VideoSurfaceFormat, MAX_VIDEO_SURFACE_HEIGHT, MAX_VIDEO_SURFACE_WIDTH,
+    VideoProfile, VideoSurfaceDesc, VideoSurfaceFormat, MAX_VIDEO_SURFACE_HEIGHT,
+    MAX_VIDEO_SURFACE_WIDTH,
 };
 
 const DEFAULT_MAX_WIDTH: u32 = MAX_VIDEO_SURFACE_WIDTH;
@@ -141,7 +145,7 @@ impl DecoderBackend for VaapiVideoDiscovery {
                 request.config.coded_width,
                 request.config.coded_height,
                 None,
-                vec![()],
+                vec![(); 24],
             )
             .map_err(|_| DecoderError::UnsupportedDecodeConfiguration)?;
         let context = display
@@ -156,8 +160,11 @@ impl DecoderBackend for VaapiVideoDiscovery {
 
         Ok(Box::new(VaapiH264Decoder {
             context,
-            surface: surfaces.into_iter().next(),
+            available_surfaces: surfaces,
+            decoded_surfaces: BTreeMap::new(),
+            frontend: H264DecoderState::new(),
             device_id: request.config.device_id,
+            max_live_surfaces: 0,
         }))
     }
 }
@@ -242,7 +249,7 @@ pub fn decode_h264_drm_prime_for_diagnostic(
         .into_iter()
         .next()
         .ok_or(DecoderError::DecodeFailed)?;
-    let surface = decode_h264_access_unit(context, surface, &parsed)?;
+    let surface = decode_h264_access_unit(context, surface, &parsed, &BTreeMap::new())?;
     let validation_checksum =
         validation_checksum(&surface, parsed.desc.coded_width, parsed.desc.coded_height)
             .map_err(|_| DecoderError::DecodeFailed)?;
@@ -295,18 +302,32 @@ fn decoder_profile_from_parsed(parsed: &ParsedH264AccessUnit) -> VideoProfile {
 
 struct VaapiH264Decoder {
     context: Rc<Context>,
-    surface: Option<Surface<()>>,
+    available_surfaces: Vec<Surface<()>>,
+    decoded_surfaces: BTreeMap<(u16, i32), DecodedSurfaceState>,
+    frontend: H264DecoderState,
     device_id: DeviceId,
+    max_live_surfaces: usize,
 }
 
 impl BackendDecoder for VaapiH264Decoder {
     fn submit_access_unit(
         &mut self,
         request: &SubmitAccessUnitRequest,
-    ) -> Result<BackendDecodedSurface, DecoderError> {
-        let parsed = parse_annex_b_access_unit(&request.data).map_err(decoder_error_from_h264)?;
-        let surface = self.surface.take().ok_or(DecoderError::DecodeFailed)?;
-        let surface = decode_h264_access_unit(Rc::clone(&self.context), surface, &parsed)?;
+    ) -> Result<Vec<BackendDecodedSurface>, DecoderError> {
+        let parsed = self
+            .frontend
+            .parse_access_unit(&request.data)
+            .map_err(decoder_error_from_h264)?;
+        let surface = self
+            .available_surfaces
+            .pop()
+            .ok_or(DecoderError::DecodeFailed)?;
+        let surface = decode_h264_access_unit(
+            Rc::clone(&self.context),
+            surface,
+            &parsed,
+            &self.decoded_surfaces,
+        )?;
         let validation_checksum =
             validation_checksum(&surface, parsed.desc.coded_width, parsed.desc.coded_height)
                 .map_err(|_| DecoderError::DecodeFailed)?;
@@ -358,21 +379,86 @@ impl BackendDecoder for VaapiH264Decoder {
         } else {
             eprintln!("qgs-vaapi: VA surface DRM PRIME export probe failed");
         }
-
-        Ok(BackendDecodedSurface {
-            resource: Box::new(VaapiVideoSurface {
-                surface,
+        let id = parsed.picture.id();
+        self.decoded_surfaces.insert(
+            surface_key(&id),
+            DecodedSurfaceState {
+                surface: Rc::new(surface),
+                desc: parsed.desc.clone(),
                 validation_checksum,
-                export_probe,
-            }),
-            desc: parsed.desc,
-        })
+                export_probe: export_probe.clone(),
+            },
+        );
+        self.max_live_surfaces = self.max_live_surfaces.max(self.decoded_surfaces.len());
+        let update = self
+            .frontend
+            .finish_picture(&parsed)
+            .map_err(decoder_error_from_h264)?;
+        eprintln!(
+            "qgs-vaapi: H.264 DPB occupancy={} output_pending={} live_va_surfaces={}",
+            update.max_dpb_occupancy,
+            update.max_output_pending,
+            self.decoded_surfaces.len()
+        );
+        let outputs = self.outputs_from_ids(&update.output_ready)?;
+        for released in update.released {
+            self.decoded_surfaces.remove(&surface_key(&released));
+        }
+        Ok(outputs)
     }
+
+    fn flush(
+        &mut self,
+        _request: &qgs_protocol::FlushDecoderRequest,
+    ) -> Result<Vec<BackendDecodedSurface>, DecoderError> {
+        let update = self.frontend.flush();
+        eprintln!(
+            "qgs-vaapi: H.264 flush DPB occupancy={} output_pending={} max_live_va_surfaces={}",
+            update.max_dpb_occupancy, update.max_output_pending, self.max_live_surfaces
+        );
+        let outputs = self.outputs_from_ids(&update.output_ready)?;
+        for released in &update.released {
+            self.decoded_surfaces.remove(&surface_key(released));
+        }
+        Ok(outputs)
+    }
+}
+
+impl VaapiH264Decoder {
+    fn outputs_from_ids(
+        &self,
+        output_ready: &[H264PictureId],
+    ) -> Result<Vec<BackendDecodedSurface>, DecoderError> {
+        output_ready
+            .iter()
+            .map(|id| {
+                let surface = self
+                    .decoded_surfaces
+                    .get(&surface_key(id))
+                    .ok_or(DecoderError::DecodeFailed)?;
+                Ok(BackendDecodedSurface {
+                    resource: Box::new(VaapiVideoSurface {
+                        surface: Rc::clone(&surface.surface),
+                        validation_checksum: surface.validation_checksum,
+                        export_probe: surface.export_probe.clone(),
+                    }),
+                    desc: surface.desc.clone(),
+                })
+            })
+            .collect()
+    }
+}
+
+struct DecodedSurfaceState {
+    surface: Rc<Surface<()>>,
+    desc: VideoSurfaceDesc,
+    validation_checksum: u32,
+    export_probe: Option<VaapiExportProbe>,
 }
 
 struct VaapiVideoSurface {
     #[allow(dead_code)]
-    surface: Surface<()>,
+    surface: Rc<Surface<()>>,
     #[allow(dead_code)]
     validation_checksum: u32,
     #[allow(dead_code)]
@@ -386,6 +472,7 @@ impl BackendResource for VaapiVideoSurface {
 }
 
 #[allow(dead_code)]
+#[derive(Clone)]
 struct VaapiExportProbe {
     object_count: usize,
     layer_count: usize,
@@ -403,9 +490,10 @@ fn decode_h264_access_unit(
     context: Rc<Context>,
     surface: Surface<()>,
     parsed: &ParsedH264AccessUnit,
+    decoded_surfaces: &BTreeMap<(u16, i32), DecodedSurfaceState>,
 ) -> Result<Surface<()>, DecoderError> {
     let mut picture = Picture::new(0, Rc::clone(&context), surface);
-    let pic_param = picture_parameter(parsed, picture.surface().id());
+    let pic_param = picture_parameter(parsed, picture.surface().id(), decoded_surfaces)?;
     picture.add_buffer(
         context
             .create_buffer(BufferType::PictureParameter(PictureParameter::H264(
@@ -423,7 +511,7 @@ fn decode_h264_access_unit(
             )))
             .map_err(|_| DecoderError::DecodeFailed)?,
     );
-    let slice_param = slice_parameters(parsed);
+    let slice_param = slice_parameters(parsed, decoded_surfaces)?;
     picture.add_buffer(
         context
             .create_buffer(BufferType::SliceParameter(SliceParameter::H264(
@@ -450,7 +538,11 @@ fn decode_h264_access_unit(
         .map_err(|_| DecoderError::DecodeFailed)
 }
 
-fn picture_parameter(parsed: &ParsedH264AccessUnit, surface_id: u32) -> PictureParameterBufferH264 {
+fn picture_parameter(
+    parsed: &ParsedH264AccessUnit,
+    surface_id: u32,
+    decoded_surfaces: &BTreeMap<(u16, i32), DecodedSurfaceState>,
+) -> Result<PictureParameterBufferH264, DecoderError> {
     let picture = &parsed.picture;
     let current = PictureH264::new(
         surface_id,
@@ -459,7 +551,7 @@ fn picture_parameter(parsed: &ParsedH264AccessUnit, surface_id: u32) -> PictureP
         picture.top_field_order_cnt,
         picture.bottom_field_order_cnt,
     );
-    let references = invalid_picture_array_16();
+    let references = reference_frames(parsed, decoded_surfaces)?;
     let seq_fields = H264SeqFields::new(
         picture.chroma_format_idc,
         0,
@@ -485,7 +577,7 @@ fn picture_parameter(parsed: &ParsedH264AccessUnit, surface_id: u32) -> PictureP
         picture.redundant_pic_cnt_present_flag as u32,
         picture.reference_pic_flag as u32,
     );
-    PictureParameterBufferH264::new(
+    Ok(PictureParameterBufferH264::new(
         current,
         references,
         picture.picture_width_in_mbs_minus1,
@@ -503,13 +595,18 @@ fn picture_parameter(parsed: &ParsedH264AccessUnit, surface_id: u32) -> PictureP
         picture.second_chroma_qp_index_offset,
         &pic_fields,
         picture.frame_num,
-    )
+    ))
 }
 
-fn slice_parameters(parsed: &ParsedH264AccessUnit) -> SliceParameterBufferH264 {
+fn slice_parameters(
+    parsed: &ParsedH264AccessUnit,
+    decoded_surfaces: &BTreeMap<(u16, i32), DecodedSurfaceState>,
+) -> Result<SliceParameterBufferH264, DecoderError> {
     let mut params = SliceParameterBufferH264::new_array();
     let mut offset = 0_u32;
     for slice in &parsed.slices {
+        let ref_list0 = reference_list_array(&slice.ref_pic_list0, decoded_surfaces)?;
+        let ref_list1 = reference_list_array(&slice.ref_pic_list1, decoded_surfaces)?;
         params.add_slice_parameter(
             slice.nal_bytes.len() as u32,
             offset,
@@ -525,8 +622,8 @@ fn slice_parameters(parsed: &ParsedH264AccessUnit) -> SliceParameterBufferH264 {
             slice.disable_deblocking_filter_idc,
             slice.slice_alpha_c0_offset_div2,
             slice.slice_beta_offset_div2,
-            invalid_picture_array_32(),
-            invalid_picture_array_32(),
+            ref_list0,
+            ref_list1,
             0,
             0,
             0,
@@ -544,7 +641,58 @@ fn slice_parameters(parsed: &ParsedH264AccessUnit) -> SliceParameterBufferH264 {
         );
         offset = offset.saturating_add(slice.nal_bytes.len() as u32);
     }
-    params
+    Ok(params)
+}
+
+fn reference_frames(
+    parsed: &ParsedH264AccessUnit,
+    decoded_surfaces: &BTreeMap<(u16, i32), DecodedSurfaceState>,
+) -> Result<[PictureH264; 16], DecoderError> {
+    let mut references = invalid_picture_array_16();
+    for (index, reference) in parsed.reference_frames.iter().take(16).enumerate() {
+        references[index] = picture_from_reference(reference, decoded_surfaces)?;
+    }
+    Ok(references)
+}
+
+fn reference_list_array(
+    refs: &[H264PictureId],
+    decoded_surfaces: &BTreeMap<(u16, i32), DecodedSurfaceState>,
+) -> Result<[PictureH264; 32], DecoderError> {
+    let mut pictures = invalid_picture_array_32();
+    for (index, id) in refs.iter().take(32).enumerate() {
+        let Some(surface) = decoded_surfaces.get(&surface_key(id)) else {
+            return Err(DecoderError::DecodeFailed);
+        };
+        pictures[index] = PictureH264::new(
+            surface.surface.id(),
+            u32::from(id.frame_num),
+            0,
+            id.poc,
+            id.poc,
+        );
+    }
+    Ok(pictures)
+}
+
+fn picture_from_reference(
+    reference: &ParsedH264Reference,
+    decoded_surfaces: &BTreeMap<(u16, i32), DecodedSurfaceState>,
+) -> Result<PictureH264, DecoderError> {
+    let Some(surface) = decoded_surfaces.get(&surface_key(&reference.id)) else {
+        return Err(DecoderError::DecodeFailed);
+    };
+    Ok(PictureH264::new(
+        surface.surface.id(),
+        u32::from(reference.frame_num),
+        0,
+        reference.top_field_order_cnt,
+        reference.bottom_field_order_cnt,
+    ))
+}
+
+fn surface_key(id: &H264PictureId) -> (u16, i32) {
+    (id.frame_num, id.poc)
 }
 
 fn invalid_picture() -> PictureH264 {

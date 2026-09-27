@@ -336,6 +336,32 @@ fn handle_client(
                     }
                 }
             }
+            WireMessage::FlushDecoder { request, .. } => {
+                if let Some(session) = &mut session {
+                    match session.flush_decoder(&request) {
+                        Ok(response) => WireMessage::DecodeOutput {
+                            request_id,
+                            response,
+                        },
+                        Err(err) => {
+                            eprintln!("decoder flush failed: {err}");
+                            WireMessage::Error {
+                                request_id,
+                                response: ErrorResponse {
+                                    code: protocol_code_from_decoder_error(&err),
+                                },
+                            }
+                        }
+                    }
+                } else {
+                    WireMessage::Error {
+                        request_id,
+                        response: ErrorResponse {
+                            code: ProtocolErrorCode::SessionRequired,
+                        },
+                    }
+                }
+            }
             WireMessage::DestroyDecoder { request, .. } => {
                 if let Some(session) = &mut session {
                     match session.destroy_decoder(&request) {

@@ -6,12 +6,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use qgs_protocol::{
     handle_hello, BufferCreatedResponse, BufferDesc, CreateDecoderRequest, CreateSyncRequest,
-    DecodeOutputResponse, DecoderCreatedResponse, DecoderDestroyedResponse, DecoderId,
-    DestroyDecoderRequest, DeviceCapabilities, DeviceDesc, DeviceId, ExportResourceRequest,
-    ExportSyncRequest, ExportedResourceMetadata, ExportedSyncMetadata, HelloRequest,
-    ImageCreatedResponse, ImageDesc, ProtocolError, ResourceDestroyedResponse, ResourceId,
-    ResourceKind, SelectedMemoryProperties, SessionId, SubmitAccessUnitRequest,
-    SyncCreatedResponse, SyncId, VideoCapabilities, VideoSurfaceDesc, WelcomeResponse,
+    DecodeOutputResponse, DecodedVideoSurface, DecoderCreatedResponse, DecoderDestroyedResponse,
+    DecoderId, DestroyDecoderRequest, DeviceCapabilities, DeviceDesc, DeviceId,
+    ExportResourceRequest, ExportSyncRequest, ExportedResourceMetadata, ExportedSyncMetadata,
+    FlushDecoderRequest, HelloRequest, ImageCreatedResponse, ImageDesc, ProtocolError,
+    ResourceDestroyedResponse, ResourceId, ResourceKind, SelectedMemoryProperties, SessionId,
+    SubmitAccessUnitRequest, SyncCreatedResponse, SyncId, VideoCapabilities, VideoSurfaceDesc,
+    WelcomeResponse,
 };
 
 pub trait DeviceDiscovery {
@@ -133,7 +134,12 @@ pub trait BackendDecoder {
     fn submit_access_unit(
         &mut self,
         request: &SubmitAccessUnitRequest,
-    ) -> Result<BackendDecodedSurface, DecoderError>;
+    ) -> Result<Vec<BackendDecodedSurface>, DecoderError>;
+
+    fn flush(
+        &mut self,
+        request: &FlushDecoderRequest,
+    ) -> Result<Vec<BackendDecodedSurface>, DecoderError>;
 }
 
 pub struct BackendBufferAllocation {
@@ -471,23 +477,56 @@ impl Session {
             .get_mut(request.decoder_id)?
             .decoder
             .submit_access_unit(request)?;
-        decoded.desc.validate()?;
-        let resource_id = self
-            .resources
-            .allocate_id()
-            .map_err(|_| DecoderError::DecodeFailed)?;
-        self.resources.insert(
-            resource_id,
-            ResourceEntry {
-                kind: ResourceKind::VideoSurface,
-                resource: decoded.resource,
-            },
-        );
+        let outputs = self.register_decoded_surfaces(decoded)?;
         Ok(DecodeOutputResponse {
             decoder_id: request.decoder_id,
-            resource_id,
-            surface: decoded.desc,
+            outputs,
         })
+    }
+
+    pub fn flush_decoder(
+        &mut self,
+        request: &FlushDecoderRequest,
+    ) -> Result<DecodeOutputResponse, DecoderError> {
+        let decoded = self
+            .decoders
+            .get_mut(request.decoder_id)?
+            .decoder
+            .flush(request)?;
+        let outputs = self.register_decoded_surfaces(decoded)?;
+        Ok(DecodeOutputResponse {
+            decoder_id: request.decoder_id,
+            outputs,
+        })
+    }
+
+    fn register_decoded_surfaces(
+        &mut self,
+        decoded: Vec<BackendDecodedSurface>,
+    ) -> Result<Vec<DecodedVideoSurface>, DecoderError> {
+        if decoded.len() > qgs_protocol::MAX_DECODE_OUTPUT_SURFACE_COUNT {
+            return Err(DecoderError::DecodeFailed);
+        }
+        let mut outputs = Vec::with_capacity(decoded.len());
+        for decoded in decoded {
+            decoded.desc.validate()?;
+            let resource_id = self
+                .resources
+                .allocate_id()
+                .map_err(|_| DecoderError::DecodeFailed)?;
+            self.resources.insert(
+                resource_id,
+                ResourceEntry {
+                    kind: ResourceKind::VideoSurface,
+                    resource: decoded.resource,
+                },
+            );
+            outputs.push(DecodedVideoSurface {
+                resource_id,
+                surface: decoded.desc,
+            });
+        }
+        Ok(outputs)
     }
 
     pub fn destroy_decoder(
