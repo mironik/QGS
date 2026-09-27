@@ -70,6 +70,14 @@ QGS result:
 - Random access to edit unit 53 starts from the MXF-derived random-access point
   at edit unit 48 and produces the same decoded-frame checksum as sequential
   decode.
+- Step 10 uploads the software-decoded `yuv422p10le` VideoSurface planes to
+  Vulkan storage buffers and runs a fixed GPU YCbCr -> RGBA validation shader.
+  The proof passes on Intel HD Graphics 4600 and NVIDIA GTX 950M / NVK with no
+  CPU pixel copy between the software VideoSurface and the GPU processing input
+  beyond the explicit fallback upload.
+- Step 10 validates first frame, sequential edit unit 53, random-access edit
+  unit 53, and final frame. Sequential and random-access edit unit 53 produce
+  the same GPU output checksum.
 
 Privacy handling:
 

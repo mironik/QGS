@@ -18,7 +18,7 @@ use qgs_protocol::{
     ExternalSharing, ImageDesc, ImageUsageFlags, InteropCapabilities, MemoryCapabilities,
     MemoryHeapDesc, PixelFormat, ResourceKind, SelectedMemoryProperties, SyncExportHandleType,
     SyncKind, VideoCapabilities, MAX_DEVICE_COUNT, MAX_DEVICE_NAME_LEN, MAX_MEMORY_HEAP_COUNT,
-    MAX_MEMORY_TYPE_COUNT,
+    MAX_MEMORY_TYPE_COUNT, MAX_VIDEO_SURFACE_HEIGHT, MAX_VIDEO_SURFACE_WIDTH,
 };
 
 mod haswell_video_diagnostic;
@@ -54,6 +54,53 @@ const IMAGE_INVERT_SHADER: [u32; 208] = [
     1, 327761, 6, 29, 26, 2, 327761, 6, 30, 26, 3, 327816, 6, 31, 17, 27, 327816, 6, 32, 17, 28,
     327816, 6, 33, 17, 29, 458832, 9, 34, 31, 32, 33, 30, 262243, 25, 24, 34, 65789, 65592,
 ];
+const YUV422P10_LOCAL_SIZE_X: u32 = 8;
+const YUV422P10_LOCAL_SIZE_Y: u32 = 8;
+const YUV422P10_OUTPUT_COMPONENTS: usize = 4;
+const YUV422P10_OUTPUT_BYTES_PER_COMPONENT: usize = 2;
+const YUV422P10_TO_RGBA_U16_SHADER: [u32; 740] = [
+    119734787, 66816, 851979, 205, 0, 131089, 1, 393227, 1, 1280527431, 1685353262, 808793134, 0,
+    196622, 0, 1, 720911, 5, 4, 1852399981, 0, 23, 36, 76, 88, 98, 160, 393232, 4, 17, 8, 8, 1,
+    262215, 23, 11, 28, 196679, 34, 2, 327752, 34, 0, 35, 0, 327752, 34, 1, 35, 4, 327752, 34, 2,
+    35, 8, 327752, 34, 3, 35, 12, 262215, 73, 6, 4, 196679, 74, 2, 262216, 74, 0, 24, 327752, 74,
+    0, 35, 0, 196679, 76, 24, 262215, 76, 33, 0, 262215, 76, 34, 0, 262215, 85, 6, 4, 196679, 86,
+    2, 262216, 86, 0, 24, 327752, 86, 0, 35, 0, 196679, 88, 24, 262215, 88, 33, 1, 262215, 88, 34,
+    0, 262215, 95, 6, 4, 196679, 96, 2, 262216, 96, 0, 24, 327752, 96, 0, 35, 0, 196679, 98, 24,
+    262215, 98, 33, 2, 262215, 98, 34, 0, 262215, 157, 6, 16, 196679, 158, 2, 262216, 158, 0, 25,
+    327752, 158, 0, 35, 0, 196679, 160, 25, 262215, 160, 33, 3, 262215, 160, 34, 0, 262215, 180,
+    11, 25, 131091, 2, 196641, 3, 2, 196630, 6, 32, 262187, 6, 13, 0, 262187, 6, 14, 1065353216,
+    262165, 18, 32, 0, 262167, 21, 18, 3, 262176, 22, 1, 21, 262203, 22, 23, 1, 262187, 18, 24, 0,
+    262176, 25, 1, 18, 262187, 18, 29, 1, 131092, 32, 393246, 34, 18, 18, 18, 18, 262176, 35, 9,
+    34, 262203, 35, 36, 9, 262165, 37, 32, 1, 262187, 37, 38, 0, 262176, 39, 9, 18, 262187, 37, 47,
+    1, 262187, 37, 57, 2, 262187, 37, 65, 3, 196637, 73, 18, 196638, 74, 73, 262176, 75, 12, 74,
+    262203, 75, 76, 12, 262176, 78, 12, 18, 262187, 18, 81, 1023, 196637, 85, 18, 196638, 86, 85,
+    262176, 87, 12, 86, 262203, 87, 88, 12, 196637, 95, 18, 196638, 96, 95, 262176, 97, 12, 96,
+    262203, 97, 98, 12, 262187, 6, 106, 1115684864, 262187, 6, 113, 1140850688, 262167, 156, 18, 4,
+    196637, 157, 156, 196638, 158, 157, 262176, 159, 12, 158, 262203, 159, 160, 12, 262187, 6, 163,
+    1199570688, 262187, 18, 175, 65535, 262176, 177, 12, 156, 262187, 18, 179, 8, 393260, 21, 180,
+    179, 179, 29, 262187, 6, 199, 982884389, 262187, 6, 201, 988176106, 262187, 6, 202, 962279677,
+    262187, 6, 203, 973665712, 262187, 6, 204, 990361937, 327734, 2, 4, 0, 3, 131320, 5, 196855,
+    181, 0, 196859, 24, 182, 131320, 182, 327745, 25, 26, 23, 24, 262205, 18, 27, 26, 327745, 25,
+    30, 23, 29, 262205, 18, 31, 30, 327745, 39, 40, 36, 38, 262205, 18, 41, 40, 327854, 32, 42, 27,
+    41, 262312, 32, 43, 42, 196855, 45, 0, 262394, 43, 44, 45, 131320, 44, 327745, 39, 48, 36, 47,
+    262205, 18, 49, 48, 327854, 32, 50, 31, 49, 131321, 45, 131320, 45, 458997, 32, 51, 42, 182,
+    50, 44, 196855, 53, 0, 262394, 51, 52, 53, 131320, 52, 131321, 181, 131320, 53, 327745, 39, 58,
+    36, 57, 262205, 18, 59, 58, 327812, 18, 60, 31, 59, 327808, 18, 62, 60, 27, 327745, 39, 66, 36,
+    65, 262205, 18, 67, 66, 327812, 18, 68, 31, 67, 327874, 18, 70, 27, 47, 327808, 18, 71, 68, 70,
+    393281, 78, 79, 76, 38, 62, 262205, 18, 80, 79, 327879, 18, 82, 80, 81, 262256, 6, 83, 82,
+    393281, 78, 90, 88, 38, 71, 262205, 18, 91, 90, 327879, 18, 92, 91, 81, 262256, 6, 93, 92,
+    393281, 78, 100, 98, 38, 71, 262205, 18, 101, 100, 327879, 18, 102, 101, 81, 262256, 6, 103,
+    102, 327811, 6, 107, 83, 106, 458764, 6, 108, 1, 40, 13, 107, 327813, 6, 110, 108, 199, 327811,
+    6, 114, 93, 113, 327811, 6, 119, 103, 113, 327813, 6, 125, 119, 201, 327809, 6, 126, 110, 125,
+    524300, 6, 190, 1, 43, 126, 13, 14, 327813, 6, 133, 114, 202, 327811, 6, 134, 110, 133, 327813,
+    6, 137, 119, 203, 327811, 6, 138, 134, 137, 524300, 6, 194, 1, 43, 138, 13, 14, 327813, 6, 145,
+    114, 204, 327809, 6, 146, 110, 145, 524300, 6, 198, 1, 43, 146, 13, 14, 327812, 18, 153, 31,
+    41, 327808, 18, 155, 153, 27, 327813, 6, 164, 190, 163, 393228, 6, 165, 1, 1, 164, 262253, 18,
+    166, 165, 327813, 6, 168, 194, 163, 393228, 6, 169, 1, 1, 168, 262253, 18, 170, 169, 327813, 6,
+    172, 198, 163, 393228, 6, 173, 1, 1, 172, 262253, 18, 174, 173, 458832, 156, 176, 166, 170,
+    174, 175, 393281, 177, 178, 160, 38, 155, 196670, 178, 176, 131321, 181, 131320, 181, 65789,
+    65592,
+];
 
 type BackendResult<T> = Result<T, BackendError>;
 
@@ -78,6 +125,53 @@ impl std::fmt::Display for BackendError {
             Self::InvalidInput => write!(f, "invalid Vulkan backend input"),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum YcbcrConversion {
+    Rec709Limited,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Yuv422P10Plane<'a> {
+    pub width_samples: u32,
+    pub height: u32,
+    pub stride_bytes: usize,
+    pub data: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Yuv422P10Upload<'a> {
+    pub device_id: DeviceId,
+    pub width: u32,
+    pub height: u32,
+    pub y: Yuv422P10Plane<'a>,
+    pub cb: Yuv422P10Plane<'a>,
+    pub cr: Yuv422P10Plane<'a>,
+    pub conversion: YcbcrConversion,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Yuv422P10GpuOutput {
+    pub width: u32,
+    pub height: u32,
+    pub rgba_u16: Vec<u16>,
+    pub checksum: u64,
+    pub cpu_surface_bytes: usize,
+    pub staging_bytes: usize,
+    pub gpu_plane_bytes: usize,
+    pub output_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Yuv422P10Layout {
+    y_samples: usize,
+    chroma_samples: usize,
+    output_samples: usize,
+    cpu_surface_bytes: usize,
+    staging_bytes: usize,
+    gpu_plane_bytes: usize,
+    output_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -169,6 +263,28 @@ impl VulkanDeviceDiscovery {
         } else {
             Err(ResourceError::ExportFailed)
         }
+    }
+
+    pub fn process_yuv422p10_surface(
+        &self,
+        upload: &Yuv422P10Upload<'_>,
+    ) -> Result<Yuv422P10GpuOutput, ResourceError> {
+        let layout = validate_yuv422p10_upload(upload)?;
+        let device = self
+            .devices
+            .iter()
+            .find(|device| device.desc.id == upload.device_id)
+            .ok_or(ResourceError::UnknownDeviceId)?
+            .device
+            .clone();
+        if !device.queue_supports_compute() {
+            return Err(ResourceError::UnsupportedMemoryRequirements);
+        }
+
+        let y_values = expand_yuv422p10_plane(upload.y)?;
+        let cb_values = expand_yuv422p10_plane(upload.cb)?;
+        let cr_values = expand_yuv422p10_plane(upload.cr)?;
+        run_yuv422p10_gpu_proof(&device, upload, layout, &y_values, &cb_values, &cr_values)
     }
 
     pub fn import_wait_and_validate_synced_buffer(
@@ -1824,6 +1940,182 @@ fn one_time_commands<T>(
     ))
 }
 
+fn validate_yuv422p10_upload(
+    upload: &Yuv422P10Upload<'_>,
+) -> Result<Yuv422P10Layout, ResourceError> {
+    if upload.width == 0
+        || upload.height == 0
+        || upload.width > MAX_VIDEO_SURFACE_WIDTH
+        || upload.height > MAX_VIDEO_SURFACE_HEIGHT
+        || !upload.width.is_multiple_of(2)
+    {
+        return Err(ResourceError::InvalidImageDimensions);
+    }
+    validate_yuv422p10_plane(upload.y, upload.width, upload.height)?;
+    validate_yuv422p10_plane(upload.cb, upload.width / 2, upload.height)?;
+    validate_yuv422p10_plane(upload.cr, upload.width / 2, upload.height)?;
+
+    let y_samples = checked_sample_count(upload.width, upload.height)?;
+    let chroma_samples = checked_sample_count(upload.width / 2, upload.height)?;
+    let output_pixels = y_samples;
+    let output_samples = output_pixels
+        .checked_mul(YUV422P10_OUTPUT_COMPONENTS)
+        .ok_or(ResourceError::InvalidImageDimensions)?;
+    let cpu_surface_bytes = upload
+        .y
+        .data
+        .len()
+        .checked_add(upload.cb.data.len())
+        .and_then(|total| total.checked_add(upload.cr.data.len()))
+        .ok_or(ResourceError::InvalidImageDimensions)?;
+    let staging_samples = y_samples
+        .checked_add(chroma_samples)
+        .and_then(|total| total.checked_add(chroma_samples))
+        .ok_or(ResourceError::InvalidImageDimensions)?;
+    let staging_bytes = staging_samples
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(ResourceError::InvalidImageDimensions)?;
+    let output_bytes = output_samples
+        .checked_mul(YUV422P10_OUTPUT_BYTES_PER_COMPONENT)
+        .ok_or(ResourceError::InvalidImageDimensions)?;
+
+    Ok(Yuv422P10Layout {
+        y_samples,
+        chroma_samples,
+        output_samples,
+        cpu_surface_bytes,
+        staging_bytes,
+        gpu_plane_bytes: staging_bytes,
+        output_bytes,
+    })
+}
+
+fn validate_yuv422p10_plane(
+    plane: Yuv422P10Plane<'_>,
+    expected_width_samples: u32,
+    expected_height: u32,
+) -> Result<(), ResourceError> {
+    if plane.width_samples != expected_width_samples || plane.height != expected_height {
+        return Err(ResourceError::InvalidImageDimensions);
+    }
+    let row_bytes = row_bytes_for_u16_samples(plane.width_samples)?;
+    if plane.stride_bytes < row_bytes || plane.stride_bytes == 0 {
+        return Err(ResourceError::InvalidImageDimensions);
+    }
+    let required_len = plane
+        .stride_bytes
+        .checked_mul(
+            usize::try_from(plane.height).map_err(|_| ResourceError::InvalidImageDimensions)?,
+        )
+        .ok_or(ResourceError::InvalidImageDimensions)?;
+    if plane.data.len() < required_len {
+        return Err(ResourceError::InvalidImageDimensions);
+    }
+    Ok(())
+}
+
+fn row_bytes_for_u16_samples(width_samples: u32) -> Result<usize, ResourceError> {
+    usize::try_from(width_samples)
+        .ok()
+        .and_then(|width| width.checked_mul(2))
+        .ok_or(ResourceError::InvalidImageDimensions)
+}
+
+fn checked_sample_count(width: u32, height: u32) -> Result<usize, ResourceError> {
+    usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .ok_or(ResourceError::InvalidImageDimensions)
+}
+
+fn expand_yuv422p10_plane(plane: Yuv422P10Plane<'_>) -> Result<Vec<u32>, ResourceError> {
+    validate_yuv422p10_plane(plane, plane.width_samples, plane.height)?;
+    let width =
+        usize::try_from(plane.width_samples).map_err(|_| ResourceError::InvalidImageDimensions)?;
+    let height =
+        usize::try_from(plane.height).map_err(|_| ResourceError::InvalidImageDimensions)?;
+    let row_bytes = row_bytes_for_u16_samples(plane.width_samples)?;
+    let mut values = Vec::with_capacity(
+        width
+            .checked_mul(height)
+            .ok_or(ResourceError::InvalidImageDimensions)?,
+    );
+    for row in 0..height {
+        let start = row
+            .checked_mul(plane.stride_bytes)
+            .ok_or(ResourceError::InvalidImageDimensions)?;
+        let end = start
+            .checked_add(row_bytes)
+            .ok_or(ResourceError::InvalidImageDimensions)?;
+        let row_data = plane
+            .data
+            .get(start..end)
+            .ok_or(ResourceError::InvalidImageDimensions)?;
+        let (samples, remainder) = row_data.as_chunks::<2>();
+        if !remainder.is_empty() {
+            return Err(ResourceError::InvalidImageDimensions);
+        }
+        for sample in samples {
+            values.push(u32::from(u16::from_le_bytes([sample[0], sample[1]])) & 0x03ff);
+        }
+    }
+    Ok(values)
+}
+
+pub fn yuv422p10_reference_rgba_u16(
+    upload: &Yuv422P10Upload<'_>,
+) -> Result<Vec<u16>, ResourceError> {
+    let layout = validate_yuv422p10_upload(upload)?;
+    let y_values = expand_yuv422p10_plane(upload.y)?;
+    let cb_values = expand_yuv422p10_plane(upload.cb)?;
+    let cr_values = expand_yuv422p10_plane(upload.cr)?;
+    let width = usize::try_from(upload.width).map_err(|_| ResourceError::InvalidImageDimensions)?;
+    let height =
+        usize::try_from(upload.height).map_err(|_| ResourceError::InvalidImageDimensions)?;
+    let chroma_width = width / 2;
+    let mut out = Vec::with_capacity(layout.output_samples);
+    for row in 0..height {
+        for x in 0..width {
+            let y = y_values[row * width + x];
+            let chroma_index = row * chroma_width + (x / 2);
+            let cb = cb_values[chroma_index];
+            let cr = cr_values[chroma_index];
+            out.extend_from_slice(&convert_rec709_limited_to_rgba_u16(y, cb, cr));
+        }
+    }
+    Ok(out)
+}
+
+fn convert_rec709_limited_to_rgba_u16(y: u32, cb: u32, cr: u32) -> [u16; 4] {
+    let y_limited = ((y as f32 - 64.0).max(0.0)) / 876.0;
+    let cb_centered = (cb as f32 - 512.0) / 896.0;
+    let cr_centered = (cr as f32 - 512.0) / 896.0;
+    let r = (y_limited + 1.5748 * cr_centered).clamp(0.0, 1.0);
+    let g = (y_limited - 0.187324 * cb_centered - 0.468124 * cr_centered).clamp(0.0, 1.0);
+    let b = (y_limited + 1.8556 * cb_centered).clamp(0.0, 1.0);
+    [
+        (r * 65535.0).round() as u16,
+        (g * 65535.0).round() as u16,
+        (b * 65535.0).round() as u16,
+        u16::MAX,
+    ]
+}
+
+pub fn yuv422p10_rgba_u16_checksum(values: &[u16]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for value in values {
+        for byte in value.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
+}
+
 fn describe_device(
     raw_id: u64,
     properties: vk::PhysicalDeviceProperties,
@@ -2532,6 +2824,237 @@ fn run_image_invert_proof(
     readback.read_bytes(0, input_pixels.len())
 }
 
+fn run_yuv422p10_gpu_proof(
+    device: &Arc<GpuDevice>,
+    upload: &Yuv422P10Upload<'_>,
+    layout: Yuv422P10Layout,
+    y_values: &[u32],
+    cb_values: &[u32],
+    cr_values: &[u32],
+) -> Result<Yuv422P10GpuOutput, ResourceError> {
+    let y_bytes = checked_byte_len(y_values.len(), std::mem::size_of::<u32>())?;
+    let chroma_bytes = checked_byte_len(cb_values.len(), std::mem::size_of::<u32>())?;
+    let output_u32_bytes = checked_byte_len(layout.output_samples, std::mem::size_of::<u32>())?;
+    let output_u16_bytes = checked_byte_len(layout.output_samples, std::mem::size_of::<u16>())?;
+
+    let staging_y = upload_storage_plane(device, y_values)?;
+    let staging_cb = upload_storage_plane(device, cb_values)?;
+    let staging_cr = upload_storage_plane(device, cr_values)?;
+    let gpu_y = GpuBuffer::new(
+        device.clone(),
+        y_bytes,
+        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
+        None,
+        vk::MemoryPropertyFlags::empty(),
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        false,
+    )?;
+    let gpu_cb = GpuBuffer::new(
+        device.clone(),
+        chroma_bytes,
+        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
+        None,
+        vk::MemoryPropertyFlags::empty(),
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        false,
+    )?;
+    let gpu_cr = GpuBuffer::new(
+        device.clone(),
+        chroma_bytes,
+        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
+        None,
+        vk::MemoryPropertyFlags::empty(),
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        false,
+    )?;
+    let output = GpuBuffer::new(
+        device.clone(),
+        output_u32_bytes,
+        vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::STORAGE_BUFFER,
+        None,
+        vk::MemoryPropertyFlags::empty(),
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        false,
+    )?;
+    let readback = GpuBuffer::new(
+        device.clone(),
+        output_u32_bytes,
+        vk::BufferUsageFlags::TRANSFER_DST,
+        None,
+        vk::MemoryPropertyFlags::HOST_VISIBLE,
+        vk::MemoryPropertyFlags::HOST_COHERENT,
+        false,
+    )?;
+    let pipeline = Yuv422P10PipelineState::new(device.clone())?;
+    let descriptor = pipeline.write_buffers(&gpu_y, &gpu_cb, &gpu_cr, &output)?;
+    let params = Yuv422P10ShaderParams {
+        width: upload.width,
+        height: upload.height,
+        y_stride_samples: upload.width,
+        chroma_stride_samples: upload.width / 2,
+    };
+
+    let (_, _pending) = one_time_commands(
+        device,
+        |command_buffer| {
+            copy_buffer(command_buffer, &staging_y, &gpu_y, y_bytes);
+            copy_buffer(command_buffer, &staging_cb, &gpu_cb, chroma_bytes);
+            copy_buffer(command_buffer, &staging_cr, &gpu_cr, chroma_bytes);
+            buffer_barrier(
+                device,
+                command_buffer,
+                &[&gpu_y, &gpu_cb, &gpu_cr],
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+            );
+            // SAFETY: command buffer is recording; pipeline, descriptor set,
+            // and buffers are live for the submission. Push constants match
+            // the fixed shader's 16-byte parameter block.
+            unsafe {
+                device.device.cmd_bind_pipeline(
+                    command_buffer,
+                    vk::PipelineBindPoint::COMPUTE,
+                    pipeline.pipeline,
+                );
+                device.device.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::COMPUTE,
+                    pipeline.layout,
+                    0,
+                    &[descriptor.set],
+                    &[],
+                );
+                device.device.cmd_push_constants(
+                    command_buffer,
+                    pipeline.layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    params.as_bytes(),
+                );
+                device.device.cmd_dispatch(
+                    command_buffer,
+                    upload.width.div_ceil(YUV422P10_LOCAL_SIZE_X),
+                    upload.height.div_ceil(YUV422P10_LOCAL_SIZE_Y),
+                    1,
+                );
+            }
+            buffer_barrier(
+                device,
+                command_buffer,
+                &[&output],
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::TRANSFER_READ,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+            );
+            copy_buffer(command_buffer, &output, &readback, output_u32_bytes);
+            Ok(())
+        },
+        None,
+        None,
+        true,
+    )?;
+    let bytes = readback.read_bytes(0, output_u32_bytes as usize)?;
+    let mut rgba_u16 = Vec::with_capacity(layout.output_samples);
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
+        return Err(ResourceError::ExportFailed);
+    }
+    for chunk in chunks {
+        let value = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        rgba_u16.push(u16::try_from(value).map_err(|_| ResourceError::ExportFailed)?);
+    }
+    if rgba_u16.len() != layout.output_samples || output_u16_bytes != layout.output_bytes as u64 {
+        return Err(ResourceError::ExportFailed);
+    }
+    let checksum = yuv422p10_rgba_u16_checksum(&rgba_u16);
+    Ok(Yuv422P10GpuOutput {
+        width: upload.width,
+        height: upload.height,
+        rgba_u16,
+        checksum,
+        cpu_surface_bytes: layout.cpu_surface_bytes,
+        staging_bytes: layout.staging_bytes,
+        gpu_plane_bytes: layout.gpu_plane_bytes,
+        output_bytes: layout.output_bytes,
+    })
+}
+
+fn upload_storage_plane(
+    device: &Arc<GpuDevice>,
+    values: &[u32],
+) -> Result<GpuBuffer, ResourceError> {
+    let size = checked_byte_len(values.len(), std::mem::size_of::<u32>())?;
+    let buffer = GpuBuffer::new(
+        device.clone(),
+        size,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        None,
+        vk::MemoryPropertyFlags::HOST_VISIBLE,
+        vk::MemoryPropertyFlags::HOST_COHERENT,
+        false,
+    )?;
+    buffer.write_bytes(0, cast_u32_slice(values))?;
+    Ok(buffer)
+}
+
+fn checked_byte_len(count: usize, bytes_per_item: usize) -> Result<u64, ResourceError> {
+    let bytes = count
+        .checked_mul(bytes_per_item)
+        .ok_or(ResourceError::InvalidBufferSize)?;
+    u64::try_from(bytes).map_err(|_| ResourceError::InvalidBufferSize)
+}
+
+fn copy_buffer(command_buffer: vk::CommandBuffer, src: &GpuBuffer, dst: &GpuBuffer, size: u64) {
+    let copy = vk::BufferCopy::default().size(size);
+    // SAFETY: command buffer is recording, buffers are live, and caller uses
+    // QGS-created buffers with the required transfer usages.
+    unsafe {
+        src.device
+            .device
+            .cmd_copy_buffer(command_buffer, src.buffer, dst.buffer, &[copy]);
+    }
+}
+
+fn buffer_barrier(
+    device: &GpuDevice,
+    command_buffer: vk::CommandBuffer,
+    buffers: &[&GpuBuffer],
+    src_access: vk::AccessFlags,
+    dst_access: vk::AccessFlags,
+    src_stage: vk::PipelineStageFlags,
+    dst_stage: vk::PipelineStageFlags,
+) {
+    let barriers = buffers
+        .iter()
+        .map(|buffer| {
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(src_access)
+                .dst_access_mask(dst_access)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(buffer.buffer)
+                .offset(0)
+                .size(buffer.size)
+        })
+        .collect::<Vec<_>>();
+    // SAFETY: command buffer is recording. Barriers reference live buffers
+    // owned by the same device and cover their full allocation-backed ranges.
+    unsafe {
+        device.device.cmd_pipeline_barrier(
+            command_buffer,
+            src_stage,
+            dst_stage,
+            vk::DependencyFlags::empty(),
+            &[],
+            &barriers,
+            &[],
+        );
+    }
+}
+
 struct ImageTransition {
     image: vk::Image,
     old_layout: vk::ImageLayout,
@@ -2806,6 +3329,255 @@ impl Drop for ComputePipelineState {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct Yuv422P10ShaderParams {
+    width: u32,
+    height: u32,
+    y_stride_samples: u32,
+    chroma_stride_samples: u32,
+}
+
+impl Yuv422P10ShaderParams {
+    fn as_bytes(&self) -> &[u8] {
+        // SAFETY: Yuv422P10ShaderParams is repr(C), contains only u32 fields,
+        // and has no padding-dependent validity. The returned slice is tied to
+        // self and exactly covers the push-constant struct.
+        unsafe {
+            std::slice::from_raw_parts(
+                (self as *const Self).cast::<u8>(),
+                std::mem::size_of::<Self>(),
+            )
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Yuv422P10PipelineState {
+    device: Arc<GpuDevice>,
+    shader: vk::ShaderModule,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    descriptor_pool: vk::DescriptorPool,
+}
+
+impl Yuv422P10PipelineState {
+    fn new(device: Arc<GpuDevice>) -> Result<Self, ResourceError> {
+        let shader_info = vk::ShaderModuleCreateInfo::default().code(&YUV422P10_TO_RGBA_U16_SHADER);
+        // SAFETY: shader code is fixed QGS-controlled SPIR-V compiled for the
+        // descriptor/push-constant contract below.
+        let shader =
+            unsafe { device.device.create_shader_module(&shader_info, None) }.map_err(|err| {
+                eprintln!("vulkan YUV shader module creation failed: {err:?}");
+                ResourceError::ExportFailed
+            })?;
+        let bindings = [
+            storage_buffer_binding(0),
+            storage_buffer_binding(1),
+            storage_buffer_binding(2),
+            storage_buffer_binding(3),
+        ];
+        let descriptor_set_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        // SAFETY: descriptor set layout info references the local bindings for
+        // the duration of this call.
+        let descriptor_set_layout = unsafe {
+            device
+                .device
+                .create_descriptor_set_layout(&descriptor_set_layout_info, None)
+        }
+        .map_err(|err| {
+            eprintln!("vulkan YUV descriptor set layout creation failed: {err:?}");
+            // SAFETY: shader was created above and is still owned here.
+            unsafe {
+                device.device.destroy_shader_module(shader, None);
+            }
+            ResourceError::ExportFailed
+        })?;
+        let push_ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(std::mem::size_of::<Yuv422P10ShaderParams>() as u32)];
+        let set_layouts = [descriptor_set_layout];
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&push_ranges);
+        // SAFETY: pipeline layout info references live descriptor set layout and
+        // fixed push-constant range.
+        let layout = unsafe {
+            device
+                .device
+                .create_pipeline_layout(&pipeline_layout_info, None)
+        }
+        .map_err(|err| {
+            eprintln!("vulkan YUV pipeline layout creation failed: {err:?}");
+            // SAFETY: objects are live and owned by this constructor.
+            unsafe {
+                device
+                    .device
+                    .destroy_descriptor_set_layout(descriptor_set_layout, None);
+                device.device.destroy_shader_module(shader, None);
+            }
+            ResourceError::ExportFailed
+        })?;
+        let entry_point = c"main";
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(shader)
+            .name(entry_point);
+        let pipeline_info = vk::ComputePipelineCreateInfo::default()
+            .stage(stage)
+            .layout(layout);
+        // SAFETY: shader module and pipeline layout are live and match the
+        // fixed QGS YUV422P10 descriptor contract.
+        let pipeline = unsafe {
+            device.device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[pipeline_info],
+                None,
+            )
+        }
+        .map_err(|(_, err)| {
+            eprintln!("vulkan YUV compute pipeline creation failed: {err:?}");
+            // SAFETY: objects are live and owned by this constructor.
+            unsafe {
+                device.device.destroy_pipeline_layout(layout, None);
+                device
+                    .device
+                    .destroy_descriptor_set_layout(descriptor_set_layout, None);
+                device.device.destroy_shader_module(shader, None);
+            }
+            ResourceError::ExportFailed
+        })?[0];
+        let pool_size = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(4)];
+        let descriptor_pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(1)
+            .pool_sizes(&pool_size);
+        // SAFETY: descriptor pool info is valid for one fixed four-binding set.
+        let descriptor_pool = unsafe {
+            device
+                .device
+                .create_descriptor_pool(&descriptor_pool_info, None)
+        }
+        .map_err(|err| {
+            eprintln!("vulkan YUV descriptor pool creation failed: {err:?}");
+            // SAFETY: objects are live and owned by this constructor.
+            unsafe {
+                device.device.destroy_pipeline(pipeline, None);
+                device.device.destroy_pipeline_layout(layout, None);
+                device
+                    .device
+                    .destroy_descriptor_set_layout(descriptor_set_layout, None);
+                device.device.destroy_shader_module(shader, None);
+            }
+            ResourceError::ExportFailed
+        })?;
+
+        Ok(Self {
+            device,
+            shader,
+            descriptor_set_layout,
+            layout,
+            pipeline,
+            descriptor_pool,
+        })
+    }
+
+    fn write_buffers(
+        &self,
+        y: &GpuBuffer,
+        cb: &GpuBuffer,
+        cr: &GpuBuffer,
+        output: &GpuBuffer,
+    ) -> Result<DescriptorSet, ResourceError> {
+        let set_layouts = [self.descriptor_set_layout];
+        let allocate_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&set_layouts);
+        // SAFETY: descriptor pool and set layout are live.
+        let sets = unsafe { self.device.device.allocate_descriptor_sets(&allocate_info) }.map_err(
+            |err| {
+                eprintln!("vulkan YUV descriptor set allocation failed: {err:?}");
+                ResourceError::ExportFailed
+            },
+        )?;
+        let set = sets[0];
+        let buffer_infos = [
+            vk::DescriptorBufferInfo::default()
+                .buffer(y.buffer)
+                .offset(0)
+                .range(y.size),
+            vk::DescriptorBufferInfo::default()
+                .buffer(cb.buffer)
+                .offset(0)
+                .range(cb.size),
+            vk::DescriptorBufferInfo::default()
+                .buffer(cr.buffer)
+                .offset(0)
+                .range(cr.size),
+            vk::DescriptorBufferInfo::default()
+                .buffer(output.buffer)
+                .offset(0)
+                .range(output.size),
+        ];
+        let writes = [
+            storage_buffer_write(set, 0, &buffer_infos[0..1]),
+            storage_buffer_write(set, 1, &buffer_infos[1..2]),
+            storage_buffer_write(set, 2, &buffer_infos[2..3]),
+            storage_buffer_write(set, 3, &buffer_infos[3..4]),
+        ];
+        // SAFETY: descriptor set is allocated from this pool, and buffer infos
+        // reference live buffers for the call and subsequent submission.
+        unsafe {
+            self.device.device.update_descriptor_sets(&writes, &[]);
+        }
+        Ok(DescriptorSet { set })
+    }
+}
+
+impl Drop for Yuv422P10PipelineState {
+    fn drop(&mut self) {
+        // SAFETY: Yuv422P10PipelineState owns these objects and they are
+        // destroyed in dependency order after submissions complete.
+        unsafe {
+            self.device
+                .device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device.device.destroy_pipeline(self.pipeline, None);
+            self.device
+                .device
+                .destroy_pipeline_layout(self.layout, None);
+            self.device
+                .device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            self.device.device.destroy_shader_module(self.shader, None);
+        }
+    }
+}
+
+fn storage_buffer_binding(binding: u32) -> vk::DescriptorSetLayoutBinding<'static> {
+    vk::DescriptorSetLayoutBinding::default()
+        .binding(binding)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+}
+
+fn storage_buffer_write<'a>(
+    set: vk::DescriptorSet,
+    binding: u32,
+    info: &'a [vk::DescriptorBufferInfo],
+) -> vk::WriteDescriptorSet<'a> {
+    vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(binding)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .buffer_info(info)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct DescriptorSet {
     set: vk::DescriptorSet,
@@ -2925,5 +3697,99 @@ mod tests {
         assert_eq!(version.major, 1);
         assert_eq!(version.minor, 3);
         assert_eq!(version.patch, 281);
+    }
+
+    fn tiny_yuv422p10_upload<'a>(
+        y: &'a [u8],
+        cb: &'a [u8],
+        cr: &'a [u8],
+        stride_y: usize,
+        stride_c: usize,
+    ) -> Yuv422P10Upload<'a> {
+        Yuv422P10Upload {
+            device_id: DeviceId::new(1).expect("device"),
+            width: 2,
+            height: 1,
+            y: Yuv422P10Plane {
+                width_samples: 2,
+                height: 1,
+                stride_bytes: stride_y,
+                data: y,
+            },
+            cb: Yuv422P10Plane {
+                width_samples: 1,
+                height: 1,
+                stride_bytes: stride_c,
+                data: cb,
+            },
+            cr: Yuv422P10Plane {
+                width_samples: 1,
+                height: 1,
+                stride_bytes: stride_c,
+                data: cr,
+            },
+            conversion: YcbcrConversion::Rec709Limited,
+        }
+    }
+
+    #[test]
+    fn validates_yuv422p10_plane_dimensions_and_padding() {
+        let y = [64_u16.to_le_bytes(), 940_u16.to_le_bytes(), [0xaa, 0xbb]].concat();
+        let cb = [512_u16.to_le_bytes(), [0xcc, 0xdd]].concat();
+        let cr = [512_u16.to_le_bytes(), [0xee, 0xff]].concat();
+        let upload = tiny_yuv422p10_upload(&y, &cb, &cr, 6, 4);
+
+        let layout = validate_yuv422p10_upload(&upload).expect("valid upload");
+
+        assert_eq!(layout.y_samples, 2);
+        assert_eq!(layout.chroma_samples, 1);
+        assert_eq!(layout.cpu_surface_bytes, 14);
+        assert_eq!(
+            expand_yuv422p10_plane(upload.y).expect("expand"),
+            vec![64, 940]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_yuv422p10_uploads() {
+        let y = [0_u8; 4];
+        let c = [0_u8; 2];
+        let mut upload = tiny_yuv422p10_upload(&y, &c, &c, 4, 2);
+
+        upload.width = 3;
+        assert!(matches!(
+            validate_yuv422p10_upload(&upload),
+            Err(ResourceError::InvalidImageDimensions)
+        ));
+
+        upload.width = 2;
+        upload.cb.stride_bytes = 1;
+        assert!(matches!(
+            validate_yuv422p10_upload(&upload),
+            Err(ResourceError::InvalidImageDimensions)
+        ));
+    }
+
+    #[test]
+    fn reference_conversion_uses_422_horizontal_chroma_addressing() {
+        let y = [64_u16.to_le_bytes(), 940_u16.to_le_bytes()].concat();
+        let cb = [512_u16.to_le_bytes()].concat();
+        let cr = [512_u16.to_le_bytes()].concat();
+        let upload = tiny_yuv422p10_upload(&y, &cb, &cr, 4, 2);
+
+        let rgba = yuv422p10_reference_rgba_u16(&upload).expect("reference");
+
+        assert_eq!(&rgba[0..4], &[0, 0, 0, u16::MAX]);
+        assert_eq!(&rgba[4..8], &[u16::MAX, u16::MAX, u16::MAX, u16::MAX]);
+    }
+
+    #[test]
+    fn checksum_is_deterministic_for_yuv422p10_output() {
+        let values = [1_u16, 2, 3, u16::MAX];
+
+        assert_eq!(
+            yuv422p10_rgba_u16_checksum(&values),
+            yuv422p10_rgba_u16_checksum(&values)
+        );
     }
 }

@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
+use qgs_core::DeviceDiscovery;
 use qgs_linux::{
     connect_socket, default_socket_path, receive_message, receive_message_with_attachments,
     send_message,
@@ -25,8 +27,9 @@ use qgs_software_video::{
     decoder_config_for_surface, DecodeRunStats, SoftwareH264Decoder, SoftwareVideoBackend,
 };
 use qgs_vulkan::{
-    diagnose_haswell_video_import, DiagnosticDrmLayer, DiagnosticDrmObject, DiagnosticDrmPlane,
-    HaswellVideoDiagnosticInput, VulkanDeviceDiscovery,
+    diagnose_haswell_video_import, yuv422p10_reference_rgba_u16, yuv422p10_rgba_u16_checksum,
+    DiagnosticDrmLayer, DiagnosticDrmObject, DiagnosticDrmPlane, HaswellVideoDiagnosticInput,
+    VulkanDeviceDiscovery, YcbcrConversion, Yuv422P10Plane, Yuv422P10Upload,
 };
 
 const DEMO_BUFFER_SIZE: u64 = 1024 * 1024;
@@ -37,6 +40,7 @@ const H264_DECODE_ONLY_ARG: &str = "--h264-decode-only";
 const HASWELL_VIDEO_DIAGNOSTIC_ARG: &str = "--haswell-video-diagnostic";
 const MXF_INSPECT_ARG: &str = "--mxf-inspect";
 const SOFTWARE_DECODE_MXF_ARG: &str = "--software-decode-mxf";
+const SOFTWARE_GPU_MXF_ARG: &str = "--software-gpu-mxf";
 const H264_FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/h264/idr-64x64-baseline.h264");
 const H264_LONG_GOP_FIXTURE: &[u8] =
     include_bytes!("../../../tests/fixtures/h264/long-gop-128x72-main.h264");
@@ -52,6 +56,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(path) = args.software_decode_mxf_path {
         return software_decode_mxf(&path);
+    }
+    if let Some(path) = args.software_gpu_mxf_path {
+        return software_gpu_mxf(&path);
     }
 
     let socket_path = args.socket_path;
@@ -237,6 +244,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Image processing proof:");
     for device in &physical_devices {
         request_id = test_image_processing_proof(&mut stream, request_id, device)?;
+        println!();
+    }
+
+    println!("Software YUV422P10 GPU upload proof:");
+    for device in &physical_devices {
+        test_synthetic_yuv422p10_gpu_proof(device)?;
         println!();
     }
 
@@ -659,6 +672,197 @@ fn software_decode_mxf(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>>
     );
 
     Ok(())
+}
+
+fn software_gpu_mxf(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    let source = MediaSource::parse(&bytes)?;
+    let first_access_unit = source.extract_video_access_unit(&bytes, 0)?;
+    let parsed = qgs_codec_h264::parse_annex_b_access_unit(&first_access_unit)?;
+    let config = decoder_config_for_surface(
+        qgs_protocol::DeviceId::new(1)?,
+        parsed.profile,
+        parsed.desc.bit_depth,
+        parsed.desc.chroma,
+        parsed.desc.coded_width,
+        parsed.desc.coded_height,
+    );
+    if !SoftwareVideoBackend::supports_config(&config) {
+        return Err("software backend does not support parsed stream".into());
+    }
+
+    let positioned = source
+        .index
+        .video
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            Ok((
+                entry.edit_unit,
+                source.extract_video_access_unit(&bytes, index)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, qgs_mxf::MxfError>>()?;
+    let sequential_start = Instant::now();
+    let sequential = decode_positioned_access_units_with_context(config.clone(), &positioned)?;
+    let sequential_decode_elapsed = sequential_start.elapsed();
+
+    let target = 53_u64.min(source.index.video.len().saturating_sub(1) as u64);
+    let start = source
+        .index
+        .nearest_random_access_before(target)
+        .map(|entry| entry.edit_unit)
+        .unwrap_or(target);
+    let random_positioned = (start..=target)
+        .map(|edit_unit| {
+            let index = usize::try_from(edit_unit)?;
+            Ok((edit_unit, source.extract_video_access_unit(&bytes, index)?))
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    let random = decode_positioned_access_units_with_context(config, &random_positioned)?;
+
+    let first = sequential.frames.first().ok_or("no decoded frames")?;
+    let middle = sequential
+        .frames
+        .iter()
+        .find(|frame| frame.presentation_index == target)
+        .ok_or("sequential target frame missing")?;
+    let random_target = random
+        .frames
+        .iter()
+        .find(|frame| frame.presentation_index == target)
+        .ok_or("random-access target frame missing")?;
+    let final_frame = sequential.frames.last().ok_or("no final decoded frame")?;
+
+    let discovery = VulkanDeviceDiscovery::new()?;
+    let devices = discovery.enumerate_devices()?;
+    let physical_devices = devices
+        .iter()
+        .filter(|device| {
+            matches!(
+                device.class,
+                DeviceClass::IntegratedGpu | DeviceClass::DiscreteGpu
+            )
+        })
+        .collect::<Vec<_>>();
+    if physical_devices.is_empty() {
+        return Err("no physical Vulkan devices for software GPU proof".into());
+    }
+
+    println!("Software YUV422P10 -> GPU processing proof:");
+    println!("  file: {}", mxf_file_label(path));
+    println!("  parsed profile: {:?}", parsed.profile);
+    println!(
+        "  parsed format: {} x {}, {}-bit {:?}",
+        parsed.desc.coded_width,
+        parsed.desc.coded_height,
+        parsed.desc.bit_depth.get(),
+        parsed.desc.chroma
+    );
+    println!(
+        "  software decoder pixel format: {}",
+        first.decoder_pixel_format
+    );
+    println!("  sequential decoded frames: {}", sequential.frames.len());
+    println!("  random-access target: {target}");
+    println!("  nearest prior random access: {start}");
+    println!(
+        "  software decode observation: {:.3}s for {} frames",
+        sequential_decode_elapsed.as_secs_f64(),
+        sequential.frames.len()
+    );
+
+    for device in physical_devices {
+        println!();
+        println!("[{:?}] {}", device.class, device.name);
+        run_software_gpu_frame_proof(&discovery, device, "first", first)?;
+        let sequential_middle =
+            run_software_gpu_frame_proof(&discovery, device, "sequential-53", middle)?;
+        let random_middle =
+            run_software_gpu_frame_proof(&discovery, device, "random-53", random_target)?;
+        if sequential_middle != random_middle {
+            return Err("sequential/random frame 53 GPU checksum mismatch".into());
+        }
+        run_software_gpu_frame_proof(&discovery, device, "final", final_frame)?;
+        println!("  sequential/random frame 53 GPU match: yes");
+    }
+
+    Ok(())
+}
+
+fn run_software_gpu_frame_proof(
+    discovery: &VulkanDeviceDiscovery,
+    device: &DeviceDesc,
+    label: &str,
+    frame: &qgs_software_video::SoftwareVideoSurface,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let upload = yuv422p10_upload_for_frame(device.id, frame)?;
+    let reference_start = Instant::now();
+    let reference = yuv422p10_reference_rgba_u16(&upload)?;
+    let reference_elapsed = reference_start.elapsed();
+    let reference_checksum = yuv422p10_rgba_u16_checksum(&reference);
+    let gpu_start = Instant::now();
+    let output = discovery.process_yuv422p10_surface(&upload)?;
+    let gpu_elapsed = gpu_start.elapsed();
+    let max_delta = max_u16_delta(&reference, &output.rgba_u16)?;
+    if max_delta > 1 {
+        return Err(format!("{label} GPU output exceeded tolerance: max delta {max_delta}").into());
+    }
+    println!(
+        "  {label}: presentation={} gpu_checksum=0x{:016x} cpu_ref=0x{:016x} max_delta={} gpu_time={:.3}ms ref_time={:.3}ms",
+        frame.presentation_index,
+        output.checksum,
+        reference_checksum,
+        max_delta,
+        gpu_elapsed.as_secs_f64() * 1000.0,
+        reference_elapsed.as_secs_f64() * 1000.0
+    );
+    println!(
+        "    memory: cpu_surface={} staging={} gpu_planes={} output={}",
+        output.cpu_surface_bytes, output.staging_bytes, output.gpu_plane_bytes, output.output_bytes
+    );
+    Ok(output.checksum)
+}
+
+fn yuv422p10_upload_for_frame<'a>(
+    device_id: qgs_protocol::DeviceId,
+    frame: &'a qgs_software_video::SoftwareVideoSurface,
+) -> Result<Yuv422P10Upload<'a>, Box<dyn std::error::Error>> {
+    if frame.storage_format != qgs_software_video::SoftwarePixelFormat::Yuv422P10Le
+        || frame.planes.len() != 3
+    {
+        return Err("expected YUV422P10LE software surface".into());
+    }
+    let plane = |index: usize| -> Yuv422P10Plane<'a> {
+        let plane = &frame.planes[index];
+        Yuv422P10Plane {
+            width_samples: plane.width_samples,
+            height: plane.height,
+            stride_bytes: plane.stride_bytes,
+            data: &plane.data,
+        }
+    };
+    Ok(Yuv422P10Upload {
+        device_id,
+        width: frame.desc.coded_width,
+        height: frame.desc.coded_height,
+        y: plane(0),
+        cb: plane(1),
+        cr: plane(2),
+        conversion: YcbcrConversion::Rec709Limited,
+    })
+}
+
+fn max_u16_delta(left: &[u16], right: &[u16]) -> Result<u16, Box<dyn std::error::Error>> {
+    if left.len() != right.len() {
+        return Err("CPU/GPU output lengths differ".into());
+    }
+    Ok(left
+        .iter()
+        .zip(right)
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0))
 }
 
 fn decode_positioned_access_units_with_context(
@@ -1753,6 +1957,85 @@ fn test_image_processing_proof(
     Ok(request_id)
 }
 
+fn test_synthetic_yuv422p10_gpu_proof(
+    device: &DeviceDesc,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("[{:?}] {}", device.class, device.name);
+    let width = 8_u32;
+    let height = 4_u32;
+    let y_stride = 20_usize;
+    let c_stride = 12_usize;
+    let mut y = vec![0_u8; y_stride * height as usize];
+    let mut cb = vec![0_u8; c_stride * height as usize];
+    let mut cr = vec![0_u8; c_stride * height as usize];
+    for row in 0..height as usize {
+        for x in 0..width as usize {
+            let sample = 64_u16 + u16::try_from((row * width as usize + x) * 7 % 877)?;
+            y[row * y_stride + x * 2..row * y_stride + x * 2 + 2]
+                .copy_from_slice(&sample.to_le_bytes());
+        }
+        for x in 0..(width as usize / 2) {
+            let cb_sample = 512_u16 + u16::try_from((x * 11 + row * 3) % 96)?;
+            let cr_sample = 512_u16.saturating_sub(u16::try_from((x * 5 + row * 7) % 96)?);
+            cb[row * c_stride + x * 2..row * c_stride + x * 2 + 2]
+                .copy_from_slice(&cb_sample.to_le_bytes());
+            cr[row * c_stride + x * 2..row * c_stride + x * 2 + 2]
+                .copy_from_slice(&cr_sample.to_le_bytes());
+        }
+    }
+    let upload = Yuv422P10Upload {
+        device_id: device.id,
+        width,
+        height,
+        y: Yuv422P10Plane {
+            width_samples: width,
+            height,
+            stride_bytes: y_stride,
+            data: &y,
+        },
+        cb: Yuv422P10Plane {
+            width_samples: width / 2,
+            height,
+            stride_bytes: c_stride,
+            data: &cb,
+        },
+        cr: Yuv422P10Plane {
+            width_samples: width / 2,
+            height,
+            stride_bytes: c_stride,
+            data: &cr,
+        },
+        conversion: YcbcrConversion::Rec709Limited,
+    };
+    let reference = yuv422p10_reference_rgba_u16(&upload)?;
+    let reference_checksum = yuv422p10_rgba_u16_checksum(&reference);
+    let discovery = VulkanDeviceDiscovery::new()?;
+    let started = Instant::now();
+    let output = discovery.process_yuv422p10_surface(&upload)?;
+    let elapsed = started.elapsed();
+    let max_delta = max_u16_delta(&reference, &output.rgba_u16)?;
+    println!("  input: 8x4 YUV422P10LE with padded CPU strides");
+    println!("  representation: three u32 storage-buffer GPU planes");
+    println!("  operation: fixed Rec.709 limited YCbCr -> RGBA u16 compute proof");
+    println!("  gpu checksum: 0x{:016x}", output.checksum);
+    println!("  cpu checksum: 0x{reference_checksum:016x}");
+    println!("  max CPU/GPU delta: {max_delta}");
+    println!(
+        "  memory: cpu_surface={} staging={} gpu_planes={} output={}",
+        output.cpu_surface_bytes, output.staging_bytes, output.gpu_plane_bytes, output.output_bytes
+    );
+    println!(
+        "  DEVELOPMENT OBSERVATION - NOT A BENCHMARK: {:.3}ms upload/process/readback",
+        elapsed.as_secs_f64() * 1000.0
+    );
+    if max_delta > 1 {
+        return Err("synthetic YUV422P10 GPU proof exceeded tolerance".into());
+    }
+    println!("Validation:");
+    println!("PASS");
+    Ok(())
+}
+
 fn compute_proof_input() -> Vec<u32> {
     let mut values = (0..1024_u32).collect::<Vec<_>>();
     values[..6].copy_from_slice(&[0, 1, 2, 3, 100, 1000]);
@@ -2474,6 +2757,7 @@ struct Args {
     haswell_video_diagnostic: bool,
     mxf_inspect_path: Option<PathBuf>,
     software_decode_mxf_path: Option<PathBuf>,
+    software_gpu_mxf_path: Option<PathBuf>,
 }
 
 impl Args {
@@ -2486,9 +2770,14 @@ impl Args {
         let mut next_arg_is_mxf_path = false;
         let mut software_decode_mxf_path = None;
         let mut next_arg_is_software_decode_mxf_path = false;
+        let mut software_gpu_mxf_path = None;
+        let mut next_arg_is_software_gpu_mxf_path = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_software_decode_mxf_path {
+            if next_arg_is_software_gpu_mxf_path {
+                software_gpu_mxf_path = Some(PathBuf::from(arg));
+                next_arg_is_software_gpu_mxf_path = false;
+            } else if next_arg_is_software_decode_mxf_path {
                 software_decode_mxf_path = Some(PathBuf::from(arg));
                 next_arg_is_software_decode_mxf_path = false;
             } else if next_arg_is_mxf_path {
@@ -2505,6 +2794,8 @@ impl Args {
                 next_arg_is_mxf_path = true;
             } else if arg == SOFTWARE_DECODE_MXF_ARG {
                 next_arg_is_software_decode_mxf_path = true;
+            } else if arg == SOFTWARE_GPU_MXF_ARG {
+                next_arg_is_software_gpu_mxf_path = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -2517,6 +2808,7 @@ impl Args {
             haswell_video_diagnostic,
             mxf_inspect_path,
             software_decode_mxf_path,
+            software_gpu_mxf_path,
         }
     }
 }

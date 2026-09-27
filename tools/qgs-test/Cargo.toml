@@ -7,6 +7,7 @@ version.workspace = true
 [dependencies]
 qgs-linux = { path = "../../crates/qgs-linux" }
 qgs-codec-h264 = { path = "../../crates/qgs-codec-h264" }
+qgs-core = { path = "../../crates/qgs-core" }
 qgs-mxf = { path = "../../crates/qgs-mxf" }
 qgs-protocol = { path = "../../crates/qgs-protocol" }
 qgs-software-video = { path = "../../crates/qgs-software-video" }

@@ -414,6 +414,44 @@ software frames may be copied once from decoder-owned `AVFrame` memory into
 owned QGS planes so that no FFmpeg pointers escape the backend. This is CPU
 software decode, not zero-copy video processing and not a GPU upload path.
 
+M2 Step 10 adds the first software-decoded video GPU processing fallback:
+
+```text
+professional MXF
+    |
+qgs-mxf
+    |
+H.264 High 4:2:2 10-bit access units
+    |
+qgs-software-video / libavcodec
+    |
+CPU-backed YUV422P10LE VideoSurface
+    |
+explicit qgs-vulkan upload
+    |
+fixed GPU YCbCr -> RGBA processing proof
+```
+
+This path is deliberately not zero-copy. QGS copies CPU-decoded software
+VideoSurface planes into explicit staging resources, transfers them to
+GPU-owned storage buffers, runs a fixed internal compute shader, and reads back
+only the processed validation result. It remains separate from the frozen
+Haswell VA -> Vulkan imported-image work and from any future hardware decode /
+zero-copy path.
+
+The first GPU representation for software-decoded `yuv422p10le` is
+plane-oriented: Y, Cb, and Cr are uploaded as separate numeric sample buffers.
+The CPU source stores 10-bit values in little-endian 16-bit slots; the upload
+expands those values to `u32` storage-buffer samples so the path does not rely
+on 16-bit storage-buffer feature support on older GPUs. Chroma addressing is
+4:2:2: `floor(x / 2)` horizontally and no vertical subsampling.
+
+The Step 10 shader is a fixed QGS-owned proof shader. It uses an explicit
+Rec.709 limited-range conversion for the acceptance sample and writes RGBA
+`u16` validation output. This is not the final QGS color-management pipeline:
+there is no LUT system, HDR processing, display transform, public shader API,
+or presentation path.
+
 M2 Step 2 adds real VA-API decode capability discovery through a backend
 boundary:
 

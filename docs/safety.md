@@ -43,6 +43,8 @@ Unsafe API categories:
 - Vulkan external semaphore sync-FD export/import
 - host memory mapping, flush, invalidate, and bounded pointer copies
 - fixed embedded SPIR-V shader module creation and compute dispatch
+- software-decoded YUV422P10 plane upload through staging buffers, fixed
+  storage-buffer compute processing, push constants, and validation readback
 
 Why unsafe is required:
 
@@ -75,6 +77,13 @@ The safe QGS wrapper validates:
   copy-transference handles
 - fixed compute shaders use explicit descriptor set layout `set=0,binding=0`
   and no client-provided SPIR-V is accepted
+- the fixed YUV422P10 proof shader uses explicit descriptor bindings for Y,
+  Cb, Cr, and RGBA output storage buffers plus a 16-byte push-constant block
+- software video upload validates dimensions, even-width 4:2:2 policy, plane
+  dimensions, source strides, byte lengths, and arithmetic overflow before
+  recording Vulkan commands
+- CPU YUV422P10 samples are expanded from little-endian 16-bit storage into
+  `u32` GPU storage-buffer samples without reducing 10-bit precision
 - submitted work is retained or waited at cleanup boundaries before Vulkan
   resources and semaphores are destroyed
 - optional validation-layer runs can be enabled with
@@ -94,8 +103,8 @@ Remaining assumptions:
 - Device idle waits are used at resource cleanup boundaries to make destruction
   validity explicit; they are not the producer-to-consumer dependency.
 
-Unsafe block count in QGS-owned production Vulkan backend code after GPU R1:
-82.
+Unsafe block count in QGS-owned production Vulkan backend code after M2 Step 10:
+98.
 
 ### qgs-vulkan Haswell video interop diagnostic
 
@@ -138,4 +147,4 @@ Remaining assumptions:
 
 Unsafe block count in retained Haswell diagnostic code after GPU R1: 32.
 
-Unsafe block count in all QGS-owned code after GPU R1: 114.
+Unsafe block count in all QGS-owned code after M2 Step 10: 130.

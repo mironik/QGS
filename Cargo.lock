@@ -392,6 +392,7 @@ name = "qgs-test"
 version = "0.1.0"
 dependencies = [
  "qgs-codec-h264",
+ "qgs-core",
  "qgs-linux",
  "qgs-mxf",
  "qgs-protocol",
