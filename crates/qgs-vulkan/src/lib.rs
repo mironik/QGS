@@ -27,6 +27,8 @@ use vulkano::command_buffer::{
     AutoCommandBufferBuilder, CommandBufferSubmitInfo, CommandBufferUsage, CopyBufferInfo,
     PrimaryAutoCommandBuffer, SemaphoreSubmitInfo, SubmitInfo,
 };
+use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
+use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
@@ -40,6 +42,11 @@ use vulkano::memory::{
     DedicatedAllocation, ExternalMemoryHandleType, ExternalMemoryHandleTypes, MemoryAllocateInfo,
     MemoryHeapFlags, MemoryImportInfo, MemoryMapInfo, MemoryPropertyFlags, ResourceMemory,
 };
+use vulkano::pipeline::compute::ComputePipelineCreateInfo;
+use vulkano::pipeline::layout::PipelineDescriptorSetLayoutCreateInfo;
+use vulkano::pipeline::{
+    ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo,
+};
 use vulkano::sync::fence::{Fence, FenceCreateInfo};
 use vulkano::sync::semaphore::{
     ExternalSemaphoreHandleType, ExternalSemaphoreHandleTypes, ExternalSemaphoreInfo, Semaphore,
@@ -48,11 +55,23 @@ use vulkano::sync::semaphore::{
 use vulkano::{Version, VulkanLibrary};
 
 #[allow(unsafe_code)]
+mod external_compute;
+#[allow(unsafe_code)]
 mod external_memory;
 #[allow(unsafe_code)]
 mod external_sync;
 
 const SHARED_VALIDATION_MARKER: &[u8] = b"QGS-M1S6";
+const COMPUTE_LOCAL_SIZE_X: u32 = 64;
+const COMPUTE_INCREMENT_SHADER: [u32; 136] = [
+    119734787, 65536, 0, 22, 0, 131089, 1, 196622, 0, 1, 393231, 5, 1, 1852399981, 0, 9, 393232, 1,
+    17, 64, 1, 1, 196611, 2, 450, 262215, 9, 11, 28, 262215, 10, 6, 4, 327752, 11, 0, 35, 0,
+    196679, 11, 2, 262215, 13, 34, 0, 262215, 13, 33, 0, 131091, 2, 196641, 3, 2, 262165, 4, 32, 0,
+    262187, 4, 5, 1, 262187, 4, 6, 0, 262167, 7, 4, 3, 262176, 8, 1, 7, 262203, 8, 9, 1, 196637,
+    10, 4, 196638, 11, 10, 262176, 12, 12, 11, 262203, 12, 13, 12, 262176, 14, 1, 4, 262176, 15,
+    12, 4, 327734, 2, 1, 0, 3, 131320, 16, 327745, 14, 17, 9, 6, 262205, 4, 18, 17, 393281, 15, 19,
+    13, 6, 18, 262205, 4, 20, 19, 327808, 4, 21, 20, 5, 196670, 19, 21, 65789, 65592,
+];
 
 #[derive(Debug)]
 pub struct VulkanDeviceDiscovery {
@@ -75,10 +94,24 @@ impl VulkanDeviceDiscovery {
             }
 
             let desc = describe_device((index as u64) + 1, &physical_device)?;
-            let queue_family_index = physical_device
-                .queue_family_properties()
+            let queue_family_properties = physical_device.queue_family_properties();
+            let queue_family_index = queue_family_properties
                 .iter()
-                .position(|queue| queue.queue_count > 0)
+                .position(|queue| {
+                    queue.queue_count > 0
+                        && queue.queue_flags.intersects(QueueFlags::GRAPHICS)
+                        && queue.queue_flags.intersects(QueueFlags::COMPUTE)
+                })
+                .or_else(|| {
+                    queue_family_properties.iter().position(|queue| {
+                        queue.queue_count > 0 && queue.queue_flags.intersects(QueueFlags::COMPUTE)
+                    })
+                })
+                .or_else(|| {
+                    queue_family_properties
+                        .iter()
+                        .position(|queue| queue.queue_count > 0)
+                })
                 .ok_or(DeviceDiscoveryError::BackendFailed)?
                 as u32;
             let supported_extensions = physical_device.supported_extensions();
@@ -113,6 +146,10 @@ impl VulkanDeviceDiscovery {
                     ..Default::default()
                 },
             ));
+            let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
+                logical_device.clone(),
+                Default::default(),
+            ));
 
             devices.push(RegisteredDevice {
                 desc,
@@ -121,6 +158,7 @@ impl VulkanDeviceDiscovery {
                 queue,
                 memory_allocator,
                 command_allocator,
+                descriptor_set_allocator,
             });
         }
 
@@ -277,6 +315,92 @@ impl VulkanDeviceDiscovery {
             sync_metadata.fill_pattern,
         )
     }
+
+    pub fn import_wait_and_run_compute_increment_proof(
+        &self,
+        source_device: &DeviceDesc,
+        resource_metadata: &ExportedResourceMetadata,
+        resource_handle: File,
+        sync_metadata: &ExportedSyncMetadata,
+        sync_handle: File,
+        input_values: &[u32],
+    ) -> Result<Vec<u32>, ResourceError> {
+        if input_values.is_empty()
+            || !input_values
+                .len()
+                .is_multiple_of(COMPUTE_LOCAL_SIZE_X as usize)
+        {
+            return Err(ResourceError::InvalidBufferSize);
+        }
+        let input_bytes = u64::try_from(input_values.len())
+            .ok()
+            .and_then(|len| len.checked_mul(std::mem::size_of::<u32>() as u64))
+            .ok_or(ResourceError::InvalidBufferSize)?;
+        if input_bytes > resource_metadata.size_bytes {
+            return Err(ResourceError::InvalidBufferSize);
+        }
+        if sync_metadata.handle_type != SyncExportHandleType::SyncFd
+            || sync_metadata.attachment_count != 1
+        {
+            return Err(ResourceError::ExportFailed);
+        }
+        if resource_metadata.device_id != source_device.id
+            || resource_metadata.size_bytes == 0
+            || resource_metadata.allocation_size_bytes < resource_metadata.size_bytes
+            || resource_metadata.attachment_count != 1
+            || !resource_metadata.usage.contains(BufferUsageFlags::STORAGE)
+        {
+            return Err(ResourceError::ExportFailed);
+        }
+
+        let device = self
+            .devices
+            .iter()
+            .find(|device| device_matches_export_source(&device.desc, source_device))
+            .ok_or(ResourceError::UnknownDeviceId)?;
+        let supports_compute = device
+            .physical_device
+            .queue_family_properties()
+            .get(device.queue.queue_family_index() as usize)
+            .is_some_and(|queue| queue.queue_flags.intersects(QueueFlags::COMPUTE));
+        if !supports_compute {
+            return Err(ResourceError::UnsupportedMemoryRequirements);
+        }
+
+        let usage = map_buffer_usage(resource_metadata.usage)?;
+        let handle_type = map_external_handle_type(resource_metadata.handle_type)?;
+        validate_external_buffer_support(device, usage, handle_type)?;
+        validate_sync_fd_support(device).map_err(|_| ResourceError::ExportFailed)?;
+
+        let imported_buffer = import_external_buffer(
+            device,
+            resource_metadata,
+            usage,
+            handle_type,
+            resource_handle,
+        )?;
+        let imported_semaphore = Semaphore::new(
+            device.logical_device.clone(),
+            SemaphoreCreateInfo::default(),
+        )
+        .map_err(|err| {
+            eprintln!("vulkan compute sync import semaphore creation failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+        let imported_semaphore = Arc::new(imported_semaphore);
+        external_sync::import_sync_fd(&imported_semaphore, sync_handle).map_err(|err| {
+            eprintln!("vulkan compute sync-fd import failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+
+        run_compute_increment_proof(
+            device,
+            imported_buffer,
+            imported_semaphore,
+            input_values,
+            input_bytes,
+        )
+    }
 }
 
 impl DeviceDiscovery for VulkanDeviceDiscovery {
@@ -415,6 +539,7 @@ struct RegisteredDevice {
     queue: Arc<Queue>,
     memory_allocator: Arc<StandardMemoryAllocator>,
     command_allocator: Arc<StandardCommandBufferAllocator>,
+    descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
 }
 
 #[derive(Debug)]
@@ -972,6 +1097,169 @@ fn validate_synced_gpu_copy(
     } else {
         Err(ResourceError::ExportFailed)
     }
+}
+
+fn run_compute_increment_proof(
+    device: &RegisteredDevice,
+    imported_buffer: Subbuffer<[u8]>,
+    wait_semaphore: Arc<Semaphore>,
+    input_values: &[u32],
+    input_bytes: u64,
+) -> Result<Vec<u32>, ResourceError> {
+    let storage_buffer = imported_buffer.slice(..input_bytes).reinterpret::<[u32]>();
+    let upload = Buffer::from_iter(
+        device.memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_SRC,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        input_values.iter().copied(),
+    )
+    .map_err(|err| {
+        eprintln!("vulkan compute upload allocation failed: {err}");
+        ResourceError::AllocationFailed
+    })?;
+    let readback = Buffer::new_slice::<u32>(
+        device.memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+            ..Default::default()
+        },
+        input_values.len() as u64,
+    )
+    .map_err(|err| {
+        eprintln!("vulkan compute readback allocation failed: {err}");
+        ResourceError::AllocationFailed
+    })?;
+
+    let shader = external_compute::create_shader_module(
+        device.logical_device.clone(),
+        &COMPUTE_INCREMENT_SHADER,
+    )
+    .map_err(|err| {
+        eprintln!("vulkan compute shader module creation failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    let entry_point = shader
+        .entry_point("main")
+        .ok_or(ResourceError::ExportFailed)?;
+    let stage = PipelineShaderStageCreateInfo::new(entry_point);
+    let layout = PipelineLayout::new(
+        device.logical_device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
+            .into_pipeline_layout_create_info(device.logical_device.clone())
+            .map_err(|err| {
+                eprintln!("vulkan compute pipeline layout reflection failed: {err}");
+                ResourceError::ExportFailed
+            })?,
+    )
+    .map_err(|err| {
+        eprintln!("vulkan compute pipeline layout creation failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    let pipeline = ComputePipeline::new(
+        device.logical_device.clone(),
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .map_err(|err| {
+        eprintln!("vulkan compute pipeline creation failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    let descriptor_set = DescriptorSet::new(
+        device.descriptor_set_allocator.clone(),
+        pipeline.layout().set_layouts()[0].clone(),
+        [WriteDescriptorSet::buffer(0, storage_buffer.clone())],
+        [],
+    )
+    .map_err(|err| {
+        eprintln!("vulkan compute descriptor set creation failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+
+    let mut builder = AutoCommandBufferBuilder::primary(
+        device.command_allocator.clone(),
+        device.queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
+    )
+    .map_err(|err| {
+        eprintln!("vulkan compute command buffer creation failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    builder
+        .copy_buffer(CopyBufferInfo::buffers(upload, storage_buffer.clone()))
+        .map_err(|err| {
+            eprintln!("vulkan compute upload copy recording failed: {err}");
+            ResourceError::ExportFailed
+        })?
+        .bind_pipeline_compute(pipeline.clone())
+        .map_err(|err| {
+            eprintln!("vulkan compute pipeline bind failed: {err}");
+            ResourceError::ExportFailed
+        })?
+        .bind_descriptor_sets(
+            PipelineBindPoint::Compute,
+            pipeline.layout().clone(),
+            0,
+            descriptor_set,
+        )
+        .map_err(|err| {
+            eprintln!("vulkan compute descriptor bind failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+    let groups_x = (input_values.len() as u32).div_ceil(COMPUTE_LOCAL_SIZE_X);
+    external_compute::dispatch_compute(&mut builder, [groups_x, 1, 1]).map_err(|err| {
+        eprintln!("vulkan compute dispatch recording failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    builder
+        .copy_buffer(CopyBufferInfo::buffers(storage_buffer, readback.clone()))
+        .map_err(|err| {
+            eprintln!("vulkan compute readback copy recording failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+
+    let command_buffer = builder.build().map_err(|err| {
+        eprintln!("vulkan compute command buffer build failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    let fence = Arc::new(
+        Fence::new(device.logical_device.clone(), FenceCreateInfo::default()).map_err(|err| {
+            eprintln!("vulkan compute fence creation failed: {err}");
+            ResourceError::ExportFailed
+        })?,
+    );
+    let submit = SubmitInfo {
+        wait_semaphores: vec![SemaphoreSubmitInfo::new(wait_semaphore)],
+        command_buffers: vec![CommandBufferSubmitInfo::new(command_buffer)],
+        ..Default::default()
+    };
+    external_sync::submit_queue(&device.queue, &[submit], Some(&fence)).map_err(|err| {
+        eprintln!("vulkan compute queue submit failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    fence
+        .wait(Some(std::time::Duration::from_secs(5)))
+        .map_err(|err| {
+            eprintln!("vulkan compute fence wait failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+
+    let read = readback.read().map_err(|err| {
+        eprintln!("vulkan compute readback map failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    Ok(read.to_vec())
 }
 
 fn export_memory_allocator(

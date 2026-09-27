@@ -138,6 +138,19 @@ Step 7 proves cross-process GPU ordering for a minimal transfer operation. It
 does not implement compute shaders, image/video resources, a video pipeline,
 external semaphore reuse protocols, or concurrent producer/consumer scheduling.
 
+## Compute Processing Proof
+
+M1 Step 8 proves that an exported QGS buffer can be imported into a second
+Vulkan context and used by a real Vulkan compute shader while preserving the
+external-memory and external-synchronization architecture from Steps 6 and 7.
+The proof uses a fixed QGS-owned shader inside `qgs-vulkan` that increments
+`u32` values in a shared storage buffer.
+
+This is not a public QGS compute API. The protocol does not expose shader
+modules, SPIR-V blobs, descriptor binding, pipeline creation, dispatch commands,
+or scheduler policy. QGS still reports and manages resources; it does not become
+a replacement for Vulkan.
+
 ## Current Scope
 
 The initial workspace contains an explicit v0.1 protocol wire encoding, minimal
@@ -148,9 +161,10 @@ external-memory/synchronization mechanism availability. It can create and
 destroy session-owned Vulkan-backed buffer resources and can export/import
 external-memory FDs for explicitly exportable buffers on supported drivers. It
 can also prove one-shot external GPU synchronization with Linux sync FDs on
-supported drivers. It does not include an async runtime, daemonization, DRM/KMS,
-image resources, video surfaces, video decode, video encode, compute shader
-execution, reusable semaphore workflows, workload scheduling, performance
+supported drivers. It can run a private built-in compute proof against imported
+shared buffers. It does not include an async runtime, daemonization, DRM/KMS,
+image resources, video surfaces, video decode, video encode, a public compute
+API, reusable semaphore workflows, workload scheduling, performance
 benchmarking, telemetry, or free-memory reporting.
 
 Capability discovery is static information reported by the backend. It is not a

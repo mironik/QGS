@@ -147,6 +147,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
 
+    println!("Compute proof:");
+    for device in &physical_devices {
+        request_id = test_compute_proof(&mut stream, request_id, device)?;
+        println!();
+    }
+
     if let Some(device) = physical_devices.first().copied() {
         println!("Creating transient buffers for disconnect cleanup on:");
         println!("[{:?}] {}", device.class, device.name);
@@ -528,6 +534,141 @@ fn test_external_gpu_sync(
     println!("QGS resource cleanup: success");
 
     Ok(request_id)
+}
+
+fn test_compute_proof(
+    stream: &mut std::os::unix::net::UnixStream,
+    mut request_id: u64,
+    device: &DeviceDesc,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    const PRODUCER_PATTERN: u32 = 0x5147_5338;
+
+    println!("[{:?}] {}", device.class, device.name);
+    let input = compute_proof_input();
+    println!("Input elements: {}", input.len());
+    println!("Operation: u32 + 1");
+    println!("Execution: Vulkan compute");
+    println!("Shared resource: DMA-BUF");
+    println!("Synchronization: external sync FD");
+
+    request_id += 1;
+    let resource_id = match create_host_visible_external_buffer(
+        stream,
+        request_id,
+        device,
+        ExternalHandleType::DmaBuf,
+    )? {
+        Ok(resource_id) => resource_id,
+        Err(error) => {
+            println!("  create failed for DMA-BUF: {:?}", error.code);
+            println!("Validation:");
+            println!("SKIP");
+            return Ok(request_id);
+        }
+    };
+
+    request_id += 1;
+    let (resource_metadata, resource_handle) =
+        match export_resource(stream, request_id, resource_id, ExternalHandleType::DmaBuf) {
+            Ok(export) => export,
+            Err(err) => {
+                request_id += 1;
+                destroy_resource(stream, request_id, resource_id)?;
+                return Err(err);
+            }
+        };
+
+    request_id += 1;
+    let sync_id = match create_sync(stream, request_id, device)? {
+        Ok(sync_id) => sync_id,
+        Err(error) => {
+            println!("  sync creation failed: {:?}", error.code);
+            request_id += 1;
+            destroy_resource(stream, request_id, resource_id)?;
+            println!("Validation:");
+            println!("SKIP");
+            return Ok(request_id);
+        }
+    };
+
+    request_id += 1;
+    send_message(
+        stream,
+        &WireMessage::ExportSync {
+            request_id,
+            request: ExportSyncRequest {
+                sync_id,
+                resource_id,
+                fill_pattern: PRODUCER_PATTERN,
+            },
+        },
+    )?;
+    let received = receive_message_with_attachments::<1>(stream)?;
+    let WireMessage::SyncExported {
+        request_id: response_request_id,
+        response,
+    } = received.message
+    else {
+        request_id += 1;
+        destroy_resource(stream, request_id, resource_id)?;
+        return Err("expected SYNC_EXPORTED response".into());
+    };
+    if response_request_id != request_id {
+        request_id += 1;
+        destroy_resource(stream, request_id, resource_id)?;
+        return Err("sync exported request_id did not match request".into());
+    }
+    let Some(sync_handle) = received.attachments.into_iter().next() else {
+        request_id += 1;
+        destroy_resource(stream, request_id, resource_id)?;
+        return Err("missing exported sync FD attachment".into());
+    };
+
+    let importer = VulkanDeviceDiscovery::new()?;
+    let output = importer.import_wait_and_run_compute_increment_proof(
+        device,
+        &resource_metadata,
+        File::from(resource_handle),
+        &response.metadata,
+        File::from(sync_handle),
+        &input,
+    )?;
+
+    let expected = input
+        .iter()
+        .map(|value| value.wrapping_add(1))
+        .collect::<Vec<_>>();
+    println!("Validation:");
+    if output == expected {
+        println!("PASS");
+    } else {
+        println!(
+            "FAIL sample: {:?} -> {:?}, expected {:?}",
+            &input[..6.min(input.len())],
+            &output[..6.min(output.len())],
+            &expected[..6.min(expected.len())]
+        );
+        request_id += 1;
+        destroy_resource(stream, request_id, resource_id)?;
+        return Err("compute proof output did not match expected values".into());
+    }
+    println!(
+        "Sample: {:?} -> {:?}",
+        &input[..6.min(input.len())],
+        &output[..6.min(output.len())]
+    );
+
+    request_id += 1;
+    destroy_resource(stream, request_id, resource_id)?;
+    println!("QGS resource cleanup: success");
+
+    Ok(request_id)
+}
+
+fn compute_proof_input() -> Vec<u32> {
+    let mut values = (0..1024_u32).collect::<Vec<_>>();
+    values[..6].copy_from_slice(&[0, 1, 2, 3, 100, 1000]);
+    values
 }
 
 fn export_resource(

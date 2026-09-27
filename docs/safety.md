@@ -105,4 +105,44 @@ Remaining assumptions:
 - The Step 7 proof validates one-shot ordering for a minimal transfer path; it
   is not a reusable frame synchronization protocol.
 
-Unsafe block count in QGS-owned code after M1 Step 7: 4.
+### qgs-vulkan compute proof
+
+Location:
+
+- `crates/qgs-vulkan/src/external_compute.rs`
+
+Unsafe APIs:
+
+- `vulkano::shader::ShaderModule::new`
+- `vulkano::command_buffer::AutoCommandBufferBuilder::dispatch`
+
+Why unsafe is required:
+
+Vulkano 0.35.2 requires unsafe calls for creating a shader module from SPIR-V
+words and for recording a dispatch. M1 Step 8 needs a real GPU compute dispatch
+against the imported shared buffer, but it does not expose shaders or dispatch
+commands to QGS clients.
+
+The safe QGS wrapper validates or constrains:
+
+- the SPIR-V is a fixed QGS-owned shader embedded in `qgs-vulkan`
+- no client-provided SPIR-V or shader parameters are accepted
+- the shader layout is reflected by Vulkano before pipeline creation
+- descriptor set `0`, binding `0` is bound to the imported shared storage
+  buffer before dispatch
+- the input element count is non-zero and a multiple of the fixed local size
+- the dispatch group count is derived from the validated input element count
+- the selected queue family supports compute
+- the compute submission waits on the imported external sync FD before touching
+  the shared buffer
+- a fence wait is used only after submission so CPU validation can read the
+  result
+
+Remaining assumptions:
+
+- Vulkano and the Vulkan driver uphold shader-module and dispatch validation
+  requirements for the fixed embedded SPIR-V.
+- The embedded shader remains a small audited proof shader and is not treated as
+  a public QGS compute interface.
+
+Unsafe block count in QGS-owned code after M1 Step 8: 6.
