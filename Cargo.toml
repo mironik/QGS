@@ -3,6 +3,7 @@ members = [
     "crates/qgs-codec-h264",
     "crates/qgs-core",
     "crates/qgs-linux",
+    "crates/qgs-mp4",
     "crates/qgs-mxf",
     "crates/qgs-protocol",
     "crates/qgs-software-video",

@@ -427,9 +427,7 @@ impl BackendDecoder for VaapiH264Decoder {
             self.decoded_surfaces.len()
         );
         let outputs = self.outputs_from_ids(&update.output_ready)?;
-        for released in update.released {
-            self.decoded_surfaces.remove(&surface_key(&released));
-        }
+        self.release_decoded_surfaces(&update.released);
         Ok(outputs)
     }
 
@@ -443,14 +441,23 @@ impl BackendDecoder for VaapiH264Decoder {
             update.max_dpb_occupancy, update.max_output_pending, self.max_live_surfaces
         );
         let outputs = self.outputs_from_ids(&update.output_ready)?;
-        for released in &update.released {
-            self.decoded_surfaces.remove(&surface_key(released));
-        }
+        self.release_decoded_surfaces(&update.released);
         Ok(outputs)
     }
 }
 
 impl VaapiH264Decoder {
+    fn release_decoded_surfaces(&mut self, released: &[H264PictureId]) {
+        for id in released {
+            let Some(state) = self.decoded_surfaces.remove(&surface_key(id)) else {
+                continue;
+            };
+            if let Ok(surface) = Rc::try_unwrap(state.surface) {
+                self.available_surfaces.push(surface);
+            }
+        }
+    }
+
     fn outputs_from_ids(
         &self,
         output_ready: &[H264PictureId],
@@ -573,7 +580,7 @@ fn picture_parameter(
     let current = PictureH264::new(
         surface_id,
         u32::from(picture.frame_num),
-        0,
+        h264_picture_flags(picture.reference_pic_flag),
         picture.top_field_order_cnt,
         picture.bottom_field_order_cnt,
     );
@@ -693,7 +700,7 @@ fn reference_list_array(
         pictures[index] = PictureH264::new(
             surface.surface.id(),
             u32::from(id.frame_num),
-            0,
+            h264_picture_flags(true),
             id.poc,
             id.poc,
         );
@@ -711,10 +718,18 @@ fn picture_from_reference(
     Ok(PictureH264::new(
         surface.surface.id(),
         u32::from(reference.frame_num),
-        0,
+        h264_picture_flags(true),
         reference.top_field_order_cnt,
         reference.bottom_field_order_cnt,
     ))
+}
+
+fn h264_picture_flags(short_term_reference: bool) -> u32 {
+    if short_term_reference {
+        libva::VA_PICTURE_H264_SHORT_TERM_REFERENCE
+    } else {
+        0
+    }
 }
 
 fn surface_key(id: &H264PictureId) -> (u16, i32) {

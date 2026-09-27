@@ -1,0 +1,10 @@
+[package]
+name = "qgs-mp4"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+mp4 = "0.14.0"
+qgs-codec-h264 = { path = "../qgs-codec-h264" }
+qgs-protocol = { path = "../qgs-protocol" }

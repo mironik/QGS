@@ -7,6 +7,7 @@ QGS is safe Rust by default.
 - `qgs-protocol`
 - `qgs-core`
 - `qgs-linux`
+- `qgs-mp4`
 - `qgsd`
 - `qgs-test`
 
@@ -154,3 +155,17 @@ Remaining assumptions:
 Unsafe block count in retained Haswell diagnostic code after GPU R1: 32.
 
 Unsafe block count in all QGS-owned code after M2 Step 11: 136.
+
+## M2 Step 12 MP4/proxy safety note
+
+`qgs-mp4` is safe Rust and uses `#![forbid(unsafe_code)]`.
+
+The Step 12 MP4 proxy parser treats camera proxy files as untrusted input. It
+validates box sizes, file offsets, sample counts, sample sizes, chunk mappings,
+composition offsets, AVC NAL length widths, and normalized access-unit bounds
+before allocation or extraction. The parser rejects zero-length and truncated
+length-prefixed AVC NAL units as malformed compressed media rather than
+treating them as padding.
+
+M2 Step 12 does not add unsafe Rust and does not change the Vulkan unsafe
+inventory.

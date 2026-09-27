@@ -11,6 +11,9 @@ use qgs_linux::{
     connect_socket, default_socket_path, receive_message, receive_message_with_attachments,
     send_message,
 };
+use qgs_mp4::{
+    classify_video_track, nearest_random_access_before, MediaHealth, Mp4Source, Mp4TrackKind,
+};
 use qgs_mxf::{IndexSource, MediaSource, RandomAccess, TrackKind};
 use qgs_protocol::{
     BitDepth, BufferDesc, BufferUsageFlags, ChromaSubsampling, CreateBufferRequest,
@@ -24,7 +27,8 @@ use qgs_protocol::{
     CURRENT_PROTOCOL_VERSION,
 };
 use qgs_software_video::{
-    decoder_config_for_surface, DecodeRunStats, SoftwareH264Decoder, SoftwareVideoBackend,
+    decoder_config_for_surface, DecodeRunStats, SoftwareH264Decoder, SoftwarePixelFormat,
+    SoftwareVideoBackend,
 };
 use qgs_vulkan::{
     diagnose_haswell_video_import, yuv422p10_reference_rgba_u16, yuv422p10_rgba_u16_checksum,
@@ -32,6 +36,7 @@ use qgs_vulkan::{
     FrameProcessorError, GpuFrameProcessor, GpuFrameProcessorConfig, HaswellVideoDiagnosticInput,
     VulkanDeviceDiscovery, YcbcrConversion, Yuv422P10Plane, Yuv422P10Upload,
 };
+use sha2::{Digest, Sha256};
 
 const DEMO_BUFFER_SIZE: u64 = 1024 * 1024;
 const IMAGE_PROOF_WIDTH: u32 = 64;
@@ -42,6 +47,15 @@ const HASWELL_VIDEO_DIAGNOSTIC_ARG: &str = "--haswell-video-diagnostic";
 const MXF_INSPECT_ARG: &str = "--mxf-inspect";
 const SOFTWARE_DECODE_MXF_ARG: &str = "--software-decode-mxf";
 const SOFTWARE_GPU_MXF_ARG: &str = "--software-gpu-mxf";
+const PROXY_PROOF_ARG: &str = "--proxy-proof";
+const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
+    "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
+const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
+    "9d0c64bed89303e6b8e1e32ef04984b62a174508528de42be87f82a985f039c8";
+const EXPECTED_FX6_SAMPLE002_MXF_SHA256: &str =
+    "52a82d3527717096892a78bfd62f62f864e891fc4321e09ad7ed0856a7b9f24e";
+const EXPECTED_FX6_SAMPLE002_PROXY_SHA256: &str =
+    "fa7b646f7dc84bee84744dbaee89924b7f94982405c2fc3ffea2936618f73007";
 const H264_FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/h264/idr-64x64-baseline.h264");
 const H264_LONG_GOP_FIXTURE: &[u8] =
     include_bytes!("../../../tests/fixtures/h264/long-gop-128x72-main.h264");
@@ -60,6 +74,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(path) = args.software_gpu_mxf_path {
         return software_gpu_mxf(&path);
+    }
+    if let Some((original, proxy)) = args.proxy_proof_paths {
+        return proxy_proof(&args.socket_path, &original, &proxy);
     }
 
     let socket_path = args.socket_path;
@@ -815,6 +832,377 @@ fn software_gpu_mxf(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn proxy_proof(
+    socket_path: &Path,
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let original_sha256 = sha256_hex(original_path)?;
+    let proxy_sha256 = sha256_hex(proxy_path)?;
+    let case = identify_camera_case(&original_sha256, &proxy_sha256)?;
+    if case.damaged_proxy {
+        return diagnose_damaged_proxy_case(case, proxy_path);
+    }
+
+    let original_bytes = std::fs::read(original_path)?;
+    let original = MediaSource::parse(&original_bytes)?;
+    let proxy = Mp4Source::open(proxy_path)?;
+    let proxy_video = proxy
+        .video
+        .as_ref()
+        .ok_or("proxy has no H.264 video track")?;
+    let proxy_h264 = classify_video_track(proxy_video)?;
+    let presentation_ordinals = proxy_presentation_ordinals(proxy_video)?;
+
+    println!("Camera original/proxy proof:");
+    println!("  original: {}", case.original_label);
+    println!("  proxy: {}", case.proxy_label);
+    println!("  hashes: verified");
+    println!("  association: filename ignored for proof metadata");
+    println!("Proxy MP4:");
+    println!("  major brand: {}", proxy.major_brand);
+    println!("  compatible brands: {:?}", proxy.compatible_brands);
+    println!("  movie timescale: {}", proxy.movie_timescale);
+    println!("Tracks:");
+    for track in &proxy.tracks {
+        println!(
+            "  track {}: kind={:?} handler={} codec={} timescale={} duration={} samples={}",
+            track.track_id,
+            track.kind,
+            track.handler,
+            track.codec,
+            track.timescale,
+            track.duration_units,
+            track.sample_count
+        );
+        if track.kind == Mp4TrackKind::Video {
+            println!("    dimensions: {:?} x {:?}", track.width, track.height);
+        }
+        if track.kind == Mp4TrackKind::Audio {
+            println!(
+                "    sample_rate={:?} channels={:?}",
+                track.sample_rate, track.channels
+            );
+        }
+    }
+    println!("Proxy video:");
+    println!(
+        "  H.264 {:?}, {}-bit {:?}, {} x {}",
+        proxy_h264.profile,
+        proxy_h264.bit_depth,
+        proxy_h264.chroma,
+        proxy_h264.width,
+        proxy_h264.height
+    );
+    println!(
+        "  rate: {}/{}",
+        proxy_video.frame_rate.numerator, proxy_video.frame_rate.denominator
+    );
+    println!("  samples: {}", proxy_video.samples.len());
+    println!("  duration units: {}", proxy_video.duration_units);
+    println!("  timescale: {}", proxy_video.timescale);
+    println!("  nal length size: {}", proxy_video.nal_length_size);
+    println!(
+        "  avcC parameter sets: SPS={} PPS={}",
+        proxy_video.sps_count, proxy_video.pps_count
+    );
+    println!("  picture counts: {:?}", proxy_h264.picture_counts);
+    println!("  random access positions: {:?}", proxy_h264.idr_positions);
+
+    let original_video_entries = original.index.video.len();
+    println!("Original/proxy timing:");
+    println!("  original edit units: {original_video_entries}");
+    println!(
+        "  proxy presentation samples: {}",
+        proxy_video.samples.len()
+    );
+    println!("  original duration: {:?}", original.duration);
+    println!(
+        "  original edit rate: {:?}",
+        original
+            .edit_rate
+            .map(|rate| format!("{}/{}", rate.numerator, rate.denominator))
+    );
+    println!(
+        "  proxy duration/rate: {}/{} units at {}/{} fps",
+        proxy_video.duration_units,
+        proxy_video.timescale,
+        proxy_video.frame_rate.numerator,
+        proxy_video.frame_rate.denominator
+    );
+    if original_video_entries == proxy_video.samples.len() {
+        println!("  one proxy presentation frame per original edit unit: yes");
+    } else {
+        println!("  one proxy presentation frame per original edit unit: no");
+    }
+
+    let sidecar = SonyXmlSummary::from_mxf_path(original_path)?;
+    if let Some(sidecar) = &sidecar {
+        println!("Sony XML sidecar diagnostic:");
+        println!("  XML duration edit units: {:?}", sidecar.duration);
+        println!(
+            "  XML reports proxy/substream metadata: {}",
+            yes_no(sidecar.has_proxy_metadata)
+        );
+        println!("  XML video codec: {:?}", sidecar.video_codec);
+        println!("  XML fps: {:?}", sidecar.format_fps);
+        println!("  XML layout: {:?} x {:?}", sidecar.width, sidecar.height);
+    }
+    let strong_metadata = sidecar
+        .as_ref()
+        .map(|xml| {
+            xml.has_proxy_metadata
+                && xml.duration == Some(proxy_video.samples.len() as u64)
+                && xml.width == Some(proxy_h264.width)
+                && xml.height == Some(proxy_h264.height)
+        })
+        .unwrap_or(false);
+    println!(
+        "  association confidence: {}",
+        if strong_metadata {
+            "strong metadata + timing evidence"
+        } else {
+            "supporting timing evidence only"
+        }
+    );
+
+    let proxy_config = decoder_config_for_surface(
+        qgs_protocol::DeviceId::new(1)?,
+        proxy_h264.profile,
+        BitDepth::new(proxy_h264.bit_depth)?,
+        proxy_h264.chroma,
+        proxy_h264.width,
+        proxy_h264.height,
+    );
+    if !SoftwareVideoBackend::supports_config(&proxy_config) {
+        return Err("software backend does not support proxy H.264 stream".into());
+    }
+    let proxy_positioned = proxy_video
+        .samples
+        .iter()
+        .map(|sample| {
+            Ok((
+                *presentation_ordinals
+                    .get(&sample.sample_index)
+                    .ok_or("missing proxy presentation ordinal")?,
+                sample.annex_b.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    let proxy_decode_start = Instant::now();
+    let proxy_sequential =
+        decode_positioned_access_units_with_context(proxy_config.clone(), &proxy_positioned)?;
+    let proxy_decode_elapsed = proxy_decode_start.elapsed();
+    if proxy_sequential.frames.len() != proxy_video.samples.len() {
+        return Err(format!(
+            "proxy software reference expected {} frames, got {}",
+            proxy_video.samples.len(),
+            proxy_sequential.frames.len()
+        )
+        .into());
+    }
+
+    let target = 53_u64.min(proxy_video.samples.len().saturating_sub(1) as u64);
+    let target_decode_index = presentation_ordinals
+        .iter()
+        .find_map(|(sample_index, ordinal)| (*ordinal == target).then_some(*sample_index))
+        .ok_or("target proxy presentation frame not found")?;
+    let start_decode_index = nearest_random_access_before(proxy_video, target_decode_index)
+        .ok_or("proxy random-access point not found")?;
+    let proxy_random_positioned = proxy_video
+        .samples
+        .iter()
+        .filter(|sample| {
+            sample.sample_index >= start_decode_index && sample.sample_index <= target_decode_index
+        })
+        .map(|sample| {
+            Ok((
+                *presentation_ordinals
+                    .get(&sample.sample_index)
+                    .ok_or("missing random proxy presentation ordinal")?,
+                sample.annex_b.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    let proxy_random = decode_positioned_access_units_with_context(
+        proxy_config.clone(),
+        &proxy_random_positioned,
+    )?;
+    let proxy_seq_53 = proxy_sequential
+        .frames
+        .iter()
+        .find(|frame| frame.presentation_index == target)
+        .ok_or("proxy sequential target frame missing")?;
+    let proxy_rand_53 = proxy_random
+        .frames
+        .iter()
+        .find(|frame| frame.presentation_index == target)
+        .ok_or("proxy random target frame missing")?;
+    if proxy_seq_53.checksum != proxy_rand_53.checksum {
+        return Err("proxy sequential/random frame 53 software checksum mismatch".into());
+    }
+
+    println!("Proxy software reference decode:");
+    println!("  decoded frames: {}", proxy_sequential.frames.len());
+    println!(
+        "  decoder pixel format: {}",
+        proxy_sequential
+            .frames
+            .first()
+            .map(|frame| frame.decoder_pixel_format.as_str())
+            .unwrap_or("n/a")
+    );
+    println!(
+        "  random access target: {} start decode sample: {}",
+        target, start_decode_index
+    );
+    println!("  frame 53 sequential/random checksum match: yes");
+    println!(
+        "  DEVELOPMENT OBSERVATION - NOT A BENCHMARK: {:.3}s, {:.2} fps",
+        proxy_decode_elapsed.as_secs_f64(),
+        proxy_sequential.frames.len() as f64 / proxy_decode_elapsed.as_secs_f64().max(0.000_001)
+    );
+
+    let original_positioned = original
+        .index
+        .video
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            Ok((
+                entry.edit_unit,
+                original.extract_video_access_unit(&original_bytes, index)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, qgs_mxf::MxfError>>()?;
+    let first_original_au = original.extract_video_access_unit(&original_bytes, 0)?;
+    let original_parsed = qgs_codec_h264::parse_annex_b_access_unit(&first_original_au)?;
+    let original_config = decoder_config_for_surface(
+        qgs_protocol::DeviceId::new(1)?,
+        original_parsed.profile,
+        original_parsed.desc.bit_depth,
+        original_parsed.desc.chroma,
+        original_parsed.desc.coded_width,
+        original_parsed.desc.coded_height,
+    );
+    let original_decode_start = Instant::now();
+    let original_decoded =
+        decode_positioned_access_units_with_context(original_config, &original_positioned)?;
+    let original_decode_elapsed = original_decode_start.elapsed();
+    let original_53 = original_decoded
+        .frames
+        .iter()
+        .find(|frame| frame.presentation_index == target)
+        .ok_or("original target frame missing")?;
+    let correspondence = luma_signature_delta(original_53, proxy_seq_53)?;
+    println!("Original/proxy frame correspondence:");
+    println!("  compared frame: {target}");
+    println!(
+        "  original luma signature: 0x{:016x}",
+        correspondence.original_hash
+    );
+    println!(
+        "  proxy luma signature: 0x{:016x}",
+        correspondence.proxy_hash
+    );
+    println!(
+        "  mean absolute luma signature delta: {:.2}",
+        correspondence.mean_abs_delta
+    );
+    println!(
+        "  original software decode observation: {:.3}s, {:.2} fps",
+        original_decode_elapsed.as_secs_f64(),
+        original_decoded.frames.len() as f64 / original_decode_elapsed.as_secs_f64().max(0.000_001)
+    );
+
+    run_proxy_hardware_decode(socket_path, &proxy_config, proxy_video)?;
+
+    let discovery = VulkanDeviceDiscovery::new()?;
+    let devices = discovery.enumerate_devices()?;
+    let physical_devices = devices
+        .iter()
+        .filter(|device| {
+            matches!(
+                device.class,
+                DeviceClass::IntegratedGpu | DeviceClass::DiscreteGpu
+            )
+        })
+        .collect::<Vec<_>>();
+    println!("Proxy -> GPU proof:");
+    for device in physical_devices {
+        println!("  [{:?}] {}", device.class, device.name);
+        let first = proxy_sequential
+            .frames
+            .first()
+            .ok_or("missing proxy first frame")?;
+        let final_frame = proxy_sequential
+            .frames
+            .last()
+            .ok_or("missing proxy final frame")?;
+        run_proxy_gpu_frame(&discovery, device, "proxy-first", first)?;
+        run_proxy_gpu_frame(&discovery, device, "proxy-53-sequential", proxy_seq_53)?;
+        run_proxy_gpu_frame(&discovery, device, "proxy-53-random", proxy_rand_53)?;
+        run_proxy_gpu_frame(&discovery, device, "proxy-final", final_frame)?;
+    }
+    println!("VA->Vulkan zero-copy path: frozen / not used");
+
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct CameraCase {
+    original_label: &'static str,
+    proxy_label: &'static str,
+    damaged_proxy: bool,
+}
+
+fn identify_camera_case(
+    original_sha256: &str,
+    proxy_sha256: &str,
+) -> Result<CameraCase, Box<dyn std::error::Error>> {
+    match (original_sha256, proxy_sha256) {
+        (EXPECTED_FX6_SAMPLE001_MXF_SHA256, EXPECTED_FX6_SAMPLE001_PROXY_SHA256) => {
+            Ok(CameraCase {
+                original_label: "Sony FX6 sample 001",
+                proxy_label: "Sony FX6 sample 001 proxy",
+                damaged_proxy: true,
+            })
+        }
+        (EXPECTED_FX6_SAMPLE002_MXF_SHA256, EXPECTED_FX6_SAMPLE002_PROXY_SHA256) => {
+            Ok(CameraCase {
+                original_label: "Sony FX6 sample 002",
+                proxy_label: "Sony FX6 sample 002 proxy",
+                damaged_proxy: false,
+            })
+        }
+        _ => Err("external camera case hashes do not match known Step 12 corpus".into()),
+    }
+}
+
+fn diagnose_damaged_proxy_case(
+    case: CameraCase,
+    proxy_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Camera original/proxy proof:");
+    println!("  original: {}", case.original_label);
+    println!("  proxy: {}", case.proxy_label);
+    println!("  hashes: verified");
+    match Mp4Source::open(proxy_path) {
+        Ok(_) => Err("damaged proxy unexpectedly parsed as valid MP4/H.264".into()),
+        Err(error) => {
+            let health = MediaHealth::from_open_error(&error);
+            println!("Damaged proxy diagnostic:");
+            println!("  health: {:?}", health);
+            println!("  strict parser result: {error}");
+            if health != MediaHealth::DamagedUnrecoverable {
+                return Err(format!("expected damaged/unrecoverable proxy, got {health:?}").into());
+            }
+            println!("  complete proxy playback acceptance: not attempted");
+            Ok(())
+        }
+    }
+}
+
 fn run_software_gpu_sequence_proof(
     discovery: &VulkanDeviceDiscovery,
     device: &DeviceDesc,
@@ -1073,6 +1461,7 @@ struct SonyXmlSummary {
     audio_codecs: Vec<String>,
     color_values: BTreeMap<String, String>,
     camera_model: Option<String>,
+    has_proxy_metadata: bool,
 }
 
 impl SonyXmlSummary {
@@ -1104,6 +1493,10 @@ impl SonyXmlSummary {
             find_attr(xml, "<AudioFormat", "numOfChannel").and_then(|value| value.parse().ok());
         let audio_codecs = find_all_attrs(xml, "<AudioRecPort", "audioCodec");
         let camera_model = find_attr(xml, "<Device", "modelName");
+        let has_proxy_metadata = xml.contains("SubStream")
+            || xml.contains("Proxy")
+            || xml.contains("proxy")
+            || xml.contains("substream");
         let mut color_values = BTreeMap::new();
         for name in [
             "CaptureGammaEquation",
@@ -1128,8 +1521,461 @@ impl SonyXmlSummary {
             audio_codecs,
             color_values,
             camera_model,
+            has_proxy_metadata,
         }
     }
+}
+
+fn sha256_hex(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+fn proxy_presentation_ordinals(
+    video: &qgs_mp4::Mp4VideoTrack,
+) -> Result<BTreeMap<u32, u64>, Box<dyn std::error::Error>> {
+    let mut ordered = video
+        .samples
+        .iter()
+        .map(|sample| (sample.pts, sample.sample_index))
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(pts, sample_index)| (*pts, *sample_index));
+    let mut ordinals = BTreeMap::new();
+    for (ordinal, (_, sample_index)) in ordered.into_iter().enumerate() {
+        ordinals.insert(sample_index, u64::try_from(ordinal)?);
+    }
+    Ok(ordinals)
+}
+
+struct LumaSignatureComparison {
+    original_hash: u64,
+    proxy_hash: u64,
+    mean_abs_delta: f64,
+}
+
+fn luma_signature_delta(
+    original: &qgs_software_video::SoftwareVideoSurface,
+    proxy: &qgs_software_video::SoftwareVideoSurface,
+) -> Result<LumaSignatureComparison, Box<dyn std::error::Error>> {
+    let original_signature = luma_signature(original)?;
+    let proxy_signature = luma_signature(proxy)?;
+    if original_signature.len() != proxy_signature.len() {
+        return Err("luma signature lengths differ".into());
+    }
+    let total_delta = original_signature
+        .iter()
+        .zip(&proxy_signature)
+        .map(|(a, b)| u64::from(a.abs_diff(*b)))
+        .sum::<u64>();
+    let mean_abs_delta = total_delta as f64 / original_signature.len().max(1) as f64;
+    Ok(LumaSignatureComparison {
+        original_hash: bytes_checksum(&original_signature),
+        proxy_hash: bytes_checksum(&proxy_signature),
+        mean_abs_delta,
+    })
+}
+
+fn luma_signature(
+    frame: &qgs_software_video::SoftwareVideoSurface,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let y = frame.planes.first().ok_or("missing luma plane")?;
+    let grid_w = 16_u32.min(frame.desc.coded_width);
+    let grid_h = 9_u32.min(frame.desc.coded_height);
+    let mut values = Vec::new();
+    for gy in 0..grid_h {
+        let y_pos = gy
+            .checked_mul(frame.desc.coded_height.saturating_sub(1))
+            .ok_or("luma signature y overflow")?
+            / grid_h.saturating_sub(1).max(1);
+        for gx in 0..grid_w {
+            let x_pos = gx
+                .checked_mul(frame.desc.coded_width.saturating_sub(1))
+                .ok_or("luma signature x overflow")?
+                / grid_w.saturating_sub(1).max(1);
+            let sample = match frame.storage_format {
+                SoftwarePixelFormat::Yuv420P8 => {
+                    let offset = usize::try_from(y_pos)?
+                        .checked_mul(y.stride_bytes)
+                        .and_then(|row| row.checked_add(usize::try_from(x_pos).ok()?))
+                        .ok_or("luma signature offset overflow")?;
+                    *y.data.get(offset).ok_or("luma signature out of bounds")?
+                }
+                SoftwarePixelFormat::Yuv422P10Le => {
+                    let offset = usize::try_from(y_pos)?
+                        .checked_mul(y.stride_bytes)
+                        .and_then(|row| {
+                            row.checked_add(usize::try_from(x_pos).ok()?.checked_mul(2)?)
+                        })
+                        .ok_or("luma signature offset overflow")?;
+                    let bytes = y
+                        .data
+                        .get(offset..offset + 2)
+                        .ok_or("luma signature out of bounds")?;
+                    (u16::from_le_bytes([bytes[0], bytes[1]]) >> 2) as u8
+                }
+            };
+            values.push(sample);
+        }
+    }
+    Ok(values)
+}
+
+fn bytes_checksum(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for value in bytes {
+        hash ^= u64::from(*value);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn run_proxy_hardware_decode(
+    socket_path: &Path,
+    config: &DecoderConfig,
+    video: &qgs_mp4::Mp4VideoTrack,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stream = connect_socket(socket_path)?;
+    let mut request_id = 1_u64;
+    send_message(
+        &mut stream,
+        &WireMessage::Hello {
+            request_id,
+            request: HelloRequest::current(),
+        },
+    )?;
+    let response = receive_message(&mut stream)?;
+    let WireMessage::Welcome { .. } = response else {
+        return Err("expected WELCOME for proxy hardware proof".into());
+    };
+    request_id += 1;
+    send_message(&mut stream, &WireMessage::EnumerateDevices { request_id })?;
+    let response = receive_message(&mut stream)?;
+    let WireMessage::DeviceList { response, .. } = response else {
+        return Err("expected DEVICE_LIST for proxy hardware proof".into());
+    };
+    let Some(device) = response
+        .devices
+        .iter()
+        .find(|device| {
+            device.vendor_id == 0x8086 && matches!(device.class, DeviceClass::IntegratedGpu)
+        })
+        .or_else(|| {
+            response
+                .devices
+                .iter()
+                .find(|device| matches!(device.class, DeviceClass::IntegratedGpu))
+        })
+    else {
+        println!("Intel proxy hardware decode: no integrated GPU advertised");
+        return Ok(());
+    };
+    let mut intel_config = config.clone();
+    intel_config.device_id = device.id;
+    let supports_proxy = query_h264_decode_support(
+        &mut stream,
+        &mut request_id,
+        device,
+        H264Profile::High,
+        ChromaSubsampling::Cs420,
+        8,
+    )?;
+    println!("Intel proxy capability:");
+    println!("  device: {}", device.name);
+    println!(
+        "  H.264 High 8-bit 4:2:0 support: {}",
+        yes_no(supports_proxy)
+    );
+    if !supports_proxy {
+        return Ok(());
+    }
+
+    request_id += 1;
+    send_message(
+        &mut stream,
+        &WireMessage::CreateDecoder {
+            request_id,
+            request: CreateDecoderRequest {
+                config: intel_config,
+            },
+        },
+    )?;
+    let response = receive_message(&mut stream)?;
+    let decoder_id = match response {
+        WireMessage::DecoderCreated { response, .. } => response.decoder_id,
+        WireMessage::Error { response, .. } => {
+            return Err(format!(
+                "proxy hardware decoder creation failed: {:?}",
+                response.code
+            )
+            .into());
+        }
+        _ => return Err("expected proxy DECODER_CREATED".into()),
+    };
+    let started = Instant::now();
+    let mut output_count = 0_usize;
+    let mut parser_state = qgs_codec_h264::H264DecoderState::new();
+    for sample in &video.samples {
+        let parsed_for_diagnostic = parser_state.parse_access_unit(&sample.annex_b)?;
+        let diagnostic = format!(
+            "kind={:?} idr={} frame_num={} poc={} reference={} refs={} l0={} l1={}",
+            parsed_for_diagnostic
+                .slices
+                .first()
+                .map(|slice| &slice.kind),
+            parsed_for_diagnostic.picture.idr_pic_flag,
+            parsed_for_diagnostic.picture.frame_num,
+            parsed_for_diagnostic.picture.top_field_order_cnt,
+            parsed_for_diagnostic.picture.reference_pic_flag,
+            parsed_for_diagnostic.reference_frames.len(),
+            parsed_for_diagnostic
+                .slices
+                .first()
+                .map(|slice| slice.ref_pic_list0.len())
+                .unwrap_or(0),
+            parsed_for_diagnostic
+                .slices
+                .first()
+                .map(|slice| slice.ref_pic_list1.len())
+                .unwrap_or(0)
+        );
+        parser_state.finish_picture(&parsed_for_diagnostic)?;
+        request_id += 1;
+        send_message(
+            &mut stream,
+            &WireMessage::SubmitAccessUnit {
+                request_id,
+                request: SubmitAccessUnitRequest {
+                    decoder_id,
+                    data: sample.annex_b.clone(),
+                },
+            },
+        )?;
+        let response = receive_message(&mut stream)?;
+        let response = match response {
+            WireMessage::DecodeOutput { response, .. } => response,
+            WireMessage::Error { response, .. } => {
+                return Err(format!(
+                    "proxy hardware decode failed at sample {}: {:?} ({diagnostic})",
+                    sample.sample_index, response.code
+                )
+                .into());
+            }
+            other => {
+                return Err(format!(
+                    "expected proxy DECODE_OUTPUT at sample {}, got {:?}",
+                    sample.sample_index, other
+                )
+                .into());
+            }
+        };
+        output_count += response.outputs.len();
+        for output in response.outputs {
+            request_id += 1;
+            destroy_resource(&mut stream, request_id, output.resource_id)?;
+        }
+    }
+    request_id += 1;
+    send_message(
+        &mut stream,
+        &WireMessage::FlushDecoder {
+            request_id,
+            request: FlushDecoderRequest { decoder_id },
+        },
+    )?;
+    let response = receive_message(&mut stream)?;
+    let WireMessage::DecodeOutput { response, .. } = response else {
+        return Err("expected proxy flush DECODE_OUTPUT".into());
+    };
+    output_count += response.outputs.len();
+    for output in response.outputs {
+        request_id += 1;
+        destroy_resource(&mut stream, request_id, output.resource_id)?;
+    }
+    let elapsed = started.elapsed();
+    if output_count != video.samples.len() {
+        return Err(format!(
+            "proxy hardware decode expected {} frames, got {output_count}",
+            video.samples.len()
+        )
+        .into());
+    }
+    request_id += 1;
+    send_message(
+        &mut stream,
+        &WireMessage::DestroyDecoder {
+            request_id,
+            request: DestroyDecoderRequest { decoder_id },
+        },
+    )?;
+    let response = receive_message(&mut stream)?;
+    let WireMessage::DecoderDestroyed { .. } = response else {
+        return Err("expected proxy DECODER_DESTROYED".into());
+    };
+    println!("Intel proxy hardware decode:");
+    println!("  decoded frames: {output_count}");
+    println!(
+        "  DEVELOPMENT OBSERVATION - NOT A BENCHMARK: {:.3}s, {:.2} fps, {:.2}x realtime @ 50fps",
+        elapsed.as_secs_f64(),
+        output_count as f64 / elapsed.as_secs_f64().max(0.000_001),
+        (output_count as f64 / elapsed.as_secs_f64().max(0.000_001)) / 50.0
+    );
+    Ok(())
+}
+
+struct ProxyGpuUpload {
+    y: Vec<u8>,
+    cb: Vec<u8>,
+    cr: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+impl ProxyGpuUpload {
+    fn upload(&self, device_id: qgs_protocol::DeviceId) -> Yuv422P10Upload<'_> {
+        let y_stride = usize::try_from(self.width).expect("width") * 2;
+        let c_stride = usize::try_from(self.width / 2).expect("width") * 2;
+        Yuv422P10Upload {
+            device_id,
+            width: self.width,
+            height: self.height,
+            y: Yuv422P10Plane {
+                width_samples: self.width,
+                height: self.height,
+                stride_bytes: y_stride,
+                data: &self.y,
+            },
+            cb: Yuv422P10Plane {
+                width_samples: self.width / 2,
+                height: self.height,
+                stride_bytes: c_stride,
+                data: &self.cb,
+            },
+            cr: Yuv422P10Plane {
+                width_samples: self.width / 2,
+                height: self.height,
+                stride_bytes: c_stride,
+                data: &self.cr,
+            },
+            conversion: YcbcrConversion::Rec709Limited,
+        }
+    }
+}
+
+fn proxy_yuv420p8_to_yuv422p10(
+    frame: &qgs_software_video::SoftwareVideoSurface,
+) -> Result<ProxyGpuUpload, Box<dyn std::error::Error>> {
+    if frame.storage_format != SoftwarePixelFormat::Yuv420P8 || frame.planes.len() != 3 {
+        return Err("expected YUV420P8 proxy frame".into());
+    }
+    let width = frame.desc.coded_width;
+    let height = frame.desc.coded_height;
+    let y_stride = usize::try_from(width)?
+        .checked_mul(2)
+        .ok_or("stride overflow")?;
+    let c_stride = usize::try_from(width / 2)?
+        .checked_mul(2)
+        .ok_or("stride overflow")?;
+    let mut y = vec![
+        0_u8;
+        y_stride
+            .checked_mul(usize::try_from(height)?)
+            .ok_or("Y len overflow")?
+    ];
+    let mut cb = vec![
+        0_u8;
+        c_stride
+            .checked_mul(usize::try_from(height)?)
+            .ok_or("Cb len overflow")?
+    ];
+    let mut cr = vec![
+        0_u8;
+        c_stride
+            .checked_mul(usize::try_from(height)?)
+            .ok_or("Cr len overflow")?
+    ];
+    let src_y = &frame.planes[0];
+    let src_cb = &frame.planes[1];
+    let src_cr = &frame.planes[2];
+    for row in 0..usize::try_from(height)? {
+        for x in 0..usize::try_from(width)? {
+            let src_offset = row
+                .checked_mul(src_y.stride_bytes)
+                .and_then(|base| base.checked_add(x))
+                .ok_or("Y source offset overflow")?;
+            let value =
+                u16::from(*src_y.data.get(src_offset).ok_or("Y source out of bounds")?) << 2;
+            y[row * y_stride + x * 2..row * y_stride + x * 2 + 2]
+                .copy_from_slice(&value.to_le_bytes());
+        }
+        let chroma_row = row / 2;
+        for x in 0..usize::try_from(width / 2)? {
+            let src_offset = chroma_row
+                .checked_mul(src_cb.stride_bytes)
+                .and_then(|base| base.checked_add(x))
+                .ok_or("C source offset overflow")?;
+            let cb_value = u16::from(
+                *src_cb
+                    .data
+                    .get(src_offset)
+                    .ok_or("Cb source out of bounds")?,
+            ) << 2;
+            let cr_value = u16::from(
+                *src_cr
+                    .data
+                    .get(src_offset)
+                    .ok_or("Cr source out of bounds")?,
+            ) << 2;
+            cb[row * c_stride + x * 2..row * c_stride + x * 2 + 2]
+                .copy_from_slice(&cb_value.to_le_bytes());
+            cr[row * c_stride + x * 2..row * c_stride + x * 2 + 2]
+                .copy_from_slice(&cr_value.to_le_bytes());
+        }
+    }
+    Ok(ProxyGpuUpload {
+        y,
+        cb,
+        cr,
+        width,
+        height,
+    })
+}
+
+fn run_proxy_gpu_frame(
+    discovery: &VulkanDeviceDiscovery,
+    device: &DeviceDesc,
+    label: &str,
+    frame: &qgs_software_video::SoftwareVideoSurface,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let converted = proxy_yuv420p8_to_yuv422p10(frame)?;
+    let upload = converted.upload(device.id);
+    let reference = yuv422p10_reference_rgba_u16(&upload)?;
+    let reference_checksum = yuv422p10_rgba_u16_checksum(&reference);
+    let mut processor = GpuFrameProcessor::new(
+        discovery,
+        GpuFrameProcessorConfig {
+            device_id: device.id,
+            width: upload.width,
+            height: upload.height,
+            slot_count: 3,
+            conversion: upload.conversion,
+        },
+    )?;
+    let token = processor.submit_frame(
+        &upload,
+        FrameIdentity {
+            presentation_position: frame.presentation_index,
+        },
+    )?;
+    let output = processor.wait_for_frame(token)?;
+    let max_delta = max_u16_delta(&reference, &output.rgba_u16)?;
+    if max_delta > 1 {
+        return Err(format!("proxy GPU output exceeded tolerance: {max_delta}").into());
+    }
+    println!(
+        "    {label}: presentation={} checksum=0x{:016x} cpu=0x{reference_checksum:016x} max_delta={max_delta}",
+        output.presentation_position, output.checksum
+    );
+    Ok(())
 }
 
 fn print_sony_xml_comparison(
@@ -3099,6 +3945,7 @@ struct Args {
     mxf_inspect_path: Option<PathBuf>,
     software_decode_mxf_path: Option<PathBuf>,
     software_gpu_mxf_path: Option<PathBuf>,
+    proxy_proof_paths: Option<(PathBuf, PathBuf)>,
 }
 
 impl Args {
@@ -3113,9 +3960,24 @@ impl Args {
         let mut next_arg_is_software_decode_mxf_path = false;
         let mut software_gpu_mxf_path = None;
         let mut next_arg_is_software_gpu_mxf_path = false;
+        let mut proxy_proof_original = None;
+        let mut proxy_proof_paths = None;
+        let mut next_arg_is_proxy_original = false;
+        let mut next_arg_is_proxy_proxy = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_software_gpu_mxf_path {
+            if next_arg_is_proxy_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = proxy_proof_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                proxy_proof_paths = Some((original, proxy));
+                next_arg_is_proxy_proxy = false;
+            } else if next_arg_is_proxy_original {
+                proxy_proof_original = Some(PathBuf::from(arg));
+                next_arg_is_proxy_original = false;
+                next_arg_is_proxy_proxy = true;
+            } else if next_arg_is_software_gpu_mxf_path {
                 software_gpu_mxf_path = Some(PathBuf::from(arg));
                 next_arg_is_software_gpu_mxf_path = false;
             } else if next_arg_is_software_decode_mxf_path {
@@ -3137,6 +3999,8 @@ impl Args {
                 next_arg_is_software_decode_mxf_path = true;
             } else if arg == SOFTWARE_GPU_MXF_ARG {
                 next_arg_is_software_gpu_mxf_path = true;
+            } else if arg == PROXY_PROOF_ARG {
+                next_arg_is_proxy_original = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -3150,13 +4014,15 @@ impl Args {
             mxf_inspect_path,
             software_decode_mxf_path,
             software_gpu_mxf_path,
+            proxy_proof_paths,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{mxf_file_label, SonyXmlSummary};
+    use super::{mxf_file_label, proxy_presentation_ordinals, SonyXmlSummary};
+    use qgs_mp4::{Mp4VideoSample, Mp4VideoTrack, Rational};
     use std::path::PathBuf;
 
     #[test]
@@ -3190,6 +4056,7 @@ mod tests {
         assert_eq!(summary.audio_channels, Some(4));
         assert_eq!(summary.audio_codecs, vec!["LPCM24", "LPCM24"]);
         assert_eq!(summary.camera_model.as_deref(), Some("ILME-FX6V"));
+        assert!(!summary.has_proxy_metadata);
         assert_eq!(
             summary
                 .color_values
@@ -3208,5 +4075,42 @@ mod tests {
         let path = PathBuf::from("/home/example/private-camera/Clip 0001.MXF");
 
         assert_eq!(mxf_file_label(&path), "<external>");
+    }
+
+    #[test]
+    fn proxy_presentation_ordinals_sort_by_pts_not_decode_index() {
+        let video = Mp4VideoTrack {
+            track_id: 1,
+            width: 1920,
+            height: 1080,
+            timescale: 50_000,
+            duration_units: 3_000,
+            frame_rate: Rational {
+                numerator: 50,
+                denominator: 1,
+            },
+            nal_length_size: 4,
+            sps_count: 1,
+            pps_count: 1,
+            samples: vec![sample(0, 0), sample(1, 2_000), sample(2, 1_000)],
+        };
+
+        let ordinals = proxy_presentation_ordinals(&video).expect("ordinals");
+
+        assert_eq!(ordinals.get(&0), Some(&0));
+        assert_eq!(ordinals.get(&2), Some(&1));
+        assert_eq!(ordinals.get(&1), Some(&2));
+    }
+
+    fn sample(sample_index: u32, pts: i64) -> Mp4VideoSample {
+        Mp4VideoSample {
+            sample_index,
+            dts: u64::from(sample_index) * 1_000,
+            pts,
+            duration: 1_000,
+            composition_offset: 0,
+            is_sync: sample_index == 0,
+            annex_b: vec![0, 0, 0, 1, 0x65],
+        }
     }
 }

@@ -297,6 +297,56 @@ streams such as SMPTE 436M ANC. QGS preserves the data track and essence
 identity but does not interpret ANC payloads in M2 Step 8. This remains a
 container/source-media concept, not a vendor product classification.
 
+M2 Step 12 adds a bounded MP4/AVC proxy-container frontend for camera proxy
+proofs:
+
+```text
+camera source
+    |
+    +-- original MXF  -> qgs-mxf
+    |
+    +-- proxy MP4     -> qgs-mp4
+                          |
+                          +-- ISO BMFF track/sample tables
+                          +-- avcC parameter sets
+                          +-- DTS/PTS/composition offsets
+                          +-- sync/random-access samples
+                          |
+                    bounded H.264 access units
+```
+
+`qgs-mp4` owns only the bounded ISO BMFF subset needed by supported camera
+proxy files: track discovery, sample tables, chunk offsets, sample sizes,
+composition timing, sync samples, AVCDecoderConfigurationRecord parsing, and
+strict length-prefixed AVC sample normalization. It does not decode H.264
+pixels, parse MXF, perform VA-API work, perform Vulkan work, or introduce Qnc
+timeline semantics. `qgs-codec-h264` remains container-independent and receives
+normalized codec access units.
+
+Original/proxy association is modeled as source-media compatibility evidence,
+not filename matching and not a Qnc editing policy. A generic future
+multi-variant source model may represent original and proxy variants of the
+same camera source, but Step 12 only proves technical association from sidecar
+metadata, frame counts, timing, and codec/container inspection. Vendor-specific
+sidecar details remain isolated to tooling/diagnostics and do not enter
+low-level codec or protocol enums.
+
+Camera media health is distinct from codec support. QGS must keep malformed or
+damaged media separate from valid-but-unsupported codec/backend combinations:
+
+```text
+Valid
+ValidButUnsupported
+DamagedRecoverable
+DamagedUnrecoverable
+FatalContainerError
+```
+
+Step 12 keeps strict AVC normalization: a length-prefixed AVC sample containing
+a zero-length NAL is malformed and is not silently reinterpreted as padding.
+The damaged proxy sample is reported as damaged/unrecoverable for complete
+proxy playback, while a separate clean proxy sample is used for acceptance.
+
 ## H.264 Decode Frontend Boundary
 
 M2 Step 3B adds the first narrow hardware decode proof:

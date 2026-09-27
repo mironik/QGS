@@ -205,16 +205,18 @@ impl H264DecoderState {
         &mut self,
         parsed: &ParsedH264AccessUnit,
     ) -> Result<H264DecodeUpdate, H264Error> {
+        let mut output_ready = Vec::new();
+        let mut released = Vec::new();
         if parsed.picture.idr_pic_flag {
-            let mut released = self
-                .dpb
-                .iter()
-                .map(|picture| picture.id.clone())
-                .collect::<Vec<_>>();
-            self.dpb.clear();
             if parsed.picture.no_output_of_prior_pics_flag {
-                released.clear();
+                released.extend(self.dpb.iter().map(|picture| picture.id.clone()));
+            } else {
+                let (mut ready, mut prior_released) = self.drain_ready(true);
+                output_ready.append(&mut ready);
+                released.append(&mut prior_released);
+                released.extend(self.dpb.iter().map(|picture| picture.id.clone()));
             }
+            self.dpb.clear();
         }
 
         apply_reference_marking(self, parsed)?;
@@ -233,7 +235,9 @@ impl H264DecoderState {
                 .filter(|picture| picture.output_needed)
                 .count(),
         );
-        let (output_ready, released) = self.drain_ready(false);
+        let (mut ready, mut newly_released) = self.drain_ready(false);
+        output_ready.append(&mut ready);
+        released.append(&mut newly_released);
         Ok(H264DecodeUpdate {
             output_ready,
             released,
@@ -554,7 +558,13 @@ fn reference_lists(
     let lists = match kind {
         H264SliceKind::I => (Vec::new(), Vec::new()),
         H264SliceKind::P => {
-            refs.sort_by_key(|picture| std::cmp::Reverse(picture.frame_num));
+            refs.sort_by_key(|picture| {
+                std::cmp::Reverse(short_term_pic_num(
+                    picture.frame_num,
+                    header.frame_num,
+                    max_frame_num,
+                ))
+            });
             let mut list0 = refs.into_iter().map(|picture| picture.id).collect();
             apply_ref_modifications_l0(&mut list0, dpb, header, max_frame_num, header.frame_num)?;
             (list0, Vec::new())
@@ -657,7 +667,7 @@ fn apply_short_term_modifications(
     let max_pic_num = i32::try_from(max_frame_num)
         .map_err(|_| H264Error::UnsupportedFeature("large MaxFrameNum"))?;
     for (ref_idx, modification) in modifications.iter().enumerate() {
-        let pic_num = match modification {
+        let pic_num_no_wrap = match modification {
             ModificationOfPicNums::Subtract(abs_diff_pic_num_minus1) => {
                 let diff = i32::try_from(abs_diff_pic_num_minus1 + 1)
                     .map_err(|_| H264Error::UnsupportedFeature("large ref list modification"))?;
@@ -684,11 +694,18 @@ fn apply_short_term_modifications(
                 ));
             }
         };
-        pic_num_pred = pic_num;
+        pic_num_pred = pic_num_no_wrap;
+        let pic_num = if pic_num_no_wrap > i32::from(curr_pic_num) {
+            pic_num_no_wrap - max_pic_num
+        } else {
+            pic_num_no_wrap
+        };
         let Some(reference) = dpb
             .iter()
             .filter(|picture| picture.reference)
-            .find(|picture| i32::from(picture.frame_num) == pic_num)
+            .find(|picture| {
+                short_term_pic_num(picture.frame_num, curr_pic_num, max_frame_num) == pic_num
+            })
             .map(|picture| picture.id.clone())
         else {
             return Err(H264Error::UnsupportedFeature(
@@ -699,6 +716,17 @@ fn apply_short_term_modifications(
         list.insert(ref_idx.min(list.len()), reference);
     }
     Ok(())
+}
+
+fn short_term_pic_num(frame_num: u16, curr_pic_num: u16, max_frame_num: u32) -> i32 {
+    let frame_num = i32::from(frame_num);
+    let curr_pic_num = i32::from(curr_pic_num);
+    let max_frame_num = i32::try_from(max_frame_num).unwrap_or(i32::MAX);
+    if frame_num > curr_pic_num {
+        frame_num - max_frame_num
+    } else {
+        frame_num
+    }
 }
 
 fn validate_supported_sps_pps(
@@ -902,7 +930,13 @@ fn apply_reference_marking(
                         .iter()
                         .enumerate()
                         .filter(|(_, picture)| picture.reference)
-                        .min_by_key(|(_, picture)| picture.frame_num)
+                        .min_by_key(|(_, picture)| {
+                            short_term_pic_num(
+                                picture.frame_num,
+                                parsed.picture.frame_num,
+                                state.max_frame_num,
+                            )
+                        })
                         .map(|(index, _)| index)
                     {
                         state.dpb[index].reference = false;
@@ -924,11 +958,13 @@ fn apply_reference_marking(
                         if pic_num < 0 {
                             pic_num += max_frame_num;
                         }
-                        if let Some(picture) = state
-                            .dpb
-                            .iter_mut()
-                            .find(|picture| i32::from(picture.frame_num) == pic_num)
-                        {
+                        if let Some(picture) = state.dpb.iter_mut().find(|picture| {
+                            short_term_pic_num(
+                                picture.frame_num,
+                                parsed.picture.frame_num,
+                                state.max_frame_num,
+                            ) == pic_num
+                        }) {
                             picture.reference = false;
                         }
                     }
@@ -1412,6 +1448,145 @@ mod tests {
         assert!(output_pocs.windows(2).all(|pair| pair[0] <= pair[1]));
         assert!(state.max_dpb_occupancy() > 1);
         assert!(state.max_output_pending() > 0);
+    }
+
+    #[test]
+    fn short_term_pic_num_wraps_against_current_frame_num() {
+        assert_eq!(short_term_pic_num(7, 8, 16), 7);
+        assert_eq!(short_term_pic_num(8, 8, 16), 8);
+        assert_eq!(short_term_pic_num(15, 8, 16), -1);
+    }
+
+    #[test]
+    fn idr_reset_outputs_pending_pictures_when_allowed() {
+        let mut state = H264DecoderState::new();
+        state.max_num_reorder_frames = 2;
+        state.dpb.push(dpb_picture_for_test(10, 10, true, true));
+        state.dpb.push(dpb_picture_for_test(11, 11, true, true));
+
+        let parsed = parsed_picture_for_finish_test(0, 0, true, false);
+        let update = state
+            .finish_picture(&parsed)
+            .expect("IDR reset drains prior pictures");
+
+        assert_eq!(
+            update.output_ready,
+            vec![
+                H264PictureId {
+                    frame_num: 10,
+                    poc: 10
+                },
+                H264PictureId {
+                    frame_num: 11,
+                    poc: 11
+                }
+            ]
+        );
+        assert_eq!(
+            update.released,
+            vec![
+                H264PictureId {
+                    frame_num: 10,
+                    poc: 10
+                },
+                H264PictureId {
+                    frame_num: 11,
+                    poc: 11
+                }
+            ]
+        );
+    }
+
+    fn dpb_picture_for_test(
+        frame_num: u16,
+        poc: i32,
+        reference: bool,
+        output_needed: bool,
+    ) -> DpbPicture {
+        DpbPicture {
+            id: H264PictureId { frame_num, poc },
+            frame_num,
+            top_field_order_cnt: poc,
+            bottom_field_order_cnt: poc,
+            reference,
+            output_needed,
+        }
+    }
+
+    fn parsed_picture_for_finish_test(
+        frame_num: u16,
+        poc: i32,
+        idr: bool,
+        no_output_of_prior_pics_flag: bool,
+    ) -> ParsedH264AccessUnit {
+        ParsedH264AccessUnit {
+            desc: VideoSurfaceDesc {
+                coded_width: 16,
+                coded_height: 16,
+                visible_region: VisibleRegion {
+                    x: 0,
+                    y: 0,
+                    width: 16,
+                    height: 16,
+                },
+                format: VideoSurfaceFormat::Nv12,
+                bit_depth: BitDepth::new(8).expect("8-bit"),
+                chroma: ChromaSubsampling::Cs420,
+                scan_mode: ScanMode::Progressive,
+                field_order: FieldOrder::Unknown,
+            },
+            profile: H264Profile::High,
+            level_idc: 42,
+            picture: ParsedH264Picture {
+                picture_width_in_mbs_minus1: 0,
+                picture_height_in_mbs_minus1: 0,
+                bit_depth_luma_minus8: 0,
+                bit_depth_chroma_minus8: 0,
+                num_ref_frames: 2,
+                chroma_format_idc: 1,
+                gaps_in_frame_num_value_allowed_flag: false,
+                frame_mbs_only_flag: true,
+                mb_adaptive_frame_field_flag: false,
+                direct_8x8_inference_flag: true,
+                log2_max_frame_num_minus4: 0,
+                pic_order_cnt_type: 0,
+                log2_max_pic_order_cnt_lsb_minus4: 0,
+                delta_pic_order_always_zero_flag: false,
+                num_slice_groups_minus1: 0,
+                slice_group_map_type: 0,
+                slice_group_change_rate_minus1: 0,
+                entropy_coding_mode_flag: true,
+                weighted_pred_flag: false,
+                weighted_bipred_idc: 0,
+                transform_8x8_mode_flag: false,
+                field_pic_flag: false,
+                constrained_intra_pred_flag: false,
+                pic_order_present_flag: false,
+                deblocking_filter_control_present_flag: true,
+                redundant_pic_cnt_present_flag: false,
+                reference_pic_flag: true,
+                idr_pic_flag: idr,
+                no_output_of_prior_pics_flag,
+                long_term_reference_flag: false,
+                dec_ref_pic_marking: Some(ParsedDecRefPicMarking::Idr {
+                    no_output_of_prior_pics_flag,
+                    long_term_reference_flag: false,
+                }),
+                pic_init_qp_minus26: 0,
+                pic_init_qs_minus26: 0,
+                chroma_qp_index_offset: 0,
+                second_chroma_qp_index_offset: 0,
+                frame_num,
+                top_field_order_cnt: poc,
+                bottom_field_order_cnt: poc,
+                scaling_list4x4: [[16; 16]; 6],
+                scaling_list8x8: [[16; 64]; 2],
+            },
+            slices: Vec::new(),
+            reference_frames: Vec::new(),
+            max_dpb_frames: 2,
+            max_num_reorder_frames: 2,
+        }
     }
 
     fn split_access_units_for_test(data: &[u8]) -> Vec<Vec<u8>> {
