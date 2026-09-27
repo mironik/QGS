@@ -8,7 +8,7 @@ use qgs_linux::{
     connect_socket, default_socket_path, receive_message, receive_message_with_attachments,
     send_message,
 };
-use qgs_mxf::{MediaSource, RandomAccess, TrackKind};
+use qgs_mxf::{IndexSource, MediaSource, RandomAccess, TrackKind};
 use qgs_protocol::{
     BitDepth, BufferDesc, BufferUsageFlags, ChromaSubsampling, CreateBufferRequest,
     CreateDecoderRequest, CreateImageRequest, CreateSyncRequest, DecoderConfig,
@@ -350,7 +350,31 @@ fn inspect_mxf(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         println!("  edit rate: {}/{}", rate.numerator, rate.denominator);
     }
     println!("  KLV triplets: {}", source.klv_count);
-    println!("  partitions: {}", source.partitions.len());
+    println!("  metadata sets: {}", source.metadata_set_count);
+    if let Some(pattern) = source.operational_pattern {
+        println!("  operational pattern: {pattern}");
+    }
+    println!("Partitions:");
+    for partition in &source.partitions {
+        println!(
+            "  {:?}: offset={} body_sid={} index_sid={} header_bytes={} index_bytes={}",
+            partition.kind,
+            partition.offset,
+            partition.body_sid,
+            partition.index_sid,
+            partition.header_byte_count,
+            partition.index_byte_count
+        );
+    }
+    println!("Packages:");
+    for package in &source.packages {
+        println!(
+            "  {:?}: uid={} tracks={}",
+            package.kind,
+            package.uid,
+            package.track_refs.len()
+        );
+    }
     if let Some(timecode) = &source.timecode {
         println!("Timecode:");
         println!("  start frame: {}", timecode.start_frame);
@@ -371,17 +395,32 @@ fn inspect_mxf(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             TrackKind::Video => {
                 if let Some(video) = &track.video {
                     println!("    codec: {:?}", video.codec);
+                    println!("    descriptor source: {:?}", video.source);
                     println!(
                         "    dimensions: {} x {}",
                         video.coded_width, video.coded_height
                     );
+                    println!(
+                        "    display: {} x {}",
+                        video.display_width, video.display_height
+                    );
                     println!("    bit depth: {}", video.bit_depth);
                     println!("    chroma: {:?}", video.chroma);
+                    if let Some(aspect) = video.aspect_ratio {
+                        println!(
+                            "    aspect ratio: {}/{}",
+                            aspect.numerator, aspect.denominator
+                        );
+                    }
                 }
             }
             TrackKind::Audio => {
                 if let Some(audio) = &track.audio {
+                    println!("    descriptor source: {:?}", audio.source);
                     println!("    channels: {:?}", audio.channels);
+                    if let Some(rate) = audio.sample_rate {
+                        println!("    sample rate: {}/{}", rate.numerator, rate.denominator);
+                    }
                     println!("    bit depth: {:?}", audio.bit_depth);
                 }
             }
@@ -396,8 +435,37 @@ fn inspect_mxf(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         .filter(|entry| entry.random_access == RandomAccess::Yes)
         .count();
     println!("Index:");
+    let index_source = if source
+        .index
+        .video
+        .iter()
+        .any(|entry| entry.source == IndexSource::MxfProvided)
+    {
+        "MXF provided"
+    } else {
+        "QGS derived"
+    };
+    println!("  source: {index_source}");
     println!("  video entries: {}", source.index.video.len());
     println!("  random access points: {random_access_points}");
+    println!("  index segments: {}", source.index_segments.len());
+    for segment in &source.index_segments {
+        println!(
+            "  segment: body_sid={} index_sid={} entries={} delta_entries={}",
+            segment.body_sid,
+            segment.index_sid,
+            segment.entries.len(),
+            segment.delta_entries.len()
+        );
+    }
+    println!("  RIP entries: {}", source.rip.len());
+
+    if !source.diagnostics.is_empty() {
+        println!("Warnings:");
+        for diagnostic in &source.diagnostics {
+            println!("  {:?}: {}", diagnostic.kind, diagnostic.message);
+        }
+    }
 
     let target = source.index.video.len().saturating_div(2);
     let start = source

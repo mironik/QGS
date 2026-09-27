@@ -220,8 +220,11 @@ MXF
     |
 qgs-mxf
     |\
-    | +-- Media Index
-    | +-- Tracks / Timecode / Descriptors
+    | +-- structural metadata
+    | +-- packages / tracks / descriptors
+    | +-- timecode
+    | +-- media index
+    | +-- essence
     |
 compressed essence access units
     |
@@ -249,6 +252,27 @@ permitted, derives a video index from H.264 essence KLVs, and records whether
 the index is QGS-derived rather than MXF-provided. It does not implement the
 complete SMPTE MXF ecosystem, persistent index caching, file-opening protocol
 messages, audio decoding, video decoding, or product/workflow classification.
+
+M2 Step 8 extends the same boundary with Primer Pack parsing, local-tag to UL
+resolution, a bounded metadata graph, package/track/reference handling,
+metadata-derived CDCI and Wave audio descriptors, MXF Index Table Segments, and
+Random Index Pack parsing. Container-described properties and codec-described
+properties remain distinct:
+
+```text
+MXF descriptor metadata
+        |
+        +-- cross-check diagnostics
+        |
+H.264 SPS/PPS/slice syntax
+```
+
+QGS reports metadata/codec disagreement explicitly for diagnostics instead of
+silently overwriting one source with another. MXF-provided indexes are preferred
+when valid; QGS-derived essence scanning remains a separate fallback. File
+access stays local to the `qgs-mxf` library and `qgs-test` inspection tool in
+M2 Step 8; no daemon `OPEN_PATH` or arbitrary filesystem protocol surface is
+introduced.
 
 ## H.264 Decode Frontend Boundary
 
