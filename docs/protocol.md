@@ -118,6 +118,40 @@ External handle type values are:
 | 1 | DMA-BUF FD |
 | 2 | opaque Vulkan external-memory FD |
 
+CREATE_SYNC is request kind `1`, opcode `7`. It is a session operation and
+must be sent after HELLO/WELCOME. Its payload is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `DeviceId` from the current `qgsd` process/session |
+| 8 | u8 | sync kind |
+| 9 | u8 | requested sync export handle type |
+| 10 | 6 bytes | reserved, currently `0` |
+
+Sync kind values are:
+
+| Value | Kind |
+| ---: | --- |
+| 1 | binary semaphore |
+
+Sync export handle type values are:
+
+| Value | Type |
+| ---: | --- |
+| 1 | Linux sync FD |
+
+EXPORT_SYNC is request kind `1`, opcode `8`. It is a session operation and
+must be sent after HELLO/WELCOME. For M1 Step 7, exporting a sync object submits
+a minimal producer GPU fill operation against a session-owned buffer and signals
+the exported synchronization primitive from that GPU submission. Its payload is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `SyncId` owned by the current session |
+| 8 | u64 | QGS `ResourceId` buffer owned by the current session |
+| 16 | u32 | producer fill pattern for the Step 7 validation operation |
+| 20 | 4 bytes | reserved, currently `0` |
+
 WELCOME is response kind `2`, opcode `1`. Its payload is:
 
 | Offset | Width | Field |
@@ -260,6 +294,34 @@ The backend memory type index is backend import metadata. Normal clients treat
 it as opaque. It is interpreted only by the matching `qgs-vulkan` import helper
 for the same backend/device identity.
 
+SYNC_CREATED is response kind `2`, opcode `8`. Its payload is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `SyncId` |
+
+SYNC_EXPORTED is response kind `2`, opcode `9`. Its payload contains only
+bounded metadata. The native sync FD is not encoded as an integer in this
+payload; it is carried as one Linux transport attachment.
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | exported QGS `SyncId` |
+| 8 | u8 | sync export handle type |
+| 9 | u8 | expected attachment count, currently `1` |
+| 10 | 2 bytes | reserved, currently `0` |
+| 12 | u32 | producer fill pattern used by the Step 7 validation operation |
+
+`SyncId` is a non-zero, opaque, QGS-owned identifier. It represents an ordering
+primitive, not resource memory. For M1 Step 7, a `SyncId` is unique within its
+owning session/lifetime and is not persistent across sessions or daemon
+restarts. Another session cannot export or use it.
+
+M1 Step 7 uses a Vulkan binary external semaphore exported as a Linux sync FD.
+Linux sync FDs have copy-transference semantics: each exported FD represents one
+signal/wait cycle. The importer uses a temporary semaphore payload, and the wait
+consumes that payload. This model is intentionally one-shot for M1.
+
 `ResourceId` is a non-zero, opaque, QGS-owned identifier. It does not expose
 pointers, Vulkan handles, file descriptors, or any native resource handle.
 For M1 Step 5, a `ResourceId` is unique within its owning session/lifetime and
@@ -285,11 +347,17 @@ usage bits, empty usage flags, malformed memory preference flags, nonzero
 reserved bytes, truncated payloads, and trailing payload bytes. DESTROY_RESOURCE
 receivers must reject zero `ResourceId` values. Unknown resources and
 cross-session resource attempts return a stable UnknownResource error.
+CREATE_SYNC receivers must reject zero `DeviceId` values, unknown sync kinds,
+unknown sync handle types, nonzero reserved bytes, truncated payloads, and
+trailing payload bytes. EXPORT_SYNC receivers must reject zero `SyncId` values,
+zero `ResourceId` values, nonzero reserved bytes, truncated payloads, and
+trailing payload bytes. Unknown sync IDs and cross-session sync attempts return
+a stable UnknownSync error.
 
 Major protocol versions are incompatible. Minor versions are backward-compatible
 only within the same major version. A server selects the highest protocol
 version it supports that is inside the client's supported range. The
-implementation through M1 Step 6 supports only server version `0.1`.
+implementation through M1 Step 7 supports only server version `0.1`.
 
 ## Transport
 
@@ -300,11 +368,12 @@ For Linux M1, `qgsd` and `qgs-test` communicate over a Unix Domain Socket using
 synchronous blocking I/O. This is the first real IPC transport, but it does not
 change the protocol's transport independence.
 
-M1 Step 6 adds Linux transport attachments for external-memory FDs. The Linux
-transport uses Unix Domain Socket ancillary data (`SCM_RIGHTS`) and supports at
-most one attached FD per message. Missing or excessive attachments are rejected
-by the attachment receive path. FD ownership is represented with owned file
-descriptor types; descriptors are closed by RAII when dropped.
+M1 Step 6 adds Linux transport attachments for external-memory FDs. M1 Step 7
+reuses the same attachment model for Linux sync FDs. The Linux transport uses
+Unix Domain Socket ancillary data (`SCM_RIGHTS`) and supports at most one
+attached FD per message. Missing or excessive attachments are rejected by the
+attachment receive path. FD ownership is represented with owned file descriptor
+types; descriptors are closed by RAII when dropped.
 
 These are three separate things:
 
@@ -314,7 +383,10 @@ These are three separate things:
 
 Large video/GPU data and buffer contents are not carried in normal QGS IPC
 messages. Step 6 transfers only a native reference to shared external memory.
+Step 7 transfers only a native synchronization handle and bounded metadata.
 
-External memory sharing does not implement external GPU synchronization.
-M1 Step 6 uses a deliberately quiescent validation sequence. External semaphore
-or fence workflows are deferred until before concurrent GPU workloads.
+External memory sharing and external synchronization are separate. The Step 7
+sync FD proves producer-to-consumer GPU ordering for one minimal transfer/fill
+validation path. It does not implement a reusable per-frame synchronization
+protocol, external semaphore pooling, image/video resource synchronization, or a
+compute/video pipeline.

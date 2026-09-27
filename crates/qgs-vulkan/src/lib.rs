@@ -1,24 +1,36 @@
 #![deny(unsafe_code)]
 
 use std::fs::File;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use qgs_core::{
-    BackendBufferAllocation, BackendResource, BackendResourceExport, DeviceDiscovery,
-    DeviceDiscoveryError, ResourceBackend, ResourceError,
+    BackendBufferAllocation, BackendResource, BackendResourceExport, BackendSync,
+    BackendSyncExport, DeviceDiscovery, DeviceDiscoveryError, ResourceBackend, ResourceError,
+    SyncBackend, SyncError,
 };
 use qgs_protocol::{
-    ApiVersion, BackendApi, BufferDesc, BufferUsageFlags, ComputeCapabilities, DeviceCapabilities,
-    DeviceClass, DeviceDesc, DeviceId, ExportResourceRequest, ExportedResourceMetadata,
-    ExternalHandleType, ExternalSharing, InteropCapabilities, MemoryCapabilities, MemoryHeapDesc,
-    SelectedMemoryProperties, MAX_DEVICE_COUNT, MAX_DEVICE_NAME_LEN, MAX_MEMORY_HEAP_COUNT,
-    MAX_MEMORY_TYPE_COUNT,
+    ApiVersion, BackendApi, BufferDesc, BufferUsageFlags, ComputeCapabilities, CreateSyncRequest,
+    DeviceCapabilities, DeviceClass, DeviceDesc, DeviceId, ExportResourceRequest,
+    ExportSyncRequest, ExportedResourceMetadata, ExportedSyncMetadata, ExternalHandleType,
+    ExternalSharing, InteropCapabilities, MemoryCapabilities, MemoryHeapDesc,
+    SelectedMemoryProperties, SyncExportHandleType, SyncKind, MAX_DEVICE_COUNT,
+    MAX_DEVICE_NAME_LEN, MAX_MEMORY_HEAP_COUNT, MAX_MEMORY_TYPE_COUNT,
 };
 use vulkano::buffer::{
     Buffer, BufferCreateInfo, BufferMemory, BufferUsage, ExternalBufferInfo, RawBuffer, Subbuffer,
 };
+use vulkano::command_buffer::allocator::{
+    StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo,
+};
+use vulkano::command_buffer::{
+    AutoCommandBufferBuilder, CommandBufferSubmitInfo, CommandBufferUsage, CopyBufferInfo,
+    PrimaryAutoCommandBuffer, SemaphoreSubmitInfo, SubmitInfo,
+};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
-use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo, QueueFlags};
+use vulkano::device::{
+    Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
+};
 use vulkano::instance::{Instance, InstanceCreateInfo};
 use vulkano::memory::allocator::{
     AllocationCreateInfo, GenericMemoryAllocatorCreateInfo, MemoryAllocatePreference,
@@ -28,10 +40,17 @@ use vulkano::memory::{
     DedicatedAllocation, ExternalMemoryHandleType, ExternalMemoryHandleTypes, MemoryAllocateInfo,
     MemoryHeapFlags, MemoryImportInfo, MemoryMapInfo, MemoryPropertyFlags, ResourceMemory,
 };
+use vulkano::sync::fence::{Fence, FenceCreateInfo};
+use vulkano::sync::semaphore::{
+    ExternalSemaphoreHandleType, ExternalSemaphoreHandleTypes, ExternalSemaphoreInfo, Semaphore,
+    SemaphoreCreateInfo, SemaphoreType,
+};
 use vulkano::{Version, VulkanLibrary};
 
 #[allow(unsafe_code)]
 mod external_memory;
+#[allow(unsafe_code)]
+mod external_sync;
 
 const SHARED_VALIDATION_MARKER: &[u8] = b"QGS-M1S6";
 
@@ -68,9 +87,11 @@ impl VulkanDeviceDiscovery {
                 khr_external_memory_fd: supported_extensions.khr_external_memory_fd,
                 ext_external_memory_dma_buf: supported_extensions.ext_external_memory_dma_buf,
                 khr_dedicated_allocation: supported_extensions.khr_dedicated_allocation,
+                khr_external_semaphore: supported_extensions.khr_external_semaphore,
+                khr_external_semaphore_fd: supported_extensions.khr_external_semaphore_fd,
                 ..DeviceExtensions::empty()
             };
-            let (logical_device, _) = Device::new(
+            let (logical_device, mut queues) = Device::new(
                 physical_device.clone(),
                 DeviceCreateInfo {
                     enabled_extensions,
@@ -82,14 +103,24 @@ impl VulkanDeviceDiscovery {
                 },
             )
             .map_err(|_| DeviceDiscoveryError::BackendFailed)?;
+            let queue = queues.next().ok_or(DeviceDiscoveryError::BackendFailed)?;
             let memory_allocator =
                 Arc::new(StandardMemoryAllocator::new_default(logical_device.clone()));
+            let command_allocator = Arc::new(StandardCommandBufferAllocator::new(
+                logical_device.clone(),
+                StandardCommandBufferAllocatorCreateInfo {
+                    primary_buffer_count: 4,
+                    ..Default::default()
+                },
+            ));
 
             devices.push(RegisteredDevice {
                 desc,
                 physical_device,
                 logical_device,
+                queue,
                 memory_allocator,
+                command_allocator,
             });
         }
 
@@ -185,6 +216,67 @@ impl VulkanDeviceDiscovery {
             Err(ResourceError::ExportFailed)
         }
     }
+
+    pub fn import_wait_and_validate_synced_buffer(
+        &self,
+        source_device: &DeviceDesc,
+        resource_metadata: &ExportedResourceMetadata,
+        resource_handle: File,
+        sync_metadata: &ExportedSyncMetadata,
+        sync_handle: File,
+    ) -> Result<(), ResourceError> {
+        if sync_metadata.handle_type != SyncExportHandleType::SyncFd
+            || sync_metadata.attachment_count != 1
+        {
+            return Err(ResourceError::ExportFailed);
+        }
+        if resource_metadata.device_id != source_device.id
+            || resource_metadata.size_bytes == 0
+            || resource_metadata.allocation_size_bytes < resource_metadata.size_bytes
+            || resource_metadata.attachment_count != 1
+        {
+            return Err(ResourceError::ExportFailed);
+        }
+
+        let device = self
+            .devices
+            .iter()
+            .find(|device| device_matches_export_source(&device.desc, source_device))
+            .ok_or(ResourceError::UnknownDeviceId)?;
+
+        let usage = map_buffer_usage(resource_metadata.usage)?;
+        let handle_type = map_external_handle_type(resource_metadata.handle_type)?;
+        validate_external_buffer_support(device, usage, handle_type)?;
+        validate_sync_fd_support(device).map_err(|_| ResourceError::ExportFailed)?;
+
+        let imported_buffer = import_external_buffer(
+            device,
+            resource_metadata,
+            usage,
+            handle_type,
+            resource_handle,
+        )?;
+        let imported_semaphore = Semaphore::new(
+            device.logical_device.clone(),
+            SemaphoreCreateInfo::default(),
+        )
+        .map_err(|err| {
+            eprintln!("vulkan sync import semaphore creation failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+        let imported_semaphore = Arc::new(imported_semaphore);
+        external_sync::import_sync_fd(&imported_semaphore, sync_handle).map_err(|err| {
+            eprintln!("vulkan sync-fd import failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+
+        validate_synced_gpu_copy(
+            device,
+            imported_buffer,
+            imported_semaphore,
+            sync_metadata.fill_pattern,
+        )
+    }
 }
 
 impl DeviceDiscovery for VulkanDeviceDiscovery {
@@ -275,13 +367,54 @@ impl ResourceBackend for VulkanDeviceDiscovery {
     }
 }
 
+impl SyncBackend for VulkanDeviceDiscovery {
+    fn create_sync(&self, request: &CreateSyncRequest) -> Result<Box<dyn BackendSync>, SyncError> {
+        if request.kind != SyncKind::BinarySemaphore {
+            return Err(SyncError::SyncExportFailed);
+        }
+        if request.handle_type != SyncExportHandleType::SyncFd {
+            return Err(SyncError::UnsupportedSyncHandleType);
+        }
+
+        let device = self
+            .devices
+            .iter()
+            .find(|device| device.desc.id == request.device_id)
+            .ok_or(SyncError::UnknownDeviceId)?;
+        validate_sync_fd_support(device)?;
+
+        let semaphore = Semaphore::new(
+            device.logical_device.clone(),
+            SemaphoreCreateInfo {
+                export_handle_types: ExternalSemaphoreHandleTypes::SYNC_FD,
+                ..Default::default()
+            },
+        )
+        .map_err(|err| {
+            eprintln!("vulkan sync creation failed: {err}");
+            SyncError::SyncExportFailed
+        })?;
+
+        Ok(Box::new(VulkanSyncResource {
+            device_id: request.device_id,
+            handle_type: request.handle_type,
+            semaphore: Arc::new(semaphore),
+            queue: device.queue.clone(),
+            command_allocator: device.command_allocator.clone(),
+            exported: AtomicBool::new(false),
+            pending_command_buffers: Mutex::new(Vec::new()),
+        }))
+    }
+}
+
 #[derive(Debug)]
 struct RegisteredDevice {
     desc: DeviceDesc,
     physical_device: Arc<PhysicalDevice>,
-    #[allow(dead_code)]
     logical_device: Arc<Device>,
+    queue: Arc<Queue>,
     memory_allocator: Arc<StandardMemoryAllocator>,
+    command_allocator: Arc<StandardCommandBufferAllocator>,
 }
 
 #[derive(Debug)]
@@ -291,7 +424,71 @@ struct VulkanBufferResource {
     selected_memory: SelectedMemoryProperties,
 }
 
+struct VulkanSyncResource {
+    device_id: DeviceId,
+    handle_type: SyncExportHandleType,
+    semaphore: Arc<Semaphore>,
+    queue: Arc<Queue>,
+    command_allocator: Arc<StandardCommandBufferAllocator>,
+    exported: AtomicBool,
+    pending_command_buffers: Mutex<Vec<Arc<PrimaryAutoCommandBuffer>>>,
+}
+
+impl BackendSync for VulkanSyncResource {
+    fn export_for_resource(
+        &self,
+        request: &ExportSyncRequest,
+        resource: &dyn BackendResource,
+    ) -> Result<BackendSyncExport, SyncError> {
+        if self.handle_type != SyncExportHandleType::SyncFd {
+            return Err(SyncError::UnsupportedSyncHandleType);
+        }
+        if self.exported.swap(true, Ordering::AcqRel) {
+            return Err(SyncError::SyncExportFailed);
+        }
+
+        let buffer = resource
+            .as_any()
+            .downcast_ref::<VulkanBufferResource>()
+            .ok_or(SyncError::SyncExportFailed)?;
+        if buffer.desc.device_id != self.device_id {
+            return Err(SyncError::UnknownResource);
+        }
+
+        let command_buffer = submit_gpu_fill(
+            self.command_allocator.clone(),
+            self.queue.clone(),
+            buffer.buffer.clone(),
+            self.semaphore.clone(),
+            request.fill_pattern,
+        )?;
+        self.pending_command_buffers
+            .lock()
+            .map_err(|_| SyncError::SyncExportFailed)?
+            .push(command_buffer);
+
+        let handle = external_sync::export_sync_fd(&self.semaphore).map_err(|err| {
+            eprintln!("vulkan sync-fd export failed: {err}");
+            SyncError::SyncExportFailed
+        })?;
+
+        Ok(BackendSyncExport {
+            metadata: ExportedSyncMetadata {
+                sync_id: request.sync_id,
+                handle_type: self.handle_type,
+                attachment_count: 1,
+                fill_pattern: request.fill_pattern,
+            },
+            handle,
+        })
+    }
+}
+
 impl BackendResource for VulkanBufferResource {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn export(
         &self,
         request: &ExportResourceRequest,
@@ -569,6 +766,212 @@ fn validate_external_buffer_support(
     }
 
     Ok(())
+}
+
+fn validate_sync_fd_support(device: &RegisteredDevice) -> Result<(), SyncError> {
+    let extensions = device.logical_device.enabled_extensions();
+    if !extensions.khr_external_semaphore_fd {
+        return Err(SyncError::UnsupportedSyncHandleType);
+    }
+
+    let mut info = ExternalSemaphoreInfo::handle_type(ExternalSemaphoreHandleType::SyncFd);
+    info.semaphore_type = SemaphoreType::Binary;
+    let properties = device
+        .physical_device
+        .external_semaphore_properties(info)
+        .map_err(|err| {
+            eprintln!("vulkan external semaphore property query failed: {err}");
+            SyncError::UnsupportedSyncHandleType
+        })?;
+
+    if properties.exportable && properties.importable {
+        Ok(())
+    } else {
+        Err(SyncError::UnsupportedSyncHandleType)
+    }
+}
+
+fn submit_gpu_fill(
+    command_allocator: Arc<StandardCommandBufferAllocator>,
+    queue: Arc<Queue>,
+    buffer: Subbuffer<[u8]>,
+    signal_semaphore: Arc<Semaphore>,
+    pattern: u32,
+) -> Result<Arc<PrimaryAutoCommandBuffer>, SyncError> {
+    if buffer.size() < 4 || !buffer.size().is_multiple_of(4) {
+        return Err(SyncError::SyncExportFailed);
+    }
+
+    let fill_buffer = buffer.reinterpret::<[u32]>();
+    let mut builder = AutoCommandBufferBuilder::primary(
+        command_allocator,
+        queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
+    )
+    .map_err(|err| {
+        eprintln!("vulkan producer command buffer creation failed: {err}");
+        SyncError::SyncExportFailed
+    })?;
+    builder.fill_buffer(fill_buffer, pattern).map_err(|err| {
+        eprintln!("vulkan producer fill command recording failed: {err}");
+        SyncError::SyncExportFailed
+    })?;
+    let command_buffer = builder.build().map_err(|err| {
+        eprintln!("vulkan producer command buffer build failed: {err}");
+        SyncError::SyncExportFailed
+    })?;
+
+    let submit = SubmitInfo {
+        command_buffers: vec![CommandBufferSubmitInfo::new(command_buffer.clone())],
+        signal_semaphores: vec![SemaphoreSubmitInfo::new(signal_semaphore)],
+        ..Default::default()
+    };
+    external_sync::submit_queue(&queue, &[submit], None).map_err(|err| {
+        eprintln!("vulkan producer queue submit failed: {err}");
+        SyncError::SyncExportFailed
+    })?;
+
+    Ok(command_buffer)
+}
+
+fn import_external_buffer(
+    device: &RegisteredDevice,
+    metadata: &ExportedResourceMetadata,
+    usage: BufferUsage,
+    handle_type: ExternalMemoryHandleType,
+    handle: File,
+) -> Result<Subbuffer<[u8]>, ResourceError> {
+    let raw_buffer = RawBuffer::new(
+        device.logical_device.clone(),
+        BufferCreateInfo {
+            size: metadata.size_bytes,
+            usage,
+            external_memory_handle_types: ExternalMemoryHandleTypes::from(handle_type),
+            ..Default::default()
+        },
+    )
+    .map_err(|err| {
+        eprintln!("vulkan import raw-buffer creation failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+
+    let dedicated_allocation = metadata
+        .dedicated_allocation
+        .then_some(DedicatedAllocation::Buffer(&raw_buffer));
+    let mut imported_memory = external_memory::import_device_memory(
+        device.logical_device.clone(),
+        MemoryAllocateInfo {
+            allocation_size: metadata.allocation_size_bytes,
+            memory_type_index: metadata.backend_memory_type_index,
+            dedicated_allocation,
+            ..Default::default()
+        },
+        MemoryImportInfo::Fd {
+            handle_type,
+            file: handle,
+        },
+    )
+    .map_err(|err| {
+        eprintln!("vulkan external memory import failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    imported_memory
+        .map(MemoryMapInfo {
+            offset: 0,
+            size: metadata.allocation_size_bytes,
+            ..Default::default()
+        })
+        .map_err(|err| {
+            eprintln!("vulkan imported memory map failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+
+    let imported_buffer = raw_buffer
+        .bind_memory(ResourceMemory::new_dedicated(imported_memory))
+        .map_err(|(err, _, _)| {
+            eprintln!("vulkan imported memory bind failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+    Ok(Subbuffer::from(Arc::new(imported_buffer)))
+}
+
+fn validate_synced_gpu_copy(
+    device: &RegisteredDevice,
+    imported_buffer: Subbuffer<[u8]>,
+    wait_semaphore: Arc<Semaphore>,
+    expected_pattern: u32,
+) -> Result<(), ResourceError> {
+    let readback = Buffer::new_slice::<u8>(
+        device.memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+            ..Default::default()
+        },
+        4,
+    )
+    .map_err(|err| {
+        eprintln!("vulkan readback buffer allocation failed: {err}");
+        ResourceError::AllocationFailed
+    })?;
+
+    let mut builder = AutoCommandBufferBuilder::primary(
+        device.command_allocator.clone(),
+        device.queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
+    )
+    .map_err(|err| {
+        eprintln!("vulkan consumer command buffer creation failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    builder
+        .copy_buffer(CopyBufferInfo::buffers(
+            imported_buffer.slice(..4),
+            readback.clone(),
+        ))
+        .map_err(|err| {
+            eprintln!("vulkan consumer copy command recording failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+    let command_buffer = builder.build().map_err(|err| {
+        eprintln!("vulkan consumer command buffer build failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    let fence = Arc::new(
+        Fence::new(device.logical_device.clone(), FenceCreateInfo::default()).map_err(|err| {
+            eprintln!("vulkan consumer fence creation failed: {err}");
+            ResourceError::ExportFailed
+        })?,
+    );
+    let submit = SubmitInfo {
+        wait_semaphores: vec![SemaphoreSubmitInfo::new(wait_semaphore)],
+        command_buffers: vec![CommandBufferSubmitInfo::new(command_buffer)],
+        ..Default::default()
+    };
+    external_sync::submit_queue(&device.queue, &[submit], Some(&fence)).map_err(|err| {
+        eprintln!("vulkan consumer queue submit failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    fence
+        .wait(Some(std::time::Duration::from_secs(5)))
+        .map_err(|err| {
+            eprintln!("vulkan consumer fence wait failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+
+    let read = readback.read().map_err(|err| {
+        eprintln!("vulkan readback map failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    if read.get(..4) == Some(&expected_pattern.to_le_bytes()) {
+        Ok(())
+    } else {
+        Err(ResourceError::ExportFailed)
+    }
 }
 
 fn export_memory_allocator(

@@ -38,6 +38,10 @@ const DESTROY_RESOURCE_PAYLOAD_LEN: usize = 8;
 const RESOURCE_DESTROYED_PAYLOAD_LEN: usize = 8;
 const EXPORT_RESOURCE_PAYLOAD_LEN: usize = 16;
 const RESOURCE_EXPORTED_PAYLOAD_LEN: usize = 48;
+const CREATE_SYNC_PAYLOAD_LEN: usize = 16;
+const EXPORT_SYNC_PAYLOAD_LEN: usize = 24;
+const SYNC_CREATED_PAYLOAD_LEN: usize = 8;
+const SYNC_EXPORTED_PAYLOAD_LEN: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ProtocolVersion {
@@ -126,6 +130,8 @@ pub enum Request {
     CreateBuffer(CreateBufferRequest),
     DestroyResource(DestroyResourceRequest),
     ExportResource(ExportResourceRequest),
+    CreateSync(CreateSyncRequest),
+    ExportSync(ExportSyncRequest),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -168,6 +174,20 @@ pub struct ExportResourceRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateSyncRequest {
+    pub device_id: DeviceId,
+    pub kind: SyncKind,
+    pub handle_type: SyncExportHandleType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExportSyncRequest {
+    pub sync_id: SyncId,
+    pub resource_id: ResourceId,
+    pub fill_pattern: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Response {
     Welcome(WelcomeResponse),
     Error(ErrorResponse),
@@ -176,6 +196,8 @@ pub enum Response {
     BufferCreated(BufferCreatedResponse),
     ResourceDestroyed(ResourceDestroyedResponse),
     ResourceExported(ResourceExportedResponse),
+    SyncCreated(SyncCreatedResponse),
+    SyncExported(SyncExportedResponse),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -532,6 +554,97 @@ pub struct ExportedResourceMetadata {
     pub attachment_count: u8,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SyncId(u64);
+
+impl SyncId {
+    pub fn new(raw: u64) -> Result<Self, ProtocolError> {
+        if raw == 0 {
+            Err(ProtocolError::InvalidSyncId)
+        } else {
+            Ok(Self(raw))
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncKind {
+    BinarySemaphore,
+}
+
+impl SyncKind {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::BinarySemaphore => 1,
+        }
+    }
+}
+
+impl TryFrom<u8> for SyncKind {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::BinarySemaphore),
+            _ => Err(ProtocolError::MalformedPayload),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncExportHandleType {
+    SyncFd,
+}
+
+impl SyncExportHandleType {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::SyncFd => 1,
+        }
+    }
+}
+
+impl TryFrom<u8> for SyncExportHandleType {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::SyncFd),
+            _ => Err(ProtocolError::MalformedPayload),
+        }
+    }
+}
+
+impl fmt::Display for SyncExportHandleType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SyncFd => write!(f, "sync-fd"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncCreatedResponse {
+    pub sync_id: SyncId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncExportedResponse {
+    pub metadata: ExportedSyncMetadata,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExportedSyncMetadata {
+    pub sync_id: SyncId,
+    pub handle_type: SyncExportHandleType,
+    pub attachment_count: u8,
+    pub fill_pattern: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceCapabilities {
     pub device_id: DeviceId,
@@ -608,6 +721,10 @@ pub enum ProtocolErrorCode {
     ResourceNotExportable = 28,
     UnsupportedExternalHandleType = 29,
     ExportFailed = 30,
+    InvalidSyncId = 31,
+    UnknownSync = 32,
+    UnsupportedSyncHandleType = 33,
+    SyncExportFailed = 34,
 }
 
 impl ProtocolErrorCode {
@@ -651,6 +768,10 @@ impl TryFrom<u32> for ProtocolErrorCode {
             28 => Ok(Self::ResourceNotExportable),
             29 => Ok(Self::UnsupportedExternalHandleType),
             30 => Ok(Self::ExportFailed),
+            31 => Ok(Self::InvalidSyncId),
+            32 => Ok(Self::UnknownSync),
+            33 => Ok(Self::UnsupportedSyncHandleType),
+            34 => Ok(Self::SyncExportFailed),
             _ => Err(ProtocolError::MalformedPayload),
         }
     }
@@ -723,6 +844,10 @@ pub enum ProtocolError {
     ResourceNotExportable,
     UnsupportedExternalHandleType,
     ExportFailed,
+    InvalidSyncId,
+    UnknownSync,
+    UnsupportedSyncHandleType,
+    SyncExportFailed,
     MalformedPayload,
     InvalidVersionRange {
         min: ProtocolVersion,
@@ -798,6 +923,10 @@ impl fmt::Display for ProtocolError {
                 write!(f, "unsupported external handle type")
             }
             Self::ExportFailed => write!(f, "resource export failed"),
+            Self::InvalidSyncId => write!(f, "sync id must be non-zero"),
+            Self::UnknownSync => write!(f, "unknown sync id"),
+            Self::UnsupportedSyncHandleType => write!(f, "unsupported sync handle type"),
+            Self::SyncExportFailed => write!(f, "sync export failed"),
             Self::MalformedPayload => write!(f, "malformed payload"),
             Self::InvalidVersionRange { min, max } => {
                 write!(f, "invalid protocol version range: {min}..={max}")
@@ -849,6 +978,10 @@ impl From<&ProtocolError> for ProtocolErrorCode {
             ProtocolError::ResourceNotExportable => Self::ResourceNotExportable,
             ProtocolError::UnsupportedExternalHandleType => Self::UnsupportedExternalHandleType,
             ProtocolError::ExportFailed => Self::ExportFailed,
+            ProtocolError::InvalidSyncId => Self::InvalidSyncId,
+            ProtocolError::UnknownSync => Self::UnknownSync,
+            ProtocolError::UnsupportedSyncHandleType => Self::UnsupportedSyncHandleType,
+            ProtocolError::SyncExportFailed => Self::SyncExportFailed,
             ProtocolError::InvalidVersionRange { .. } => Self::InvalidVersionRange,
             ProtocolError::UnsupportedVersion { .. } => Self::UnsupportedVersion,
         }
@@ -873,6 +1006,8 @@ pub enum RequestOpcode {
     CreateBuffer,
     DestroyResource,
     ExportResource,
+    CreateSync,
+    ExportSync,
 }
 
 impl RequestOpcode {
@@ -884,6 +1019,8 @@ impl RequestOpcode {
             Self::CreateBuffer => 4,
             Self::DestroyResource => 5,
             Self::ExportResource => 6,
+            Self::CreateSync => 7,
+            Self::ExportSync => 8,
         }
     }
 }
@@ -897,6 +1034,8 @@ pub enum ResponseOpcode {
     BufferCreated,
     ResourceDestroyed,
     ResourceExported,
+    SyncCreated,
+    SyncExported,
 }
 
 impl ResponseOpcode {
@@ -909,6 +1048,8 @@ impl ResponseOpcode {
             Self::BufferCreated => 5,
             Self::ResourceDestroyed => 6,
             Self::ResourceExported => 7,
+            Self::SyncCreated => 8,
+            Self::SyncExported => 9,
         }
     }
 }
@@ -948,6 +1089,14 @@ pub enum WireMessage {
         request_id: u64,
         request: ExportResourceRequest,
     },
+    CreateSync {
+        request_id: u64,
+        request: CreateSyncRequest,
+    },
+    ExportSync {
+        request_id: u64,
+        request: ExportSyncRequest,
+    },
     Welcome {
         request_id: u64,
         response: WelcomeResponse,
@@ -976,6 +1125,14 @@ pub enum WireMessage {
         request_id: u64,
         response: ResourceExportedResponse,
     },
+    SyncCreated {
+        request_id: u64,
+        response: SyncCreatedResponse,
+    },
+    SyncExported {
+        request_id: u64,
+        response: SyncExportedResponse,
+    },
 }
 
 impl WireMessage {
@@ -987,13 +1144,17 @@ impl WireMessage {
             | Self::CreateBuffer { request_id, .. }
             | Self::DestroyResource { request_id, .. }
             | Self::ExportResource { request_id, .. }
+            | Self::CreateSync { request_id, .. }
+            | Self::ExportSync { request_id, .. }
             | Self::Welcome { request_id, .. }
             | Self::Error { request_id, .. }
             | Self::DeviceList { request_id, .. }
             | Self::DeviceCapabilities { request_id, .. }
             | Self::BufferCreated { request_id, .. }
             | Self::ResourceDestroyed { request_id, .. }
-            | Self::ResourceExported { request_id, .. } => *request_id,
+            | Self::ResourceExported { request_id, .. }
+            | Self::SyncCreated { request_id, .. }
+            | Self::SyncExported { request_id, .. } => *request_id,
         }
     }
 }
@@ -1050,6 +1211,24 @@ pub fn encode_wire_message(message: &WireMessage) -> Vec<u8> {
             RequestOpcode::ExportResource.wire_value(),
             *request_id,
             encode_export_resource_payload(request),
+        ),
+        WireMessage::CreateSync {
+            request_id,
+            request,
+        } => (
+            MessageKind::Request,
+            RequestOpcode::CreateSync.wire_value(),
+            *request_id,
+            encode_create_sync_payload(request),
+        ),
+        WireMessage::ExportSync {
+            request_id,
+            request,
+        } => (
+            MessageKind::Request,
+            RequestOpcode::ExportSync.wire_value(),
+            *request_id,
+            encode_export_sync_payload(request),
         ),
         WireMessage::Welcome {
             request_id,
@@ -1113,6 +1292,24 @@ pub fn encode_wire_message(message: &WireMessage) -> Vec<u8> {
             ResponseOpcode::ResourceExported.wire_value(),
             *request_id,
             encode_resource_exported_payload(response),
+        ),
+        WireMessage::SyncCreated {
+            request_id,
+            response,
+        } => (
+            MessageKind::Response,
+            ResponseOpcode::SyncCreated.wire_value(),
+            *request_id,
+            encode_sync_created_payload(response),
+        ),
+        WireMessage::SyncExported {
+            request_id,
+            response,
+        } => (
+            MessageKind::Response,
+            ResponseOpcode::SyncExported.wire_value(),
+            *request_id,
+            encode_sync_exported_payload(response),
         ),
     };
 
@@ -1244,6 +1441,14 @@ pub fn decode_wire_message_parts(
             request_id: header.request_id,
             request: decode_export_resource_payload(payload)?,
         }),
+        (MessageKind::Request, 7) => Ok(WireMessage::CreateSync {
+            request_id: header.request_id,
+            request: decode_create_sync_payload(payload)?,
+        }),
+        (MessageKind::Request, 8) => Ok(WireMessage::ExportSync {
+            request_id: header.request_id,
+            request: decode_export_sync_payload(payload)?,
+        }),
         (MessageKind::Response, 1) => Ok(WireMessage::Welcome {
             request_id: header.request_id,
             response: decode_welcome_payload(payload)?,
@@ -1271,6 +1476,14 @@ pub fn decode_wire_message_parts(
         (MessageKind::Response, 7) => Ok(WireMessage::ResourceExported {
             request_id: header.request_id,
             response: decode_resource_exported_payload(payload)?,
+        }),
+        (MessageKind::Response, 8) => Ok(WireMessage::SyncCreated {
+            request_id: header.request_id,
+            response: decode_sync_created_payload(payload)?,
+        }),
+        (MessageKind::Response, 9) => Ok(WireMessage::SyncExported {
+            request_id: header.request_id,
+            response: decode_sync_exported_payload(payload)?,
         }),
         _ => Err(ProtocolError::UnknownOpcode {
             kind: header.kind,
@@ -1332,7 +1545,7 @@ fn encode_wire_header(header: &WireHeader, bytes: &mut Vec<u8>) {
 
 fn validate_opcode(kind: MessageKind, opcode: u8) -> Result<(), ProtocolError> {
     match (kind, opcode) {
-        (MessageKind::Request, 1..=6) | (MessageKind::Response, 1..=7) => Ok(()),
+        (MessageKind::Request, 1..=8) | (MessageKind::Response, 1..=9) => Ok(()),
         _ => Err(ProtocolError::UnknownOpcode { kind, opcode }),
     }
 }
@@ -1506,6 +1719,72 @@ fn decode_export_resource_payload(bytes: &[u8]) -> Result<ExportResourceRequest,
     Ok(ExportResourceRequest {
         resource_id: ResourceId::new(read_u64(bytes, 0))?,
         handle_type: ExternalHandleType::try_from(bytes[8])?,
+    })
+}
+
+fn encode_create_sync_payload(request: &CreateSyncRequest) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(CREATE_SYNC_PAYLOAD_LEN);
+    bytes.extend_from_slice(&request.device_id.get().to_le_bytes());
+    bytes.push(request.kind.wire_value());
+    bytes.push(request.handle_type.wire_value());
+    bytes.extend_from_slice(&[0_u8; 6]);
+    bytes
+}
+
+fn decode_create_sync_payload(bytes: &[u8]) -> Result<CreateSyncRequest, ProtocolError> {
+    if bytes.len() != CREATE_SYNC_PAYLOAD_LEN {
+        return if bytes.len() < CREATE_SYNC_PAYLOAD_LEN {
+            Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len(),
+                expected: CREATE_SYNC_PAYLOAD_LEN,
+            })
+        } else {
+            Err(ProtocolError::TrailingPayload {
+                len: bytes.len() - CREATE_SYNC_PAYLOAD_LEN,
+            })
+        };
+    }
+    if bytes[10..16].iter().any(|value| *value != 0) {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(CreateSyncRequest {
+        device_id: DeviceId::new(read_u64(bytes, 0))?,
+        kind: SyncKind::try_from(bytes[8])?,
+        handle_type: SyncExportHandleType::try_from(bytes[9])?,
+    })
+}
+
+fn encode_export_sync_payload(request: &ExportSyncRequest) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(EXPORT_SYNC_PAYLOAD_LEN);
+    bytes.extend_from_slice(&request.sync_id.get().to_le_bytes());
+    bytes.extend_from_slice(&request.resource_id.get().to_le_bytes());
+    bytes.extend_from_slice(&request.fill_pattern.to_le_bytes());
+    bytes.extend_from_slice(&[0_u8; 4]);
+    bytes
+}
+
+fn decode_export_sync_payload(bytes: &[u8]) -> Result<ExportSyncRequest, ProtocolError> {
+    if bytes.len() != EXPORT_SYNC_PAYLOAD_LEN {
+        return if bytes.len() < EXPORT_SYNC_PAYLOAD_LEN {
+            Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len(),
+                expected: EXPORT_SYNC_PAYLOAD_LEN,
+            })
+        } else {
+            Err(ProtocolError::TrailingPayload {
+                len: bytes.len() - EXPORT_SYNC_PAYLOAD_LEN,
+            })
+        };
+    }
+    if bytes[20..24].iter().any(|value| *value != 0) {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(ExportSyncRequest {
+        sync_id: SyncId::new(read_u64(bytes, 0))?,
+        resource_id: ResourceId::new(read_u64(bytes, 8))?,
+        fill_pattern: read_u32(bytes, 16),
     })
 }
 
@@ -1880,6 +2159,70 @@ fn decode_resource_exported_payload(
     })
 }
 
+fn encode_sync_created_payload(response: &SyncCreatedResponse) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(SYNC_CREATED_PAYLOAD_LEN);
+    bytes.extend_from_slice(&response.sync_id.get().to_le_bytes());
+    bytes
+}
+
+fn decode_sync_created_payload(bytes: &[u8]) -> Result<SyncCreatedResponse, ProtocolError> {
+    if bytes.len() != SYNC_CREATED_PAYLOAD_LEN {
+        return if bytes.len() < SYNC_CREATED_PAYLOAD_LEN {
+            Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len(),
+                expected: SYNC_CREATED_PAYLOAD_LEN,
+            })
+        } else {
+            Err(ProtocolError::TrailingPayload {
+                len: bytes.len() - SYNC_CREATED_PAYLOAD_LEN,
+            })
+        };
+    }
+
+    Ok(SyncCreatedResponse {
+        sync_id: SyncId::new(read_u64(bytes, 0))?,
+    })
+}
+
+fn encode_sync_exported_payload(response: &SyncExportedResponse) -> Vec<u8> {
+    let metadata = &response.metadata;
+    let mut bytes = Vec::with_capacity(SYNC_EXPORTED_PAYLOAD_LEN);
+    bytes.extend_from_slice(&metadata.sync_id.get().to_le_bytes());
+    bytes.push(metadata.handle_type.wire_value());
+    bytes.push(metadata.attachment_count);
+    bytes.extend_from_slice(&[0_u8; 2]);
+    bytes.extend_from_slice(&metadata.fill_pattern.to_le_bytes());
+    bytes
+}
+
+fn decode_sync_exported_payload(bytes: &[u8]) -> Result<SyncExportedResponse, ProtocolError> {
+    if bytes.len() != SYNC_EXPORTED_PAYLOAD_LEN {
+        return if bytes.len() < SYNC_EXPORTED_PAYLOAD_LEN {
+            Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len(),
+                expected: SYNC_EXPORTED_PAYLOAD_LEN,
+            })
+        } else {
+            Err(ProtocolError::TrailingPayload {
+                len: bytes.len() - SYNC_EXPORTED_PAYLOAD_LEN,
+            })
+        };
+    }
+    if bytes[10..12].iter().any(|value| *value != 0) || bytes[16..].iter().any(|value| *value != 0)
+    {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    Ok(SyncExportedResponse {
+        metadata: ExportedSyncMetadata {
+            sync_id: SyncId::new(read_u64(bytes, 0))?,
+            handle_type: SyncExportHandleType::try_from(bytes[8])?,
+            attachment_count: bytes[9],
+            fill_pattern: read_u32(bytes, 12),
+        },
+    })
+}
+
 fn validate_buffer_size(size: u64) -> Result<u64, ProtocolError> {
     if size == 0 || size > MAX_BUFFER_SIZE_BYTES {
         Err(ProtocolError::InvalidBufferSize {
@@ -2051,6 +2394,150 @@ mod tests {
                 max: ProtocolVersion::new(1, 0),
                 supported: CURRENT_PROTOCOL_VERSION,
             }
+        );
+    }
+
+    #[test]
+    fn sync_id_zero_is_rejected() {
+        assert_eq!(SyncId::new(0), Err(ProtocolError::InvalidSyncId));
+        assert_eq!(SyncId::new(9).expect("sync id").get(), 9);
+    }
+
+    #[test]
+    fn create_sync_request_round_trips() {
+        let message = WireMessage::CreateSync {
+            request_id: 701,
+            request: CreateSyncRequest {
+                device_id: DeviceId::new(3).expect("device id"),
+                kind: SyncKind::BinarySemaphore,
+                handle_type: SyncExportHandleType::SyncFd,
+            },
+        };
+
+        let decoded =
+            decode_wire_message(&encode_wire_message(&message)).expect("decode create sync");
+
+        assert_eq!(decoded, message);
+        assert_eq!(decoded.request_id(), 701);
+    }
+
+    #[test]
+    fn export_sync_request_round_trips() {
+        let message = WireMessage::ExportSync {
+            request_id: 702,
+            request: ExportSyncRequest {
+                sync_id: SyncId::new(4).expect("sync id"),
+                resource_id: ResourceId::new(5).expect("resource id"),
+                fill_pattern: 0x1a2b_3c4d,
+            },
+        };
+
+        let decoded =
+            decode_wire_message(&encode_wire_message(&message)).expect("decode export sync");
+
+        assert_eq!(decoded, message);
+        assert_eq!(decoded.request_id(), 702);
+    }
+
+    #[test]
+    fn sync_created_response_round_trips() {
+        let message = WireMessage::SyncCreated {
+            request_id: 703,
+            response: SyncCreatedResponse {
+                sync_id: SyncId::new(6).expect("sync id"),
+            },
+        };
+
+        let decoded =
+            decode_wire_message(&encode_wire_message(&message)).expect("decode sync created");
+
+        assert_eq!(decoded, message);
+        assert_eq!(decoded.request_id(), 703);
+    }
+
+    #[test]
+    fn sync_exported_response_round_trips() {
+        let message = WireMessage::SyncExported {
+            request_id: 704,
+            response: SyncExportedResponse {
+                metadata: ExportedSyncMetadata {
+                    sync_id: SyncId::new(7).expect("sync id"),
+                    handle_type: SyncExportHandleType::SyncFd,
+                    attachment_count: 1,
+                    fill_pattern: 0xfeed_beef,
+                },
+            },
+        };
+
+        let decoded =
+            decode_wire_message(&encode_wire_message(&message)).expect("decode sync exported");
+
+        assert_eq!(decoded, message);
+        assert_eq!(decoded.request_id(), 704);
+    }
+
+    #[test]
+    fn create_sync_rejects_reserved_bytes() {
+        let mut payload = encode_create_sync_payload(&CreateSyncRequest {
+            device_id: DeviceId::new(1).expect("device id"),
+            kind: SyncKind::BinarySemaphore,
+            handle_type: SyncExportHandleType::SyncFd,
+        });
+        payload[10] = 1;
+
+        assert_eq!(
+            decode_create_sync_payload(&payload),
+            Err(ProtocolError::MalformedPayload)
+        );
+    }
+
+    #[test]
+    fn export_sync_rejects_truncated_payload() {
+        let payload = [0_u8; EXPORT_SYNC_PAYLOAD_LEN - 1];
+
+        assert_eq!(
+            decode_export_sync_payload(&payload),
+            Err(ProtocolError::TruncatedPayload {
+                actual: EXPORT_SYNC_PAYLOAD_LEN - 1,
+                expected: EXPORT_SYNC_PAYLOAD_LEN,
+            })
+        );
+    }
+
+    #[test]
+    fn sync_exported_rejects_unknown_handle_type() {
+        let mut payload = encode_sync_exported_payload(&SyncExportedResponse {
+            metadata: ExportedSyncMetadata {
+                sync_id: SyncId::new(1).expect("sync id"),
+                handle_type: SyncExportHandleType::SyncFd,
+                attachment_count: 1,
+                fill_pattern: 1,
+            },
+        });
+        payload[8] = 99;
+
+        assert_eq!(
+            decode_sync_exported_payload(&payload),
+            Err(ProtocolError::MalformedPayload)
+        );
+    }
+
+    #[test]
+    fn sync_error_codes_are_stable() {
+        assert_eq!(ProtocolErrorCode::InvalidSyncId.wire_value(), 31);
+        assert_eq!(ProtocolErrorCode::UnknownSync.wire_value(), 32);
+        assert_eq!(
+            ProtocolErrorCode::UnsupportedSyncHandleType.wire_value(),
+            33
+        );
+        assert_eq!(ProtocolErrorCode::SyncExportFailed.wire_value(), 34);
+        assert_eq!(
+            ProtocolErrorCode::try_from(32).expect("known sync error"),
+            ProtocolErrorCode::UnknownSync
+        );
+        assert_eq!(
+            ProtocolErrorCode::from(&ProtocolError::UnknownSync),
+            ProtocolErrorCode::UnknownSync
         );
     }
 

@@ -57,7 +57,52 @@ Remaining assumptions:
 - Vulkano and the Vulkan driver uphold the documented FD ownership behavior.
 - Backend memory type indices in export metadata are interpreted only by
   `qgs-vulkan` for the matching backend/device.
-- M1 validation uses host-visible shared memory and a quiescent CPU read/write
-  sequence; concurrent GPU synchronization is deferred.
+- M1 Step 6 validation uses host-visible shared memory and a quiescent CPU
+  read/write sequence. GPU ordering is handled separately by Step 7.
 
-Unsafe block count in QGS-owned code after M1 Step 6: 1.
+### qgs-vulkan external synchronization
+
+Location:
+
+- `crates/qgs-vulkan/src/external_sync.rs`
+
+Unsafe APIs:
+
+- `vulkano::sync::semaphore::Semaphore::export_fd`
+- `vulkano::sync::semaphore::Semaphore::import_fd`
+- `vulkano::device::QueueGuard::submit`
+
+Why unsafe is required:
+
+Vulkano 0.35.2 exposes POSIX FD semaphore export/import and direct queue submit
+as unsafe operations. Step 7 needs the external semaphore FD to be signaled by a
+GPU queue submission, transferred to another process, imported into a second
+Vulkan context, and waited on by a consumer GPU submission. No higher-level safe
+Vulkano path satisfying those exact external-handle semantics was found.
+
+The safe QGS wrapper validates or constrains:
+
+- the selected handle type is Linux sync FD
+- the physical device reports sync FD external semaphore import/export support
+- the semaphore is binary and created with sync FD export support
+- export occurs only after QGS has submitted exactly one producer GPU signal
+  operation and no producer-side wait operation
+- the sync FD is transferred as an owned transport attachment and moved into
+  the import call
+- sync FD import uses temporary payload semantics as required for
+  copy-transference handles
+- producer and consumer contexts are matched using QGS-visible backend/device
+  identity rather than Vulkan enumeration order
+- submitted command buffers, semaphores, and fences are retained for the
+  operation lifetime
+
+Remaining assumptions:
+
+- Vulkano and the Vulkan driver uphold documented sync FD ownership and
+  semaphore-payload semantics.
+- The backend/device identity used by M1 is sufficient for the local
+  two-process proof, but it is not a persistent identity model.
+- The Step 7 proof validates one-shot ordering for a minimal transfer path; it
+  is not a reusable frame synchronization protocol.
+
+Unsafe block count in QGS-owned code after M1 Step 7: 4.

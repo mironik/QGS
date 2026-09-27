@@ -9,10 +9,11 @@ use qgs_linux::{
     send_message,
 };
 use qgs_protocol::{
-    BufferDesc, BufferUsageFlags, CreateBufferRequest, DestroyResourceRequest, DeviceCapabilities,
-    DeviceClass, DeviceDesc, ErrorResponse, ExportResourceRequest, ExternalHandleType,
-    ExternalSharing, HelloRequest, MemoryPreference, QueryDeviceCapabilitiesRequest, ResourceId,
-    SelectedMemoryProperties, WireMessage, CURRENT_PROTOCOL_VERSION,
+    BufferDesc, BufferUsageFlags, CreateBufferRequest, CreateSyncRequest, DestroyResourceRequest,
+    DeviceCapabilities, DeviceClass, DeviceDesc, ErrorResponse, ExportResourceRequest,
+    ExportSyncRequest, ExternalHandleType, ExternalSharing, HelloRequest, MemoryPreference,
+    QueryDeviceCapabilitiesRequest, ResourceId, SelectedMemoryProperties, SyncExportHandleType,
+    SyncId, SyncKind, WireMessage, CURRENT_PROTOCOL_VERSION,
 };
 use qgs_vulkan::VulkanDeviceDiscovery;
 
@@ -137,6 +138,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("External memory sharing:");
     for device in &physical_devices {
         request_id = test_external_memory(&mut stream, request_id, device)?;
+        println!();
+    }
+
+    println!("External GPU synchronization:");
+    for device in &physical_devices {
+        request_id = test_external_gpu_sync(&mut stream, request_id, device)?;
         println!();
     }
 
@@ -413,6 +420,199 @@ fn test_external_memory(
 
     println!("  external sharing unsupported on this device by current driver");
     Ok(request_id)
+}
+
+fn test_external_gpu_sync(
+    stream: &mut std::os::unix::net::UnixStream,
+    mut request_id: u64,
+    device: &DeviceDesc,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    const FILL_PATTERN: u32 = 0x5147_5337;
+
+    request_id += 1;
+    let resource_id = match create_host_visible_external_buffer(
+        stream,
+        request_id,
+        device,
+        ExternalHandleType::DmaBuf,
+    )? {
+        Ok(resource_id) => resource_id,
+        Err(error) => {
+            println!("  create failed for DMA-BUF: {:?}", error.code);
+            println!("  external GPU synchronization unsupported on this device by current driver");
+            return Ok(request_id);
+        }
+    };
+
+    request_id += 1;
+    let (resource_metadata, resource_handle) =
+        match export_resource(stream, request_id, resource_id, ExternalHandleType::DmaBuf) {
+            Ok(export) => export,
+            Err(err) => {
+                request_id += 1;
+                destroy_resource(stream, request_id, resource_id)?;
+                return Err(err);
+            }
+        };
+
+    request_id += 1;
+    let sync_id = match create_sync(stream, request_id, device)? {
+        Ok(sync_id) => sync_id,
+        Err(error) => {
+            println!("  sync creation failed: {:?}", error.code);
+            request_id += 1;
+            destroy_resource(stream, request_id, resource_id)?;
+            return Ok(request_id);
+        }
+    };
+
+    request_id += 1;
+    send_message(
+        stream,
+        &WireMessage::ExportSync {
+            request_id,
+            request: ExportSyncRequest {
+                sync_id,
+                resource_id,
+                fill_pattern: FILL_PATTERN,
+            },
+        },
+    )?;
+    let received = receive_message_with_attachments::<1>(stream)?;
+    let WireMessage::SyncExported {
+        request_id: response_request_id,
+        response,
+    } = received.message
+    else {
+        request_id += 1;
+        destroy_resource(stream, request_id, resource_id)?;
+        return Err("expected SYNC_EXPORTED response".into());
+    };
+    if response_request_id != request_id {
+        request_id += 1;
+        destroy_resource(stream, request_id, resource_id)?;
+        return Err("sync exported request_id did not match request".into());
+    }
+    if response.metadata.sync_id != sync_id || response.metadata.attachment_count != 1 {
+        request_id += 1;
+        destroy_resource(stream, request_id, resource_id)?;
+        return Err("sync export metadata did not match request".into());
+    }
+    let Some(sync_handle) = received.attachments.into_iter().next() else {
+        request_id += 1;
+        destroy_resource(stream, request_id, resource_id)?;
+        return Err("missing exported sync FD attachment".into());
+    };
+
+    println!("Sync export:");
+    println!("  mechanism: {}", response.metadata.handle_type);
+    println!("  native sync FD received: yes");
+
+    let importer = VulkanDeviceDiscovery::new()?;
+    importer.import_wait_and_validate_synced_buffer(
+        device,
+        &resource_metadata,
+        File::from(resource_handle),
+        &response.metadata,
+        File::from(sync_handle),
+    )?;
+
+    println!("Consumer:");
+    println!("  imported shared buffer: success");
+    println!("  imported sync primitive: success");
+    println!("  GPU wait + dependent copy validation: success");
+    println!("  producer->consumer idle wait: no");
+
+    request_id += 1;
+    destroy_resource(stream, request_id, resource_id)?;
+    println!("QGS resource cleanup: success");
+
+    Ok(request_id)
+}
+
+fn export_resource(
+    stream: &mut std::os::unix::net::UnixStream,
+    request_id: u64,
+    resource_id: ResourceId,
+    handle_type: ExternalHandleType,
+) -> Result<(qgs_protocol::ExportedResourceMetadata, OwnedFd), Box<dyn std::error::Error>> {
+    send_message(
+        stream,
+        &WireMessage::ExportResource {
+            request_id,
+            request: ExportResourceRequest {
+                resource_id,
+                handle_type,
+            },
+        },
+    )?;
+    let received = receive_message_with_attachments::<1>(stream)?;
+    let WireMessage::ResourceExported {
+        request_id: response_request_id,
+        response,
+    } = received.message
+    else {
+        return Err("expected RESOURCE_EXPORTED response".into());
+    };
+    if response_request_id != request_id {
+        return Err("resource exported request_id did not match request".into());
+    }
+    if response.metadata.resource_id != resource_id || response.metadata.attachment_count != 1 {
+        return Err("resource export metadata did not match request".into());
+    }
+    let Some(handle) = received.attachments.into_iter().next() else {
+        return Err("missing exported FD attachment".into());
+    };
+
+    println!("Export:");
+    println!("  mechanism: {}", response.metadata.handle_type);
+    println!("  native FD received: yes");
+
+    Ok((response.metadata, handle))
+}
+
+fn create_sync(
+    stream: &mut std::os::unix::net::UnixStream,
+    request_id: u64,
+    device: &DeviceDesc,
+) -> Result<Result<SyncId, ErrorResponse>, Box<dyn std::error::Error>> {
+    send_message(
+        stream,
+        &WireMessage::CreateSync {
+            request_id,
+            request: CreateSyncRequest {
+                device_id: device.id,
+                kind: SyncKind::BinarySemaphore,
+                handle_type: SyncExportHandleType::SyncFd,
+            },
+        },
+    )?;
+
+    match receive_message(stream)? {
+        WireMessage::SyncCreated {
+            request_id: response_request_id,
+            response,
+        } => {
+            if response_request_id != request_id {
+                return Err("sync created request_id did not match request".into());
+            }
+            println!("Sync created:");
+            println!("  id: {}", response.sync_id.get());
+            println!("  kind: BinarySemaphore");
+            println!("  export handle: sync-fd");
+            Ok(Ok(response.sync_id))
+        }
+        WireMessage::Error {
+            request_id: response_request_id,
+            response,
+        } => {
+            if response_request_id != request_id {
+                return Err("sync error request_id did not match request".into());
+            }
+            Ok(Err(response))
+        }
+        _ => Err("expected SYNC_CREATED or ERROR response".into()),
+    }
 }
 
 fn validate_import(

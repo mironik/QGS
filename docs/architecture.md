@@ -106,6 +106,38 @@ Unsafe Rust remains prohibited in all normal QGS crates. A narrowly scoped,
 documented unsafe boundary exists in `qgs-vulkan` only for Vulkano external
 memory import where no practical safe API is available. See `docs/safety.md`.
 
+## External Synchronization Boundary
+
+M1 Step 7 keeps shared resource identity and execution ordering separate:
+
+```text
+ResourceId
+    represents
+shared memory/resource identity
+
+SyncId
+    represents
+producer-to-consumer GPU execution ordering
+```
+
+A synchronization primitive is not a buffer, and a buffer is not a semaphore.
+Both are owned by the session that created them. Another session cannot export
+or use them, and disconnecting the client drops any still-owned resources and
+sync objects.
+
+The Step 7 proof uses a Vulkan binary external semaphore exported as a Linux
+sync FD. The producer submits GPU transfer work that fills the shared buffer and
+signals the semaphore. The sync FD is transferred as a Linux transport
+attachment with `SCM_RIGHTS`. The consumer imports the semaphore payload,
+submits GPU work that waits on it, copies from the shared buffer into a
+readback buffer, and then waits on a fence only to let the CPU inspect the
+consumer result. `device.wait_idle()` and `queue.wait_idle()` are not used as
+the producer-to-consumer dependency mechanism.
+
+Step 7 proves cross-process GPU ordering for a minimal transfer operation. It
+does not implement compute shaders, image/video resources, a video pipeline,
+external semaphore reuse protocols, or concurrent producer/consumer scheduling.
+
 ## Current Scope
 
 The initial workspace contains an explicit v0.1 protocol wire encoding, minimal
@@ -115,10 +147,11 @@ abstraction. It reports compute queue limits, memory heap/type summaries, and
 external-memory/synchronization mechanism availability. It can create and
 destroy session-owned Vulkan-backed buffer resources and can export/import
 external-memory FDs for explicitly exportable buffers on supported drivers. It
-does not include an async runtime, daemonization, DRM/KMS, image resources,
-video surfaces, video decode, video encode, compute execution, external
-semaphore workflows, workload scheduling, performance benchmarking, telemetry,
-or free-memory reporting.
+can also prove one-shot external GPU synchronization with Linux sync FDs on
+supported drivers. It does not include an async runtime, daemonization, DRM/KMS,
+image resources, video surfaces, video decode, video encode, compute shader
+execution, reusable semaphore workflows, workload scheduling, performance
+benchmarking, telemetry, or free-memory reporting.
 
 Capability discovery is static information reported by the backend. It is not a
 measurement of current load, available/free VRAM, throughput, or scheduling

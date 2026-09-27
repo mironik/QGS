@@ -1,12 +1,14 @@
 #![forbid(unsafe_code)]
 
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use qgs_protocol::{
-    handle_hello, BufferCreatedResponse, BufferDesc, DeviceCapabilities, DeviceDesc, DeviceId,
-    ExportResourceRequest, ExportedResourceMetadata, HelloRequest, ProtocolError,
-    ResourceDestroyedResponse, ResourceId, ResourceKind, SelectedMemoryProperties, SessionId,
+    handle_hello, BufferCreatedResponse, BufferDesc, CreateSyncRequest, DeviceCapabilities,
+    DeviceDesc, DeviceId, ExportResourceRequest, ExportSyncRequest, ExportedResourceMetadata,
+    ExportedSyncMetadata, HelloRequest, ProtocolError, ResourceDestroyedResponse, ResourceId,
+    ResourceKind, SelectedMemoryProperties, SessionId, SyncCreatedResponse, SyncId,
     WelcomeResponse,
 };
 
@@ -53,11 +55,27 @@ pub trait ResourceBackend {
 }
 
 pub trait BackendResource: Send {
+    fn as_any(&self) -> &dyn Any;
+
     fn export(
         &self,
         _request: &ExportResourceRequest,
     ) -> Result<BackendResourceExport, ResourceError> {
         Err(ResourceError::ResourceNotExportable)
+    }
+}
+
+pub trait SyncBackend {
+    fn create_sync(&self, request: &CreateSyncRequest) -> Result<Box<dyn BackendSync>, SyncError>;
+}
+
+pub trait BackendSync: Send {
+    fn export_for_resource(
+        &self,
+        _request: &ExportSyncRequest,
+        _resource: &dyn BackendResource,
+    ) -> Result<BackendSyncExport, SyncError> {
+        Err(SyncError::SyncExportFailed)
     }
 }
 
@@ -73,6 +91,12 @@ pub struct BackendResourceExport {
 }
 
 #[derive(Debug)]
+pub struct BackendSyncExport {
+    pub metadata: ExportedSyncMetadata,
+    pub handle: std::fs::File,
+}
+
+#[derive(Debug)]
 pub enum ResourceError {
     UnknownResource,
     InvalidBufferSize,
@@ -83,6 +107,44 @@ pub enum ResourceError {
     ExportFailed,
     UnknownDeviceId,
     Protocol(ProtocolError),
+}
+
+#[derive(Debug)]
+pub enum SyncError {
+    UnknownSync,
+    UnknownResource,
+    UnknownDeviceId,
+    UnsupportedSyncHandleType,
+    SyncExportFailed,
+    Protocol(ProtocolError),
+}
+
+impl std::fmt::Display for SyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownSync => write!(f, "unknown sync id"),
+            Self::UnknownResource => write!(f, "unknown resource id"),
+            Self::UnknownDeviceId => write!(f, "unknown device id"),
+            Self::UnsupportedSyncHandleType => write!(f, "unsupported sync handle type"),
+            Self::SyncExportFailed => write!(f, "sync export failed"),
+            Self::Protocol(err) => write!(f, "invalid sync protocol data: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for SyncError {}
+
+impl From<ProtocolError> for SyncError {
+    fn from(value: ProtocolError) -> Self {
+        match value {
+            ProtocolError::UnknownSync => Self::UnknownSync,
+            ProtocolError::UnknownResource => Self::UnknownResource,
+            ProtocolError::UnknownDeviceId => Self::UnknownDeviceId,
+            ProtocolError::UnsupportedSyncHandleType => Self::UnsupportedSyncHandleType,
+            ProtocolError::SyncExportFailed => Self::SyncExportFailed,
+            err => Self::Protocol(err),
+        }
+    }
 }
 
 impl std::fmt::Display for ResourceError {
@@ -148,6 +210,7 @@ impl SessionManager {
         Ok(Session {
             id,
             resources: ResourceRegistry::new(),
+            syncs: SyncRegistry::new(),
         })
     }
 
@@ -160,6 +223,7 @@ impl SessionManager {
 pub struct Session {
     id: SessionId,
     resources: ResourceRegistry,
+    syncs: SyncRegistry,
 }
 
 impl Session {
@@ -208,8 +272,35 @@ impl Session {
             .export(request)
     }
 
+    pub fn create_sync(
+        &mut self,
+        backend: &impl SyncBackend,
+        request: &CreateSyncRequest,
+    ) -> Result<SyncCreatedResponse, SyncError> {
+        let id = self.syncs.allocate_id()?;
+        let sync = backend.create_sync(request)?;
+        self.syncs.insert(id, SyncEntry { sync });
+
+        Ok(SyncCreatedResponse { sync_id: id })
+    }
+
+    pub fn export_sync(&self, request: &ExportSyncRequest) -> Result<BackendSyncExport, SyncError> {
+        let sync = self.syncs.get(request.sync_id)?;
+        let resource = self
+            .resources
+            .get(request.resource_id)
+            .map_err(|_| SyncError::UnknownResource)?;
+
+        sync.sync
+            .export_for_resource(request, resource.resource.as_ref())
+    }
+
     pub fn resource_count(&self) -> usize {
         self.resources.len()
+    }
+
+    pub fn sync_count(&self) -> usize {
+        self.syncs.len()
     }
 }
 
@@ -274,6 +365,56 @@ struct ResourceEntry {
     resource: Box<dyn BackendResource>,
 }
 
+struct SyncRegistry {
+    next_sync_id: u64,
+    syncs: BTreeMap<SyncId, SyncEntry>,
+}
+
+impl SyncRegistry {
+    fn new() -> Self {
+        Self {
+            next_sync_id: 1,
+            syncs: BTreeMap::new(),
+        }
+    }
+
+    fn allocate_id(&mut self) -> Result<SyncId, SyncError> {
+        let id = SyncId::new(self.next_sync_id)?;
+        self.next_sync_id = self
+            .next_sync_id
+            .checked_add(1)
+            .ok_or(SyncError::SyncExportFailed)?;
+        Ok(id)
+    }
+
+    fn insert(&mut self, id: SyncId, entry: SyncEntry) {
+        self.syncs.insert(id, entry);
+    }
+
+    fn get(&self, id: SyncId) -> Result<&SyncEntry, SyncError> {
+        self.syncs.get(&id).ok_or(SyncError::UnknownSync)
+    }
+
+    fn len(&self) -> usize {
+        self.syncs.len()
+    }
+}
+
+impl Drop for SyncRegistry {
+    fn drop(&mut self) {
+        if !self.syncs.is_empty() {
+            eprintln!(
+                "qgs-core: releasing {} sync object(s) owned by session",
+                self.syncs.len()
+            );
+        }
+    }
+}
+
+struct SyncEntry {
+    sync: Box<dyn BackendSync>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,8 +422,9 @@ mod tests {
     use std::sync::Arc;
 
     use qgs_protocol::{
-        BufferUsageFlags, DeviceId, ExportResourceRequest, ExternalHandleType, ExternalSharing,
-        MemoryPreference, MAX_BUFFER_SIZE_BYTES,
+        BufferUsageFlags, CreateSyncRequest, DeviceId, ExportResourceRequest, ExportSyncRequest,
+        ExternalHandleType, ExternalSharing, MemoryPreference, SyncExportHandleType, SyncKind,
+        MAX_BUFFER_SIZE_BYTES,
     };
 
     #[test]
@@ -497,6 +639,103 @@ mod tests {
         assert_eq!(backend.drop_count.load(Ordering::Relaxed), 3);
     }
 
+    #[test]
+    fn create_sync_returns_unique_nonzero_ids() {
+        let backend = MockBackend::default();
+        let mut session = SessionManager::new().create_session().expect("session");
+
+        let first = session
+            .create_sync(&backend, &sample_sync_request())
+            .expect("first sync");
+        let second = session
+            .create_sync(&backend, &sample_sync_request())
+            .expect("second sync");
+
+        assert_ne!(first.sync_id.get(), 0);
+        assert_ne!(first.sync_id, second.sync_id);
+        assert_eq!(session.sync_count(), 2);
+    }
+
+    #[test]
+    fn unknown_sync_export_is_rejected() {
+        let session = SessionManager::new().create_session().expect("session");
+
+        let err = session
+            .export_sync(&ExportSyncRequest {
+                sync_id: SyncId::new(99).expect("sync id"),
+                resource_id: ResourceId::new(1).expect("resource id"),
+                fill_pattern: 1,
+            })
+            .expect_err("sync is unknown");
+
+        assert!(matches!(err, SyncError::UnknownSync));
+    }
+
+    #[test]
+    fn session_cannot_export_another_sessions_sync() {
+        let backend = MockBackend::default();
+        let sessions = SessionManager::new();
+        let mut first_session = sessions.create_session().expect("first session");
+        let mut second_session = sessions.create_session().expect("second session");
+        let created = first_session
+            .create_sync(&backend, &sample_sync_request())
+            .expect("sync created");
+        let buffer = second_session
+            .create_buffer(&backend, &sample_buffer_desc())
+            .expect("buffer created");
+
+        let err = second_session
+            .export_sync(&ExportSyncRequest {
+                sync_id: created.sync_id,
+                resource_id: buffer.resource_id,
+                fill_pattern: 1,
+            })
+            .expect_err("sync belongs to another session");
+
+        assert!(matches!(err, SyncError::UnknownSync));
+    }
+
+    #[test]
+    fn session_cannot_export_sync_for_another_sessions_resource() {
+        let backend = MockBackend::default();
+        let sessions = SessionManager::new();
+        let mut first_session = sessions.create_session().expect("first session");
+        let mut second_session = sessions.create_session().expect("second session");
+        let sync = first_session
+            .create_sync(&backend, &sample_sync_request())
+            .expect("sync created");
+        let buffer = second_session
+            .create_buffer(&backend, &sample_buffer_desc())
+            .expect("buffer created");
+
+        let err = first_session
+            .export_sync(&ExportSyncRequest {
+                sync_id: sync.sync_id,
+                resource_id: buffer.resource_id,
+                fill_pattern: 1,
+            })
+            .expect_err("resource belongs to another session");
+
+        assert!(matches!(err, SyncError::UnknownResource));
+    }
+
+    #[test]
+    fn dropping_session_releases_owned_syncs() {
+        let backend = MockBackend::default();
+        {
+            let mut session = SessionManager::new().create_session().expect("session");
+            session
+                .create_sync(&backend, &sample_sync_request())
+                .expect("first sync");
+            session
+                .create_sync(&backend, &sample_sync_request())
+                .expect("second sync");
+            assert_eq!(session.sync_count(), 2);
+        }
+
+        assert_eq!(backend.sync_drop_count.load(Ordering::Relaxed), 2);
+    }
+
     fn simulate_client_disconnect(backend: &MockBackend) {
         let mut session = SessionManager::new().create_session().expect("session");
         for _ in 0..3 {
@@ -516,10 +755,19 @@ mod tests {
         }
     }
 
+    fn sample_sync_request() -> CreateSyncRequest {
+        CreateSyncRequest {
+            device_id: DeviceId::new(1).expect("device id"),
+            kind: SyncKind::BinarySemaphore,
+            handle_type: SyncExportHandleType::SyncFd,
+        }
+    }
+
     #[derive(Default)]
     struct MockBackend {
         create_count: Arc<AtomicUsize>,
         drop_count: Arc<AtomicUsize>,
+        sync_drop_count: Arc<AtomicUsize>,
     }
 
     impl ResourceBackend for MockBackend {
@@ -541,13 +789,40 @@ mod tests {
         }
     }
 
+    impl SyncBackend for MockBackend {
+        fn create_sync(
+            &self,
+            _request: &CreateSyncRequest,
+        ) -> Result<Box<dyn BackendSync>, SyncError> {
+            Ok(Box::new(MockSync {
+                drop_count: Arc::clone(&self.sync_drop_count),
+            }))
+        }
+    }
+
     struct MockResource {
         drop_count: Arc<AtomicUsize>,
     }
 
-    impl BackendResource for MockResource {}
+    impl BackendResource for MockResource {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
 
     impl Drop for MockResource {
+        fn drop(&mut self) {
+            self.drop_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct MockSync {
+        drop_count: Arc<AtomicUsize>,
+    }
+
+    impl BackendSync for MockSync {}
+
+    impl Drop for MockSync {
         fn drop(&mut self) {
             self.drop_count.fetch_add(1, Ordering::Relaxed);
         }

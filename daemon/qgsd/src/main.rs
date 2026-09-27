@@ -2,14 +2,17 @@
 
 use std::path::PathBuf;
 
-use qgs_core::{DeviceDiscovery, ResourceBackend, ResourceError, Session, SessionManager};
+use qgs_core::{
+    DeviceDiscovery, ResourceBackend, ResourceError, Session, SessionManager, SyncBackend,
+    SyncError,
+};
 use qgs_linux::{
     bind_socket, default_socket_path, receive_message, remove_socket_file, send_message,
     send_message_with_attachments, TransportError,
 };
 use qgs_protocol::{
     DeviceCapabilitiesResponse, DeviceListResponse, ErrorResponse, ProtocolError,
-    ProtocolErrorCode, ResourceExportedResponse, WireMessage,
+    ProtocolErrorCode, ResourceExportedResponse, SyncExportedResponse, WireMessage,
 };
 use qgs_vulkan::VulkanDeviceDiscovery;
 
@@ -34,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn handle_client(
     stream: &mut std::os::unix::net::UnixStream,
     sessions: &SessionManager,
-    discovery: &(impl DeviceDiscovery + ResourceBackend),
+    discovery: &(impl DeviceDiscovery + ResourceBackend + SyncBackend),
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut session: Option<Session> = None;
 
@@ -43,10 +46,11 @@ fn handle_client(
             Ok(message) => message,
             Err(TransportError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
                 if let Some(session) = &session {
-                    if session.resource_count() > 0 {
+                    if session.resource_count() > 0 || session.sync_count() > 0 {
                         eprintln!(
-                            "client disconnected; releasing {} resource(s) for session {}",
+                            "client disconnected; releasing {} resource(s) and {} sync object(s) for session {}",
                             session.resource_count(),
+                            session.sync_count(),
                             session.id().get()
                         );
                     }
@@ -236,13 +240,73 @@ fn handle_client(
                     }
                 }
             }
+            WireMessage::CreateSync { request, .. } => {
+                if let Some(session) = &mut session {
+                    match session.create_sync(discovery, &request) {
+                        Ok(response) => WireMessage::SyncCreated {
+                            request_id,
+                            response,
+                        },
+                        Err(err) => {
+                            eprintln!("sync creation failed: {err}");
+                            WireMessage::Error {
+                                request_id,
+                                response: ErrorResponse {
+                                    code: protocol_code_from_sync_error(&err),
+                                },
+                            }
+                        }
+                    }
+                } else {
+                    WireMessage::Error {
+                        request_id,
+                        response: ErrorResponse {
+                            code: ProtocolErrorCode::SessionRequired,
+                        },
+                    }
+                }
+            }
+            WireMessage::ExportSync { request, .. } => {
+                if let Some(session) = &session {
+                    match session.export_sync(&request) {
+                        Ok(export) => {
+                            let message = WireMessage::SyncExported {
+                                request_id,
+                                response: SyncExportedResponse {
+                                    metadata: export.metadata,
+                                },
+                            };
+                            send_message_with_attachments(stream, &message, &[&export.handle])?;
+                            continue;
+                        }
+                        Err(err) => {
+                            eprintln!("sync export failed: {err}");
+                            WireMessage::Error {
+                                request_id,
+                                response: ErrorResponse {
+                                    code: protocol_code_from_sync_error(&err),
+                                },
+                            }
+                        }
+                    }
+                } else {
+                    WireMessage::Error {
+                        request_id,
+                        response: ErrorResponse {
+                            code: ProtocolErrorCode::SessionRequired,
+                        },
+                    }
+                }
+            }
             WireMessage::Welcome { .. }
             | WireMessage::Error { .. }
             | WireMessage::DeviceList { .. }
             | WireMessage::DeviceCapabilities { .. }
             | WireMessage::BufferCreated { .. }
             | WireMessage::ResourceDestroyed { .. }
-            | WireMessage::ResourceExported { .. } => WireMessage::Error {
+            | WireMessage::ResourceExported { .. }
+            | WireMessage::SyncCreated { .. }
+            | WireMessage::SyncExported { .. } => WireMessage::Error {
                 request_id,
                 response: ErrorResponse {
                     code: ProtocolErrorCode::from(&ProtocolError::MalformedPayload),
@@ -251,6 +315,17 @@ fn handle_client(
         };
 
         send_message(stream, &response)?;
+    }
+}
+
+fn protocol_code_from_sync_error(err: &SyncError) -> ProtocolErrorCode {
+    match err {
+        SyncError::UnknownSync => ProtocolErrorCode::UnknownSync,
+        SyncError::UnknownResource => ProtocolErrorCode::UnknownResource,
+        SyncError::UnknownDeviceId => ProtocolErrorCode::UnknownDeviceId,
+        SyncError::UnsupportedSyncHandleType => ProtocolErrorCode::UnsupportedSyncHandleType,
+        SyncError::SyncExportFailed => ProtocolErrorCode::SyncExportFailed,
+        SyncError::Protocol(err) => ProtocolErrorCode::from(err),
     }
 }
 

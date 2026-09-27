@@ -258,6 +258,22 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
+    #[test]
+    fn rejects_missing_expected_attachment() {
+        let (mut sender, mut receiver) = UnixStream::pair().expect("socket pair");
+        let message = WireMessage::EnumerateDevices { request_id: 79 };
+
+        let send_thread = thread::spawn(move || {
+            send_message(&mut sender, &message).expect("send message without fd");
+        });
+
+        let err = receive_message_with_attachments::<1>(&mut receiver)
+            .expect_err("missing attachment is rejected");
+
+        send_thread.join().expect("send thread");
+        assert!(matches!(err, TransportError::Io(_)));
+    }
+
     fn unique_socket_path() -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
