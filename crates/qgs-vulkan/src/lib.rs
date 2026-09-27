@@ -5,17 +5,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use qgs_core::{
-    BackendBufferAllocation, BackendResource, BackendResourceExport, BackendSync,
-    BackendSyncExport, DeviceDiscovery, DeviceDiscoveryError, ResourceBackend, ResourceError,
-    SyncBackend, SyncError,
+    BackendBufferAllocation, BackendImageAllocation, BackendResource, BackendResourceExport,
+    BackendSync, BackendSyncExport, DeviceDiscovery, DeviceDiscoveryError, ResourceBackend,
+    ResourceError, SyncBackend, SyncError,
 };
 use qgs_protocol::{
     ApiVersion, BackendApi, BufferDesc, BufferUsageFlags, ComputeCapabilities, CreateSyncRequest,
     DeviceCapabilities, DeviceClass, DeviceDesc, DeviceId, ExportResourceRequest,
     ExportSyncRequest, ExportedResourceMetadata, ExportedSyncMetadata, ExternalHandleType,
-    ExternalSharing, InteropCapabilities, MemoryCapabilities, MemoryHeapDesc,
-    SelectedMemoryProperties, SyncExportHandleType, SyncKind, MAX_DEVICE_COUNT,
-    MAX_DEVICE_NAME_LEN, MAX_MEMORY_HEAP_COUNT, MAX_MEMORY_TYPE_COUNT,
+    ExternalSharing, ImageDesc, ImageUsageFlags, InteropCapabilities, MemoryCapabilities,
+    MemoryHeapDesc, PixelFormat, ResourceKind, SelectedMemoryProperties, SyncExportHandleType,
+    SyncKind, MAX_DEVICE_COUNT, MAX_DEVICE_NAME_LEN, MAX_MEMORY_HEAP_COUNT, MAX_MEMORY_TYPE_COUNT,
 };
 use vulkano::buffer::{
     Buffer, BufferCreateInfo, BufferMemory, BufferUsage, ExternalBufferInfo, RawBuffer, Subbuffer,
@@ -24,14 +24,22 @@ use vulkano::command_buffer::allocator::{
     StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo,
 };
 use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferSubmitInfo, CommandBufferUsage, CopyBufferInfo,
-    PrimaryAutoCommandBuffer, SemaphoreSubmitInfo, SubmitInfo,
+    AutoCommandBufferBuilder, ClearColorImageInfo, CommandBufferSubmitInfo, CommandBufferUsage,
+    CopyBufferInfo, CopyImageToBufferInfo, PrimaryAutoCommandBuffer, SemaphoreSubmitInfo,
+    SubmitInfo,
 };
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
+};
+use vulkano::format::{ClearColorValue, Format};
+use vulkano::image::sys::RawImage;
+use vulkano::image::view::ImageView;
+use vulkano::image::{
+    Image, ImageCreateInfo, ImageDrmFormatModifierInfo, ImageFormatInfo, ImageMemory, ImageTiling,
+    ImageType, ImageUsage, SampleCount,
 };
 use vulkano::instance::{Instance, InstanceCreateInfo};
 use vulkano::memory::allocator::{
@@ -71,6 +79,19 @@ const COMPUTE_INCREMENT_SHADER: [u32; 136] = [
     10, 4, 196638, 11, 10, 262176, 12, 12, 11, 262203, 12, 13, 12, 262176, 14, 1, 4, 262176, 15,
     12, 4, 327734, 2, 1, 0, 3, 131320, 16, 327745, 14, 17, 9, 6, 262205, 4, 18, 17, 393281, 15, 19,
     13, 6, 18, 262205, 4, 20, 19, 327808, 4, 21, 20, 5, 196670, 19, 21, 65789, 65592,
+];
+const IMAGE_INVERT_SHADER: [u32; 208] = [
+    119734787, 65536, 0, 35, 0, 131089, 1, 196622, 0, 1, 393231, 5, 3, 1852399981, 0, 11, 393232,
+    3, 17, 8, 8, 1, 196611, 2, 450, 262149, 3, 1852399981, 0, 524293, 11, 1197436007, 1633841004,
+    1986939244, 1952539503, 1231974249, 68, 196613, 14, 6778217, 262215, 11, 11, 28, 262215, 14,
+    34, 0, 262215, 14, 33, 0, 131091, 1, 196641, 2, 1, 262165, 4, 32, 0, 262165, 5, 32, 1, 196630,
+    6, 32, 262167, 7, 4, 3, 262167, 8, 5, 2, 262167, 9, 6, 4, 262176, 10, 1, 7, 262203, 10, 11, 1,
+    589849, 12, 6, 1, 0, 0, 0, 2, 4, 262176, 13, 0, 12, 262203, 13, 14, 0, 262187, 4, 15, 0,
+    262187, 4, 16, 1, 262187, 6, 17, 1065353216, 327734, 1, 3, 0, 2, 131320, 18, 262205, 7, 19, 11,
+    327761, 4, 20, 19, 0, 327761, 4, 21, 19, 1, 262268, 5, 22, 20, 262268, 5, 23, 21, 327760, 8,
+    24, 22, 23, 262205, 12, 25, 14, 327778, 9, 26, 25, 24, 327761, 6, 27, 26, 0, 327761, 6, 28, 26,
+    1, 327761, 6, 29, 26, 2, 327761, 6, 30, 26, 3, 327816, 6, 31, 17, 27, 327816, 6, 32, 17, 28,
+    327816, 6, 33, 17, 29, 458832, 9, 34, 31, 32, 33, 30, 262243, 25, 24, 34, 65789, 65592,
 ];
 
 #[derive(Debug)]
@@ -122,6 +143,7 @@ impl VulkanDeviceDiscovery {
                 khr_dedicated_allocation: supported_extensions.khr_dedicated_allocation,
                 khr_external_semaphore: supported_extensions.khr_external_semaphore,
                 khr_external_semaphore_fd: supported_extensions.khr_external_semaphore_fd,
+                ext_image_drm_format_modifier: supported_extensions.ext_image_drm_format_modifier,
                 ..DeviceExtensions::empty()
             };
             let (logical_device, mut queues) = Device::new(
@@ -187,7 +209,10 @@ impl VulkanDeviceDiscovery {
             .find(|device| device_matches_export_source(&device.desc, source_device))
             .ok_or(ResourceError::UnknownDeviceId)?;
 
-        let usage = map_buffer_usage(metadata.usage)?;
+        if metadata.kind != ResourceKind::Buffer {
+            return Err(ResourceError::ExportFailed);
+        }
+        let usage = map_buffer_usage(metadata.buffer_usage.ok_or(ResourceError::ExportFailed)?)?;
         let handle_type = map_external_handle_type(metadata.handle_type)?;
         validate_external_buffer_support(device, usage, handle_type)?;
 
@@ -282,7 +307,14 @@ impl VulkanDeviceDiscovery {
             .find(|device| device_matches_export_source(&device.desc, source_device))
             .ok_or(ResourceError::UnknownDeviceId)?;
 
-        let usage = map_buffer_usage(resource_metadata.usage)?;
+        if resource_metadata.kind != ResourceKind::Buffer {
+            return Err(ResourceError::ExportFailed);
+        }
+        let usage = map_buffer_usage(
+            resource_metadata
+                .buffer_usage
+                .ok_or(ResourceError::ExportFailed)?,
+        )?;
         let handle_type = map_external_handle_type(resource_metadata.handle_type)?;
         validate_external_buffer_support(device, usage, handle_type)?;
         validate_sync_fd_support(device).map_err(|_| ResourceError::ExportFailed)?;
@@ -348,7 +380,11 @@ impl VulkanDeviceDiscovery {
             || resource_metadata.size_bytes == 0
             || resource_metadata.allocation_size_bytes < resource_metadata.size_bytes
             || resource_metadata.attachment_count != 1
-            || !resource_metadata.usage.contains(BufferUsageFlags::STORAGE)
+            || resource_metadata.kind != ResourceKind::Buffer
+            || !resource_metadata
+                .buffer_usage
+                .ok_or(ResourceError::ExportFailed)?
+                .contains(BufferUsageFlags::STORAGE)
         {
             return Err(ResourceError::ExportFailed);
         }
@@ -367,7 +403,11 @@ impl VulkanDeviceDiscovery {
             return Err(ResourceError::UnsupportedMemoryRequirements);
         }
 
-        let usage = map_buffer_usage(resource_metadata.usage)?;
+        let usage = map_buffer_usage(
+            resource_metadata
+                .buffer_usage
+                .ok_or(ResourceError::ExportFailed)?,
+        )?;
         let handle_type = map_external_handle_type(resource_metadata.handle_type)?;
         validate_external_buffer_support(device, usage, handle_type)?;
         validate_sync_fd_support(device).map_err(|_| ResourceError::ExportFailed)?;
@@ -400,6 +440,128 @@ impl VulkanDeviceDiscovery {
             input_values,
             input_bytes,
         )
+    }
+
+    pub fn import_wait_and_run_image_invert_proof(
+        &self,
+        source_device: &DeviceDesc,
+        resource_metadata: &ExportedResourceMetadata,
+        resource_handle: File,
+        sync_metadata: &ExportedSyncMetadata,
+        sync_handle: File,
+        input_pixels: &[u8],
+    ) -> Result<Vec<u8>, ResourceError> {
+        if sync_metadata.handle_type != SyncExportHandleType::SyncFd
+            || sync_metadata.attachment_count != 1
+        {
+            return Err(ResourceError::ExportFailed);
+        }
+        if resource_metadata.kind != ResourceKind::Image
+            || resource_metadata.device_id != source_device.id
+            || resource_metadata.attachment_count != 1
+        {
+            return Err(ResourceError::ExportFailed);
+        }
+        let width = resource_metadata
+            .image_width
+            .ok_or(ResourceError::ExportFailed)?;
+        let height = resource_metadata
+            .image_height
+            .ok_or(ResourceError::ExportFailed)?;
+        if !width.is_multiple_of(8) || !height.is_multiple_of(8) {
+            return Err(ResourceError::InvalidImageDimensions);
+        }
+        let format = resource_metadata
+            .pixel_format
+            .ok_or(ResourceError::ExportFailed)?;
+        let image_usage = resource_metadata
+            .image_usage
+            .ok_or(ResourceError::ExportFailed)?;
+        let expected_len =
+            qgs_protocol::image_byte_len(width, height, format).map_err(ResourceError::from)?;
+        if input_pixels.len() as u64 != expected_len {
+            return Err(ResourceError::InvalidImageDimensions);
+        }
+
+        let device = self
+            .devices
+            .iter()
+            .find(|device| device_matches_export_source(&device.desc, source_device))
+            .ok_or(ResourceError::UnknownDeviceId)?;
+        let supports_compute = device
+            .physical_device
+            .queue_family_properties()
+            .get(device.queue.queue_family_index() as usize)
+            .is_some_and(|queue| queue.queue_flags.intersects(QueueFlags::COMPUTE));
+        if !supports_compute {
+            return Err(ResourceError::UnsupportedMemoryRequirements);
+        }
+
+        let vk_format = map_pixel_format(format)?;
+        let usage = map_image_usage(image_usage)?;
+        let handle_type = map_external_handle_type(resource_metadata.handle_type)?;
+        let (tiling, drm_format_modifiers) = if handle_type == ExternalMemoryHandleType::DmaBuf {
+            if let Some(modifier) = resource_metadata.backend_image_layout_token {
+                validate_external_image_support(
+                    device,
+                    vk_format,
+                    usage,
+                    ImageTiling::DrmFormatModifier,
+                    Some(modifier),
+                    handle_type,
+                )?;
+                (ImageTiling::DrmFormatModifier, vec![modifier])
+            } else {
+                validate_external_image_support(
+                    device,
+                    vk_format,
+                    usage,
+                    ImageTiling::Linear,
+                    None,
+                    handle_type,
+                )?;
+                (ImageTiling::Linear, Vec::new())
+            }
+        } else {
+            validate_external_image_support(
+                device,
+                vk_format,
+                usage,
+                ImageTiling::Optimal,
+                None,
+                handle_type,
+            )?;
+            (ImageTiling::Optimal, Vec::new())
+        };
+        validate_sync_fd_support(device).map_err(|_| ResourceError::ExportFailed)?;
+
+        let imported_image = import_external_image(
+            device,
+            ImportedImageInfo {
+                metadata: resource_metadata,
+                format: vk_format,
+                usage,
+                tiling,
+                drm_format_modifiers,
+                handle_type,
+                handle: resource_handle,
+            },
+        )?;
+        let imported_semaphore = Semaphore::new(
+            device.logical_device.clone(),
+            SemaphoreCreateInfo::default(),
+        )
+        .map_err(|err| {
+            eprintln!("vulkan image sync import semaphore creation failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+        let imported_semaphore = Arc::new(imported_semaphore);
+        external_sync::import_sync_fd(&imported_semaphore, sync_handle).map_err(|err| {
+            eprintln!("vulkan image sync-fd import failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+
+        run_image_invert_proof(device, imported_image, imported_semaphore, input_pixels)
     }
 }
 
@@ -489,6 +651,81 @@ impl ResourceBackend for VulkanDeviceDiscovery {
             selected_memory,
         })
     }
+
+    fn create_image(&self, desc: &ImageDesc) -> Result<BackendImageAllocation, ResourceError> {
+        desc.validate()?;
+        let device = self
+            .devices
+            .iter()
+            .find(|device| device.desc.id == desc.device_id)
+            .ok_or(ResourceError::UnknownDeviceId)?;
+
+        let format = map_pixel_format(desc.format)?;
+        let usage = map_image_usage(desc.usage)?;
+        let (external_handle_types, tiling, drm_format_modifiers) = match desc.external_sharing {
+            ExternalSharing::None => (
+                ExternalMemoryHandleTypes::empty(),
+                ImageTiling::Optimal,
+                Vec::new(),
+            ),
+            ExternalSharing::Required { handle_type } => {
+                let handle_type = map_external_handle_type(handle_type)?;
+                let (tiling, drm_format_modifiers) =
+                    external_image_layout(device, format, usage, handle_type)?;
+                (
+                    ExternalMemoryHandleTypes::from(handle_type),
+                    tiling,
+                    drm_format_modifiers,
+                )
+            }
+        };
+        let allocator = if external_handle_types.is_empty() {
+            device.memory_allocator.clone()
+        } else {
+            Arc::new(export_memory_allocator(
+                device.logical_device.clone(),
+                external_handle_types,
+            ))
+        };
+        let image = Image::new(
+            allocator,
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format,
+                extent: [desc.width, desc.height, 1],
+                usage,
+                tiling,
+                samples: SampleCount::Sample1,
+                drm_format_modifiers,
+                external_memory_handle_types: external_handle_types,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                allocate_preference: if external_handle_types.is_empty() {
+                    MemoryAllocatePreference::Unknown
+                } else {
+                    MemoryAllocatePreference::AlwaysAllocate
+                },
+                ..Default::default()
+            },
+        )
+        .map_err(|err| {
+            eprintln!("vulkan image allocation failed: {err}");
+            ResourceError::AllocationFailed
+        })?;
+
+        let selected_memory = selected_image_memory_properties(&device.physical_device, &image)?;
+
+        Ok(BackendImageAllocation {
+            resource: Box::new(VulkanImageResource {
+                image,
+                desc: desc.clone(),
+                selected_memory,
+            }),
+            selected_memory,
+        })
+    }
 }
 
 impl SyncBackend for VulkanDeviceDiscovery {
@@ -549,6 +786,13 @@ struct VulkanBufferResource {
     selected_memory: SelectedMemoryProperties,
 }
 
+#[derive(Debug)]
+struct VulkanImageResource {
+    image: Arc<Image>,
+    desc: ImageDesc,
+    selected_memory: SelectedMemoryProperties,
+}
+
 struct VulkanSyncResource {
     device_id: DeviceId,
     handle_type: SyncExportHandleType,
@@ -572,21 +816,32 @@ impl BackendSync for VulkanSyncResource {
             return Err(SyncError::SyncExportFailed);
         }
 
-        let buffer = resource
-            .as_any()
-            .downcast_ref::<VulkanBufferResource>()
-            .ok_or(SyncError::SyncExportFailed)?;
-        if buffer.desc.device_id != self.device_id {
-            return Err(SyncError::UnknownResource);
-        }
-
-        let command_buffer = submit_gpu_fill(
-            self.command_allocator.clone(),
-            self.queue.clone(),
-            buffer.buffer.clone(),
-            self.semaphore.clone(),
-            request.fill_pattern,
-        )?;
+        let command_buffer =
+            if let Some(buffer) = resource.as_any().downcast_ref::<VulkanBufferResource>() {
+                if buffer.desc.device_id != self.device_id {
+                    return Err(SyncError::UnknownResource);
+                }
+                submit_gpu_fill(
+                    self.command_allocator.clone(),
+                    self.queue.clone(),
+                    buffer.buffer.clone(),
+                    self.semaphore.clone(),
+                    request.fill_pattern,
+                )?
+            } else if let Some(image) = resource.as_any().downcast_ref::<VulkanImageResource>() {
+                if image.desc.device_id != self.device_id {
+                    return Err(SyncError::UnknownResource);
+                }
+                submit_gpu_image_clear(
+                    self.command_allocator.clone(),
+                    self.queue.clone(),
+                    image.image.clone(),
+                    self.semaphore.clone(),
+                    request.fill_pattern,
+                )?
+            } else {
+                return Err(SyncError::SyncExportFailed);
+            };
         self.pending_command_buffers
             .lock()
             .map_err(|_| SyncError::SyncExportFailed)?
@@ -647,10 +902,86 @@ impl BackendResource for VulkanBufferResource {
             metadata: ExportedResourceMetadata {
                 resource_id: request.resource_id,
                 device_id: self.desc.device_id,
+                kind: ResourceKind::Buffer,
                 size_bytes: self.desc.size_bytes,
                 allocation_size_bytes,
-                usage: self.desc.usage,
+                buffer_usage: Some(self.desc.usage),
+                image_width: None,
+                image_height: None,
+                pixel_format: None,
+                image_usage: None,
                 backend_memory_type_index: memory_type_index,
+                backend_image_layout_token: None,
+                handle_type,
+                selected_memory: self.selected_memory,
+                dedicated_allocation,
+                attachment_count: 1,
+            },
+            handle,
+        })
+    }
+}
+
+impl BackendResource for VulkanImageResource {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn export(
+        &self,
+        request: &ExportResourceRequest,
+    ) -> Result<BackendResourceExport, ResourceError> {
+        let ExternalSharing::Required { handle_type } = self.desc.external_sharing else {
+            return Err(ResourceError::ResourceNotExportable);
+        };
+        if request.handle_type != handle_type {
+            return Err(ResourceError::UnsupportedExternalHandleType);
+        }
+
+        let (memory_type_index, allocation_size_bytes, dedicated_allocation) =
+            image_memory_export_info(&self.image)?;
+        let backend_image_layout_token = if handle_type == ExternalHandleType::DmaBuf {
+            self.image
+                .drm_format_modifier()
+                .map(|(modifier, _)| modifier)
+        } else {
+            None
+        };
+        let vk_handle_type = map_external_handle_type(handle_type)?;
+        let handle = match self.image.memory() {
+            ImageMemory::Normal(memory) => memory
+                .first()
+                .ok_or(ResourceError::ExportFailed)?
+                .device_memory()
+                .export_fd(vk_handle_type)
+                .map_err(|err| {
+                    eprintln!("vulkan image memory export failed: {err}");
+                    ResourceError::ExportFailed
+                })?,
+            ImageMemory::Sparse | ImageMemory::Swapchain { .. } | ImageMemory::External => {
+                return Err(ResourceError::ExportFailed);
+            }
+            _ => return Err(ResourceError::ExportFailed),
+        };
+
+        Ok(BackendResourceExport {
+            metadata: ExportedResourceMetadata {
+                resource_id: request.resource_id,
+                device_id: self.desc.device_id,
+                kind: ResourceKind::Image,
+                size_bytes: qgs_protocol::image_byte_len(
+                    self.desc.width,
+                    self.desc.height,
+                    self.desc.format,
+                )?,
+                allocation_size_bytes,
+                buffer_usage: None,
+                image_width: Some(self.desc.width),
+                image_height: Some(self.desc.height),
+                pixel_format: Some(self.desc.format),
+                image_usage: Some(self.desc.usage),
+                backend_memory_type_index: memory_type_index,
+                backend_image_layout_token,
                 handle_type,
                 selected_memory: self.selected_memory,
                 dedicated_allocation,
@@ -809,6 +1140,31 @@ fn map_buffer_usage(usage: BufferUsageFlags) -> Result<BufferUsage, ResourceErro
     }
 }
 
+fn map_pixel_format(format: PixelFormat) -> Result<Format, ResourceError> {
+    match format {
+        PixelFormat::Rgba8Unorm => Ok(Format::R8G8B8A8_UNORM),
+    }
+}
+
+fn map_image_usage(usage: ImageUsageFlags) -> Result<ImageUsage, ResourceError> {
+    let mut mapped = ImageUsage::empty();
+    if usage.contains(ImageUsageFlags::TRANSFER_SRC) {
+        mapped |= ImageUsage::TRANSFER_SRC;
+    }
+    if usage.contains(ImageUsageFlags::TRANSFER_DST) {
+        mapped |= ImageUsage::TRANSFER_DST;
+    }
+    if usage.contains(ImageUsageFlags::STORAGE) {
+        mapped |= ImageUsage::STORAGE;
+    }
+
+    if mapped.is_empty() {
+        Err(ResourceError::UnsupportedImageUsage)
+    } else {
+        Ok(mapped)
+    }
+}
+
 fn map_memory_preference(desc: &BufferDesc) -> MemoryTypeFilter {
     let preference = desc.memory_preference;
     let mut filter = MemoryTypeFilter::empty();
@@ -833,6 +1189,35 @@ fn selected_memory_properties(
     let memory_type_index = match buffer.buffer().memory() {
         BufferMemory::Normal(memory) => memory.device_memory().memory_type_index(),
         BufferMemory::Sparse | BufferMemory::External => {
+            return Err(ResourceError::AllocationFailed);
+        }
+        _ => return Err(ResourceError::AllocationFailed),
+    };
+    let memory_type = physical_device
+        .memory_properties()
+        .memory_types
+        .get(memory_type_index as usize)
+        .ok_or(ResourceError::AllocationFailed)?;
+    let flags = memory_type.property_flags;
+
+    Ok(SelectedMemoryProperties {
+        device_local: flags.intersects(MemoryPropertyFlags::DEVICE_LOCAL),
+        host_visible: flags.intersects(MemoryPropertyFlags::HOST_VISIBLE),
+        host_coherent: flags.intersects(MemoryPropertyFlags::HOST_COHERENT),
+    })
+}
+
+fn selected_image_memory_properties(
+    physical_device: &PhysicalDevice,
+    image: &Image,
+) -> Result<SelectedMemoryProperties, ResourceError> {
+    let memory_type_index = match image.memory() {
+        ImageMemory::Normal(memory) => memory
+            .first()
+            .ok_or(ResourceError::AllocationFailed)?
+            .device_memory()
+            .memory_type_index(),
+        ImageMemory::Sparse | ImageMemory::Swapchain { .. } | ImageMemory::External => {
             return Err(ResourceError::AllocationFailed);
         }
         _ => return Err(ResourceError::AllocationFailed),
@@ -883,6 +1268,82 @@ fn validate_external_buffer_support(
             eprintln!("vulkan external-buffer property query failed: {err}");
             ResourceError::UnsupportedExternalHandleType
         })?;
+
+    if !properties.external_memory_properties.exportable
+        || !properties.external_memory_properties.importable
+    {
+        return Err(ResourceError::ResourceNotExportable);
+    }
+
+    Ok(())
+}
+
+fn external_image_layout(
+    device: &RegisteredDevice,
+    format: Format,
+    usage: ImageUsage,
+    handle_type: ExternalMemoryHandleType,
+) -> Result<(ImageTiling, Vec<u64>), ResourceError> {
+    if handle_type == ExternalMemoryHandleType::DmaBuf {
+        validate_external_image_support(
+            device,
+            format,
+            usage,
+            ImageTiling::Linear,
+            None,
+            handle_type,
+        )?;
+        return Ok((ImageTiling::Linear, Vec::new()));
+    }
+
+    validate_external_image_support(
+        device,
+        format,
+        usage,
+        ImageTiling::Optimal,
+        None,
+        handle_type,
+    )?;
+    Ok((ImageTiling::Optimal, Vec::new()))
+}
+
+fn validate_external_image_support(
+    device: &RegisteredDevice,
+    format: Format,
+    usage: ImageUsage,
+    tiling: ImageTiling,
+    drm_format_modifier: Option<u64>,
+    handle_type: ExternalMemoryHandleType,
+) -> Result<(), ResourceError> {
+    let extensions = device.logical_device.enabled_extensions();
+    if !extensions.khr_external_memory_fd {
+        return Err(ResourceError::UnsupportedExternalHandleType);
+    }
+    if handle_type == ExternalMemoryHandleType::DmaBuf && !extensions.ext_external_memory_dma_buf {
+        return Err(ResourceError::UnsupportedExternalHandleType);
+    }
+
+    let properties = device
+        .physical_device
+        .image_format_properties(ImageFormatInfo {
+            format,
+            image_type: ImageType::Dim2d,
+            tiling,
+            usage,
+            drm_format_modifier_info: drm_format_modifier.map(|drm_format_modifier| {
+                ImageDrmFormatModifierInfo {
+                    drm_format_modifier,
+                    ..Default::default()
+                }
+            }),
+            external_memory_handle_type: Some(handle_type),
+            ..Default::default()
+        })
+        .map_err(|err| {
+            eprintln!("vulkan external-image property query failed: {err}");
+            ResourceError::UnsupportedImageExternalSharing
+        })?
+        .ok_or(ResourceError::UnsupportedImageExternalSharing)?;
 
     if !properties.external_memory_properties.exportable
         || !properties.external_memory_properties.importable
@@ -959,6 +1420,50 @@ fn submit_gpu_fill(
     Ok(command_buffer)
 }
 
+fn submit_gpu_image_clear(
+    command_allocator: Arc<StandardCommandBufferAllocator>,
+    queue: Arc<Queue>,
+    image: Arc<Image>,
+    signal_semaphore: Arc<Semaphore>,
+    pattern: u32,
+) -> Result<Arc<PrimaryAutoCommandBuffer>, SyncError> {
+    let r = f32::from((pattern & 0xff) as u8) / 255.0;
+    let g = f32::from(((pattern >> 8) & 0xff) as u8) / 255.0;
+    let b = f32::from(((pattern >> 16) & 0xff) as u8) / 255.0;
+    let a = f32::from(((pattern >> 24) & 0xff) as u8) / 255.0;
+    let mut builder = AutoCommandBufferBuilder::primary(
+        command_allocator,
+        queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
+    )
+    .map_err(|err| {
+        eprintln!("vulkan image producer command buffer creation failed: {err}");
+        SyncError::SyncExportFailed
+    })?;
+    let mut clear = ClearColorImageInfo::image(image);
+    clear.clear_value = ClearColorValue::Float([r, g, b, a]);
+    builder.clear_color_image(clear).map_err(|err| {
+        eprintln!("vulkan image producer clear command recording failed: {err}");
+        SyncError::SyncExportFailed
+    })?;
+    let command_buffer = builder.build().map_err(|err| {
+        eprintln!("vulkan image producer command buffer build failed: {err}");
+        SyncError::SyncExportFailed
+    })?;
+
+    let submit = SubmitInfo {
+        command_buffers: vec![CommandBufferSubmitInfo::new(command_buffer.clone())],
+        signal_semaphores: vec![SemaphoreSubmitInfo::new(signal_semaphore)],
+        ..Default::default()
+    };
+    external_sync::submit_queue(&queue, &[submit], None).map_err(|err| {
+        eprintln!("vulkan image producer queue submit failed: {err}");
+        SyncError::SyncExportFailed
+    })?;
+
+    Ok(command_buffer)
+}
+
 fn import_external_buffer(
     device: &RegisteredDevice,
     metadata: &ExportedResourceMetadata,
@@ -1018,6 +1523,80 @@ fn import_external_buffer(
             ResourceError::ExportFailed
         })?;
     Ok(Subbuffer::from(Arc::new(imported_buffer)))
+}
+
+struct ImportedImageInfo<'a> {
+    metadata: &'a ExportedResourceMetadata,
+    format: Format,
+    usage: ImageUsage,
+    tiling: ImageTiling,
+    drm_format_modifiers: Vec<u64>,
+    handle_type: ExternalMemoryHandleType,
+    handle: File,
+}
+
+fn import_external_image(
+    device: &RegisteredDevice,
+    info: ImportedImageInfo<'_>,
+) -> Result<Arc<Image>, ResourceError> {
+    let ImportedImageInfo {
+        metadata,
+        format,
+        usage,
+        tiling,
+        drm_format_modifiers,
+        handle_type,
+        handle,
+    } = info;
+    let width = metadata.image_width.ok_or(ResourceError::ExportFailed)?;
+    let height = metadata.image_height.ok_or(ResourceError::ExportFailed)?;
+    let raw_image = RawImage::new(
+        device.logical_device.clone(),
+        ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format,
+            extent: [width, height, 1],
+            usage,
+            tiling,
+            samples: SampleCount::Sample1,
+            drm_format_modifiers,
+            external_memory_handle_types: ExternalMemoryHandleTypes::from(handle_type),
+            ..Default::default()
+        },
+    )
+    .map_err(|err| {
+        eprintln!("vulkan import raw-image creation failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+
+    let dedicated_allocation = metadata
+        .dedicated_allocation
+        .then_some(DedicatedAllocation::Image(&raw_image));
+    let imported_memory = external_memory::import_device_memory(
+        device.logical_device.clone(),
+        MemoryAllocateInfo {
+            allocation_size: metadata.allocation_size_bytes,
+            memory_type_index: metadata.backend_memory_type_index,
+            dedicated_allocation,
+            ..Default::default()
+        },
+        MemoryImportInfo::Fd {
+            handle_type,
+            file: handle,
+        },
+    )
+    .map_err(|err| {
+        eprintln!("vulkan external image memory import failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+
+    let imported_image = raw_image
+        .bind_memory([ResourceMemory::new_dedicated(imported_memory)])
+        .map_err(|(err, _, _)| {
+            eprintln!("vulkan imported image memory bind failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+    Ok(Arc::new(imported_image))
 }
 
 fn validate_synced_gpu_copy(
@@ -1097,6 +1676,152 @@ fn validate_synced_gpu_copy(
     } else {
         Err(ResourceError::ExportFailed)
     }
+}
+
+fn run_image_invert_proof(
+    device: &RegisteredDevice,
+    imported_image: Arc<Image>,
+    wait_semaphore: Arc<Semaphore>,
+    input_pixels: &[u8],
+) -> Result<Vec<u8>, ResourceError> {
+    let readback = Buffer::new_slice::<u8>(
+        device.memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+            ..Default::default()
+        },
+        input_pixels.len() as u64,
+    )
+    .map_err(|err| {
+        eprintln!("vulkan image readback allocation failed: {err}");
+        ResourceError::AllocationFailed
+    })?;
+
+    let shader =
+        external_compute::create_shader_module(device.logical_device.clone(), &IMAGE_INVERT_SHADER)
+            .map_err(|err| {
+                eprintln!("vulkan image shader module creation failed: {err}");
+                ResourceError::ExportFailed
+            })?;
+    let entry_point = shader
+        .entry_point("main")
+        .ok_or(ResourceError::ExportFailed)?;
+    let stage = PipelineShaderStageCreateInfo::new(entry_point);
+    let layout = PipelineLayout::new(
+        device.logical_device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
+            .into_pipeline_layout_create_info(device.logical_device.clone())
+            .map_err(|err| {
+                eprintln!("vulkan image pipeline layout reflection failed: {err}");
+                ResourceError::ExportFailed
+            })?,
+    )
+    .map_err(|err| {
+        eprintln!("vulkan image pipeline layout creation failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    let pipeline = ComputePipeline::new(
+        device.logical_device.clone(),
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .map_err(|err| {
+        eprintln!("vulkan image compute pipeline creation failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    let image_view = ImageView::new_default(imported_image.clone()).map_err(|err| {
+        eprintln!("vulkan image view creation failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    let descriptor_set = DescriptorSet::new(
+        device.descriptor_set_allocator.clone(),
+        pipeline.layout().set_layouts()[0].clone(),
+        [WriteDescriptorSet::image_view(0, image_view)],
+        [],
+    )
+    .map_err(|err| {
+        eprintln!("vulkan image descriptor set creation failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+
+    let mut builder = AutoCommandBufferBuilder::primary(
+        device.command_allocator.clone(),
+        device.queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
+    )
+    .map_err(|err| {
+        eprintln!("vulkan image command buffer creation failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    builder
+        .bind_pipeline_compute(pipeline.clone())
+        .map_err(|err| {
+            eprintln!("vulkan image pipeline bind failed: {err}");
+            ResourceError::ExportFailed
+        })?
+        .bind_descriptor_sets(
+            PipelineBindPoint::Compute,
+            pipeline.layout().clone(),
+            0,
+            descriptor_set,
+        )
+        .map_err(|err| {
+            eprintln!("vulkan image descriptor bind failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+    let extent = imported_image.extent();
+    let groups_x = extent[0].div_ceil(8);
+    let groups_y = extent[1].div_ceil(8);
+    external_compute::dispatch_compute(&mut builder, [groups_x, groups_y, 1]).map_err(|err| {
+        eprintln!("vulkan image dispatch recording failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    builder
+        .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
+            imported_image,
+            readback.clone(),
+        ))
+        .map_err(|err| {
+            eprintln!("vulkan image readback copy recording failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+
+    let command_buffer = builder.build().map_err(|err| {
+        eprintln!("vulkan image command buffer build failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    let fence = Arc::new(
+        Fence::new(device.logical_device.clone(), FenceCreateInfo::default()).map_err(|err| {
+            eprintln!("vulkan image fence creation failed: {err}");
+            ResourceError::ExportFailed
+        })?,
+    );
+    let submit = SubmitInfo {
+        wait_semaphores: vec![SemaphoreSubmitInfo::new(wait_semaphore)],
+        command_buffers: vec![CommandBufferSubmitInfo::new(command_buffer)],
+        ..Default::default()
+    };
+    external_sync::submit_queue(&device.queue, &[submit], Some(&fence)).map_err(|err| {
+        eprintln!("vulkan image queue submit failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    fence
+        .wait(Some(std::time::Duration::from_secs(5)))
+        .map_err(|err| {
+            eprintln!("vulkan image fence wait failed: {err}");
+            ResourceError::ExportFailed
+        })?;
+
+    let read = readback.read().map_err(|err| {
+        eprintln!("vulkan image readback map failed: {err}");
+        ResourceError::ExportFailed
+    })?;
+    Ok(read.to_vec())
 }
 
 fn run_compute_increment_proof(
@@ -1310,6 +2035,23 @@ fn buffer_memory_export_info(buffer: &Subbuffer<[u8]>) -> Result<(u32, u64, bool
             memory.device_memory().is_dedicated(),
         )),
         BufferMemory::Sparse | BufferMemory::External => Err(ResourceError::ExportFailed),
+        _ => Err(ResourceError::ExportFailed),
+    }
+}
+
+fn image_memory_export_info(image: &Image) -> Result<(u32, u64, bool), ResourceError> {
+    match image.memory() {
+        ImageMemory::Normal(memory) => {
+            let memory = memory.first().ok_or(ResourceError::ExportFailed)?;
+            Ok((
+                memory.device_memory().memory_type_index(),
+                memory.device_memory().allocation_size(),
+                memory.device_memory().is_dedicated(),
+            ))
+        }
+        ImageMemory::Sparse | ImageMemory::Swapchain { .. } | ImageMemory::External => {
+            Err(ResourceError::ExportFailed)
+        }
         _ => Err(ResourceError::ExportFailed),
     }
 }

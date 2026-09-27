@@ -9,15 +9,18 @@ use qgs_linux::{
     send_message,
 };
 use qgs_protocol::{
-    BufferDesc, BufferUsageFlags, CreateBufferRequest, CreateSyncRequest, DestroyResourceRequest,
-    DeviceCapabilities, DeviceClass, DeviceDesc, ErrorResponse, ExportResourceRequest,
-    ExportSyncRequest, ExternalHandleType, ExternalSharing, HelloRequest, MemoryPreference,
-    QueryDeviceCapabilitiesRequest, ResourceId, SelectedMemoryProperties, SyncExportHandleType,
-    SyncId, SyncKind, WireMessage, CURRENT_PROTOCOL_VERSION,
+    BufferDesc, BufferUsageFlags, CreateBufferRequest, CreateImageRequest, CreateSyncRequest,
+    DestroyResourceRequest, DeviceCapabilities, DeviceClass, DeviceDesc, ErrorResponse,
+    ExportResourceRequest, ExportSyncRequest, ExternalHandleType, ExternalSharing, HelloRequest,
+    ImageDesc, ImageUsageFlags, MemoryPreference, PixelFormat, QueryDeviceCapabilitiesRequest,
+    ResourceId, SelectedMemoryProperties, SyncExportHandleType, SyncId, SyncKind, WireMessage,
+    CURRENT_PROTOCOL_VERSION,
 };
 use qgs_vulkan::VulkanDeviceDiscovery;
 
 const DEMO_BUFFER_SIZE: u64 = 1024 * 1024;
+const IMAGE_PROOF_WIDTH: u32 = 64;
+const IMAGE_PROOF_HEIGHT: u32 = 64;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = socket_path_from_args();
@@ -153,8 +156,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
 
+    println!("Image processing proof:");
+    for device in &physical_devices {
+        request_id = test_image_processing_proof(&mut stream, request_id, device)?;
+        println!();
+    }
+
     if let Some(device) = physical_devices.first().copied() {
-        println!("Creating transient buffers for disconnect cleanup on:");
+        println!("Creating transient resources for disconnect cleanup on:");
         println!("[{:?}] {}", device.class, device.name);
         for _ in 0..3 {
             request_id += 1;
@@ -166,7 +175,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ExternalSharing::None,
             )?;
         }
-        println!("Leaving 3 transient buffers alive and disconnecting.");
+        request_id += 1;
+        let _ = create_image(
+            &mut stream,
+            request_id,
+            device,
+            IMAGE_PROOF_WIDTH,
+            IMAGE_PROOF_HEIGHT,
+            ExternalSharing::None,
+        )?;
+        println!("Leaving 3 transient buffers and 1 transient image alive and disconnecting.");
     }
 
     Ok(())
@@ -356,6 +374,112 @@ fn create_host_visible_external_buffer(
             Ok(Err(response))
         }
         _ => Err("expected BUFFER_CREATED or ERROR response".into()),
+    }
+}
+
+fn create_image(
+    stream: &mut std::os::unix::net::UnixStream,
+    request_id: u64,
+    device: &DeviceDesc,
+    width: u32,
+    height: u32,
+    external_sharing: ExternalSharing,
+) -> Result<ResourceId, Box<dyn std::error::Error>> {
+    send_message(
+        stream,
+        &WireMessage::CreateImage {
+            request_id,
+            request: CreateImageRequest {
+                desc: ImageDesc {
+                    device_id: device.id,
+                    width,
+                    height,
+                    format: PixelFormat::Rgba8Unorm,
+                    usage: ImageUsageFlags::TRANSFER_SRC
+                        | ImageUsageFlags::TRANSFER_DST
+                        | ImageUsageFlags::STORAGE,
+                    external_sharing,
+                },
+            },
+        },
+    )?;
+
+    let response = receive_message(stream)?;
+    let WireMessage::ImageCreated {
+        request_id: response_request_id,
+        response,
+    } = response
+    else {
+        return Err("expected IMAGE_CREATED response".into());
+    };
+
+    if response_request_id != request_id {
+        return Err("image created request_id did not match request".into());
+    }
+
+    println!("Image created:");
+    println!("  id: {}", response.resource_id.get());
+    println!("  size: {} x {}", response.width, response.height);
+    println!("  format: {}", response.format);
+    print_selected_memory(response.selected_memory);
+
+    Ok(response.resource_id)
+}
+
+fn create_external_image(
+    stream: &mut std::os::unix::net::UnixStream,
+    request_id: u64,
+    device: &DeviceDesc,
+    handle_type: ExternalHandleType,
+) -> Result<Result<ResourceId, ErrorResponse>, Box<dyn std::error::Error>> {
+    println!("Image:");
+    println!("  {IMAGE_PROOF_WIDTH} x {IMAGE_PROOF_HEIGHT}");
+    println!("  format: Rgba8Unorm");
+    println!("  resource: Image");
+    println!("  external sharing: {handle_type}");
+    send_message(
+        stream,
+        &WireMessage::CreateImage {
+            request_id,
+            request: CreateImageRequest {
+                desc: ImageDesc {
+                    device_id: device.id,
+                    width: IMAGE_PROOF_WIDTH,
+                    height: IMAGE_PROOF_HEIGHT,
+                    format: PixelFormat::Rgba8Unorm,
+                    usage: ImageUsageFlags::TRANSFER_SRC
+                        | ImageUsageFlags::TRANSFER_DST
+                        | ImageUsageFlags::STORAGE,
+                    external_sharing: ExternalSharing::Required { handle_type },
+                },
+            },
+        },
+    )?;
+
+    match receive_message(stream)? {
+        WireMessage::ImageCreated {
+            request_id: response_request_id,
+            response,
+        } => {
+            if response_request_id != request_id {
+                return Err("image created request_id did not match request".into());
+            }
+            println!("Created:");
+            println!("  ResourceId: {}", response.resource_id.get());
+            println!("  exportable: yes");
+            print_selected_memory(response.selected_memory);
+            Ok(Ok(response.resource_id))
+        }
+        WireMessage::Error {
+            request_id: response_request_id,
+            response,
+        } => {
+            if response_request_id != request_id {
+                return Err("image error request_id did not match request".into());
+            }
+            Ok(Err(response))
+        }
+        _ => Err("expected IMAGE_CREATED or ERROR response".into()),
     }
 }
 
@@ -665,10 +789,152 @@ fn test_compute_proof(
     Ok(request_id)
 }
 
+fn test_image_processing_proof(
+    stream: &mut std::os::unix::net::UnixStream,
+    mut request_id: u64,
+    device: &DeviceDesc,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    const PRODUCER_PATTERN: u32 = 0x5147_5339;
+
+    println!("[{:?}] {}", device.class, device.name);
+
+    request_id += 1;
+    let resource_id =
+        match create_external_image(stream, request_id, device, ExternalHandleType::DmaBuf)? {
+            Ok(resource_id) => resource_id,
+            Err(error) => {
+                println!("  create failed for DMA-BUF: {:?}", error.code);
+                println!("Validation:");
+                println!("SKIP");
+                return Ok(request_id);
+            }
+        };
+
+    request_id += 1;
+    let (resource_metadata, resource_handle) =
+        match export_resource(stream, request_id, resource_id, ExternalHandleType::DmaBuf) {
+            Ok(export) => export,
+            Err(err) => {
+                request_id += 1;
+                destroy_resource(stream, request_id, resource_id)?;
+                return Err(err);
+            }
+        };
+
+    request_id += 1;
+    let sync_id = match create_sync(stream, request_id, device)? {
+        Ok(sync_id) => sync_id,
+        Err(error) => {
+            println!("  sync creation failed: {:?}", error.code);
+            request_id += 1;
+            destroy_resource(stream, request_id, resource_id)?;
+            println!("Validation:");
+            println!("SKIP");
+            return Ok(request_id);
+        }
+    };
+
+    request_id += 1;
+    send_message(
+        stream,
+        &WireMessage::ExportSync {
+            request_id,
+            request: ExportSyncRequest {
+                sync_id,
+                resource_id,
+                fill_pattern: PRODUCER_PATTERN,
+            },
+        },
+    )?;
+    let received = receive_message_with_attachments::<1>(stream)?;
+    let WireMessage::SyncExported {
+        request_id: response_request_id,
+        response,
+    } = received.message
+    else {
+        request_id += 1;
+        destroy_resource(stream, request_id, resource_id)?;
+        return Err("expected SYNC_EXPORTED response".into());
+    };
+    if response_request_id != request_id {
+        request_id += 1;
+        destroy_resource(stream, request_id, resource_id)?;
+        return Err("sync exported request_id did not match request".into());
+    }
+    let Some(sync_handle) = received.attachments.into_iter().next() else {
+        request_id += 1;
+        destroy_resource(stream, request_id, resource_id)?;
+        return Err("missing exported sync FD attachment".into());
+    };
+
+    let input = vec![0_u8; (IMAGE_PROOF_WIDTH as usize) * (IMAGE_PROOF_HEIGHT as usize) * 4];
+    let importer = VulkanDeviceDiscovery::new()?;
+    let output = importer.import_wait_and_run_image_invert_proof(
+        device,
+        &resource_metadata,
+        File::from(resource_handle),
+        &response.metadata,
+        File::from(sync_handle),
+        &input,
+    )?;
+    let expected = image_proof_expected_from_clear(PRODUCER_PATTERN, input.len());
+
+    println!("Processing:");
+    println!("  operation: private RGBA invert proof");
+    println!("  execution: Vulkan GPU");
+    println!("  synchronization: external sync FD");
+    println!("Validation:");
+    if output == expected {
+        println!("PASS");
+    } else {
+        println!(
+            "FAIL sample: {:?} -> {:?}, expected {:?}",
+            &input[..8.min(input.len())],
+            &output[..8.min(output.len())],
+            &expected[..8.min(expected.len())]
+        );
+        request_id += 1;
+        destroy_resource(stream, request_id, resource_id)?;
+        return Err("image proof output did not match expected pixels".into());
+    }
+    println!(
+        "Sample RGBA bytes: {:?} -> {:?}",
+        observed_linear_dma_buf_rgba(PRODUCER_PATTERN),
+        &output[..8.min(output.len())]
+    );
+    println!("producer->consumer idle wait: no");
+
+    request_id += 1;
+    destroy_resource(stream, request_id, resource_id)?;
+    println!("QGS resource cleanup: success");
+
+    Ok(request_id)
+}
+
 fn compute_proof_input() -> Vec<u32> {
     let mut values = (0..1024_u32).collect::<Vec<_>>();
     values[..6].copy_from_slice(&[0, 1, 2, 3, 100, 1000]);
     values
+}
+
+fn image_clear_rgba(pattern: u32) -> [u8; 4] {
+    [
+        (pattern & 0xff) as u8,
+        ((pattern >> 8) & 0xff) as u8,
+        ((pattern >> 16) & 0xff) as u8,
+        ((pattern >> 24) & 0xff) as u8,
+    ]
+}
+
+fn image_proof_expected_from_clear(pattern: u32, len: usize) -> Vec<u8> {
+    let [r, g, b, a] = observed_linear_dma_buf_rgba(pattern);
+    std::iter::repeat_n([255 - r, 255 - g, 255 - b, a], len / 4)
+        .flatten()
+        .collect()
+}
+
+fn observed_linear_dma_buf_rgba(pattern: u32) -> [u8; 4] {
+    [0, 0, 0, image_clear_rgba(pattern)[3]]
 }
 
 fn export_resource(

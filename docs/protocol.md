@@ -142,15 +142,48 @@ Sync export handle type values are:
 
 EXPORT_SYNC is request kind `1`, opcode `8`. It is a session operation and
 must be sent after HELLO/WELCOME. For M1 Step 7, exporting a sync object submits
-a minimal producer GPU fill operation against a session-owned buffer and signals
+a minimal producer GPU operation against a session-owned resource and signals
 the exported synchronization primitive from that GPU submission. Its payload is:
 
 | Offset | Width | Field |
 | --- | ---: | --- |
 | 0 | u64 | QGS `SyncId` owned by the current session |
-| 8 | u64 | QGS `ResourceId` buffer owned by the current session |
+| 8 | u64 | QGS `ResourceId` owned by the current session |
 | 16 | u32 | producer fill pattern for the Step 7 validation operation |
 | 20 | 4 bytes | reserved, currently `0` |
+
+CREATE_IMAGE is request kind `1`, opcode `9`. It is a session operation and
+must be sent after HELLO/WELCOME. Its payload is a fixed-size `ImageDesc`:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `DeviceId` from the current `qgsd` process/session |
+| 8 | u32 | image width in pixels |
+| 12 | u32 | image height in pixels |
+| 16 | u8 | pixel format |
+| 17 | u8 | external sharing selector |
+| 18 | 2 bytes | reserved, currently `0` |
+| 20 | u32 | image usage flags |
+
+Pixel format values are:
+
+| Value | Format |
+| ---: | --- |
+| 1 | Rgba8Unorm |
+
+Image usage flag values are:
+
+| Bit | Usage |
+| ---: | --- |
+| 0 | TRANSFER_SRC |
+| 1 | TRANSFER_DST |
+| 2 | STORAGE |
+
+M1 Step 9 supports only single-plane `Rgba8Unorm` images. The maximum image
+dimensions are 8192 x 8192. Width and height must be non-zero, usage must be
+non-empty, and unknown usage bits or pixel formats are rejected. Vulkan image
+tiling and layout transitions are backend implementation details and are not
+exposed in the QGS protocol.
 
 WELCOME is response kind `2`, opcode `1`. Its payload is:
 
@@ -280,19 +313,33 @@ it is carried as one Linux transport attachment.
 | --- | ---: | --- |
 | 0 | u64 | exported QGS `ResourceId` |
 | 8 | u64 | QGS `DeviceId` |
-| 16 | u64 | buffer size in bytes |
+| 16 | u8 | resource kind |
+| 17 | u8 | external handle type |
+| 18 | u8 | selected memory property flags |
+| 19 | u8 | dedicated allocation, boolean |
+| 20 | u8 | expected attachment count, currently `1` |
+| 21 | u8 | pixel format, or `0` for non-image resources |
+| 22 | 2 bytes | reserved, currently `0` |
 | 24 | u64 | backend allocation size in bytes |
-| 32 | u32 | buffer usage flags |
-| 36 | u32 | backend memory type index |
-| 40 | u8 | external handle type |
-| 41 | u8 | selected memory property flags |
-| 42 | u8 | dedicated allocation, boolean |
-| 43 | u8 | expected attachment count, currently `1` |
-| 44 | 4 bytes | reserved, currently `0` |
+| 32 | u32 | backend memory type index |
+| 36 | u32 | buffer usage flags, or `0` for non-buffer resources |
+| 40 | u32 | image usage flags, or `0` for non-image resources |
+| 44 | u32 | image width, or `0` for non-image resources |
+| 48 | u32 | image height, or `0` for non-image resources |
+| 52 | u64 | logical resource size in bytes |
+| 60 | 4 bytes | reserved, currently `0` |
+| 64 | u64 | backend image layout token, or `0` when absent |
 
-The backend memory type index is backend import metadata. Normal clients treat
-it as opaque. It is interpreted only by the matching `qgs-vulkan` import helper
-for the same backend/device identity.
+Resource kind values are:
+
+| Value | Kind |
+| ---: | --- |
+| 1 | Buffer |
+| 2 | Image |
+
+The backend memory type index and backend image layout token are backend import
+metadata. Normal clients treat them as opaque. They are interpreted only by the
+matching `qgs-vulkan` import helper for the same backend/device identity.
 
 SYNC_CREATED is response kind `2`, opcode `8`. Its payload is:
 
@@ -312,6 +359,17 @@ payload; it is carried as one Linux transport attachment.
 | 10 | 2 bytes | reserved, currently `0` |
 | 12 | u32 | producer fill pattern used by the Step 7 validation operation |
 
+IMAGE_CREATED is response kind `2`, opcode `10`. Its payload is:
+
+| Offset | Width | Field |
+| --- | ---: | --- |
+| 0 | u64 | QGS `ResourceId` |
+| 8 | u32 | image width in pixels |
+| 12 | u32 | image height in pixels |
+| 16 | u8 | pixel format |
+| 17 | u8 | selected memory property flags |
+| 18 | 6 bytes | reserved, currently `0` |
+
 `SyncId` is a non-zero, opaque, QGS-owned identifier. It represents an ordering
 primitive, not resource memory. For M1 Step 7, a `SyncId` is unique within its
 owning session/lifetime and is not persistent across sessions or daemon
@@ -328,9 +386,10 @@ For M1 Step 5, a `ResourceId` is unique within its owning session/lifetime and
 is not persistent across sessions or daemon restarts. A resource belongs to
 exactly one session. Another session cannot use or destroy it.
 
-M1 Step 5 supports only `Buffer` resources. The maximum single buffer size is
-64 MiB. This is an M1 safety limit to prevent unbounded allocation requests; it
-is not a final product limit.
+M1 Step 9 supports `Buffer` and `Image` resources. The maximum single buffer
+size is 64 MiB. This is an M1 safety limit to prevent unbounded allocation
+requests; it is not a final product limit. Image dimensions are limited as
+documented above.
 
 ## Validation
 
@@ -352,12 +411,16 @@ unknown sync handle types, nonzero reserved bytes, truncated payloads, and
 trailing payload bytes. EXPORT_SYNC receivers must reject zero `SyncId` values,
 zero `ResourceId` values, nonzero reserved bytes, truncated payloads, and
 trailing payload bytes. Unknown sync IDs and cross-session sync attempts return
-a stable UnknownSync error.
+a stable UnknownSync error. CREATE_IMAGE receivers must reject zero dimensions,
+oversized dimensions, unsupported pixel formats, invalid usage flags, nonzero
+reserved bytes, truncated payloads, and trailing payload bytes. Exported image
+metadata must be internally consistent with the resource kind, dimensions,
+format, logical byte size, and attachment count.
 
 Major protocol versions are incompatible. Minor versions are backward-compatible
 only within the same major version. A server selects the highest protocol
 version it supports that is inside the client's supported range. The
-implementation through M1 Step 7 supports only server version `0.1`.
+implementation through M1 Step 9 supports only server version `0.1`.
 
 ## Transport
 

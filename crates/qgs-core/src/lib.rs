@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use qgs_protocol::{
     handle_hello, BufferCreatedResponse, BufferDesc, CreateSyncRequest, DeviceCapabilities,
     DeviceDesc, DeviceId, ExportResourceRequest, ExportSyncRequest, ExportedResourceMetadata,
-    ExportedSyncMetadata, HelloRequest, ProtocolError, ResourceDestroyedResponse, ResourceId,
-    ResourceKind, SelectedMemoryProperties, SessionId, SyncCreatedResponse, SyncId,
-    WelcomeResponse,
+    ExportedSyncMetadata, HelloRequest, ImageCreatedResponse, ImageDesc, ProtocolError,
+    ResourceDestroyedResponse, ResourceId, ResourceKind, SelectedMemoryProperties, SessionId,
+    SyncCreatedResponse, SyncId, WelcomeResponse,
 };
 
 pub trait DeviceDiscovery {
@@ -52,6 +52,8 @@ impl From<ProtocolError> for DeviceDiscoveryError {
 
 pub trait ResourceBackend {
     fn create_buffer(&self, desc: &BufferDesc) -> Result<BackendBufferAllocation, ResourceError>;
+
+    fn create_image(&self, desc: &ImageDesc) -> Result<BackendImageAllocation, ResourceError>;
 }
 
 pub trait BackendResource: Send {
@@ -84,6 +86,11 @@ pub struct BackendBufferAllocation {
     pub selected_memory: SelectedMemoryProperties,
 }
 
+pub struct BackendImageAllocation {
+    pub resource: Box<dyn BackendResource>,
+    pub selected_memory: SelectedMemoryProperties,
+}
+
 #[derive(Debug)]
 pub struct BackendResourceExport {
     pub metadata: ExportedResourceMetadata,
@@ -100,8 +107,12 @@ pub struct BackendSyncExport {
 pub enum ResourceError {
     UnknownResource,
     InvalidBufferSize,
+    InvalidImageDimensions,
     AllocationFailed,
     UnsupportedMemoryRequirements,
+    UnsupportedPixelFormat,
+    UnsupportedImageUsage,
+    UnsupportedImageExternalSharing,
     ResourceNotExportable,
     UnsupportedExternalHandleType,
     ExportFailed,
@@ -152,8 +163,14 @@ impl std::fmt::Display for ResourceError {
         match self {
             Self::UnknownResource => write!(f, "unknown resource id"),
             Self::InvalidBufferSize => write!(f, "invalid buffer size"),
+            Self::InvalidImageDimensions => write!(f, "invalid image dimensions"),
             Self::AllocationFailed => write!(f, "resource allocation failed"),
             Self::UnsupportedMemoryRequirements => write!(f, "unsupported memory requirements"),
+            Self::UnsupportedPixelFormat => write!(f, "unsupported pixel format"),
+            Self::UnsupportedImageUsage => write!(f, "unsupported image usage"),
+            Self::UnsupportedImageExternalSharing => {
+                write!(f, "unsupported image external sharing")
+            }
             Self::ResourceNotExportable => write!(f, "resource is not exportable"),
             Self::UnsupportedExternalHandleType => write!(f, "unsupported external handle type"),
             Self::ExportFailed => write!(f, "resource export failed"),
@@ -169,10 +186,14 @@ impl From<ProtocolError> for ResourceError {
     fn from(value: ProtocolError) -> Self {
         match value {
             ProtocolError::InvalidBufferSize { .. } => Self::InvalidBufferSize,
+            ProtocolError::InvalidImageDimensions { .. } => Self::InvalidImageDimensions,
             ProtocolError::UnknownDeviceId => Self::UnknownDeviceId,
             ProtocolError::UnknownResource => Self::UnknownResource,
             ProtocolError::AllocationFailed => Self::AllocationFailed,
             ProtocolError::UnsupportedMemoryRequirements => Self::UnsupportedMemoryRequirements,
+            ProtocolError::UnsupportedPixelFormat => Self::UnsupportedPixelFormat,
+            ProtocolError::UnsupportedImageUsage { .. } => Self::UnsupportedImageUsage,
+            ProtocolError::UnsupportedImageExternalSharing => Self::UnsupportedImageExternalSharing,
             ProtocolError::ResourceNotExportable => Self::ResourceNotExportable,
             ProtocolError::UnsupportedExternalHandleType => Self::UnsupportedExternalHandleType,
             ProtocolError::ExportFailed => Self::ExportFailed,
@@ -250,6 +271,31 @@ impl Session {
         Ok(BufferCreatedResponse {
             resource_id: id,
             size_bytes: desc.size_bytes,
+            selected_memory: allocation.selected_memory,
+        })
+    }
+
+    pub fn create_image(
+        &mut self,
+        backend: &impl ResourceBackend,
+        desc: &ImageDesc,
+    ) -> Result<ImageCreatedResponse, ResourceError> {
+        desc.validate()?;
+        let id = self.resources.allocate_id()?;
+        let allocation = backend.create_image(desc)?;
+        self.resources.insert(
+            id,
+            ResourceEntry {
+                kind: ResourceKind::Image,
+                resource: allocation.resource,
+            },
+        );
+
+        Ok(ImageCreatedResponse {
+            resource_id: id,
+            width: desc.width,
+            height: desc.height,
+            format: desc.format,
             selected_memory: allocation.selected_memory,
         })
     }
@@ -423,8 +469,8 @@ mod tests {
 
     use qgs_protocol::{
         BufferUsageFlags, CreateSyncRequest, DeviceId, ExportResourceRequest, ExportSyncRequest,
-        ExternalHandleType, ExternalSharing, MemoryPreference, SyncExportHandleType, SyncKind,
-        MAX_BUFFER_SIZE_BYTES,
+        ExternalHandleType, ExternalSharing, ImageUsageFlags, MemoryPreference, PixelFormat,
+        SyncExportHandleType, SyncKind, MAX_BUFFER_SIZE_BYTES,
     };
 
     #[test]
@@ -481,6 +527,50 @@ mod tests {
 
         assert_eq!(session.resource_count(), 0);
         assert_eq!(backend.drop_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn create_image_returns_valid_nonzero_resource_id() {
+        let backend = MockBackend::default();
+        let mut session = SessionManager::new().create_session().expect("session");
+
+        let created = session
+            .create_image(&backend, &sample_image_desc())
+            .expect("image created");
+
+        assert_ne!(created.resource_id.get(), 0);
+        assert_eq!(session.resource_count(), 1);
+    }
+
+    #[test]
+    fn destroy_image_removes_resource() {
+        let backend = MockBackend::default();
+        let mut session = SessionManager::new().create_session().expect("session");
+        let created = session
+            .create_image(&backend, &sample_image_desc())
+            .expect("image created");
+
+        session
+            .destroy_resource(created.resource_id)
+            .expect("resource destroyed");
+
+        assert_eq!(session.resource_count(), 0);
+        assert_eq!(backend.drop_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn zero_width_image_is_rejected_before_backend_allocation() {
+        let backend = MockBackend::default();
+        let mut session = SessionManager::new().create_session().expect("session");
+        let mut desc = sample_image_desc();
+        desc.width = 0;
+
+        let err = session
+            .create_image(&backend, &desc)
+            .expect_err("zero-width image is invalid");
+
+        assert!(matches!(err, ResourceError::InvalidImageDimensions));
+        assert_eq!(backend.create_image_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -577,6 +667,24 @@ mod tests {
     }
 
     #[test]
+    fn session_cannot_destroy_another_sessions_image() {
+        let backend = MockBackend::default();
+        let sessions = SessionManager::new();
+        let mut first_session = sessions.create_session().expect("first session");
+        let mut second_session = sessions.create_session().expect("second session");
+        let created = first_session
+            .create_image(&backend, &sample_image_desc())
+            .expect("image created");
+
+        let err = second_session
+            .destroy_resource(created.resource_id)
+            .expect_err("image belongs to another session");
+
+        assert!(matches!(err, ResourceError::UnknownResource));
+        assert_eq!(first_session.resource_count(), 1);
+    }
+
+    #[test]
     fn non_exportable_resource_export_is_rejected() {
         let backend = MockBackend::default();
         let mut session = SessionManager::new().create_session().expect("session");
@@ -632,9 +740,41 @@ mod tests {
     }
 
     #[test]
+    fn dropping_session_releases_owned_images() {
+        let backend = MockBackend::default();
+        {
+            let mut session = SessionManager::new().create_session().expect("session");
+            session
+                .create_image(&backend, &sample_image_desc())
+                .expect("first image");
+            session
+                .create_image(&backend, &sample_image_desc())
+                .expect("second image");
+            assert_eq!(session.resource_count(), 2);
+        }
+
+        assert_eq!(backend.drop_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn client_disconnect_session_drop_releases_resources() {
         let backend = MockBackend::default();
         simulate_client_disconnect(&backend);
+
+        assert_eq!(backend.drop_count.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn client_disconnect_session_drop_releases_images() {
+        let backend = MockBackend::default();
+        {
+            let mut session = SessionManager::new().create_session().expect("session");
+            for _ in 0..3 {
+                session
+                    .create_image(&backend, &sample_image_desc())
+                    .expect("image created");
+            }
+        }
 
         assert_eq!(backend.drop_count.load(Ordering::Relaxed), 3);
     }
@@ -755,6 +895,19 @@ mod tests {
         }
     }
 
+    fn sample_image_desc() -> ImageDesc {
+        ImageDesc {
+            device_id: DeviceId::new(1).expect("device id"),
+            width: 64,
+            height: 64,
+            format: PixelFormat::Rgba8Unorm,
+            usage: ImageUsageFlags::TRANSFER_SRC
+                | ImageUsageFlags::TRANSFER_DST
+                | ImageUsageFlags::STORAGE,
+            external_sharing: ExternalSharing::None,
+        }
+    }
+
     fn sample_sync_request() -> CreateSyncRequest {
         CreateSyncRequest {
             device_id: DeviceId::new(1).expect("device id"),
@@ -766,6 +919,7 @@ mod tests {
     #[derive(Default)]
     struct MockBackend {
         create_count: Arc<AtomicUsize>,
+        create_image_count: Arc<AtomicUsize>,
         drop_count: Arc<AtomicUsize>,
         sync_drop_count: Arc<AtomicUsize>,
     }
@@ -784,6 +938,20 @@ mod tests {
                     device_local: true,
                     host_visible: true,
                     host_coherent: true,
+                },
+            })
+        }
+
+        fn create_image(&self, _desc: &ImageDesc) -> Result<BackendImageAllocation, ResourceError> {
+            self.create_image_count.fetch_add(1, Ordering::Relaxed);
+            Ok(BackendImageAllocation {
+                resource: Box::new(MockResource {
+                    drop_count: Arc::clone(&self.drop_count),
+                }),
+                selected_memory: SelectedMemoryProperties {
+                    device_local: true,
+                    host_visible: false,
+                    host_coherent: false,
                 },
             })
         }

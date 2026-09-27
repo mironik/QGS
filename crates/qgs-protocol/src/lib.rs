@@ -29,15 +29,23 @@ pub const MAX_MEMORY_TYPE_COUNT: usize = 32;
 /// Conservative M1 single-buffer allocation safety limit.
 pub const MAX_BUFFER_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Conservative M1 maximum image width.
+pub const MAX_IMAGE_WIDTH: u32 = 8192;
+
+/// Conservative M1 maximum image height.
+pub const MAX_IMAGE_HEIGHT: u32 = 8192;
+
 const DEVICE_ENTRY_FIXED_LEN: usize = 32;
 const DEVICE_CAPABILITIES_FIXED_PREFIX_LEN: usize = 52;
 const MEMORY_HEAP_ENTRY_LEN: usize = 16;
 const CREATE_BUFFER_PAYLOAD_LEN: usize = 24;
+const CREATE_IMAGE_PAYLOAD_LEN: usize = 24;
 const BUFFER_CREATED_PAYLOAD_LEN: usize = 24;
+const IMAGE_CREATED_PAYLOAD_LEN: usize = 24;
 const DESTROY_RESOURCE_PAYLOAD_LEN: usize = 8;
 const RESOURCE_DESTROYED_PAYLOAD_LEN: usize = 8;
 const EXPORT_RESOURCE_PAYLOAD_LEN: usize = 16;
-const RESOURCE_EXPORTED_PAYLOAD_LEN: usize = 48;
+const RESOURCE_EXPORTED_PAYLOAD_LEN: usize = 72;
 const CREATE_SYNC_PAYLOAD_LEN: usize = 16;
 const EXPORT_SYNC_PAYLOAD_LEN: usize = 24;
 const SYNC_CREATED_PAYLOAD_LEN: usize = 8;
@@ -128,6 +136,7 @@ pub enum Request {
     EnumerateDevices(EnumerateDevicesRequest),
     QueryDeviceCapabilities(QueryDeviceCapabilitiesRequest),
     CreateBuffer(CreateBufferRequest),
+    CreateImage(CreateImageRequest),
     DestroyResource(DestroyResourceRequest),
     ExportResource(ExportResourceRequest),
     CreateSync(CreateSyncRequest),
@@ -163,6 +172,11 @@ pub struct CreateBufferRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateImageRequest {
+    pub desc: ImageDesc,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DestroyResourceRequest {
     pub resource_id: ResourceId,
 }
@@ -194,6 +208,7 @@ pub enum Response {
     DeviceList(DeviceListResponse),
     DeviceCapabilities(DeviceCapabilitiesResponse),
     BufferCreated(BufferCreatedResponse),
+    ImageCreated(ImageCreatedResponse),
     ResourceDestroyed(ResourceDestroyedResponse),
     ResourceExported(ResourceExportedResponse),
     SyncCreated(SyncCreatedResponse),
@@ -358,12 +373,14 @@ impl ResourceId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResourceKind {
     Buffer,
+    Image,
 }
 
 impl ResourceKind {
     pub const fn wire_value(self) -> u8 {
         match self {
             Self::Buffer => 1,
+            Self::Image => 2,
         }
     }
 }
@@ -374,6 +391,7 @@ impl TryFrom<u8> for ResourceKind {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(Self::Buffer),
+            2 => Ok(Self::Image),
             _ => Err(ProtocolError::MalformedPayload),
         }
     }
@@ -418,6 +436,76 @@ impl std::ops::BitOr for BufferUsageFlags {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PixelFormat {
+    Rgba8Unorm,
+}
+
+impl PixelFormat {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::Rgba8Unorm => 1,
+        }
+    }
+}
+
+impl TryFrom<u8> for PixelFormat {
+    type Error = ProtocolError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Rgba8Unorm),
+            _ => Err(ProtocolError::UnsupportedPixelFormat),
+        }
+    }
+}
+
+impl fmt::Display for PixelFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rgba8Unorm => write!(f, "Rgba8Unorm"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageUsageFlags(u32);
+
+impl ImageUsageFlags {
+    pub const TRANSFER_SRC: Self = Self(0x1);
+    pub const TRANSFER_DST: Self = Self(0x2);
+    pub const STORAGE: Self = Self(0x4);
+
+    pub fn new(raw: u32) -> Result<Self, ProtocolError> {
+        let flags = Self(raw);
+        if raw == 0 || raw & !Self::all_known().bits() != 0 {
+            Err(ProtocolError::UnsupportedImageUsage { flags: raw })
+        } else {
+            Ok(flags)
+        }
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    const fn all_known() -> Self {
+        Self(Self::TRANSFER_SRC.0 | Self::TRANSFER_DST.0 | Self::STORAGE.0)
+    }
+}
+
+impl std::ops::BitOr for ImageUsageFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MemoryPreference {
     pub device_preferred: bool,
     pub host_visible_required: bool,
@@ -443,6 +531,36 @@ pub struct BufferDesc {
     pub external_sharing: ExternalSharing,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageDesc {
+    pub device_id: DeviceId,
+    pub width: u32,
+    pub height: u32,
+    pub format: PixelFormat,
+    pub usage: ImageUsageFlags,
+    pub external_sharing: ExternalSharing,
+}
+
+impl ImageDesc {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        validate_image_dimensions(self.width, self.height)?;
+        ImageUsageFlags::new(self.usage.bits())?;
+        if !matches!(
+            self.external_sharing,
+            ExternalSharing::None
+                | ExternalSharing::Required {
+                    handle_type: ExternalHandleType::DmaBuf
+                }
+                | ExternalSharing::Required {
+                    handle_type: ExternalHandleType::OpaqueFd
+                }
+        ) {
+            return Err(ProtocolError::UnsupportedImageExternalSharing);
+        }
+        Ok(())
+    }
+}
+
 impl BufferDesc {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         validate_buffer_size(self.size_bytes)?;
@@ -462,6 +580,15 @@ pub struct SelectedMemoryProperties {
 pub struct BufferCreatedResponse {
     pub resource_id: ResourceId,
     pub size_bytes: u64,
+    pub selected_memory: SelectedMemoryProperties,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageCreatedResponse {
+    pub resource_id: ResourceId,
+    pub width: u32,
+    pub height: u32,
+    pub format: PixelFormat,
     pub selected_memory: SelectedMemoryProperties,
 }
 
@@ -544,10 +671,16 @@ pub struct ResourceExportedResponse {
 pub struct ExportedResourceMetadata {
     pub resource_id: ResourceId,
     pub device_id: DeviceId,
+    pub kind: ResourceKind,
     pub size_bytes: u64,
     pub allocation_size_bytes: u64,
-    pub usage: BufferUsageFlags,
+    pub buffer_usage: Option<BufferUsageFlags>,
+    pub image_width: Option<u32>,
+    pub image_height: Option<u32>,
+    pub pixel_format: Option<PixelFormat>,
+    pub image_usage: Option<ImageUsageFlags>,
     pub backend_memory_type_index: u32,
+    pub backend_image_layout_token: Option<u64>,
     pub handle_type: ExternalHandleType,
     pub selected_memory: SelectedMemoryProperties,
     pub dedicated_allocation: bool,
@@ -725,6 +858,10 @@ pub enum ProtocolErrorCode {
     UnknownSync = 32,
     UnsupportedSyncHandleType = 33,
     SyncExportFailed = 34,
+    InvalidImageDimensions = 35,
+    UnsupportedPixelFormat = 36,
+    UnsupportedImageUsage = 37,
+    UnsupportedImageExternalSharing = 38,
 }
 
 impl ProtocolErrorCode {
@@ -772,6 +909,10 @@ impl TryFrom<u32> for ProtocolErrorCode {
             32 => Ok(Self::UnknownSync),
             33 => Ok(Self::UnsupportedSyncHandleType),
             34 => Ok(Self::SyncExportFailed),
+            35 => Ok(Self::InvalidImageDimensions),
+            36 => Ok(Self::UnsupportedPixelFormat),
+            37 => Ok(Self::UnsupportedImageUsage),
+            38 => Ok(Self::UnsupportedImageExternalSharing),
             _ => Err(ProtocolError::MalformedPayload),
         }
     }
@@ -848,6 +989,15 @@ pub enum ProtocolError {
     UnknownSync,
     UnsupportedSyncHandleType,
     SyncExportFailed,
+    InvalidImageDimensions {
+        width: u32,
+        height: u32,
+    },
+    UnsupportedPixelFormat,
+    UnsupportedImageUsage {
+        flags: u32,
+    },
+    UnsupportedImageExternalSharing,
     MalformedPayload,
     InvalidVersionRange {
         min: ProtocolVersion,
@@ -927,6 +1077,16 @@ impl fmt::Display for ProtocolError {
             Self::UnknownSync => write!(f, "unknown sync id"),
             Self::UnsupportedSyncHandleType => write!(f, "unsupported sync handle type"),
             Self::SyncExportFailed => write!(f, "sync export failed"),
+            Self::InvalidImageDimensions { width, height } => {
+                write!(f, "invalid image dimensions {width}x{height}")
+            }
+            Self::UnsupportedPixelFormat => write!(f, "unsupported pixel format"),
+            Self::UnsupportedImageUsage { flags } => {
+                write!(f, "unsupported image usage flags: {flags:#010x}")
+            }
+            Self::UnsupportedImageExternalSharing => {
+                write!(f, "unsupported image external sharing")
+            }
             Self::MalformedPayload => write!(f, "malformed payload"),
             Self::InvalidVersionRange { min, max } => {
                 write!(f, "invalid protocol version range: {min}..={max}")
@@ -982,6 +1142,10 @@ impl From<&ProtocolError> for ProtocolErrorCode {
             ProtocolError::UnknownSync => Self::UnknownSync,
             ProtocolError::UnsupportedSyncHandleType => Self::UnsupportedSyncHandleType,
             ProtocolError::SyncExportFailed => Self::SyncExportFailed,
+            ProtocolError::InvalidImageDimensions { .. } => Self::InvalidImageDimensions,
+            ProtocolError::UnsupportedPixelFormat => Self::UnsupportedPixelFormat,
+            ProtocolError::UnsupportedImageUsage { .. } => Self::UnsupportedImageUsage,
+            ProtocolError::UnsupportedImageExternalSharing => Self::UnsupportedImageExternalSharing,
             ProtocolError::InvalidVersionRange { .. } => Self::InvalidVersionRange,
             ProtocolError::UnsupportedVersion { .. } => Self::UnsupportedVersion,
         }
@@ -1008,6 +1172,7 @@ pub enum RequestOpcode {
     ExportResource,
     CreateSync,
     ExportSync,
+    CreateImage,
 }
 
 impl RequestOpcode {
@@ -1021,6 +1186,7 @@ impl RequestOpcode {
             Self::ExportResource => 6,
             Self::CreateSync => 7,
             Self::ExportSync => 8,
+            Self::CreateImage => 9,
         }
     }
 }
@@ -1036,6 +1202,7 @@ pub enum ResponseOpcode {
     ResourceExported,
     SyncCreated,
     SyncExported,
+    ImageCreated,
 }
 
 impl ResponseOpcode {
@@ -1050,6 +1217,7 @@ impl ResponseOpcode {
             Self::ResourceExported => 7,
             Self::SyncCreated => 8,
             Self::SyncExported => 9,
+            Self::ImageCreated => 10,
         }
     }
 }
@@ -1080,6 +1248,10 @@ pub enum WireMessage {
     CreateBuffer {
         request_id: u64,
         request: CreateBufferRequest,
+    },
+    CreateImage {
+        request_id: u64,
+        request: CreateImageRequest,
     },
     DestroyResource {
         request_id: u64,
@@ -1117,6 +1289,10 @@ pub enum WireMessage {
         request_id: u64,
         response: BufferCreatedResponse,
     },
+    ImageCreated {
+        request_id: u64,
+        response: ImageCreatedResponse,
+    },
     ResourceDestroyed {
         request_id: u64,
         response: ResourceDestroyedResponse,
@@ -1142,6 +1318,7 @@ impl WireMessage {
             | Self::EnumerateDevices { request_id }
             | Self::QueryDeviceCapabilities { request_id, .. }
             | Self::CreateBuffer { request_id, .. }
+            | Self::CreateImage { request_id, .. }
             | Self::DestroyResource { request_id, .. }
             | Self::ExportResource { request_id, .. }
             | Self::CreateSync { request_id, .. }
@@ -1151,6 +1328,7 @@ impl WireMessage {
             | Self::DeviceList { request_id, .. }
             | Self::DeviceCapabilities { request_id, .. }
             | Self::BufferCreated { request_id, .. }
+            | Self::ImageCreated { request_id, .. }
             | Self::ResourceDestroyed { request_id, .. }
             | Self::ResourceExported { request_id, .. }
             | Self::SyncCreated { request_id, .. }
@@ -1193,6 +1371,15 @@ pub fn encode_wire_message(message: &WireMessage) -> Vec<u8> {
             RequestOpcode::CreateBuffer.wire_value(),
             *request_id,
             encode_create_buffer_payload(request),
+        ),
+        WireMessage::CreateImage {
+            request_id,
+            request,
+        } => (
+            MessageKind::Request,
+            RequestOpcode::CreateImage.wire_value(),
+            *request_id,
+            encode_create_image_payload(request),
         ),
         WireMessage::DestroyResource {
             request_id,
@@ -1274,6 +1461,15 @@ pub fn encode_wire_message(message: &WireMessage) -> Vec<u8> {
             ResponseOpcode::BufferCreated.wire_value(),
             *request_id,
             encode_buffer_created_payload(response),
+        ),
+        WireMessage::ImageCreated {
+            request_id,
+            response,
+        } => (
+            MessageKind::Response,
+            ResponseOpcode::ImageCreated.wire_value(),
+            *request_id,
+            encode_image_created_payload(response),
         ),
         WireMessage::ResourceDestroyed {
             request_id,
@@ -1449,6 +1645,10 @@ pub fn decode_wire_message_parts(
             request_id: header.request_id,
             request: decode_export_sync_payload(payload)?,
         }),
+        (MessageKind::Request, 9) => Ok(WireMessage::CreateImage {
+            request_id: header.request_id,
+            request: decode_create_image_payload(payload)?,
+        }),
         (MessageKind::Response, 1) => Ok(WireMessage::Welcome {
             request_id: header.request_id,
             response: decode_welcome_payload(payload)?,
@@ -1484,6 +1684,10 @@ pub fn decode_wire_message_parts(
         (MessageKind::Response, 9) => Ok(WireMessage::SyncExported {
             request_id: header.request_id,
             response: decode_sync_exported_payload(payload)?,
+        }),
+        (MessageKind::Response, 10) => Ok(WireMessage::ImageCreated {
+            request_id: header.request_id,
+            response: decode_image_created_payload(payload)?,
         }),
         _ => Err(ProtocolError::UnknownOpcode {
             kind: header.kind,
@@ -1545,7 +1749,7 @@ fn encode_wire_header(header: &WireHeader, bytes: &mut Vec<u8>) {
 
 fn validate_opcode(kind: MessageKind, opcode: u8) -> Result<(), ProtocolError> {
     match (kind, opcode) {
-        (MessageKind::Request, 1..=8) | (MessageKind::Response, 1..=9) => Ok(()),
+        (MessageKind::Request, 1..=9) | (MessageKind::Response, 1..=10) => Ok(()),
         _ => Err(ProtocolError::UnknownOpcode { kind, opcode }),
     }
 }
@@ -1666,6 +1870,48 @@ fn decode_create_buffer_payload(bytes: &[u8]) -> Result<CreateBufferRequest, Pro
     desc.validate()?;
 
     Ok(CreateBufferRequest { desc })
+}
+
+fn encode_create_image_payload(request: &CreateImageRequest) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(CREATE_IMAGE_PAYLOAD_LEN);
+    bytes.extend_from_slice(&request.desc.device_id.get().to_le_bytes());
+    bytes.extend_from_slice(&request.desc.width.to_le_bytes());
+    bytes.extend_from_slice(&request.desc.height.to_le_bytes());
+    bytes.push(request.desc.format.wire_value());
+    bytes.push(request.desc.external_sharing.wire_value());
+    bytes.extend_from_slice(&[0_u8; 2]);
+    bytes.extend_from_slice(&request.desc.usage.bits().to_le_bytes());
+    bytes
+}
+
+fn decode_create_image_payload(bytes: &[u8]) -> Result<CreateImageRequest, ProtocolError> {
+    if bytes.len() != CREATE_IMAGE_PAYLOAD_LEN {
+        return if bytes.len() < CREATE_IMAGE_PAYLOAD_LEN {
+            Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len(),
+                expected: CREATE_IMAGE_PAYLOAD_LEN,
+            })
+        } else {
+            Err(ProtocolError::TrailingPayload {
+                len: bytes.len() - CREATE_IMAGE_PAYLOAD_LEN,
+            })
+        };
+    }
+    if bytes[18..20].iter().any(|value| *value != 0) {
+        return Err(ProtocolError::MalformedPayload);
+    }
+
+    let desc = ImageDesc {
+        device_id: DeviceId::new(read_u64(bytes, 0))?,
+        width: read_u32(bytes, 8),
+        height: read_u32(bytes, 12),
+        format: PixelFormat::try_from(bytes[16])?,
+        external_sharing: ExternalSharing::try_from(bytes[17])?,
+        usage: ImageUsageFlags::new(read_u32(bytes, 20))?,
+    };
+    desc.validate()?;
+
+    Ok(CreateImageRequest { desc })
 }
 
 fn encode_destroy_resource_payload(request: &DestroyResourceRequest) -> Vec<u8> {
@@ -2077,6 +2323,46 @@ fn decode_buffer_created_payload(bytes: &[u8]) -> Result<BufferCreatedResponse, 
     })
 }
 
+fn encode_image_created_payload(response: &ImageCreatedResponse) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(IMAGE_CREATED_PAYLOAD_LEN);
+    bytes.extend_from_slice(&response.resource_id.get().to_le_bytes());
+    bytes.extend_from_slice(&response.width.to_le_bytes());
+    bytes.extend_from_slice(&response.height.to_le_bytes());
+    bytes.push(response.format.wire_value());
+    bytes.push(encode_selected_memory(response.selected_memory));
+    bytes.extend_from_slice(&[0_u8; 6]);
+    bytes
+}
+
+fn decode_image_created_payload(bytes: &[u8]) -> Result<ImageCreatedResponse, ProtocolError> {
+    if bytes.len() != IMAGE_CREATED_PAYLOAD_LEN {
+        return if bytes.len() < IMAGE_CREATED_PAYLOAD_LEN {
+            Err(ProtocolError::TruncatedPayload {
+                actual: bytes.len(),
+                expected: IMAGE_CREATED_PAYLOAD_LEN,
+            })
+        } else {
+            Err(ProtocolError::TrailingPayload {
+                len: bytes.len() - IMAGE_CREATED_PAYLOAD_LEN,
+            })
+        };
+    }
+    if bytes[18..24].iter().any(|value| *value != 0) {
+        return Err(ProtocolError::MalformedPayload);
+    }
+    let width = read_u32(bytes, 8);
+    let height = read_u32(bytes, 12);
+    validate_image_dimensions(width, height)?;
+
+    Ok(ImageCreatedResponse {
+        resource_id: ResourceId::new(read_u64(bytes, 0))?,
+        width,
+        height,
+        format: PixelFormat::try_from(bytes[16])?,
+        selected_memory: decode_selected_memory(bytes[17])?,
+    })
+}
+
 fn encode_resource_destroyed_payload(response: &ResourceDestroyedResponse) -> Vec<u8> {
     response.resource_id.get().to_le_bytes().to_vec()
 }
@@ -2107,15 +2393,37 @@ fn encode_resource_exported_payload(response: &ResourceExportedResponse) -> Vec<
     let mut bytes = Vec::with_capacity(RESOURCE_EXPORTED_PAYLOAD_LEN);
     bytes.extend_from_slice(&metadata.resource_id.get().to_le_bytes());
     bytes.extend_from_slice(&metadata.device_id.get().to_le_bytes());
-    bytes.extend_from_slice(&metadata.size_bytes.to_le_bytes());
-    bytes.extend_from_slice(&metadata.allocation_size_bytes.to_le_bytes());
-    bytes.extend_from_slice(&metadata.usage.bits().to_le_bytes());
-    bytes.extend_from_slice(&metadata.backend_memory_type_index.to_le_bytes());
+    bytes.push(metadata.kind.wire_value());
     bytes.push(metadata.handle_type.wire_value());
     bytes.push(encode_selected_memory(metadata.selected_memory));
     bytes.push(bool_to_u8(metadata.dedicated_allocation));
     bytes.push(metadata.attachment_count);
+    bytes.push(metadata.pixel_format.map_or(0, PixelFormat::wire_value));
+    bytes.extend_from_slice(&[0_u8; 2]);
+    bytes.extend_from_slice(&metadata.allocation_size_bytes.to_le_bytes());
+    bytes.extend_from_slice(&metadata.backend_memory_type_index.to_le_bytes());
+    bytes.extend_from_slice(
+        &metadata
+            .buffer_usage
+            .map_or(0, BufferUsageFlags::bits)
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(
+        &metadata
+            .image_usage
+            .map_or(0, ImageUsageFlags::bits)
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(&metadata.image_width.unwrap_or(0).to_le_bytes());
+    bytes.extend_from_slice(&metadata.image_height.unwrap_or(0).to_le_bytes());
+    bytes.extend_from_slice(&metadata.size_bytes.to_le_bytes());
     bytes.extend_from_slice(&[0_u8; 4]);
+    bytes.extend_from_slice(
+        &metadata
+            .backend_image_layout_token
+            .unwrap_or(0)
+            .to_le_bytes(),
+    );
     bytes
 }
 
@@ -2134,10 +2442,63 @@ fn decode_resource_exported_payload(
             })
         };
     }
-    if bytes[44..48].iter().any(|value| *value != 0) {
+    if bytes[22..24].iter().any(|value| *value != 0)
+        || bytes[60..64].iter().any(|value| *value != 0)
+    {
         return Err(ProtocolError::MalformedPayload);
     }
-    let size_bytes = validate_buffer_size(read_u64(bytes, 16))?;
+    let kind = ResourceKind::try_from(bytes[16])?;
+    let pixel_format = match bytes[21] {
+        0 => None,
+        value => Some(PixelFormat::try_from(value)?),
+    };
+    let buffer_usage_raw = read_u32(bytes, 36);
+    let image_usage_raw = read_u32(bytes, 40);
+    let image_width = read_u32(bytes, 44);
+    let image_height = read_u32(bytes, 48);
+    let size_bytes = read_u64(bytes, 52);
+    let backend_image_layout_token = match read_u64(bytes, 64) {
+        0 => None,
+        value => Some(value),
+    };
+    let (buffer_usage, image_usage, image_width, image_height, pixel_format) = match kind {
+        ResourceKind::Buffer => {
+            validate_buffer_size(size_bytes)?;
+            if image_usage_raw != 0
+                || image_width != 0
+                || image_height != 0
+                || pixel_format.is_some()
+                || backend_image_layout_token.is_some()
+            {
+                return Err(ProtocolError::MalformedPayload);
+            }
+            (
+                Some(BufferUsageFlags::new(buffer_usage_raw)?),
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        ResourceKind::Image => {
+            if buffer_usage_raw != 0 {
+                return Err(ProtocolError::MalformedPayload);
+            }
+            validate_image_dimensions(image_width, image_height)?;
+            let format = pixel_format.ok_or(ProtocolError::UnsupportedPixelFormat)?;
+            let pixel_bytes = image_byte_len(image_width, image_height, format)?;
+            if size_bytes != pixel_bytes {
+                return Err(ProtocolError::MalformedPayload);
+            }
+            (
+                None,
+                Some(ImageUsageFlags::new(image_usage_raw)?),
+                Some(image_width),
+                Some(image_height),
+                Some(format),
+            )
+        }
+    };
     let allocation_size_bytes = read_u64(bytes, 24);
     if allocation_size_bytes < size_bytes {
         return Err(ProtocolError::MalformedPayload);
@@ -2147,14 +2508,20 @@ fn decode_resource_exported_payload(
         metadata: ExportedResourceMetadata {
             resource_id: ResourceId::new(read_u64(bytes, 0))?,
             device_id: DeviceId::new(read_u64(bytes, 8))?,
+            kind,
             size_bytes,
             allocation_size_bytes,
-            usage: BufferUsageFlags::new(read_u32(bytes, 32))?,
-            backend_memory_type_index: read_u32(bytes, 36),
-            handle_type: ExternalHandleType::try_from(bytes[40])?,
-            selected_memory: decode_selected_memory(bytes[41])?,
-            dedicated_allocation: read_bool(bytes[42])?,
-            attachment_count: bytes[43],
+            buffer_usage,
+            image_width,
+            image_height,
+            pixel_format,
+            image_usage,
+            backend_memory_type_index: read_u32(bytes, 32),
+            backend_image_layout_token,
+            handle_type: ExternalHandleType::try_from(bytes[17])?,
+            selected_memory: decode_selected_memory(bytes[18])?,
+            dedicated_allocation: read_bool(bytes[19])?,
+            attachment_count: bytes[20],
         },
     })
 }
@@ -2232,6 +2599,24 @@ fn validate_buffer_size(size: u64) -> Result<u64, ProtocolError> {
     } else {
         Ok(size)
     }
+}
+
+pub fn validate_image_dimensions(width: u32, height: u32) -> Result<(), ProtocolError> {
+    if width == 0 || height == 0 || width > MAX_IMAGE_WIDTH || height > MAX_IMAGE_HEIGHT {
+        return Err(ProtocolError::InvalidImageDimensions { width, height });
+    }
+    image_byte_len(width, height, PixelFormat::Rgba8Unorm)?;
+    Ok(())
+}
+
+pub fn image_byte_len(width: u32, height: u32, format: PixelFormat) -> Result<u64, ProtocolError> {
+    let bytes_per_pixel = match format {
+        PixelFormat::Rgba8Unorm => 4_u64,
+    };
+    u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
+        .ok_or(ProtocolError::InvalidImageDimensions { width, height })
 }
 
 fn encode_memory_preference(preference: MemoryPreference) -> u8 {
@@ -3267,6 +3652,155 @@ mod tests {
     }
 
     #[test]
+    fn pixel_format_wire_round_trip() {
+        assert_eq!(PixelFormat::Rgba8Unorm.wire_value(), 1);
+        assert_eq!(PixelFormat::try_from(1), Ok(PixelFormat::Rgba8Unorm));
+    }
+
+    #[test]
+    fn rejects_invalid_pixel_format() {
+        assert_eq!(
+            PixelFormat::try_from(99),
+            Err(ProtocolError::UnsupportedPixelFormat)
+        );
+    }
+
+    #[test]
+    fn image_resource_kind_wire_round_trip() {
+        assert_eq!(ResourceKind::try_from(1), Ok(ResourceKind::Buffer));
+        assert_eq!(ResourceKind::try_from(2), Ok(ResourceKind::Image));
+    }
+
+    #[test]
+    fn image_desc_round_trip() {
+        let desc = sample_image_desc();
+        let message = WireMessage::CreateImage {
+            request_id: 350,
+            request: CreateImageRequest { desc },
+        };
+
+        assert_eq!(
+            decode_wire_message(&encode_wire_message(&message)),
+            Ok(message)
+        );
+    }
+
+    #[test]
+    fn rejects_zero_image_width() {
+        let mut bytes = encode_wire_message(&WireMessage::CreateImage {
+            request_id: 351,
+            request: CreateImageRequest {
+                desc: sample_image_desc(),
+            },
+        });
+        bytes[WIRE_HEADER_LEN + 8..WIRE_HEADER_LEN + 12].copy_from_slice(&0_u32.to_le_bytes());
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::InvalidImageDimensions {
+                width: 0,
+                height: 64,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_zero_image_height() {
+        let mut bytes = encode_wire_message(&WireMessage::CreateImage {
+            request_id: 352,
+            request: CreateImageRequest {
+                desc: sample_image_desc(),
+            },
+        });
+        bytes[WIRE_HEADER_LEN + 12..WIRE_HEADER_LEN + 16].copy_from_slice(&0_u32.to_le_bytes());
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::InvalidImageDimensions {
+                width: 64,
+                height: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_image_width() {
+        let mut bytes = encode_wire_message(&WireMessage::CreateImage {
+            request_id: 353,
+            request: CreateImageRequest {
+                desc: sample_image_desc(),
+            },
+        });
+        bytes[WIRE_HEADER_LEN + 8..WIRE_HEADER_LEN + 12]
+            .copy_from_slice(&(MAX_IMAGE_WIDTH + 1).to_le_bytes());
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::InvalidImageDimensions {
+                width: MAX_IMAGE_WIDTH + 1,
+                height: 64,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_image_height() {
+        let mut bytes = encode_wire_message(&WireMessage::CreateImage {
+            request_id: 354,
+            request: CreateImageRequest {
+                desc: sample_image_desc(),
+            },
+        });
+        bytes[WIRE_HEADER_LEN + 12..WIRE_HEADER_LEN + 16]
+            .copy_from_slice(&(MAX_IMAGE_HEIGHT + 1).to_le_bytes());
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::InvalidImageDimensions {
+                width: 64,
+                height: MAX_IMAGE_HEIGHT + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn image_byte_len_rejects_dimension_multiplication_overflow() {
+        assert_eq!(
+            image_byte_len(u32::MAX, u32::MAX, PixelFormat::Rgba8Unorm),
+            Err(ProtocolError::InvalidImageDimensions {
+                width: u32::MAX,
+                height: u32::MAX,
+            })
+        );
+    }
+
+    #[test]
+    fn create_image_request_round_trip() {
+        let message = WireMessage::CreateImage {
+            request_id: 355,
+            request: CreateImageRequest {
+                desc: sample_image_desc(),
+            },
+        };
+
+        let decoded = decode_wire_message(&encode_wire_message(&message)).expect("decode image");
+        assert_eq!(decoded, message);
+        assert_eq!(decoded.request_id(), 355);
+    }
+
+    #[test]
+    fn image_created_response_round_trip() {
+        let message = WireMessage::ImageCreated {
+            request_id: 356,
+            response: sample_image_created(12),
+        };
+
+        let decoded = decode_wire_message(&encode_wire_message(&message)).expect("decode image");
+        assert_eq!(decoded, message);
+        assert_eq!(decoded.request_id(), 356);
+    }
+
+    #[test]
     fn destroy_resource_request_round_trip() {
         let message = WireMessage::DestroyResource {
             request_id: 36,
@@ -3323,6 +3857,48 @@ mod tests {
             decode_wire_message(&encode_wire_message(&message)),
             Ok(message)
         );
+    }
+
+    #[test]
+    fn image_export_metadata_round_trip() {
+        let message = WireMessage::ResourceExported {
+            request_id: 375,
+            response: sample_image_resource_exported(13),
+        };
+
+        let decoded = decode_wire_message(&encode_wire_message(&message)).expect("decode export");
+        assert_eq!(decoded, message);
+        assert_eq!(decoded.request_id(), 375);
+    }
+
+    #[test]
+    fn rejects_malformed_image_export_metadata() {
+        let mut bytes = encode_wire_message(&WireMessage::ResourceExported {
+            request_id: 376,
+            response: sample_image_resource_exported(13),
+        });
+        bytes[WIRE_HEADER_LEN + 36..WIRE_HEADER_LEN + 40].copy_from_slice(&0x1_u32.to_le_bytes());
+
+        assert_eq!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::MalformedPayload)
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_image_payload() {
+        let mut bytes = encode_wire_message(&WireMessage::CreateImage {
+            request_id: 377,
+            request: CreateImageRequest {
+                desc: sample_image_desc(),
+            },
+        });
+        bytes.truncate(bytes.len() - 1);
+
+        assert!(matches!(
+            decode_wire_message(&bytes),
+            Err(ProtocolError::TruncatedPayload { .. })
+        ));
     }
 
     #[test]
@@ -3523,6 +4099,25 @@ mod tests {
                 ProtocolErrorCode::UnsupportedMemoryRequirements,
             ),
             (
+                ProtocolError::InvalidImageDimensions {
+                    width: 0,
+                    height: 64,
+                },
+                ProtocolErrorCode::InvalidImageDimensions,
+            ),
+            (
+                ProtocolError::UnsupportedPixelFormat,
+                ProtocolErrorCode::UnsupportedPixelFormat,
+            ),
+            (
+                ProtocolError::UnsupportedImageUsage { flags: 0x8 },
+                ProtocolErrorCode::UnsupportedImageUsage,
+            ),
+            (
+                ProtocolError::UnsupportedImageExternalSharing,
+                ProtocolErrorCode::UnsupportedImageExternalSharing,
+            ),
+            (
                 ProtocolError::ResourceNotExportable,
                 ProtocolErrorCode::ResourceNotExportable,
             ),
@@ -3606,15 +4201,50 @@ mod tests {
         }
     }
 
+    fn sample_image_desc() -> ImageDesc {
+        ImageDesc {
+            device_id: DeviceId::new(1).expect("device id"),
+            width: 64,
+            height: 64,
+            format: PixelFormat::Rgba8Unorm,
+            usage: ImageUsageFlags::TRANSFER_SRC
+                | ImageUsageFlags::TRANSFER_DST
+                | ImageUsageFlags::STORAGE,
+            external_sharing: ExternalSharing::Required {
+                handle_type: ExternalHandleType::DmaBuf,
+            },
+        }
+    }
+
+    fn sample_image_created(raw_id: u64) -> ImageCreatedResponse {
+        ImageCreatedResponse {
+            resource_id: ResourceId::new(raw_id).expect("resource id"),
+            width: 64,
+            height: 64,
+            format: PixelFormat::Rgba8Unorm,
+            selected_memory: SelectedMemoryProperties {
+                device_local: true,
+                host_visible: false,
+                host_coherent: false,
+            },
+        }
+    }
+
     fn sample_resource_exported(raw_id: u64) -> ResourceExportedResponse {
         ResourceExportedResponse {
             metadata: ExportedResourceMetadata {
                 resource_id: ResourceId::new(raw_id).expect("resource id"),
                 device_id: DeviceId::new(1).expect("device id"),
+                kind: ResourceKind::Buffer,
                 size_bytes: 1024 * 1024,
                 allocation_size_bytes: 1024 * 1024,
-                usage: BufferUsageFlags::TRANSFER_SRC | BufferUsageFlags::TRANSFER_DST,
+                buffer_usage: Some(BufferUsageFlags::TRANSFER_SRC | BufferUsageFlags::TRANSFER_DST),
+                image_width: None,
+                image_height: None,
+                pixel_format: None,
+                image_usage: None,
                 backend_memory_type_index: 0,
+                backend_image_layout_token: None,
                 handle_type: ExternalHandleType::DmaBuf,
                 selected_memory: SelectedMemoryProperties {
                     device_local: true,
@@ -3622,6 +4252,37 @@ mod tests {
                     host_coherent: true,
                 },
                 dedicated_allocation: false,
+                attachment_count: 1,
+            },
+        }
+    }
+
+    fn sample_image_resource_exported(raw_id: u64) -> ResourceExportedResponse {
+        ResourceExportedResponse {
+            metadata: ExportedResourceMetadata {
+                resource_id: ResourceId::new(raw_id).expect("resource id"),
+                device_id: DeviceId::new(1).expect("device id"),
+                kind: ResourceKind::Image,
+                size_bytes: image_byte_len(64, 64, PixelFormat::Rgba8Unorm).expect("image bytes"),
+                allocation_size_bytes: 64 * 64 * 4,
+                buffer_usage: None,
+                image_width: Some(64),
+                image_height: Some(64),
+                pixel_format: Some(PixelFormat::Rgba8Unorm),
+                image_usage: Some(
+                    ImageUsageFlags::TRANSFER_SRC
+                        | ImageUsageFlags::TRANSFER_DST
+                        | ImageUsageFlags::STORAGE,
+                ),
+                backend_memory_type_index: 0,
+                backend_image_layout_token: Some(0x0102_0304_0506_0708),
+                handle_type: ExternalHandleType::DmaBuf,
+                selected_memory: SelectedMemoryProperties {
+                    device_local: true,
+                    host_visible: false,
+                    host_coherent: false,
+                },
+                dedicated_allocation: true,
                 attachment_count: 1,
             },
         }

@@ -62,7 +62,9 @@ Session
     owns
 ResourceId
     represents
-Buffer
+Resource
+    +-- Buffer
+    +-- Image
     backed by
 backend resource
 ```
@@ -74,12 +76,14 @@ not usable by another session. When a client disconnects, its session is
 dropped and all resources still registered under that session are released by
 Rust ownership/drop.
 
-`qgs-vulkan` owns the Vulkan implementation objects that back buffers.
-Vulkan buffers, memory objects, and handles do not escape `qgs-vulkan`.
-`qgs-protocol` owns only the protocol representation.
+`qgs-vulkan` owns the Vulkan implementation objects that back buffers and
+images. Vulkan buffers, images, memory objects, layouts, tiling details, and
+handles do not escape `qgs-vulkan`. `qgs-protocol` owns only the protocol
+representation.
 
-M1 Step 5 implements buffers only. The maximum single buffer size is 64 MiB as
-a conservative M1 safety limit, not as a final product limit.
+M1 Step 9 supports buffers and simple single-plane RGBA images. VideoSurface is
+still future work. The maximum single buffer size is 64 MiB as a conservative
+M1 safety limit, not as a final product limit.
 
 M1 Step 6 adds Linux external-memory sharing for buffers that were created as
 exportable. Exporting a resource does not transfer QGS ownership: the
@@ -151,6 +155,24 @@ modules, SPIR-V blobs, descriptor binding, pipeline creation, dispatch commands,
 or scheduler policy. QGS still reports and manages resources; it does not become
 a replacement for Vulkan.
 
+## Image Processing Proof
+
+M1 Step 9 proves that a QGS-owned Vulkan Image can be session-owned through
+`ResourceId`, created as external-shareable, exported as DMA-BUF, imported into
+a second Vulkan context, synchronized with the existing external sync-FD path,
+and processed by a private built-in GPU shader.
+
+The proof uses only `PixelFormat::Rgba8Unorm` and a 64 x 64 image. The
+producer side initializes the image with GPU work and signals a sync FD. The
+consumer side imports the image, waits on the sync FD, runs a fixed
+`qgs-vulkan` image shader, and copies the result to a readback buffer only for
+validation. Pixel payloads are not carried in normal QGS IPC messages.
+
+This is not a public QGS image-processing or shader API. The protocol does not
+expose image layouts, Vulkan tiling, DRM format modifiers, shader modules,
+SPIR-V blobs, descriptor binding, pipeline creation, dispatch commands, color
+management, video formats, or presentation/display operations.
+
 ## Current Scope
 
 The initial workspace contains an explicit v0.1 protocol wire encoding, minimal
@@ -158,14 +180,14 @@ session management, Linux Unix Domain Socket transport, and Vulkan-backed
 device enumeration and static capability discovery through the `DeviceDiscovery`
 abstraction. It reports compute queue limits, memory heap/type summaries, and
 external-memory/synchronization mechanism availability. It can create and
-destroy session-owned Vulkan-backed buffer resources and can export/import
-external-memory FDs for explicitly exportable buffers on supported drivers. It
-can also prove one-shot external GPU synchronization with Linux sync FDs on
-supported drivers. It can run a private built-in compute proof against imported
-shared buffers. It does not include an async runtime, daemonization, DRM/KMS,
-image resources, video surfaces, video decode, video encode, a public compute
-API, reusable semaphore workflows, workload scheduling, performance
-benchmarking, telemetry, or free-memory reporting.
+destroy session-owned Vulkan-backed buffer and RGBA image resources and can
+export/import external-memory FDs for explicitly exportable resources on
+supported drivers. It can also prove one-shot external GPU synchronization with
+Linux sync FDs on supported drivers. It can run private built-in compute and
+image-processing proofs against imported shared resources. It does not include
+an async runtime, daemonization, DRM/KMS, video surfaces, video decode, video
+encode, a public compute or shader API, reusable semaphore workflows, workload
+scheduling, performance benchmarking, telemetry, or free-memory reporting.
 
 Capability discovery is static information reported by the backend. It is not a
 measurement of current load, available/free VRAM, throughput, or scheduling

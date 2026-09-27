@@ -185,6 +185,32 @@ fn handle_client(
                     }
                 }
             }
+            WireMessage::CreateImage { request, .. } => {
+                if let Some(session) = &mut session {
+                    match session.create_image(discovery, &request.desc) {
+                        Ok(response) => WireMessage::ImageCreated {
+                            request_id,
+                            response,
+                        },
+                        Err(err) => {
+                            eprintln!("image creation failed: {err}");
+                            WireMessage::Error {
+                                request_id,
+                                response: ErrorResponse {
+                                    code: protocol_code_from_resource_error(&err),
+                                },
+                            }
+                        }
+                    }
+                } else {
+                    WireMessage::Error {
+                        request_id,
+                        response: ErrorResponse {
+                            code: ProtocolErrorCode::SessionRequired,
+                        },
+                    }
+                }
+            }
             WireMessage::DestroyResource { request, .. } => {
                 if let Some(session) = &mut session {
                     match session.destroy_resource(request.resource_id) {
@@ -303,6 +329,7 @@ fn handle_client(
             | WireMessage::DeviceList { .. }
             | WireMessage::DeviceCapabilities { .. }
             | WireMessage::BufferCreated { .. }
+            | WireMessage::ImageCreated { .. }
             | WireMessage::ResourceDestroyed { .. }
             | WireMessage::ResourceExported { .. }
             | WireMessage::SyncCreated { .. }
@@ -333,9 +360,15 @@ fn protocol_code_from_resource_error(err: &ResourceError) -> ProtocolErrorCode {
     match err {
         ResourceError::UnknownResource => ProtocolErrorCode::UnknownResource,
         ResourceError::InvalidBufferSize => ProtocolErrorCode::InvalidBufferSize,
+        ResourceError::InvalidImageDimensions => ProtocolErrorCode::InvalidImageDimensions,
         ResourceError::AllocationFailed => ProtocolErrorCode::AllocationFailed,
         ResourceError::UnsupportedMemoryRequirements => {
             ProtocolErrorCode::UnsupportedMemoryRequirements
+        }
+        ResourceError::UnsupportedPixelFormat => ProtocolErrorCode::UnsupportedPixelFormat,
+        ResourceError::UnsupportedImageUsage => ProtocolErrorCode::UnsupportedImageUsage,
+        ResourceError::UnsupportedImageExternalSharing => {
+            ProtocolErrorCode::UnsupportedImageExternalSharing
         }
         ResourceError::ResourceNotExportable => ProtocolErrorCode::ResourceNotExportable,
         ResourceError::UnsupportedExternalHandleType => {
