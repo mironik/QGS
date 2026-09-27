@@ -84,6 +84,12 @@ The safe QGS wrapper validates:
   recording Vulkan commands
 - CPU YUV422P10 samples are expanded from little-endian 16-bit storage into
   `u32` GPU storage-buffer samples without reducing 10-bit precision
+- the reusable GPU frame processor bounds slot count, keeps descriptor sets and
+  command buffers per slot, resets command pools only after the slot fence has
+  completed, and records explicit buffer barriers for staging upload, shader
+  reads/writes, and validation readback
+- normal frame retirement uses per-slot Vulkan fences; cleanup waits submitted
+  slot fences before slot-owned resources are destroyed
 - submitted work is retained or waited at cleanup boundaries before Vulkan
   resources and semaphores are destroyed
 - optional validation-layer runs can be enabled with
@@ -103,8 +109,8 @@ Remaining assumptions:
 - Device idle waits are used at resource cleanup boundaries to make destruction
   validity explicit; they are not the producer-to-consumer dependency.
 
-Unsafe block count in QGS-owned production Vulkan backend code after M2 Step 10:
-98.
+Unsafe block count in QGS-owned production Vulkan backend code after M2 Step 11:
+104.
 
 ### qgs-vulkan Haswell video interop diagnostic
 
@@ -147,4 +153,4 @@ Remaining assumptions:
 
 Unsafe block count in retained Haswell diagnostic code after GPU R1: 32.
 
-Unsafe block count in all QGS-owned code after M2 Step 10: 130.
+Unsafe block count in all QGS-owned code after M2 Step 11: 136.

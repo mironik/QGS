@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -28,7 +28,8 @@ use qgs_software_video::{
 };
 use qgs_vulkan::{
     diagnose_haswell_video_import, yuv422p10_reference_rgba_u16, yuv422p10_rgba_u16_checksum,
-    DiagnosticDrmLayer, DiagnosticDrmObject, DiagnosticDrmPlane, HaswellVideoDiagnosticInput,
+    DiagnosticDrmLayer, DiagnosticDrmObject, DiagnosticDrmPlane, FrameIdentity,
+    FrameProcessorError, GpuFrameProcessor, GpuFrameProcessorConfig, HaswellVideoDiagnosticInput,
     VulkanDeviceDiscovery, YcbcrConversion, Yuv422P10Plane, Yuv422P10Upload,
 };
 
@@ -250,6 +251,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Software YUV422P10 GPU upload proof:");
     for device in &physical_devices {
         test_synthetic_yuv422p10_gpu_proof(device)?;
+        test_reusable_yuv422p10_gpu_processor(device)?;
         println!();
     }
 
@@ -775,53 +777,179 @@ fn software_gpu_mxf(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     for device in physical_devices {
         println!();
         println!("[{:?}] {}", device.class, device.name);
-        run_software_gpu_frame_proof(&discovery, device, "first", first)?;
-        let sequential_middle =
-            run_software_gpu_frame_proof(&discovery, device, "sequential-53", middle)?;
-        let random_middle =
-            run_software_gpu_frame_proof(&discovery, device, "random-53", random_target)?;
+        let first_six = sequential
+            .frames
+            .iter()
+            .take(6)
+            .enumerate()
+            .map(|(index, frame)| (format!("seq-{index}"), frame))
+            .collect::<Vec<_>>();
+        run_software_gpu_sequence_proof(
+            &discovery,
+            device,
+            "first-six",
+            &first_six
+                .iter()
+                .map(|(label, frame)| (label.as_str(), *frame))
+                .collect::<Vec<_>>(),
+        )?;
+        let middle_outputs = run_software_gpu_sequence_proof(
+            &discovery,
+            device,
+            "frame-53-sequential-random",
+            &[("sequential-53", middle), ("random-53", random_target)],
+        )?;
+        let sequential_middle = *middle_outputs
+            .get("sequential-53")
+            .ok_or("missing sequential frame 53 GPU output")?;
+        let random_middle = *middle_outputs
+            .get("random-53")
+            .ok_or("missing random frame 53 GPU output")?;
         if sequential_middle != random_middle {
             return Err("sequential/random frame 53 GPU checksum mismatch".into());
         }
-        run_software_gpu_frame_proof(&discovery, device, "final", final_frame)?;
+        run_software_gpu_sequence_proof(&discovery, device, "final", &[("final", final_frame)])?;
         println!("  sequential/random frame 53 GPU match: yes");
     }
 
     Ok(())
 }
 
-fn run_software_gpu_frame_proof(
+fn run_software_gpu_sequence_proof(
     discovery: &VulkanDeviceDiscovery,
     device: &DeviceDesc,
     label: &str,
-    frame: &qgs_software_video::SoftwareVideoSurface,
-) -> Result<u64, Box<dyn std::error::Error>> {
-    let upload = yuv422p10_upload_for_frame(device.id, frame)?;
-    let reference_start = Instant::now();
-    let reference = yuv422p10_reference_rgba_u16(&upload)?;
-    let reference_elapsed = reference_start.elapsed();
-    let reference_checksum = yuv422p10_rgba_u16_checksum(&reference);
-    let gpu_start = Instant::now();
-    let output = discovery.process_yuv422p10_surface(&upload)?;
-    let gpu_elapsed = gpu_start.elapsed();
-    let max_delta = max_u16_delta(&reference, &output.rgba_u16)?;
+    frames: &[(&str, &qgs_software_video::SoftwareVideoSurface)],
+) -> Result<BTreeMap<String, u64>, Box<dyn std::error::Error>> {
+    if frames.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let first_upload = yuv422p10_upload_for_frame(device.id, frames[0].1)?;
+    let mut processor = GpuFrameProcessor::new(
+        discovery,
+        GpuFrameProcessorConfig {
+            device_id: device.id,
+            width: first_upload.width,
+            height: first_upload.height,
+            slot_count: 3,
+            conversion: first_upload.conversion,
+        },
+    )?;
+    let started = Instant::now();
+    let mut pending = VecDeque::new();
+    let mut checksums = BTreeMap::new();
+    for (name, frame) in frames {
+        let upload = yuv422p10_upload_for_frame(device.id, frame)?;
+        let reference_start = Instant::now();
+        let reference = yuv422p10_reference_rgba_u16(&upload)?;
+        let reference_elapsed = reference_start.elapsed();
+        let reference_checksum = yuv422p10_rgba_u16_checksum(&reference);
+        let identity = FrameIdentity {
+            presentation_position: frame.presentation_index,
+        };
+        match processor.submit_frame(&upload, identity) {
+            Ok(token) => pending.push_back((
+                token,
+                (*name).to_string(),
+                frame.presentation_index,
+                reference,
+                reference_checksum,
+                reference_elapsed,
+            )),
+            Err(FrameProcessorError::NoFrameSlotAvailable) => {
+                while let Some((
+                    token,
+                    pending_name,
+                    presentation,
+                    reference,
+                    reference_checksum,
+                    ref_elapsed,
+                )) = pending.pop_front()
+                {
+                    let output = processor.wait_for_frame(token)?;
+                    validate_software_gpu_output(
+                        &output,
+                        &pending_name,
+                        presentation,
+                        &reference,
+                        reference_checksum,
+                        ref_elapsed,
+                        &mut checksums,
+                    )?;
+                }
+                let token = processor.submit_frame(&upload, identity)?;
+                pending.push_back((
+                    token,
+                    (*name).to_string(),
+                    frame.presentation_index,
+                    reference,
+                    reference_checksum,
+                    reference_elapsed,
+                ));
+            }
+            Err(err) => return Err(Box::new(err)),
+        }
+    }
+    while let Some((token, name, presentation, reference, reference_checksum, ref_elapsed)) =
+        pending.pop_front()
+    {
+        let output = processor.wait_for_frame(token)?;
+        validate_software_gpu_output(
+            &output,
+            &name,
+            presentation,
+            &reference,
+            reference_checksum,
+            ref_elapsed,
+            &mut checksums,
+        )?;
+    }
+    let elapsed = started.elapsed();
+    let counters = processor.counters();
+    println!(
+        "  {label}: frames={} submissions={} slot_reuses={} pipelines={} command_buffers={} elapsed={:.3}ms",
+        frames.len(),
+        counters.frame_submissions,
+        counters.slot_reuses,
+        counters.pipeline_creations,
+        counters.command_buffer_count,
+        elapsed.as_secs_f64() * 1000.0
+    );
+    Ok(checksums)
+}
+
+fn validate_software_gpu_output(
+    output: &qgs_vulkan::ProcessedFrameOutput,
+    label: &str,
+    presentation: u64,
+    reference: &[u16],
+    reference_checksum: u64,
+    reference_elapsed: std::time::Duration,
+    checksums: &mut BTreeMap<String, u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if output.presentation_position != presentation {
+        return Err(format!("{label} GPU presentation identity mismatch").into());
+    }
+    let max_delta = max_u16_delta(reference, &output.rgba_u16)?;
     if max_delta > 1 {
         return Err(format!("{label} GPU output exceeded tolerance: max delta {max_delta}").into());
     }
     println!(
-        "  {label}: presentation={} gpu_checksum=0x{:016x} cpu_ref=0x{:016x} max_delta={} gpu_time={:.3}ms ref_time={:.3}ms",
-        frame.presentation_index,
+        "  {label}: presentation={} slot={} seq={} gpu_checksum=0x{:016x} cpu_ref=0x{:016x} max_delta={} ref_time={:.3}ms",
+        presentation,
+        output.slot_index,
+        output.submission_sequence,
         output.checksum,
         reference_checksum,
         max_delta,
-        gpu_elapsed.as_secs_f64() * 1000.0,
         reference_elapsed.as_secs_f64() * 1000.0
     );
     println!(
         "    memory: cpu_surface={} staging={} gpu_planes={} output={}",
         output.cpu_surface_bytes, output.staging_bytes, output.gpu_plane_bytes, output.output_bytes
     );
-    Ok(output.checksum)
+    checksums.insert(label.to_string(), output.checksum);
+    Ok(())
 }
 
 fn yuv422p10_upload_for_frame<'a>(
@@ -2033,6 +2161,219 @@ fn test_synthetic_yuv422p10_gpu_proof(
     }
     println!("Validation:");
     println!("PASS");
+    Ok(())
+}
+
+struct SyntheticYuv422P10Frame {
+    width: u32,
+    height: u32,
+    y_stride: usize,
+    c_stride: usize,
+    y: Vec<u8>,
+    cb: Vec<u8>,
+    cr: Vec<u8>,
+}
+
+impl SyntheticYuv422P10Frame {
+    fn upload(&self, device_id: qgs_protocol::DeviceId) -> Yuv422P10Upload<'_> {
+        Yuv422P10Upload {
+            device_id,
+            width: self.width,
+            height: self.height,
+            y: Yuv422P10Plane {
+                width_samples: self.width,
+                height: self.height,
+                stride_bytes: self.y_stride,
+                data: &self.y,
+            },
+            cb: Yuv422P10Plane {
+                width_samples: self.width / 2,
+                height: self.height,
+                stride_bytes: self.c_stride,
+                data: &self.cb,
+            },
+            cr: Yuv422P10Plane {
+                width_samples: self.width / 2,
+                height: self.height,
+                stride_bytes: self.c_stride,
+                data: &self.cr,
+            },
+            conversion: YcbcrConversion::Rec709Limited,
+        }
+    }
+}
+
+fn make_synthetic_yuv422p10_frame(
+    frame_index: usize,
+) -> Result<SyntheticYuv422P10Frame, Box<dyn std::error::Error>> {
+    let width = 8_u32;
+    let height = 4_u32;
+    let y_stride = 20_usize;
+    let c_stride = 12_usize;
+    let mut y = vec![0_u8; y_stride * height as usize];
+    let mut cb = vec![0_u8; c_stride * height as usize];
+    let mut cr = vec![0_u8; c_stride * height as usize];
+    for row in 0..height as usize {
+        for x in 0..width as usize {
+            let base = row * width as usize + x + frame_index * 13;
+            let sample = 64_u16 + u16::try_from((base * 7) % 877)?;
+            y[row * y_stride + x * 2..row * y_stride + x * 2 + 2]
+                .copy_from_slice(&sample.to_le_bytes());
+        }
+        for x in 0..(width as usize / 2) {
+            let cb_sample = 512_u16 + u16::try_from((x * 11 + row * 3 + frame_index * 5) % 96)?;
+            let cr_sample =
+                512_u16.saturating_sub(u16::try_from((x * 5 + row * 7 + frame_index * 9) % 96)?);
+            cb[row * c_stride + x * 2..row * c_stride + x * 2 + 2]
+                .copy_from_slice(&cb_sample.to_le_bytes());
+            cr[row * c_stride + x * 2..row * c_stride + x * 2 + 2]
+                .copy_from_slice(&cr_sample.to_le_bytes());
+        }
+    }
+    Ok(SyntheticYuv422P10Frame {
+        width,
+        height,
+        y_stride,
+        c_stride,
+        y,
+        cb,
+        cr,
+    })
+}
+
+fn test_reusable_yuv422p10_gpu_processor(
+    device: &DeviceDesc,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("  reusable processor:");
+    let discovery = VulkanDeviceDiscovery::new()?;
+    let frames = (0..6)
+        .map(make_synthetic_yuv422p10_frame)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut processor = GpuFrameProcessor::new(
+        &discovery,
+        GpuFrameProcessorConfig {
+            device_id: device.id,
+            width: frames[0].width,
+            height: frames[0].height,
+            slot_count: 3,
+            conversion: YcbcrConversion::Rec709Limited,
+        },
+    )?;
+    let started = Instant::now();
+    let mut pending = VecDeque::new();
+    let mut checksums = Vec::new();
+    for (index, frame) in frames.iter().enumerate() {
+        let upload = frame.upload(device.id);
+        let reference = yuv422p10_reference_rgba_u16(&upload)?;
+        let reference_checksum = yuv422p10_rgba_u16_checksum(&reference);
+        match processor.submit_frame(
+            &upload,
+            FrameIdentity {
+                presentation_position: index as u64,
+            },
+        ) {
+            Ok(token) => pending.push_back((token, index, reference, reference_checksum)),
+            Err(FrameProcessorError::NoFrameSlotAvailable) => {
+                while let Some((token, submitted_index, reference, reference_checksum)) =
+                    pending.pop_front()
+                {
+                    let output = processor.wait_for_frame(token)?;
+                    validate_reusable_output(
+                        &output,
+                        submitted_index,
+                        &reference,
+                        reference_checksum,
+                    )?;
+                    checksums.push(output.checksum);
+                }
+                let token = processor.submit_frame(
+                    &upload,
+                    FrameIdentity {
+                        presentation_position: index as u64,
+                    },
+                )?;
+                pending.push_back((token, index, reference, reference_checksum));
+            }
+            Err(err) => return Err(Box::new(err)),
+        }
+        if index == 2 {
+            let fourth = frames[3].upload(device.id);
+            match processor.submit_frame(
+                &fourth,
+                FrameIdentity {
+                    presentation_position: 3,
+                },
+            ) {
+                Err(FrameProcessorError::NoFrameSlotAvailable) => {
+                    println!("    bounded backpressure after 3 in-flight frames: yes");
+                }
+                Ok(_) => return Err("processor accepted an unbounded fourth slot".into()),
+                Err(err) => return Err(Box::new(err)),
+            }
+        }
+    }
+    while let Some((token, index, reference, reference_checksum)) = pending.pop_front() {
+        let output = processor.wait_for_frame(token)?;
+        validate_reusable_output(&output, index, &reference, reference_checksum)?;
+        checksums.push(output.checksum);
+    }
+    let elapsed = started.elapsed();
+    let counters = processor.counters();
+    println!("    frames submitted: {}", counters.frame_submissions);
+    println!("    slot reuses: {}", counters.slot_reuses);
+    println!(
+        "    resources: pipelines={} shaders={} staging={} gpu_planes={} outputs={} readbacks={} command_buffers={}",
+        counters.pipeline_creations,
+        counters.shader_module_creations,
+        counters.staging_allocations,
+        counters.gpu_plane_allocations,
+        counters.output_allocations,
+        counters.readback_allocations,
+        counters.command_buffer_count
+    );
+    println!(
+        "    checksums: {:?}",
+        checksums
+            .iter()
+            .map(|checksum| format!("0x{checksum:016x}"))
+            .collect::<Vec<_>>()
+    );
+    println!(
+        "    DEVELOPMENT OBSERVATION - NOT A BENCHMARK: {:.3}ms for 6 reusable submissions",
+        elapsed.as_secs_f64() * 1000.0
+    );
+    if counters.pipeline_creations != 1
+        || counters.shader_module_creations != 1
+        || counters.staging_allocations != 9
+        || counters.gpu_plane_allocations != 9
+        || counters.output_allocations != 3
+        || counters.command_buffer_count != 3
+        || counters.frame_submissions != 6
+        || counters.slot_reuses < 3
+    {
+        return Err("reusable processor counters did not show bounded reuse".into());
+    }
+    println!("    validation: PASS");
+    Ok(())
+}
+
+fn validate_reusable_output(
+    output: &qgs_vulkan::ProcessedFrameOutput,
+    expected_index: usize,
+    reference: &[u16],
+    reference_checksum: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if output.presentation_position != expected_index as u64 {
+        return Err("processed output presentation identity mismatch".into());
+    }
+    let max_delta = max_u16_delta(reference, &output.rgba_u16)?;
+    if max_delta > 1 {
+        return Err(format!("reusable GPU output exceeded tolerance: {max_delta}").into());
+    }
+    println!(
+        "    frame {expected_index}: slot={} seq={} gpu=0x{:016x} cpu=0x{reference_checksum:016x} max_delta={max_delta}",
+        output.slot_index, output.submission_sequence, output.checksum
+    );
     Ok(())
 }
 

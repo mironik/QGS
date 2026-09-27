@@ -452,6 +452,49 @@ Rec.709 limited-range conversion for the acceptance sample and writes RGBA
 there is no LUT system, HDR processing, display transform, public shader API,
 or presentation path.
 
+M2 Step 11 replaces the one-frame proof allocation lifecycle with a bounded
+reusable GPU frame processor:
+
+```text
+software VideoSurface
+    |
+FrameSlot 0 / FrameSlot 1 / FrameSlot 2
+    |
+Vulkan submissions
+    |
+per-slot fences
+    |
+retirement and slot reuse
+```
+
+The frame processor owns shared immutable pipeline state once per processor:
+shader module, descriptor set layout, pipeline layout, compute pipeline, and a
+descriptor pool sized for the configured slots. Each slot owns reusable staging
+buffers, GPU Y/Cb/Cr plane buffers, RGBA output/readback buffers, one command
+pool, one command buffer, one fence, one descriptor set, and QGS-owned frame
+identity metadata. Slot identity, presentation position, submission sequence,
+and future output identity are intentionally distinct; a slot index is never a
+media frame identifier.
+
+Slot state is explicit:
+
+```text
+Available -> Preparing -> Submitted -> Completed -> Available
+```
+
+When all slots are submitted, the processor reports bounded backpressure rather
+than allocating another slot. Normal frame processing uses per-submission
+fences; it does not call `vkDeviceWaitIdle` or queue idle to determine slot
+reuse. Drop/cleanup may still conservatively wait for submitted slot fences,
+and lower-level resource destructors retain cleanup-boundary device-idle waits
+until a later destruction-order refinement.
+
+The Step 11 proof uses a default of three slots and demonstrates six frames as
+two bounded in-flight batches. This proves resource reuse and backpressure
+without introducing a playback scheduler. It deliberately remains separate from
+Qnc timeline concepts, final presentation, performance scheduling, and the
+frozen Haswell VA -> Vulkan zero-copy path.
+
 M2 Step 2 adds real VA-API decode capability discovery through a backend
 boundary:
 
@@ -488,11 +531,12 @@ supported drivers. It can also prove one-shot external GPU synchronization with
 Linux sync FDs on supported drivers. It can run private built-in compute and
 image-processing proofs against imported shared resources. It also defines the
 video capability and `VideoSurface` model and can perform narrow H.264
-VA-API hardware decode proofs on supported hardware. It does not include an
-async runtime, daemonization, DRM/KMS, video encode, a public compute or shader
-API, reusable semaphore workflows, workload scheduling, performance
-benchmarking, telemetry, free-memory reporting, or resumed VA -> Vulkan
-zero-copy video processing.
+VA-API hardware decode proofs on supported hardware. It can also process
+software-decoded YUV422P10LE frames through a bounded reusable GPU frame
+processor. It does not include an async runtime, daemonization, DRM/KMS, video
+encode, a public compute or shader API, reusable semaphore workflows, general
+workload scheduling, performance benchmarking, telemetry, free-memory reporting,
+or resumed VA -> Vulkan zero-copy video processing.
 
 Capability discovery is static information reported by the backend. It is not a
 measurement of current load, available/free VRAM, throughput, or scheduling

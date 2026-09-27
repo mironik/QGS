@@ -127,7 +127,7 @@ impl std::fmt::Display for BackendError {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum YcbcrConversion {
     Rec709Limited,
 }
@@ -162,6 +162,87 @@ pub struct Yuv422P10GpuOutput {
     pub gpu_plane_bytes: usize,
     pub output_bytes: usize,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameToken(u64);
+
+impl FrameToken {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameIdentity {
+    pub presentation_position: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuFrameProcessorConfig {
+    pub device_id: DeviceId,
+    pub width: u32,
+    pub height: u32,
+    pub slot_count: usize,
+    pub conversion: YcbcrConversion,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GpuFrameProcessorCounters {
+    pub pipeline_creations: u64,
+    pub shader_module_creations: u64,
+    pub gpu_plane_allocations: u64,
+    pub staging_allocations: u64,
+    pub output_allocations: u64,
+    pub readback_allocations: u64,
+    pub command_buffer_count: u64,
+    pub frame_submissions: u64,
+    pub slot_reuses: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessedFrameOutput {
+    pub token: FrameToken,
+    pub presentation_position: u64,
+    pub slot_index: usize,
+    pub submission_sequence: u64,
+    pub width: u32,
+    pub height: u32,
+    pub rgba_u16: Vec<u16>,
+    pub checksum: u64,
+    pub cpu_surface_bytes: usize,
+    pub staging_bytes: usize,
+    pub gpu_plane_bytes: usize,
+    pub output_bytes: usize,
+}
+
+#[derive(Debug)]
+pub enum FrameProcessorError {
+    Resource(ResourceError),
+    NoFrameSlotAvailable,
+    UnknownFrameToken,
+    FrameNotComplete,
+    InvalidFrameState,
+}
+
+impl From<ResourceError> for FrameProcessorError {
+    fn from(value: ResourceError) -> Self {
+        Self::Resource(value)
+    }
+}
+
+impl std::fmt::Display for FrameProcessorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Resource(err) => write!(f, "resource error: {err:?}"),
+            Self::NoFrameSlotAvailable => write!(f, "no GPU frame slot available"),
+            Self::UnknownFrameToken => write!(f, "unknown frame token"),
+            Self::FrameNotComplete => write!(f, "frame is not complete"),
+            Self::InvalidFrameState => write!(f, "invalid frame state transition"),
+        }
+    }
+}
+
+impl std::error::Error for FrameProcessorError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Yuv422P10Layout {
@@ -269,22 +350,38 @@ impl VulkanDeviceDiscovery {
         &self,
         upload: &Yuv422P10Upload<'_>,
     ) -> Result<Yuv422P10GpuOutput, ResourceError> {
-        let layout = validate_yuv422p10_upload(upload)?;
-        let device = self
-            .devices
-            .iter()
-            .find(|device| device.desc.id == upload.device_id)
-            .ok_or(ResourceError::UnknownDeviceId)?
-            .device
-            .clone();
-        if !device.queue_supports_compute() {
-            return Err(ResourceError::UnsupportedMemoryRequirements);
-        }
-
-        let y_values = expand_yuv422p10_plane(upload.y)?;
-        let cb_values = expand_yuv422p10_plane(upload.cb)?;
-        let cr_values = expand_yuv422p10_plane(upload.cr)?;
-        run_yuv422p10_gpu_proof(&device, upload, layout, &y_values, &cb_values, &cr_values)
+        let mut processor = GpuFrameProcessor::new(
+            self,
+            GpuFrameProcessorConfig {
+                device_id: upload.device_id,
+                width: upload.width,
+                height: upload.height,
+                slot_count: 1,
+                conversion: upload.conversion,
+            },
+        )
+        .map_err(frame_processor_resource_error)?;
+        let token = processor
+            .submit_frame(
+                upload,
+                FrameIdentity {
+                    presentation_position: 0,
+                },
+            )
+            .map_err(frame_processor_resource_error)?;
+        let output = processor
+            .wait_for_frame(token)
+            .map_err(frame_processor_resource_error)?;
+        Ok(Yuv422P10GpuOutput {
+            width: output.width,
+            height: output.height,
+            rgba_u16: output.rgba_u16,
+            checksum: output.checksum,
+            cpu_surface_bytes: output.cpu_surface_bytes,
+            staging_bytes: output.staging_bytes,
+            gpu_plane_bytes: output.gpu_plane_bytes,
+            output_bytes: output.output_bytes,
+        })
     }
 
     pub fn import_wait_and_validate_synced_buffer(
@@ -1797,12 +1894,24 @@ impl GpuFence {
         Ok(Self { device, fence })
     }
 
+    fn is_signaled(&self) -> BackendResult<bool> {
+        // SAFETY: fence belongs to this device and is live.
+        unsafe { self.device.device.get_fence_status(self.fence) }.map_err(BackendError::Vk)
+    }
+
+    fn reset(&self) -> BackendResult<()> {
+        // SAFETY: callers reset only after the previous submission associated
+        // with this fence has completed and the slot is available again.
+        unsafe { self.device.device.reset_fences(&[self.fence]) }?;
+        Ok(())
+    }
+
     fn wait(&self) -> BackendResult<()> {
         // SAFETY: fence belongs to this device and is live.
         unsafe {
             self.device
                 .device
-                .wait_for_fences(&[self.fence], true, 5_000_000_000)
+                .wait_for_fences(&[self.fence], true, 60_000_000_000)
         }?;
         Ok(())
     }
@@ -1826,7 +1935,10 @@ struct GpuCommandPool {
 impl GpuCommandPool {
     fn new(device: Arc<GpuDevice>) -> BackendResult<Self> {
         let create_info = vk::CommandPoolCreateInfo::default()
-            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+            .flags(
+                vk::CommandPoolCreateFlags::TRANSIENT
+                    | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+            )
             .queue_family_index(device.queue_family_index);
         // SAFETY: queue_family_index belongs to this device.
         let pool = unsafe { device.device.create_command_pool(&create_info, None) }?;
@@ -1842,6 +1954,17 @@ impl GpuCommandPool {
         let command_buffers =
             unsafe { self.device.device.allocate_command_buffers(&allocate_info) }?;
         Ok(command_buffers[0])
+    }
+
+    fn reset(&self) -> BackendResult<()> {
+        // SAFETY: callers reset only after work submitted from this pool has
+        // completed, so no command buffer from the pool is in use by the GPU.
+        unsafe {
+            self.device
+                .device
+                .reset_command_pool(self.pool, vk::CommandPoolResetFlags::empty())
+        }?;
+        Ok(())
     }
 }
 
@@ -1943,24 +2066,9 @@ fn one_time_commands<T>(
 fn validate_yuv422p10_upload(
     upload: &Yuv422P10Upload<'_>,
 ) -> Result<Yuv422P10Layout, ResourceError> {
-    if upload.width == 0
-        || upload.height == 0
-        || upload.width > MAX_VIDEO_SURFACE_WIDTH
-        || upload.height > MAX_VIDEO_SURFACE_HEIGHT
-        || !upload.width.is_multiple_of(2)
-    {
-        return Err(ResourceError::InvalidImageDimensions);
-    }
     validate_yuv422p10_plane(upload.y, upload.width, upload.height)?;
     validate_yuv422p10_plane(upload.cb, upload.width / 2, upload.height)?;
     validate_yuv422p10_plane(upload.cr, upload.width / 2, upload.height)?;
-
-    let y_samples = checked_sample_count(upload.width, upload.height)?;
-    let chroma_samples = checked_sample_count(upload.width / 2, upload.height)?;
-    let output_pixels = y_samples;
-    let output_samples = output_pixels
-        .checked_mul(YUV422P10_OUTPUT_COMPONENTS)
-        .ok_or(ResourceError::InvalidImageDimensions)?;
     let cpu_surface_bytes = upload
         .y
         .data
@@ -1968,26 +2076,7 @@ fn validate_yuv422p10_upload(
         .checked_add(upload.cb.data.len())
         .and_then(|total| total.checked_add(upload.cr.data.len()))
         .ok_or(ResourceError::InvalidImageDimensions)?;
-    let staging_samples = y_samples
-        .checked_add(chroma_samples)
-        .and_then(|total| total.checked_add(chroma_samples))
-        .ok_or(ResourceError::InvalidImageDimensions)?;
-    let staging_bytes = staging_samples
-        .checked_mul(std::mem::size_of::<u32>())
-        .ok_or(ResourceError::InvalidImageDimensions)?;
-    let output_bytes = output_samples
-        .checked_mul(YUV422P10_OUTPUT_BYTES_PER_COMPONENT)
-        .ok_or(ResourceError::InvalidImageDimensions)?;
-
-    Ok(Yuv422P10Layout {
-        y_samples,
-        chroma_samples,
-        output_samples,
-        cpu_surface_bytes,
-        staging_bytes,
-        gpu_plane_bytes: staging_bytes,
-        output_bytes,
-    })
+    yuv422p10_layout_for_dimensions(upload.width, upload.height, cpu_surface_bytes)
 }
 
 fn validate_yuv422p10_plane(
@@ -2824,170 +2913,501 @@ fn run_image_invert_proof(
     readback.read_bytes(0, input_pixels.len())
 }
 
-fn run_yuv422p10_gpu_proof(
-    device: &Arc<GpuDevice>,
-    upload: &Yuv422P10Upload<'_>,
-    layout: Yuv422P10Layout,
-    y_values: &[u32],
-    cb_values: &[u32],
-    cr_values: &[u32],
-) -> Result<Yuv422P10GpuOutput, ResourceError> {
-    let y_bytes = checked_byte_len(y_values.len(), std::mem::size_of::<u32>())?;
-    let chroma_bytes = checked_byte_len(cb_values.len(), std::mem::size_of::<u32>())?;
-    let output_u32_bytes = checked_byte_len(layout.output_samples, std::mem::size_of::<u32>())?;
-    let output_u16_bytes = checked_byte_len(layout.output_samples, std::mem::size_of::<u16>())?;
+pub struct GpuFrameProcessor {
+    device: Arc<GpuDevice>,
+    config: GpuFrameProcessorConfig,
+    pipeline: Yuv422P10PipelineState,
+    slots: Vec<FrameSlot>,
+    next_token: u64,
+    next_sequence: u64,
+    counters: GpuFrameProcessorCounters,
+}
 
-    let staging_y = upload_storage_plane(device, y_values)?;
-    let staging_cb = upload_storage_plane(device, cb_values)?;
-    let staging_cr = upload_storage_plane(device, cr_values)?;
-    let gpu_y = GpuBuffer::new(
-        device.clone(),
-        y_bytes,
-        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
-        None,
-        vk::MemoryPropertyFlags::empty(),
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        false,
-    )?;
-    let gpu_cb = GpuBuffer::new(
-        device.clone(),
-        chroma_bytes,
-        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
-        None,
-        vk::MemoryPropertyFlags::empty(),
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        false,
-    )?;
-    let gpu_cr = GpuBuffer::new(
-        device.clone(),
-        chroma_bytes,
-        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
-        None,
-        vk::MemoryPropertyFlags::empty(),
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        false,
-    )?;
-    let output = GpuBuffer::new(
-        device.clone(),
-        output_u32_bytes,
-        vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::STORAGE_BUFFER,
-        None,
-        vk::MemoryPropertyFlags::empty(),
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        false,
-    )?;
-    let readback = GpuBuffer::new(
-        device.clone(),
-        output_u32_bytes,
-        vk::BufferUsageFlags::TRANSFER_DST,
-        None,
-        vk::MemoryPropertyFlags::HOST_VISIBLE,
-        vk::MemoryPropertyFlags::HOST_COHERENT,
-        false,
-    )?;
-    let pipeline = Yuv422P10PipelineState::new(device.clone())?;
-    let descriptor = pipeline.write_buffers(&gpu_y, &gpu_cb, &gpu_cr, &output)?;
-    let params = Yuv422P10ShaderParams {
-        width: upload.width,
-        height: upload.height,
-        y_stride_samples: upload.width,
-        chroma_stride_samples: upload.width / 2,
-    };
+impl GpuFrameProcessor {
+    pub fn new(
+        discovery: &VulkanDeviceDiscovery,
+        config: GpuFrameProcessorConfig,
+    ) -> Result<Self, FrameProcessorError> {
+        validate_frame_processor_config(config)?;
+        let device = discovery
+            .devices
+            .iter()
+            .find(|device| device.desc.id == config.device_id)
+            .ok_or(FrameProcessorError::Resource(
+                ResourceError::UnknownDeviceId,
+            ))?
+            .device
+            .clone();
+        if !device.queue_supports_compute() {
+            return Err(FrameProcessorError::Resource(
+                ResourceError::UnsupportedMemoryRequirements,
+            ));
+        }
+        let layout = yuv422p10_layout_for_dimensions(config.width, config.height, 0)?;
+        let pipeline = Yuv422P10PipelineState::new(
+            device.clone(),
+            u32::try_from(config.slot_count).map_err(|_| ResourceError::InvalidBufferSize)?,
+        )?;
+        let mut slots = Vec::with_capacity(config.slot_count);
+        for index in 0..config.slot_count {
+            slots.push(FrameSlot::new(index, device.clone(), &pipeline, layout)?);
+        }
+        let slot_count = config.slot_count as u64;
+        Ok(Self {
+            device,
+            config,
+            pipeline,
+            slots,
+            next_token: 1,
+            next_sequence: 1,
+            counters: GpuFrameProcessorCounters {
+                pipeline_creations: 1,
+                shader_module_creations: 1,
+                staging_allocations: slot_count * 3,
+                gpu_plane_allocations: slot_count * 3,
+                output_allocations: slot_count,
+                readback_allocations: slot_count,
+                command_buffer_count: slot_count,
+                ..Default::default()
+            },
+        })
+    }
 
-    let (_, _pending) = one_time_commands(
-        device,
-        |command_buffer| {
-            copy_buffer(command_buffer, &staging_y, &gpu_y, y_bytes);
-            copy_buffer(command_buffer, &staging_cb, &gpu_cb, chroma_bytes);
-            copy_buffer(command_buffer, &staging_cr, &gpu_cr, chroma_bytes);
-            buffer_barrier(
-                device,
-                command_buffer,
-                &[&gpu_y, &gpu_cb, &gpu_cr],
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::SHADER_READ,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-            );
-            // SAFETY: command buffer is recording; pipeline, descriptor set,
-            // and buffers are live for the submission. Push constants match
-            // the fixed shader's 16-byte parameter block.
-            unsafe {
-                device.device.cmd_bind_pipeline(
-                    command_buffer,
-                    vk::PipelineBindPoint::COMPUTE,
-                    pipeline.pipeline,
-                );
-                device.device.cmd_bind_descriptor_sets(
-                    command_buffer,
-                    vk::PipelineBindPoint::COMPUTE,
-                    pipeline.layout,
-                    0,
-                    &[descriptor.set],
-                    &[],
-                );
-                device.device.cmd_push_constants(
-                    command_buffer,
-                    pipeline.layout,
-                    vk::ShaderStageFlags::COMPUTE,
-                    0,
-                    params.as_bytes(),
-                );
-                device.device.cmd_dispatch(
-                    command_buffer,
-                    upload.width.div_ceil(YUV422P10_LOCAL_SIZE_X),
-                    upload.height.div_ceil(YUV422P10_LOCAL_SIZE_Y),
-                    1,
-                );
+    pub fn submit_frame(
+        &mut self,
+        upload: &Yuv422P10Upload<'_>,
+        identity: FrameIdentity,
+    ) -> Result<FrameToken, FrameProcessorError> {
+        if upload.device_id != self.config.device_id
+            || upload.width != self.config.width
+            || upload.height != self.config.height
+            || upload.conversion != self.config.conversion
+        {
+            return Err(FrameProcessorError::Resource(
+                ResourceError::InvalidImageDimensions,
+            ));
+        }
+        let layout = validate_yuv422p10_upload(upload)?;
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.state.can_submit())
+            .ok_or(FrameProcessorError::NoFrameSlotAvailable)?;
+        let token = FrameToken(self.next_token);
+        self.next_token = self
+            .next_token
+            .checked_add(1)
+            .ok_or(FrameProcessorError::InvalidFrameState)?;
+        let sequence = self.next_sequence;
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or(FrameProcessorError::InvalidFrameState)?;
+        if slot.had_submission {
+            self.counters.slot_reuses = self.counters.slot_reuses.saturating_add(1);
+        }
+        slot.submit(
+            &self.device,
+            &self.pipeline,
+            FrameSubmission {
+                upload,
+                layout,
+                token,
+                identity,
+                sequence,
+            },
+        )?;
+        self.counters.frame_submissions = self.counters.frame_submissions.saturating_add(1);
+        Ok(token)
+    }
+
+    pub fn poll_completed(&mut self) -> Result<Vec<FrameToken>, FrameProcessorError> {
+        let mut completed = Vec::new();
+        for slot in &mut self.slots {
+            if slot.state == FrameSlotState::Submitted
+                && slot.fence.is_signaled().map_err(|err| {
+                    eprintln!("vulkan frame fence status query failed: {err:?}");
+                    FrameProcessorError::Resource(ResourceError::ExportFailed)
+                })?
+            {
+                slot.state = FrameSlotState::Completed;
+                if let Some(info) = slot.submitted {
+                    completed.push(info.token);
+                }
             }
-            buffer_barrier(
-                device,
-                command_buffer,
-                &[&output],
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::TRANSFER_READ,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::TRANSFER,
-            );
-            copy_buffer(command_buffer, &output, &readback, output_u32_bytes);
-            Ok(())
-        },
-        None,
-        None,
-        true,
-    )?;
-    let bytes = readback.read_bytes(0, output_u32_bytes as usize)?;
-    let mut rgba_u16 = Vec::with_capacity(layout.output_samples);
-    let (chunks, remainder) = bytes.as_chunks::<4>();
-    if !remainder.is_empty() {
-        return Err(ResourceError::ExportFailed);
+        }
+        Ok(completed)
     }
-    for chunk in chunks {
-        let value = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        rgba_u16.push(u16::try_from(value).map_err(|_| ResourceError::ExportFailed)?);
+
+    pub fn retire_completed(&mut self) -> Result<usize, FrameProcessorError> {
+        self.poll_completed()?;
+        let mut retired = 0;
+        for slot in &mut self.slots {
+            if slot.state.can_retire() {
+                slot.submitted = None;
+                slot.state = FrameSlotState::Available;
+                retired += 1;
+            }
+        }
+        Ok(retired)
     }
-    if rgba_u16.len() != layout.output_samples || output_u16_bytes != layout.output_bytes as u64 {
-        return Err(ResourceError::ExportFailed);
+
+    pub fn wait_for_frame(
+        &mut self,
+        token: FrameToken,
+    ) -> Result<ProcessedFrameOutput, FrameProcessorError> {
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.submitted.is_some_and(|info| info.token == token))
+            .ok_or(FrameProcessorError::UnknownFrameToken)?;
+        match slot.state {
+            FrameSlotState::Submitted => {
+                slot.fence.wait().map_err(|err| {
+                    eprintln!("vulkan frame fence wait failed: {err:?}");
+                    FrameProcessorError::Resource(ResourceError::ExportFailed)
+                })?;
+                slot.state = FrameSlotState::Completed;
+            }
+            FrameSlotState::Completed => {}
+            _ => return Err(FrameProcessorError::InvalidFrameState),
+        }
+        let output = slot.read_completed_output()?;
+        slot.submitted = None;
+        slot.state = FrameSlotState::Available;
+        Ok(output)
     }
-    let checksum = yuv422p10_rgba_u16_checksum(&rgba_u16);
-    Ok(Yuv422P10GpuOutput {
-        width: upload.width,
-        height: upload.height,
-        rgba_u16,
-        checksum,
-        cpu_surface_bytes: layout.cpu_surface_bytes,
-        staging_bytes: layout.staging_bytes,
-        gpu_plane_bytes: layout.gpu_plane_bytes,
-        output_bytes: layout.output_bytes,
+
+    pub fn counters(&self) -> GpuFrameProcessorCounters {
+        self.counters
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+}
+
+impl Drop for GpuFrameProcessor {
+    fn drop(&mut self) {
+        for slot in &mut self.slots {
+            if slot.state == FrameSlotState::Submitted {
+                let _ = slot.fence.wait();
+                slot.state = FrameSlotState::Completed;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameSlotState {
+    Available,
+    Preparing,
+    Submitted,
+    Completed,
+}
+
+impl FrameSlotState {
+    fn can_submit(self) -> bool {
+        self == Self::Available
+    }
+
+    fn can_retire(self) -> bool {
+        self == Self::Completed
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SubmittedFrameInfo {
+    token: FrameToken,
+    identity: FrameIdentity,
+    sequence: u64,
+    width: u32,
+    height: u32,
+    layout: Yuv422P10Layout,
+}
+
+#[derive(Clone, Copy)]
+struct FrameSubmission<'a> {
+    upload: &'a Yuv422P10Upload<'a>,
+    layout: Yuv422P10Layout,
+    token: FrameToken,
+    identity: FrameIdentity,
+    sequence: u64,
+}
+
+struct FrameSlot {
+    index: usize,
+    state: FrameSlotState,
+    submitted: Option<SubmittedFrameInfo>,
+    had_submission: bool,
+    staging_y: GpuBuffer,
+    staging_cb: GpuBuffer,
+    staging_cr: GpuBuffer,
+    gpu_y: GpuBuffer,
+    gpu_cb: GpuBuffer,
+    gpu_cr: GpuBuffer,
+    output: GpuBuffer,
+    readback: GpuBuffer,
+    command_pool: GpuCommandPool,
+    command_buffer: vk::CommandBuffer,
+    fence: GpuFence,
+    descriptor: DescriptorSet,
+}
+
+impl FrameSlot {
+    fn new(
+        index: usize,
+        device: Arc<GpuDevice>,
+        pipeline: &Yuv422P10PipelineState,
+        layout: Yuv422P10Layout,
+    ) -> Result<Self, FrameProcessorError> {
+        let y_bytes = checked_byte_len(layout.y_samples, std::mem::size_of::<u32>())?;
+        let chroma_bytes = checked_byte_len(layout.chroma_samples, std::mem::size_of::<u32>())?;
+        let output_u32_bytes = checked_byte_len(layout.output_samples, std::mem::size_of::<u32>())?;
+        let staging_y = frame_staging_buffer(&device, y_bytes)?;
+        let staging_cb = frame_staging_buffer(&device, chroma_bytes)?;
+        let staging_cr = frame_staging_buffer(&device, chroma_bytes)?;
+        let gpu_y = frame_gpu_plane_buffer(&device, y_bytes)?;
+        let gpu_cb = frame_gpu_plane_buffer(&device, chroma_bytes)?;
+        let gpu_cr = frame_gpu_plane_buffer(&device, chroma_bytes)?;
+        let output = frame_output_buffer(&device, output_u32_bytes)?;
+        let readback = frame_readback_buffer(&device, output_u32_bytes)?;
+        let command_pool = GpuCommandPool::new(device.clone()).map_err(|err| {
+            eprintln!("vulkan frame command pool creation failed: {err:?}");
+            FrameProcessorError::Resource(ResourceError::ExportFailed)
+        })?;
+        let command_buffer = command_pool.allocate_primary().map_err(|err| {
+            eprintln!("vulkan frame command buffer allocation failed: {err:?}");
+            FrameProcessorError::Resource(ResourceError::ExportFailed)
+        })?;
+        let fence = GpuFence::new(device).map_err(|err| {
+            eprintln!("vulkan frame fence creation failed: {err:?}");
+            FrameProcessorError::Resource(ResourceError::ExportFailed)
+        })?;
+        let descriptor = pipeline.write_buffers(&gpu_y, &gpu_cb, &gpu_cr, &output)?;
+        Ok(Self {
+            index,
+            state: FrameSlotState::Available,
+            submitted: None,
+            had_submission: false,
+            staging_y,
+            staging_cb,
+            staging_cr,
+            gpu_y,
+            gpu_cb,
+            gpu_cr,
+            output,
+            readback,
+            command_pool,
+            command_buffer,
+            fence,
+            descriptor,
+        })
+    }
+
+    fn submit(
+        &mut self,
+        device: &Arc<GpuDevice>,
+        pipeline: &Yuv422P10PipelineState,
+        submission: FrameSubmission<'_>,
+    ) -> Result<(), FrameProcessorError> {
+        if self.state != FrameSlotState::Available {
+            return Err(FrameProcessorError::InvalidFrameState);
+        }
+        self.state = FrameSlotState::Preparing;
+        let submit_result = self.submit_inner(device, pipeline, submission);
+        if submit_result.is_err() {
+            self.state = FrameSlotState::Available;
+            self.submitted = None;
+        }
+        submit_result
+    }
+
+    fn submit_inner(
+        &mut self,
+        device: &Arc<GpuDevice>,
+        pipeline: &Yuv422P10PipelineState,
+        submission: FrameSubmission<'_>,
+    ) -> Result<(), FrameProcessorError> {
+        let upload = submission.upload;
+        let y_values = expand_yuv422p10_plane(upload.y)?;
+        let cb_values = expand_yuv422p10_plane(upload.cb)?;
+        let cr_values = expand_yuv422p10_plane(upload.cr)?;
+        let y_bytes = checked_byte_len(y_values.len(), std::mem::size_of::<u32>())?;
+        let chroma_bytes = checked_byte_len(cb_values.len(), std::mem::size_of::<u32>())?;
+        let output_u32_bytes =
+            checked_byte_len(submission.layout.output_samples, std::mem::size_of::<u32>())?;
+        self.staging_y.write_bytes(0, cast_u32_slice(&y_values))?;
+        self.staging_cb.write_bytes(0, cast_u32_slice(&cb_values))?;
+        self.staging_cr.write_bytes(0, cast_u32_slice(&cr_values))?;
+        self.command_pool.reset().map_err(|err| {
+            eprintln!("vulkan frame command pool reset failed: {err:?}");
+            FrameProcessorError::Resource(ResourceError::ExportFailed)
+        })?;
+        self.fence.reset().map_err(|err| {
+            eprintln!("vulkan frame fence reset failed: {err:?}");
+            FrameProcessorError::Resource(ResourceError::ExportFailed)
+        })?;
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // SAFETY: command buffer belongs to a reset command pool and is not in
+        // use because this slot is Available.
+        unsafe {
+            device
+                .device
+                .begin_command_buffer(self.command_buffer, &begin)
+        }
+        .map_err(|err| {
+            eprintln!("vulkan frame command buffer begin failed: {err:?}");
+            FrameProcessorError::Resource(ResourceError::ExportFailed)
+        })?;
+        record_yuv422p10_processing_commands(
+            device,
+            self.command_buffer,
+            &self.staging_y,
+            &self.staging_cb,
+            &self.staging_cr,
+            &self.gpu_y,
+            &self.gpu_cb,
+            &self.gpu_cr,
+            &self.output,
+            &self.readback,
+            pipeline,
+            self.descriptor,
+            upload.width,
+            upload.height,
+            y_bytes,
+            chroma_bytes,
+            output_u32_bytes,
+        );
+        // SAFETY: command buffer is currently recording.
+        unsafe { device.device.end_command_buffer(self.command_buffer) }.map_err(|err| {
+            eprintln!("vulkan frame command buffer end failed: {err:?}");
+            FrameProcessorError::Resource(ResourceError::ExportFailed)
+        })?;
+        let command_buffers = [self.command_buffer];
+        let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
+        // SAFETY: queue belongs to device, command buffer is executable, and the
+        // per-slot fence/resources remain live until completion.
+        unsafe {
+            device
+                .device
+                .queue_submit(device.queue, &[submit], self.fence.fence)
+        }
+        .map_err(|err| {
+            eprintln!("vulkan frame queue submit failed: {err:?}");
+            FrameProcessorError::Resource(ResourceError::ExportFailed)
+        })?;
+        self.submitted = Some(SubmittedFrameInfo {
+            token: submission.token,
+            identity: submission.identity,
+            sequence: submission.sequence,
+            width: upload.width,
+            height: upload.height,
+            layout: submission.layout,
+        });
+        self.state = FrameSlotState::Submitted;
+        self.had_submission = true;
+        Ok(())
+    }
+
+    fn read_completed_output(&self) -> Result<ProcessedFrameOutput, FrameProcessorError> {
+        if self.state != FrameSlotState::Completed {
+            return Err(FrameProcessorError::FrameNotComplete);
+        }
+        let info = self
+            .submitted
+            .ok_or(FrameProcessorError::UnknownFrameToken)?;
+        let output_u32_bytes =
+            checked_byte_len(info.layout.output_samples, std::mem::size_of::<u32>())?;
+        let output_u16_bytes =
+            checked_byte_len(info.layout.output_samples, std::mem::size_of::<u16>())?;
+        let bytes = self.readback.read_bytes(0, output_u32_bytes as usize)?;
+        let rgba_u16 = read_rgba_u16_from_u32_bytes(&bytes, info.layout.output_samples)?;
+        if output_u16_bytes != info.layout.output_bytes as u64 {
+            return Err(FrameProcessorError::Resource(ResourceError::ExportFailed));
+        }
+        let checksum = yuv422p10_rgba_u16_checksum(&rgba_u16);
+        Ok(ProcessedFrameOutput {
+            token: info.token,
+            presentation_position: info.identity.presentation_position,
+            slot_index: self.index,
+            submission_sequence: info.sequence,
+            width: info.width,
+            height: info.height,
+            rgba_u16,
+            checksum,
+            cpu_surface_bytes: info.layout.cpu_surface_bytes,
+            staging_bytes: info.layout.staging_bytes,
+            gpu_plane_bytes: info.layout.gpu_plane_bytes,
+            output_bytes: info.layout.output_bytes,
+        })
+    }
+}
+
+fn frame_processor_resource_error(err: FrameProcessorError) -> ResourceError {
+    match err {
+        FrameProcessorError::Resource(err) => err,
+        FrameProcessorError::NoFrameSlotAvailable
+        | FrameProcessorError::UnknownFrameToken
+        | FrameProcessorError::FrameNotComplete
+        | FrameProcessorError::InvalidFrameState => ResourceError::ExportFailed,
+    }
+}
+
+fn validate_frame_processor_config(
+    config: GpuFrameProcessorConfig,
+) -> Result<(), FrameProcessorError> {
+    if config.slot_count == 0 || config.slot_count > 8 {
+        return Err(FrameProcessorError::Resource(
+            ResourceError::InvalidBufferSize,
+        ));
+    }
+    yuv422p10_layout_for_dimensions(config.width, config.height, 0)?;
+    Ok(())
+}
+
+fn yuv422p10_layout_for_dimensions(
+    width: u32,
+    height: u32,
+    cpu_surface_bytes: usize,
+) -> Result<Yuv422P10Layout, ResourceError> {
+    if width == 0
+        || height == 0
+        || width > MAX_VIDEO_SURFACE_WIDTH
+        || height > MAX_VIDEO_SURFACE_HEIGHT
+        || !width.is_multiple_of(2)
+    {
+        return Err(ResourceError::InvalidImageDimensions);
+    }
+    let y_samples = checked_sample_count(width, height)?;
+    let chroma_samples = checked_sample_count(width / 2, height)?;
+    let output_samples = y_samples
+        .checked_mul(YUV422P10_OUTPUT_COMPONENTS)
+        .ok_or(ResourceError::InvalidImageDimensions)?;
+    let staging_samples = y_samples
+        .checked_add(chroma_samples)
+        .and_then(|total| total.checked_add(chroma_samples))
+        .ok_or(ResourceError::InvalidImageDimensions)?;
+    let staging_bytes = staging_samples
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(ResourceError::InvalidImageDimensions)?;
+    let output_bytes = output_samples
+        .checked_mul(YUV422P10_OUTPUT_BYTES_PER_COMPONENT)
+        .ok_or(ResourceError::InvalidImageDimensions)?;
+    Ok(Yuv422P10Layout {
+        y_samples,
+        chroma_samples,
+        output_samples,
+        cpu_surface_bytes,
+        staging_bytes,
+        gpu_plane_bytes: staging_bytes,
+        output_bytes,
     })
 }
 
-fn upload_storage_plane(
-    device: &Arc<GpuDevice>,
-    values: &[u32],
-) -> Result<GpuBuffer, ResourceError> {
-    let size = checked_byte_len(values.len(), std::mem::size_of::<u32>())?;
-    let buffer = GpuBuffer::new(
+fn frame_staging_buffer(device: &Arc<GpuDevice>, size: u64) -> Result<GpuBuffer, ResourceError> {
+    GpuBuffer::new(
         device.clone(),
         size,
         vk::BufferUsageFlags::TRANSFER_SRC,
@@ -2995,9 +3415,182 @@ fn upload_storage_plane(
         vk::MemoryPropertyFlags::HOST_VISIBLE,
         vk::MemoryPropertyFlags::HOST_COHERENT,
         false,
-    )?;
-    buffer.write_bytes(0, cast_u32_slice(values))?;
-    Ok(buffer)
+    )
+}
+
+fn frame_gpu_plane_buffer(device: &Arc<GpuDevice>, size: u64) -> Result<GpuBuffer, ResourceError> {
+    GpuBuffer::new(
+        device.clone(),
+        size,
+        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
+        None,
+        vk::MemoryPropertyFlags::empty(),
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        false,
+    )
+}
+
+fn frame_output_buffer(device: &Arc<GpuDevice>, size: u64) -> Result<GpuBuffer, ResourceError> {
+    GpuBuffer::new(
+        device.clone(),
+        size,
+        vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::STORAGE_BUFFER,
+        None,
+        vk::MemoryPropertyFlags::empty(),
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        false,
+    )
+}
+
+fn frame_readback_buffer(device: &Arc<GpuDevice>, size: u64) -> Result<GpuBuffer, ResourceError> {
+    GpuBuffer::new(
+        device.clone(),
+        size,
+        vk::BufferUsageFlags::TRANSFER_DST,
+        None,
+        vk::MemoryPropertyFlags::HOST_VISIBLE,
+        vk::MemoryPropertyFlags::HOST_COHERENT,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_yuv422p10_processing_commands(
+    device: &GpuDevice,
+    command_buffer: vk::CommandBuffer,
+    staging_y: &GpuBuffer,
+    staging_cb: &GpuBuffer,
+    staging_cr: &GpuBuffer,
+    gpu_y: &GpuBuffer,
+    gpu_cb: &GpuBuffer,
+    gpu_cr: &GpuBuffer,
+    output: &GpuBuffer,
+    readback: &GpuBuffer,
+    pipeline: &Yuv422P10PipelineState,
+    descriptor: DescriptorSet,
+    width: u32,
+    height: u32,
+    y_bytes: u64,
+    chroma_bytes: u64,
+    output_u32_bytes: u64,
+) {
+    buffer_barrier(
+        device,
+        command_buffer,
+        &[gpu_y, gpu_cb, gpu_cr],
+        vk::AccessFlags::SHADER_READ,
+        vk::AccessFlags::TRANSFER_WRITE,
+        vk::PipelineStageFlags::COMPUTE_SHADER,
+        vk::PipelineStageFlags::TRANSFER,
+    );
+    buffer_barrier(
+        device,
+        command_buffer,
+        &[output],
+        vk::AccessFlags::TRANSFER_READ,
+        vk::AccessFlags::SHADER_WRITE,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::PipelineStageFlags::COMPUTE_SHADER,
+    );
+    buffer_barrier(
+        device,
+        command_buffer,
+        &[readback],
+        vk::AccessFlags::HOST_READ,
+        vk::AccessFlags::TRANSFER_WRITE,
+        vk::PipelineStageFlags::HOST,
+        vk::PipelineStageFlags::TRANSFER,
+    );
+    copy_buffer(command_buffer, staging_y, gpu_y, y_bytes);
+    copy_buffer(command_buffer, staging_cb, gpu_cb, chroma_bytes);
+    copy_buffer(command_buffer, staging_cr, gpu_cr, chroma_bytes);
+    buffer_barrier(
+        device,
+        command_buffer,
+        &[gpu_y, gpu_cb, gpu_cr],
+        vk::AccessFlags::TRANSFER_WRITE,
+        vk::AccessFlags::SHADER_READ,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::PipelineStageFlags::COMPUTE_SHADER,
+    );
+    let params = Yuv422P10ShaderParams {
+        width,
+        height,
+        y_stride_samples: width,
+        chroma_stride_samples: width / 2,
+    };
+    // SAFETY: command buffer is recording; pipeline, descriptor set and buffers
+    // are live for the submission. Push constants match the fixed shader's
+    // 16-byte parameter block.
+    unsafe {
+        device.device.cmd_bind_pipeline(
+            command_buffer,
+            vk::PipelineBindPoint::COMPUTE,
+            pipeline.pipeline,
+        );
+        device.device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::COMPUTE,
+            pipeline.layout,
+            0,
+            &[descriptor.set],
+            &[],
+        );
+        device.device.cmd_push_constants(
+            command_buffer,
+            pipeline.layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            params.as_bytes(),
+        );
+        device.device.cmd_dispatch(
+            command_buffer,
+            width.div_ceil(YUV422P10_LOCAL_SIZE_X),
+            height.div_ceil(YUV422P10_LOCAL_SIZE_Y),
+            1,
+        );
+    }
+    buffer_barrier(
+        device,
+        command_buffer,
+        &[output],
+        vk::AccessFlags::SHADER_WRITE,
+        vk::AccessFlags::TRANSFER_READ,
+        vk::PipelineStageFlags::COMPUTE_SHADER,
+        vk::PipelineStageFlags::TRANSFER,
+    );
+    copy_buffer(command_buffer, output, readback, output_u32_bytes);
+    buffer_barrier(
+        device,
+        command_buffer,
+        &[readback],
+        vk::AccessFlags::TRANSFER_WRITE,
+        vk::AccessFlags::HOST_READ,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::PipelineStageFlags::HOST,
+    );
+}
+
+fn read_rgba_u16_from_u32_bytes(
+    bytes: &[u8],
+    expected_samples: usize,
+) -> Result<Vec<u16>, FrameProcessorError> {
+    let mut rgba_u16 = Vec::with_capacity(expected_samples);
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
+        return Err(FrameProcessorError::Resource(ResourceError::ExportFailed));
+    }
+    for chunk in chunks {
+        let value = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        rgba_u16.push(
+            u16::try_from(value)
+                .map_err(|_| FrameProcessorError::Resource(ResourceError::ExportFailed))?,
+        );
+    }
+    if rgba_u16.len() != expected_samples {
+        return Err(FrameProcessorError::Resource(ResourceError::ExportFailed));
+    }
+    Ok(rgba_u16)
 }
 
 fn checked_byte_len(count: usize, bytes_per_item: usize) -> Result<u64, ResourceError> {
@@ -3363,7 +3956,10 @@ struct Yuv422P10PipelineState {
 }
 
 impl Yuv422P10PipelineState {
-    fn new(device: Arc<GpuDevice>) -> Result<Self, ResourceError> {
+    fn new(device: Arc<GpuDevice>, max_sets: u32) -> Result<Self, ResourceError> {
+        if max_sets == 0 {
+            return Err(ResourceError::InvalidBufferSize);
+        }
         let shader_info = vk::ShaderModuleCreateInfo::default().code(&YUV422P10_TO_RGBA_U16_SHADER);
         // SAFETY: shader code is fixed QGS-controlled SPIR-V compiled for the
         // descriptor/push-constant contract below.
@@ -3452,11 +4048,15 @@ impl Yuv422P10PipelineState {
         })?[0];
         let pool_size = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(4)];
+            .descriptor_count(
+                max_sets
+                    .checked_mul(4)
+                    .ok_or(ResourceError::InvalidBufferSize)?,
+            )];
         let descriptor_pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(1)
+            .max_sets(max_sets)
             .pool_sizes(&pool_size);
-        // SAFETY: descriptor pool info is valid for one fixed four-binding set.
+        // SAFETY: descriptor pool info is valid for max_sets fixed four-binding sets.
         let descriptor_pool = unsafe {
             device
                 .device
@@ -3768,6 +4368,64 @@ mod tests {
             validate_yuv422p10_upload(&upload),
             Err(ResourceError::InvalidImageDimensions)
         ));
+    }
+
+    #[test]
+    fn frame_processor_config_is_bounded() {
+        let device_id = DeviceId::new(1).expect("device");
+        let valid = GpuFrameProcessorConfig {
+            device_id,
+            width: 8,
+            height: 4,
+            slot_count: 3,
+            conversion: YcbcrConversion::Rec709Limited,
+        };
+
+        assert!(validate_frame_processor_config(valid).is_ok());
+        assert!(matches!(
+            validate_frame_processor_config(GpuFrameProcessorConfig {
+                slot_count: 0,
+                ..valid
+            }),
+            Err(FrameProcessorError::Resource(
+                ResourceError::InvalidBufferSize
+            ))
+        ));
+        assert!(matches!(
+            validate_frame_processor_config(GpuFrameProcessorConfig {
+                slot_count: 9,
+                ..valid
+            }),
+            Err(FrameProcessorError::Resource(
+                ResourceError::InvalidBufferSize
+            ))
+        ));
+        assert!(matches!(
+            validate_frame_processor_config(GpuFrameProcessorConfig { width: 7, ..valid }),
+            Err(FrameProcessorError::Resource(
+                ResourceError::InvalidImageDimensions
+            ))
+        ));
+    }
+
+    #[test]
+    fn frame_slot_state_exposes_safe_reuse_points() {
+        assert!(FrameSlotState::Available.can_submit());
+        assert!(!FrameSlotState::Preparing.can_submit());
+        assert!(!FrameSlotState::Submitted.can_submit());
+        assert!(!FrameSlotState::Completed.can_submit());
+
+        assert!(!FrameSlotState::Available.can_retire());
+        assert!(!FrameSlotState::Submitted.can_retire());
+        assert!(FrameSlotState::Completed.can_retire());
+    }
+
+    #[test]
+    fn frame_tokens_are_opaque_and_stable() {
+        let token = FrameToken(42);
+
+        assert_eq!(token.get(), 42);
+        assert_ne!(token, FrameToken(43));
     }
 
     #[test]
