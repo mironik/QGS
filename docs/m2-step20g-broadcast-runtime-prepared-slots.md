@@ -2,7 +2,7 @@
 
 Step 20G turns the Step 20F preroll plan into a finite prepared working-set model.
 
-This is still not real playback. QGS does not output audio, does not present to a display, does not run a realtime playout loop, and does not import QNC crates. The slot model describes what a future realtime loop can consume once backend payload preparation is connected.
+This is still not real playback. QGS does not output audio, does not present to a display, does not run a realtime Broadcast Player loop, and does not import QNC crates. The slot model describes what a future realtime loop can consume once backend payload preparation is connected.
 
 ## Relationship To Step 20F
 
@@ -52,7 +52,7 @@ Proxy MP4 AAC is not authoritative audio in either mode.
 - presentation time and duration
 - readiness
 
-For this milestone these are lightweight runtime records. They do not yet own decoded video frames, GPU outputs, or PCM playout buffers.
+For this milestone these are lightweight runtime records. They do not yet own decoded video frames, GPU outputs, or PCM output buffers.
 
 ## ProxyPreview Result
 
@@ -104,7 +104,7 @@ These values are proof configuration, not final QNC policy constants.
 Not implemented:
 
 - real decoded video payload slots
-- real PCM playout queues
+- real PCM output queues
 - speaker output
 - display output
 - realtime scheduling

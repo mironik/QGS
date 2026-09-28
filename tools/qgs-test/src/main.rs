@@ -12,12 +12,13 @@ use qgs_linux::{
     send_message,
 };
 use qgs_media_runtime::{
-    audio_samples_for_duration, av_frame_audio_range, classify_presentation, duration_abs_delta,
-    duration_from_audio_samples, evaluate_broadcast_preroll,
-    max_video_timestamp_outside_audio_range, summarize_broadcast_prepared_slots,
-    summarize_broadcast_runtime_contract, AudioFormat, AudioSampleFormat, AudioTimeline,
-    AudioTimingPacket, AvFrameAudioRange, BoundedQueue, BroadcastMediaSourceRole,
-    BroadcastPreparedAudioSlot, BroadcastPreparedPresentationSlot, BroadcastPreparedVideoSlot,
+    audio_samples_for_duration, av_frame_audio_range, build_broadcast_player_event_surface,
+    classify_presentation, duration_abs_delta, duration_from_audio_samples,
+    evaluate_broadcast_preroll, max_video_timestamp_outside_audio_range,
+    summarize_broadcast_prepared_slots, summarize_broadcast_runtime_contract, AudioFormat,
+    AudioSampleFormat, AudioTimeline, AudioTimingPacket, AvFrameAudioRange, BoundedQueue,
+    BroadcastMediaSourceRole, BroadcastPlayerEvent, BroadcastPreparedAudioSlot,
+    BroadcastPreparedPresentationSlot, BroadcastPreparedVideoSlot,
     BroadcastPreparedVideoSlotStatus, BroadcastPrerollConfig, BroadcastPrerollPlan,
     BroadcastPreviewProfile, BroadcastRuntimeCapabilities, BroadcastRuntimePrepareFacts,
     BroadcastRuntimeQueueLimits, BroadcastRuntimeSessionDescription, BroadcastRuntimeStateMachine,
@@ -2164,7 +2165,7 @@ fn broadcast_runtime_state_machine(
 
     println!("QGS Broadcast Runtime State Machine Skeleton");
     println!("--------------------------------------------");
-    println!("Not real playback: no speaker output, no display output, no real-time playout loop");
+    println!("Not real playback: no speaker output, no display output, no real-time Broadcast Player loop");
     println!("Audio source: original MXF");
     println!("Video source mode: proxy-preview");
     println!("Video source: proxy MP4");
@@ -2368,7 +2369,7 @@ fn broadcast_runtime_preroll(
 
     println!("QGS Broadcast Runtime Preroll Plan");
     println!("-----------------------------------");
-    println!("Not real playback: no speaker output, no display output, no real-time playout loop");
+    println!("Not real playback: no speaker output, no display output, no real-time Broadcast Player loop");
     println!("Audio source: original MXF");
     println!("Video source mode: proxy-preview");
     println!("Video source: proxy MP4");
@@ -2666,10 +2667,32 @@ fn broadcast_runtime_prepared_slots(
     )?;
     let ready_reached = runtime.state() == qgs_media_runtime::BroadcastRuntimeState::Ready;
     let play_from_ready = runtime.play().is_ok();
+    if play_from_ready {
+        runtime.account_happy_path()?;
+        runtime.drain()?;
+        runtime.complete()?;
+    }
+    let proxy_events = build_broadcast_player_event_surface(
+        runtime.events(),
+        &proxy_slot_summary,
+        &proxy_video_slots,
+        &proxy_audio_slots,
+        &proxy_presentation_slots,
+    );
+    let original_events = build_broadcast_player_event_surface(
+        &[
+            qgs_media_runtime::BroadcastRuntimeEvent::SessionCreated,
+            qgs_media_runtime::BroadcastRuntimeEvent::PreparingStarted,
+        ],
+        &original_slot_summary,
+        &original_video_slots,
+        &original_audio_slots,
+        &original_presentation_slots,
+    );
 
     println!("QGS Broadcast Runtime Prepared Payload Slots");
     println!("--------------------------------------------");
-    println!("Not real playback: no speaker output, no display output, no real-time playout loop");
+    println!("Not real playback: no speaker output, no display output, no real-time Broadcast Player loop");
     println!("Audio source: original MXF");
     println!("Proxy AAC: not used");
     println!("Preview profile: journalist-50i-preview");
@@ -2717,6 +2740,40 @@ fn broadcast_runtime_prepared_slots(
         yes_no(play_from_ready)
     );
     println!("  Intentional source-frame skips: {intentional_skips}");
+    println!("  Broadcast Player events: {}", proxy_events.len());
+    println!(
+        "  Event surface: preroll_ready={} prepared_slot_available={} frame_accounted={} audio_range_accounted={} intentional_skip={} runtime_completed={}",
+        yes_no(proxy_events.contains(&BroadcastPlayerEvent::PrerollReady)),
+        proxy_events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                BroadcastPlayerEvent::PreparedSlotAvailable { .. }
+            ))
+            .count(),
+        proxy_events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                BroadcastPlayerEvent::SelectedFrameAccounted { .. }
+            ))
+            .count(),
+        proxy_events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                BroadcastPlayerEvent::AudioRangeAccounted { .. }
+            ))
+            .count(),
+        proxy_events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                BroadcastPlayerEvent::IntentionalProfileSkip { .. }
+            ))
+            .count(),
+        yes_no(proxy_events.contains(&BroadcastPlayerEvent::RuntimeCompleted))
+    );
     println!("OriginalMedia:");
     println!("  video source: original MXF");
     println!("  audio source: original MXF");
@@ -2743,6 +2800,15 @@ fn broadcast_runtime_prepared_slots(
         "  Ready: {} reason={:?}",
         yes_no(original_slot_summary.preroll_status.ready),
         original_slot_summary.preroll_status.reason
+    );
+    println!(
+        "  Event surface: capability_missing={} broadcast_player_ready={}",
+        yes_no(
+            original_events.contains(&BroadcastPlayerEvent::CapabilityMissing {
+                source_mode: BroadcastVideoSourceMode::OriginalMedia,
+            })
+        ),
+        yes_no(original_events.contains(&BroadcastPlayerEvent::BroadcastPlayerReady))
     );
     println!("  Original video runtime backend: capability missing in this milestone");
 

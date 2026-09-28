@@ -4,7 +4,7 @@ Step 20D defines the first backend-neutral QGS Broadcast Runtime contract for fu
 
 Existing QNC Broadcast Player concepts may be treated as reference material only. QGS is free to define the best runtime contract for QGS/QNC OS without matching older player boundaries when those boundaries would compromise the media model.
 
-QGS provides backend facts, bounded runtime contract types, and deterministic media-range mapping. Future QNC applications may consume this through media snapshots, resolver/media identity, session/transport contracts, and runtime events. QNC applications remain responsible for final transport commands, clock policy, presentation policy, UI, playout readiness, and user-facing sessions.
+QGS provides backend facts, bounded runtime contract types, and deterministic media-range mapping. Future QNC applications may consume this through media snapshots, resolver/media identity, session/transport contracts, and runtime events. QNC applications remain responsible for final transport commands, clock policy, presentation policy, UI, Broadcast Player readiness, and user-facing sessions.
 
 ## Scope
 

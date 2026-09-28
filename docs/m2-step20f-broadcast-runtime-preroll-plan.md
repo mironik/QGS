@@ -2,7 +2,7 @@
 
 This milestone adds a backend-neutral preroll planning layer to the QGS Broadcast Runtime state-machine skeleton from Step 20E.
 
-It is still not real playback. QGS does not open an audio device, does not present to a display, does not run a real-time playout loop, and does not import QNC crates. The purpose is to model the conditions a future QNC application can require before a runtime session is allowed to enter `Ready`.
+It is still not real playback. QGS does not open an audio device, does not present to a display, does not run a real-time Broadcast Player loop, and does not import QNC crates. The purpose is to model the conditions a future QNC application can require before a runtime session is allowed to enter `Ready`.
 
 ## Source Modes
 
@@ -88,7 +88,7 @@ The original media mode probe reports the original MXF video source as present i
 Not implemented in this milestone:
 
 - real decoded video payload preroll queue
-- real PCM payload playout queue
+- real PCM payload output queue
 - audio device output
 - display output
 - real-time scheduling
