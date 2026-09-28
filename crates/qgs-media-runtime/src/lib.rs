@@ -491,15 +491,44 @@ pub enum BroadcastPreviewProfile {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BroadcastRuntimeState {
     Idle,
-    ContractReady,
+    Preparing,
+    Ready,
+    Playing,
+    Paused,
+    Draining,
+    Completed,
     Failed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastRuntimeCommand {
+    Prepare,
+    Play,
+    Pause,
+    Seek { target_time: Duration },
+    Stop,
+    Drain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BroadcastRuntimeEvent {
+    SessionCreated,
+    PreparingStarted,
+    Prepared,
+    PlaybackStarted,
+    PlaybackPaused,
+    SeekCompleted { target_time: Duration },
+    DrainingStarted,
+    Completed,
+    Failed,
     ContractPrepared,
     QueueBackpressure { queue: BroadcastRuntimeQueueKind },
     IncompleteAudioCoverage { frame_index: u64 },
+    IntentionalProfileSkip { source_frame_index: u64 },
+    LatenessDrop { frame_index: u64 },
+    FrameAccounted { frame_index: u64 },
+    AudioRangeAccounted { frame_index: u64 },
+    SimulatedPresentationDecision { frame_index: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -566,6 +595,193 @@ impl BroadcastRuntimeSessionDescription {
             return Err(PlaybackError::InvalidAudioFormat);
         }
         Ok(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BroadcastRuntimePrepareFacts {
+    pub selected_frame_count: usize,
+    pub intentional_profile_skips: usize,
+    pub audio_ranges_complete: bool,
+    pub frames_outside_audio_range: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BroadcastRuntimeAccounting {
+    pub selected_frames_accounted: usize,
+    pub audio_ranges_accounted: usize,
+    pub intentional_profile_skips: usize,
+    pub lateness_drops: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastRuntimeStateMachine {
+    state: BroadcastRuntimeState,
+    session: BroadcastRuntimeSessionDescription,
+    prepare_facts: Option<BroadcastRuntimePrepareFacts>,
+    accounting: BroadcastRuntimeAccounting,
+    events: Vec<BroadcastRuntimeEvent>,
+}
+
+impl BroadcastRuntimeStateMachine {
+    pub fn create(session: BroadcastRuntimeSessionDescription) -> Result<Self, PlaybackError> {
+        let session = session.validate()?;
+        Ok(Self {
+            state: BroadcastRuntimeState::Idle,
+            session,
+            prepare_facts: None,
+            accounting: BroadcastRuntimeAccounting {
+                selected_frames_accounted: 0,
+                audio_ranges_accounted: 0,
+                intentional_profile_skips: 0,
+                lateness_drops: 0,
+            },
+            events: vec![BroadcastRuntimeEvent::SessionCreated],
+        })
+    }
+
+    pub fn state(&self) -> BroadcastRuntimeState {
+        self.state
+    }
+
+    pub fn session(&self) -> BroadcastRuntimeSessionDescription {
+        self.session
+    }
+
+    pub fn accounting(&self) -> BroadcastRuntimeAccounting {
+        self.accounting
+    }
+
+    pub fn events(&self) -> &[BroadcastRuntimeEvent] {
+        &self.events
+    }
+
+    pub fn prepare(&mut self, facts: BroadcastRuntimePrepareFacts) -> Result<(), PlaybackError> {
+        self.ensure_state(BroadcastRuntimeState::Idle)?;
+        self.events.push(BroadcastRuntimeEvent::PreparingStarted);
+        self.state = BroadcastRuntimeState::Preparing;
+        if facts.selected_frame_count == 0
+            || !facts.audio_ranges_complete
+            || facts.frames_outside_audio_range != 0
+        {
+            self.fail();
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        self.prepare_facts = Some(facts);
+        self.events.push(BroadcastRuntimeEvent::ContractPrepared);
+        self.events.push(BroadcastRuntimeEvent::Prepared);
+        self.state = BroadcastRuntimeState::Ready;
+        Ok(())
+    }
+
+    pub fn play(&mut self) -> Result<(), PlaybackError> {
+        match self.state {
+            BroadcastRuntimeState::Ready | BroadcastRuntimeState::Paused => {
+                self.state = BroadcastRuntimeState::Playing;
+                self.events.push(BroadcastRuntimeEvent::PlaybackStarted);
+                Ok(())
+            }
+            _ => Err(PlaybackError::InvalidRuntimeTransition),
+        }
+    }
+
+    pub fn pause(&mut self) -> Result<(), PlaybackError> {
+        self.ensure_state(BroadcastRuntimeState::Playing)?;
+        self.state = BroadcastRuntimeState::Paused;
+        self.events.push(BroadcastRuntimeEvent::PlaybackPaused);
+        Ok(())
+    }
+
+    pub fn seek(&mut self, target_time: Duration) -> Result<(), PlaybackError> {
+        match self.state {
+            BroadcastRuntimeState::Ready
+            | BroadcastRuntimeState::Playing
+            | BroadcastRuntimeState::Paused => {
+                self.events
+                    .push(BroadcastRuntimeEvent::SeekCompleted { target_time });
+                Ok(())
+            }
+            _ => Err(PlaybackError::InvalidRuntimeTransition),
+        }
+    }
+
+    pub fn stop(&mut self) -> Result<(), PlaybackError> {
+        match self.state {
+            BroadcastRuntimeState::Ready
+            | BroadcastRuntimeState::Playing
+            | BroadcastRuntimeState::Paused => {
+                self.state = BroadcastRuntimeState::Completed;
+                self.events.push(BroadcastRuntimeEvent::Completed);
+                Ok(())
+            }
+            _ => Err(PlaybackError::InvalidRuntimeTransition),
+        }
+    }
+
+    pub fn account_happy_path(&mut self) -> Result<(), PlaybackError> {
+        self.ensure_state(BroadcastRuntimeState::Playing)?;
+        let facts = self
+            .prepare_facts
+            .ok_or(PlaybackError::InvalidRuntimeTransition)?;
+        for frame_index in 0..facts.selected_frame_count {
+            let frame_index =
+                u64::try_from(frame_index).map_err(|_| PlaybackError::TimestampOverflow)?;
+            self.events
+                .push(BroadcastRuntimeEvent::FrameAccounted { frame_index });
+            self.events
+                .push(BroadcastRuntimeEvent::AudioRangeAccounted { frame_index });
+            self.events
+                .push(BroadcastRuntimeEvent::SimulatedPresentationDecision { frame_index });
+        }
+        for source_frame_index in 0..facts.intentional_profile_skips {
+            self.events
+                .push(BroadcastRuntimeEvent::IntentionalProfileSkip {
+                    source_frame_index: u64::try_from(source_frame_index)
+                        .map_err(|_| PlaybackError::TimestampOverflow)?,
+                });
+        }
+        self.accounting.selected_frames_accounted = facts.selected_frame_count;
+        self.accounting.audio_ranges_accounted = facts.selected_frame_count;
+        self.accounting.intentional_profile_skips = facts.intentional_profile_skips;
+        self.accounting.lateness_drops = 0;
+        Ok(())
+    }
+
+    pub fn drain(&mut self) -> Result<(), PlaybackError> {
+        self.ensure_state(BroadcastRuntimeState::Playing)?;
+        self.state = BroadcastRuntimeState::Draining;
+        self.events.push(BroadcastRuntimeEvent::DrainingStarted);
+        Ok(())
+    }
+
+    pub fn complete(&mut self) -> Result<(), PlaybackError> {
+        self.ensure_state(BroadcastRuntimeState::Draining)?;
+        let facts = self
+            .prepare_facts
+            .ok_or(PlaybackError::InvalidRuntimeTransition)?;
+        if self.accounting.selected_frames_accounted != facts.selected_frame_count
+            || self.accounting.audio_ranges_accounted != facts.selected_frame_count
+            || self.accounting.lateness_drops != 0
+        {
+            self.fail();
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        self.state = BroadcastRuntimeState::Completed;
+        self.events.push(BroadcastRuntimeEvent::Completed);
+        Ok(())
+    }
+
+    pub fn fail(&mut self) {
+        self.state = BroadcastRuntimeState::Failed;
+        self.events.push(BroadcastRuntimeEvent::Failed);
+    }
+
+    fn ensure_state(&self, state: BroadcastRuntimeState) -> Result<(), PlaybackError> {
+        if self.state == state {
+            Ok(())
+        } else {
+            Err(PlaybackError::InvalidRuntimeTransition)
+        }
     }
 }
 
@@ -982,6 +1198,7 @@ pub enum PlaybackError {
     InvalidCapacity,
     InvalidLatePolicy,
     InvalidAudioFormat,
+    InvalidRuntimeTransition,
     TimestampOverflow,
 }
 
@@ -992,6 +1209,7 @@ impl std::fmt::Display for PlaybackError {
             Self::InvalidCapacity => write!(f, "invalid playback queue capacity"),
             Self::InvalidLatePolicy => write!(f, "invalid playback late/drop policy"),
             Self::InvalidAudioFormat => write!(f, "invalid audio format"),
+            Self::InvalidRuntimeTransition => write!(f, "invalid broadcast runtime transition"),
             Self::TimestampOverflow => write!(f, "playback timestamp overflow"),
         }
     }
@@ -1344,7 +1562,109 @@ mod tests {
 
     #[test]
     fn broadcast_runtime_session_requires_authoritative_original_audio() {
-        let session = BroadcastRuntimeSessionDescription {
+        let session = test_broadcast_session();
+        assert_eq!(session.validate().unwrap(), session);
+
+        assert!(BroadcastRuntimeSessionDescription {
+            audio_source: BroadcastMediaSourceRole::ProxyAudioDiagnosticOnly,
+            ..session
+        }
+        .validate()
+        .is_err());
+        assert!(BroadcastRuntimeSessionDescription {
+            capabilities: BroadcastRuntimeCapabilities {
+                proxy_audio_primary: true,
+                ..session.capabilities
+            },
+            ..session
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn broadcast_runtime_rejects_play_without_prepare() {
+        let mut machine = BroadcastRuntimeStateMachine::create(test_broadcast_session()).unwrap();
+
+        assert_eq!(machine.state(), BroadcastRuntimeState::Idle);
+        assert!(matches!(
+            machine.play(),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        ));
+        assert!(matches!(
+            machine.pause(),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        ));
+    }
+
+    #[test]
+    fn broadcast_runtime_happy_path_accounts_frames_and_completes() {
+        let mut machine = BroadcastRuntimeStateMachine::create(test_broadcast_session()).unwrap();
+
+        machine.prepare(test_prepare_facts()).unwrap();
+        assert_eq!(machine.state(), BroadcastRuntimeState::Ready);
+        machine.play().unwrap();
+        machine.pause().unwrap();
+        assert_eq!(machine.state(), BroadcastRuntimeState::Paused);
+        machine.play().unwrap();
+        machine.seek(Duration::from_millis(400)).unwrap();
+        machine.account_happy_path().unwrap();
+        machine.drain().unwrap();
+        machine.complete().unwrap();
+
+        assert_eq!(machine.state(), BroadcastRuntimeState::Completed);
+        assert_eq!(
+            machine.accounting(),
+            BroadcastRuntimeAccounting {
+                selected_frames_accounted: 53,
+                audio_ranges_accounted: 53,
+                intentional_profile_skips: 53,
+                lateness_drops: 0,
+            }
+        );
+        assert!(machine
+            .events()
+            .contains(&BroadcastRuntimeEvent::SessionCreated));
+        assert!(machine
+            .events()
+            .contains(&BroadcastRuntimeEvent::PreparingStarted));
+        assert!(machine.events().contains(&BroadcastRuntimeEvent::Prepared));
+        assert!(machine.events().contains(&BroadcastRuntimeEvent::Completed));
+        assert!(!machine
+            .events()
+            .iter()
+            .any(|event| matches!(event, BroadcastRuntimeEvent::LatenessDrop { .. })));
+    }
+
+    #[test]
+    fn broadcast_runtime_invalid_after_completed_and_failed_stays_terminal() {
+        let mut completed = BroadcastRuntimeStateMachine::create(test_broadcast_session()).unwrap();
+        completed.prepare(test_prepare_facts()).unwrap();
+        completed.play().unwrap();
+        completed.account_happy_path().unwrap();
+        completed.drain().unwrap();
+        completed.complete().unwrap();
+        assert!(matches!(
+            completed.seek(Duration::ZERO),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        ));
+
+        let mut failed = BroadcastRuntimeStateMachine::create(test_broadcast_session()).unwrap();
+        assert!(failed
+            .prepare(BroadcastRuntimePrepareFacts {
+                audio_ranges_complete: false,
+                ..test_prepare_facts()
+            })
+            .is_err());
+        assert_eq!(failed.state(), BroadcastRuntimeState::Failed);
+        assert!(matches!(
+            failed.prepare(test_prepare_facts()),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        ));
+    }
+
+    fn test_broadcast_session() -> BroadcastRuntimeSessionDescription {
+        BroadcastRuntimeSessionDescription {
             audio_source: BroadcastMediaSourceRole::OriginalAuthoritativeAudio,
             video_source: BroadcastMediaSourceRole::ProxyPreviewVideo,
             preview_profile: BroadcastPreviewProfile::Journalist50iPreview,
@@ -1363,24 +1683,16 @@ mod tests {
                 proxy_audio_primary: false,
                 ui_dependent: false,
             },
-        };
-        assert_eq!(session.validate().unwrap(), session);
+        }
+    }
 
-        assert!(BroadcastRuntimeSessionDescription {
-            audio_source: BroadcastMediaSourceRole::ProxyAudioDiagnosticOnly,
-            ..session
+    fn test_prepare_facts() -> BroadcastRuntimePrepareFacts {
+        BroadcastRuntimePrepareFacts {
+            selected_frame_count: 53,
+            intentional_profile_skips: 53,
+            audio_ranges_complete: true,
+            frames_outside_audio_range: 0,
         }
-        .validate()
-        .is_err());
-        assert!(BroadcastRuntimeSessionDescription {
-            capabilities: BroadcastRuntimeCapabilities {
-                proxy_audio_primary: true,
-                ..session.capabilities
-            },
-            ..session
-        }
-        .validate()
-        .is_err());
     }
 
     fn clock_ready_blocks() -> Vec<PcmAudioBlock> {
