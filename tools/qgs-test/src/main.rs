@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 
 use qgs_core::{BackendDecodedSurface, DecoderBackend, DeviceDiscovery, VideoCapabilityDiscovery};
 use qgs_linux::{
-    connect_socket, default_socket_path, probe_linux_audio_device_boundary, receive_message,
-    receive_message_with_attachments, send_message, submit_pipewire_audio_prototype,
-    LinuxAudioConversionNeed, LinuxOriginalPcmAudioFormat, LinuxPipewirePrototypeBuffer,
-    LinuxPipewirePrototypeSampleFormat,
+    connect_socket, default_socket_path, inspect_native_pipewire_stream_boundary,
+    probe_linux_audio_device_boundary, receive_message, receive_message_with_attachments,
+    send_message, submit_pipewire_audio_prototype, LinuxAudioConversionNeed,
+    LinuxOriginalPcmAudioFormat, LinuxPipewirePrototypeBuffer, LinuxPipewirePrototypeSampleFormat,
 };
 use qgs_media_runtime::{
     audio_samples_for_duration, av_frame_audio_range, bind_broadcast_audio_payload,
@@ -107,6 +107,7 @@ const BROADCAST_PLAYER_RUNTIME_ORIGINAL_VIDEO_PAYLOADS_ARG: &str =
 const BROADCAST_PLAYER_RUNTIME_VERIFICATION_ARG: &str = "--broadcast-player-runtime-verification";
 const LINUX_AUDIO_DEVICE_PROBE_ARG: &str = "--linux-audio-device-probe";
 const PIPEWIRE_AUDIO_PROTOTYPE_ARG: &str = "--pipewire-audio-prototype";
+const PIPEWIRE_AUDIO_NATIVE_PROTOTYPE_ARG: &str = "--pipewire-audio-native-prototype";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -229,6 +230,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(path) = args.pipewire_audio_prototype_path {
         return pipewire_audio_prototype(&path);
+    }
+    if let Some(path) = args.pipewire_audio_native_prototype_path {
+        return pipewire_audio_native_prototype(&path);
     }
 
     let socket_path = args.socket_path;
@@ -2026,6 +2030,81 @@ fn pipewire_audio_prototype(path: &Path) -> Result<(), Box<dyn std::error::Error
         } else {
             ""
         }
+    );
+    println!("Status: {}", report.status_message);
+
+    Ok(())
+}
+
+fn pipewire_audio_native_prototype(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    let source = MediaSource::parse(&bytes)?;
+    let audio_tracks = source
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Audio)
+        .collect::<Vec<_>>();
+    if audio_tracks.is_empty() {
+        return Err("original MXF has no audio tracks".into());
+    }
+
+    let source_format = original_linux_pcm_audio_format(&audio_tracks)?;
+    let blocks = build_original_pcm_blocks(&source, &bytes)?;
+    let prototype_sample_count = 960_u32;
+    let buffer = build_pipewire_f32_interleaved_prototype_buffer(
+        &blocks,
+        source_format.sample_rate,
+        prototype_sample_count,
+    )?;
+    let report = inspect_native_pipewire_stream_boundary(&buffer)?;
+
+    println!("Native PipeWire Stream Prototype");
+    println!("--------------------------------");
+    println!("Audio source: original MXF");
+    println!("Proxy AAC: not used");
+    println!("Full playback: no");
+    println!("Realtime Broadcast Player playback: no");
+    println!(
+        "Input PCM: tracks={} channels_per_track={} sample_rate={}Hz bit_depth={}bit",
+        source_format.track_count,
+        source_format.channels_per_track,
+        source_format.sample_rate,
+        source_format.bits_per_sample
+    );
+    println!("Planned device-boundary conversion: original 24-bit mono tracks -> f32 interleaved");
+    println!(
+        "Prototype buffer: channels={} sample_rate={}Hz samples={} bytes={}",
+        buffer.channels,
+        buffer.sample_rate,
+        buffer.sample_count,
+        buffer.bytes.len()
+    );
+    println!(
+        "PipeWire runtime library available: {}",
+        yes_no(report.runtime_library_available)
+    );
+    println!(
+        "PipeWire server reachable: {}",
+        yes_no(report.pipewire_server_reachable)
+    );
+    println!(
+        "PipeWire pkg-config entry available: {}",
+        yes_no(report.pkg_config_entry_available)
+    );
+    println!(
+        "PipeWire headers available: {}",
+        yes_no(report.headers_available)
+    );
+    println!(
+        "Stream create attempted: {}",
+        yes_no(report.stream_create_attempted)
+    );
+    println!("Buffer dequeued: {}", yes_no(report.buffer_dequeued));
+    println!("Buffer submitted: {}", yes_no(report.buffer_submitted));
+    println!("Evidence level: {:?}", report.evidence_level);
+    println!(
+        "AudioDeviceVerified: {}",
+        yes_no(report.audio_device_verified)
     );
     println!("Status: {}", report.status_message);
 
@@ -9203,6 +9282,7 @@ struct Args {
     broadcast_player_runtime_verification_paths: Option<(PathBuf, PathBuf)>,
     linux_audio_device_probe_path: Option<PathBuf>,
     pipewire_audio_prototype_path: Option<PathBuf>,
+    pipewire_audio_native_prototype_path: Option<PathBuf>,
 }
 
 impl Args {
@@ -9255,6 +9335,7 @@ impl Args {
         let mut broadcast_player_runtime_verification_paths = None;
         let mut linux_audio_device_probe_path = None;
         let mut pipewire_audio_prototype_path = None;
+        let mut pipewire_audio_native_prototype_path = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
@@ -9293,9 +9374,13 @@ impl Args {
         let mut next_arg_is_broadcast_player_runtime_verification_proxy = false;
         let mut next_arg_is_linux_audio_device_probe_path = false;
         let mut next_arg_is_pipewire_audio_prototype_path = false;
+        let mut next_arg_is_pipewire_audio_native_prototype_path = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_pipewire_audio_prototype_path {
+            if next_arg_is_pipewire_audio_native_prototype_path {
+                pipewire_audio_native_prototype_path = Some(PathBuf::from(arg));
+                next_arg_is_pipewire_audio_native_prototype_path = false;
+            } else if next_arg_is_pipewire_audio_prototype_path {
                 pipewire_audio_prototype_path = Some(PathBuf::from(arg));
                 next_arg_is_pipewire_audio_prototype_path = false;
             } else if next_arg_is_linux_audio_device_probe_path {
@@ -9568,6 +9653,8 @@ impl Args {
                 next_arg_is_linux_audio_device_probe_path = true;
             } else if arg == PIPEWIRE_AUDIO_PROTOTYPE_ARG {
                 next_arg_is_pipewire_audio_prototype_path = true;
+            } else if arg == PIPEWIRE_AUDIO_NATIVE_PROTOTYPE_ARG {
+                next_arg_is_pipewire_audio_native_prototype_path = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -9602,6 +9689,7 @@ impl Args {
             broadcast_player_runtime_verification_paths,
             linux_audio_device_probe_path,
             pipewire_audio_prototype_path,
+            pipewire_audio_native_prototype_path,
         }
     }
 }

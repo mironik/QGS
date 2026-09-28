@@ -76,6 +76,12 @@ pub enum LinuxPipewirePrototypeEvidenceLevel {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinuxNativePipewireEvidenceLevel {
+    PipeWireUnavailable,
+    NativeDevelopmentBoundaryMissing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LinuxPipewirePrototypeSampleFormat {
     F32Interleaved,
 }
@@ -128,6 +134,20 @@ pub struct LinuxPipewirePrototypeReport {
     pub sample_count: u32,
     pub bytes_submitted: usize,
     pub evidence_level: LinuxPipewirePrototypeEvidenceLevel,
+    pub audio_device_verified: bool,
+    pub status_message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinuxNativePipewireBoundaryReport {
+    pub runtime_library_available: bool,
+    pub pkg_config_entry_available: bool,
+    pub headers_available: bool,
+    pub pipewire_server_reachable: bool,
+    pub stream_create_attempted: bool,
+    pub buffer_dequeued: bool,
+    pub buffer_submitted: bool,
+    pub evidence_level: LinuxNativePipewireEvidenceLevel,
     pub audio_device_verified: bool,
     pub status_message: String,
 }
@@ -350,11 +370,86 @@ pub fn submit_pipewire_audio_prototype(
     })
 }
 
+pub fn inspect_native_pipewire_stream_boundary(
+    buffer: &LinuxPipewirePrototypeBuffer,
+) -> Result<LinuxNativePipewireBoundaryReport, LinuxAudioProbeError> {
+    buffer.validate()?;
+    let runtime_library_available = pipewire_runtime_library_available();
+    let pkg_config_entry_available = pipewire_pkg_config_entry_available();
+    let headers_available = pipewire_headers_available();
+    let pipewire_server_reachable = command_available("pw-cli") && pipewire_server_reachable();
+    let native_development_available = pkg_config_entry_available && headers_available;
+
+    let evidence_level = native_pipewire_evidence_level(
+        runtime_library_available || pipewire_server_reachable,
+        native_development_available,
+    );
+    let status_message = match evidence_level {
+        LinuxNativePipewireEvidenceLevel::PipeWireUnavailable => {
+            "PipeWire runtime was not reachable through the native boundary probe".to_string()
+        }
+        LinuxNativePipewireEvidenceLevel::NativeDevelopmentBoundaryMissing => {
+            "native PipeWire headers/pkg-config metadata are missing; cannot build a safe Rust PipeWire stream module in this workspace".to_string()
+        }
+    };
+
+    Ok(LinuxNativePipewireBoundaryReport {
+        runtime_library_available,
+        pkg_config_entry_available,
+        headers_available,
+        pipewire_server_reachable,
+        stream_create_attempted: false,
+        buffer_dequeued: false,
+        buffer_submitted: false,
+        evidence_level,
+        audio_device_verified: false,
+        status_message,
+    })
+}
+
+pub fn native_pipewire_evidence_level(
+    runtime_available: bool,
+    native_development_available: bool,
+) -> LinuxNativePipewireEvidenceLevel {
+    if !runtime_available {
+        LinuxNativePipewireEvidenceLevel::PipeWireUnavailable
+    } else if !native_development_available {
+        LinuxNativePipewireEvidenceLevel::NativeDevelopmentBoundaryMissing
+    } else {
+        // Step 21C does not invent a native stream result without a compiled native backend.
+        LinuxNativePipewireEvidenceLevel::NativeDevelopmentBoundaryMissing
+    }
+}
+
 fn pipewire_runtime_socket_available() -> bool {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .map(|runtime_dir| runtime_dir.join("pipewire-0").exists())
         .unwrap_or(false)
+}
+
+fn pipewire_runtime_library_available() -> bool {
+    Command::new("ldconfig")
+        .arg("-p")
+        .output()
+        .map(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("libpipewire-0.3.so")
+        })
+        .unwrap_or(false)
+}
+
+fn pipewire_pkg_config_entry_available() -> bool {
+    Command::new("pkg-config")
+        .arg("--exists")
+        .arg("libpipewire-0.3")
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn pipewire_headers_available() -> bool {
+    Path::new("/usr/include/pipewire-0.3").exists() && Path::new("/usr/include/spa-0.2").exists()
 }
 
 fn pipewire_server_reachable() -> bool {
@@ -692,6 +787,23 @@ mod tests {
             invalid.validate(),
             Err(LinuxAudioProbeError::InvalidPrototypeBuffer(_))
         ));
+    }
+
+    #[test]
+    fn native_pipewire_evidence_classifies_unavailable_and_missing_dev_boundary() {
+        assert_eq!(
+            native_pipewire_evidence_level(false, false),
+            LinuxNativePipewireEvidenceLevel::PipeWireUnavailable
+        );
+        assert_eq!(
+            native_pipewire_evidence_level(true, false),
+            LinuxNativePipewireEvidenceLevel::NativeDevelopmentBoundaryMissing
+        );
+        assert_eq!(
+            native_pipewire_evidence_level(true, true),
+            LinuxNativePipewireEvidenceLevel::NativeDevelopmentBoundaryMissing,
+            "without a compiled native backend, tests must not fabricate buffer submission"
+        );
     }
 
     fn unique_socket_path() -> PathBuf {
