@@ -56,6 +56,7 @@ const SOFTWARE_GPU_MXF_ARG: &str = "--software-gpu-mxf";
 const PROXY_PROOF_ARG: &str = "--proxy-proof";
 const PROXY_THROUGHPUT_ARG: &str = "--proxy-throughput";
 const PROXY_PLAYBACK_ARG: &str = "--proxy-playback";
+const PROXY_PLAYBACK_PROFILE_ARG: &str = "--proxy-playback-profile";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -90,7 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return proxy_throughput(&original, &proxy);
     }
     if let Some((original, proxy)) = args.proxy_playback_paths {
-        return proxy_playback(&original, &proxy);
+        return proxy_playback(&original, &proxy, args.proxy_playback_profile);
     }
 
     let socket_path = args.socket_path;
@@ -1418,6 +1419,7 @@ fn proxy_throughput(
 fn proxy_playback(
     original_path: &Path,
     proxy_path: &Path,
+    profile: ProxyPlaybackProfile,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let original_sha256 = sha256_hex(original_path)?;
     let proxy_sha256 = sha256_hex(proxy_path)?;
@@ -1447,9 +1449,14 @@ fn proxy_playback(
         u64::from(proxy_video.frame_rate.denominator),
     )?;
     let source_duration = rate.duration_for_frames(u64::try_from(frame_count)?)?;
+    let presentation_rate = profile.presentation_rate(rate)?;
+    let selected_frame_count = profile.selected_frame_count(frame_count);
+    let target_duration =
+        presentation_rate.duration_for_frames(u64::try_from(selected_frame_count)?)?;
     let config = PlaybackConfig::default().validate()?;
 
     println!("QGS bounded realtime proxy playback:");
+    println!("  profile: {} ({})", profile.label(), profile.description());
     println!("  original: {}", case.original_label);
     println!("  proxy: {}", case.proxy_label);
     println!("  hashes: verified");
@@ -1468,6 +1475,12 @@ fn proxy_playback(
     );
     println!("  source presentation frames: {frame_count}");
     println!("  source duration: {:.3}s", source_duration.as_secs_f64());
+    println!(
+        "  selected presentation frames: {selected_frame_count} at {}/{} fps target={:.3}s",
+        presentation_rate.numerator(),
+        presentation_rate.denominator(),
+        target_duration.as_secs_f64()
+    );
     println!(
         "  queue capacities: compressed={} decoded={} gpu={} presentation={} preroll={}",
         config.compressed_capacity,
@@ -1566,6 +1579,7 @@ fn proxy_playback(
     let mut flushed = false;
     let mut access_units_submitted = 0_usize;
     let mut decoder_outputs = 0_usize;
+    let mut intentionally_skipped_source_frames = 0_usize;
     let mut gpu_submissions = 0_usize;
     let mut gpu_completions = 0_usize;
     let mut decode_submit_elapsed = Duration::ZERO;
@@ -1613,11 +1627,13 @@ fn proxy_playback(
             decode_submit_elapsed += started.elapsed();
             access_units_submitted += 1;
             for output in outputs {
-                let identity = PlaybackFrameIdentity::from_position(u64::try_from(next_output)?);
+                let source_position = u64::try_from(next_output)?;
+                let presentation_position = profile.presentation_position(source_position);
                 next_output += 1;
                 decoded_queue
                     .try_push(DecodedPlaybackFrame {
-                        identity,
+                        source_position,
+                        presentation_position,
                         surface: output,
                     })
                     .map_err(|_| "decoded queue unexpectedly full")?;
@@ -1635,11 +1651,13 @@ fn proxy_playback(
             decode_submit_elapsed += started.elapsed();
             flushed = true;
             for output in outputs {
-                let identity = PlaybackFrameIdentity::from_position(u64::try_from(next_output)?);
+                let source_position = u64::try_from(next_output)?;
+                let presentation_position = profile.presentation_position(source_position);
                 next_output += 1;
                 decoded_queue
                     .try_push(DecodedPlaybackFrame {
-                        identity,
+                        source_position,
+                        presentation_position,
                         surface: output,
                     })
                     .map_err(|_| "decoded queue unexpectedly full during flush")?;
@@ -1652,14 +1670,20 @@ fn proxy_playback(
             let decoded = decoded_queue
                 .pop_front()
                 .ok_or("decoded queue unexpectedly empty")?;
+            let Some(presentation_position) = decoded.presentation_position else {
+                intentionally_skipped_source_frames =
+                    intentionally_skipped_source_frames.saturating_add(1);
+                continue;
+            };
+            let identity = PlaybackFrameIdentity::from_position(presentation_position);
             let pool_started = Instant::now();
             let cpu_frame = cpu_pool.acquire()?;
             pool_acquire_elapsed += pool_started.elapsed();
             let transfer_started = Instant::now();
             if progress_trace {
                 eprintln!(
-                    "step17 progress: transfer start presentation={}",
-                    decoded.identity.presentation_position
+                    "step17 progress: transfer start source={} presentation={}",
+                    decoded.source_position, identity.presentation_position
                 );
             }
             let (cpu_frame, transfer_timing) = qgs_vaapi::transfer_nv12_surface_timed(
@@ -1681,8 +1705,8 @@ fn proxy_playback(
             }
             if progress_trace {
                 eprintln!(
-                    "step17 progress: transfer done presentation={}",
-                    decoded.identity.presentation_position
+                    "step17 progress: transfer done source={} presentation={}",
+                    decoded.source_position, identity.presentation_position
                 );
             }
             let upload_started = Instant::now();
@@ -1691,7 +1715,7 @@ fn proxy_playback(
             let token = match gpu_processor.submit_frame(
                 &upload,
                 FrameIdentity {
-                    presentation_position: decoded.identity.presentation_position,
+                    presentation_position: identity.presentation_position,
                 },
             ) {
                 Ok(token) => token,
@@ -1706,15 +1730,12 @@ fn proxy_playback(
             if progress_trace {
                 eprintln!(
                     "step17 progress: gpu submit presentation={} token={}",
-                    decoded.identity.presentation_position,
+                    identity.presentation_position,
                     token.get()
                 );
             }
             gpu_queue
-                .try_push(GpuPendingPlaybackFrame {
-                    token,
-                    identity: decoded.identity,
-                })
+                .try_push(GpuPendingPlaybackFrame { token, identity })
                 .map_err(|_| "GPU queue unexpectedly full")?;
             gpu_submissions += 1;
             let submit_elapsed = started.elapsed();
@@ -1772,7 +1793,8 @@ fn proxy_playback(
 
         if state == PlaybackState::Playing {
             if let Some(frame) = presentation_queue.front() {
-                let expected = rate.frame_offset(frame.identity.presentation_position)?;
+                let expected =
+                    presentation_rate.frame_offset(frame.identity.presentation_position)?;
                 let wait_started = Instant::now();
                 clock.sleep_until(expected);
                 presentation_wait_elapsed += wait_started.elapsed();
@@ -1794,7 +1816,7 @@ fn proxy_playback(
             }
         }
 
-        if sink.decisions().len() == frame_count {
+        if sink.decisions().len() == selected_frame_count {
             break;
         }
 
@@ -1809,14 +1831,14 @@ fn proxy_playback(
     }
 
     if state == PlaybackState::Playing {
-        clock.sleep_until(source_duration);
+        clock.sleep_until(target_duration);
         state = PlaybackState::Completed;
     }
     let playback_elapsed = playback_start.elapsed();
 
-    if sink.decisions().len() != frame_count {
+    if sink.decisions().len() != selected_frame_count {
         return Err(format!(
-            "playback expected {frame_count} presentation decisions, got {}",
+            "playback expected {selected_frame_count} presentation decisions, got {}",
             sink.decisions().len()
         )
         .into());
@@ -1837,6 +1859,8 @@ fn proxy_playback(
     println!("  state: {:?}", state);
     println!("  access units submitted: {access_units_submitted}");
     println!("  decoder outputs: {decoder_outputs}");
+    println!("  selected presentation frames: {selected_frame_count}");
+    println!("  intentionally skipped source frames: {intentionally_skipped_source_frames}");
     println!("  GPU queue submissions: {gpu_submissions}");
     println!("  GPU queue completions: {gpu_completions}");
     println!(
@@ -1851,7 +1875,7 @@ fn proxy_playback(
     println!(
         "  playback wall-clock: {:.3}s target={:.3}s",
         playback_elapsed.as_secs_f64(),
-        source_duration.as_secs_f64()
+        target_duration.as_secs_f64()
     );
     println!(
         "  lateness: max={:.3} ms mean={:.3} ms median={:.3} ms",
@@ -1922,7 +1946,7 @@ fn proxy_playback(
     println!(
         "  VA transfer bytes copied: total={} per_frame={}",
         transfer_bytes_copied,
-        transfer_bytes_copied / frame_count.max(1)
+        transfer_bytes_copied / selected_frame_count.max(1)
     );
     println!(
         "  CPU pool acquire/release/upload-view aggregate: acquire={:.3} ms upload_view={:.3} ms release={:.3} ms",
@@ -1974,7 +1998,7 @@ fn proxy_playback(
             &access_units,
             visible_region,
             config,
-            source_duration,
+            target_duration,
         )?;
         run_step17_synthetic_nv12_gpu_observation(
             &discovery,
@@ -1984,7 +2008,7 @@ fn proxy_playback(
             proxy_h264.width,
             proxy_h264.height,
             frame_count,
-            source_duration,
+            target_duration,
         )?;
         if let Some(discrete_device) = devices
             .iter()
@@ -1998,7 +2022,7 @@ fn proxy_playback(
                 proxy_h264.width,
                 proxy_h264.height,
                 frame_count,
-                source_duration,
+                target_duration,
             )?;
         }
         return Ok(());
@@ -2006,6 +2030,11 @@ fn proxy_playback(
 
     if counts.dropped != 0 || counts.duplicated != 0 {
         return Err("real-time playback produced drops or duplicates".into());
+    }
+    if profile == ProxyPlaybackProfile::Journalist25p
+        && intentionally_skipped_source_frames != frame_count.saturating_sub(selected_frame_count)
+    {
+        return Err("journalist-25p profile skipped an unexpected number of source frames".into());
     }
 
     let selected = selected_proxy_ordinals(frame_count);
@@ -2077,7 +2106,8 @@ struct ScheduledAccessUnit {
 }
 
 struct DecodedPlaybackFrame {
-    identity: PlaybackFrameIdentity,
+    source_position: u64,
+    presentation_position: Option<u64>,
     surface: BackendDecodedSurface,
 }
 
@@ -2088,6 +2118,63 @@ struct ReadyPlaybackFrame {
 struct GpuPendingPlaybackFrame {
     token: qgs_vulkan::FrameToken,
     identity: PlaybackFrameIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProxyPlaybackProfile {
+    SourceRate,
+    Journalist25p,
+}
+
+impl ProxyPlaybackProfile {
+    fn parse(value: &std::ffi::OsStr) -> Result<Self, Box<dyn std::error::Error>> {
+        match value.to_str() {
+            Some("source-rate") => Ok(Self::SourceRate),
+            Some("journalist-25p") => Ok(Self::Journalist25p),
+            Some(other) => Err(format!("unsupported proxy playback profile: {other}").into()),
+            None => Err("proxy playback profile must be valid UTF-8".into()),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SourceRate => "source-rate",
+            Self::Journalist25p => "journalist-25p",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::SourceRate => "source-rate realtime proxy playback",
+            Self::Journalist25p => "25fps broadcast preview over 50p source",
+        }
+    }
+
+    fn presentation_rate(
+        self,
+        source_rate: RationalRate,
+    ) -> Result<RationalRate, Box<dyn std::error::Error>> {
+        match self {
+            Self::SourceRate => Ok(source_rate),
+            Self::Journalist25p => Ok(RationalRate::new(25, 1)?),
+        }
+    }
+
+    fn presentation_position(self, source_position: u64) -> Option<u64> {
+        match self {
+            Self::SourceRate => Some(source_position),
+            Self::Journalist25p => source_position
+                .is_multiple_of(2)
+                .then_some(source_position / 2),
+        }
+    }
+
+    fn selected_frame_count(self, source_frame_count: usize) -> usize {
+        match self {
+            Self::SourceRate => source_frame_count,
+            Self::Journalist25p => source_frame_count.div_ceil(2),
+        }
+    }
 }
 
 fn nv12_upload_for_cpu_surface<'a>(
@@ -2512,11 +2599,12 @@ fn run_step17_as_fast_full_pixel_observation(
             decode_elapsed += decode_started.elapsed();
             access_units_submitted += 1;
             for output in outputs {
-                let identity = PlaybackFrameIdentity::from_position(u64::try_from(next_output)?);
+                let source_position = u64::try_from(next_output)?;
                 next_output += 1;
                 decoded_queue
                     .try_push(DecodedPlaybackFrame {
-                        identity,
+                        source_position,
+                        presentation_position: Some(source_position),
                         surface: output,
                     })
                     .map_err(|_| "decoded queue unexpectedly full")?;
@@ -2534,11 +2622,12 @@ fn run_step17_as_fast_full_pixel_observation(
             decode_elapsed += decode_started.elapsed();
             flushed = true;
             for output in outputs {
-                let identity = PlaybackFrameIdentity::from_position(u64::try_from(next_output)?);
+                let source_position = u64::try_from(next_output)?;
                 next_output += 1;
                 decoded_queue
                     .try_push(DecodedPlaybackFrame {
-                        identity,
+                        source_position,
+                        presentation_position: Some(source_position),
                         surface: output,
                     })
                     .map_err(|_| "decoded queue unexpectedly full during flush")?;
@@ -2551,6 +2640,10 @@ fn run_step17_as_fast_full_pixel_observation(
             let decoded = decoded_queue
                 .pop_front()
                 .ok_or("decoded queue unexpectedly empty")?;
+            let presentation_position = decoded
+                .presentation_position
+                .ok_or("as-fast diagnostic expected selected frame")?;
+            let identity = PlaybackFrameIdentity::from_position(presentation_position);
             let cpu_frame = cpu_pool.acquire()?;
             let transfer_started = Instant::now();
             let (cpu_frame, transfer_timing) = qgs_vaapi::transfer_nv12_surface_timed(
@@ -2563,15 +2656,12 @@ fn run_step17_as_fast_full_pixel_observation(
             let token = gpu_processor.submit_frame(
                 &upload,
                 FrameIdentity {
-                    presentation_position: decoded.identity.presentation_position,
+                    presentation_position: identity.presentation_position,
                 },
             )?;
             cpu_pool.release(cpu_frame)?;
             gpu_queue
-                .try_push(GpuPendingPlaybackFrame {
-                    token,
-                    identity: decoded.identity,
-                })
+                .try_push(GpuPendingPlaybackFrame { token, identity })
                 .map_err(|_| "GPU queue unexpectedly full")?;
             gpu_submissions += 1;
             gpu_submit_elapsed += submit_started.elapsed();
@@ -5700,6 +5790,7 @@ struct Args {
     proxy_proof_paths: Option<(PathBuf, PathBuf)>,
     proxy_throughput_paths: Option<(PathBuf, PathBuf)>,
     proxy_playback_paths: Option<(PathBuf, PathBuf)>,
+    proxy_playback_profile: ProxyPlaybackProfile,
 }
 
 impl Args {
@@ -5720,15 +5811,21 @@ impl Args {
         let mut proxy_throughput_paths = None;
         let mut proxy_playback_original = None;
         let mut proxy_playback_paths = None;
+        let mut proxy_playback_profile = ProxyPlaybackProfile::SourceRate;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
         let mut next_arg_is_proxy_throughput_proxy = false;
         let mut next_arg_is_proxy_playback_original = false;
         let mut next_arg_is_proxy_playback_proxy = false;
+        let mut next_arg_is_proxy_playback_profile = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_proxy_playback_proxy {
+            if next_arg_is_proxy_playback_profile {
+                proxy_playback_profile =
+                    ProxyPlaybackProfile::parse(&arg).unwrap_or_else(|err| panic!("{err}"));
+                next_arg_is_proxy_playback_profile = false;
+            } else if next_arg_is_proxy_playback_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = proxy_playback_original
                     .take()
@@ -5789,6 +5886,8 @@ impl Args {
                 next_arg_is_proxy_throughput_original = true;
             } else if arg == PROXY_PLAYBACK_ARG {
                 next_arg_is_proxy_playback_original = true;
+            } else if arg == PROXY_PLAYBACK_PROFILE_ARG {
+                next_arg_is_proxy_playback_profile = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -5805,6 +5904,7 @@ impl Args {
             proxy_proof_paths,
             proxy_throughput_paths,
             proxy_playback_paths,
+            proxy_playback_profile,
         }
     }
 }
