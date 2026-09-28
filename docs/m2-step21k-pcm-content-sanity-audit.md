@@ -4,14 +4,16 @@ Step 21K pauses new playback feature work and audits the QGS original-audio
 content path after the manual PipeWire result was clarified as slight hum/buzz
 rather than recognizable original audio content.
 
-Current evidence remains conservative:
+Current evidence remains conservative, with a later manual listening follow-up:
 
 - native PipeWire stream creation works
 - native PipeWire buffer submission works
 - drain completion works
-- some audible signal/hum may be produced
-- recognizable original MXF audio content is not confirmed
-- PCM content correctness is not fully confirmed by listening
+- voice-like original-audio content was later heard in both tested versions
+- the second tested version sounded clearer and seemed present on both channels
+- channel routing and gain are still not certified
+- PCM content correctness is supported by audit data, but not fully certified by
+  listening
 - channel routing is not certified
 - `AudioDeviceVerified` remains no
 
@@ -38,6 +40,41 @@ target/qgs-audio-audit/qgs-original-audio-audit.wav
 ```
 
 The WAV is diagnostic only. It is derived from original MXF PCM, not proxy AAC.
+
+## Manual Listening Follow-up
+
+After the Step 21K audit, the diagnostic audio/output was manually listened to
+again. The updated observation was:
+
+- something like voices was audible
+- voice-like content was heard in both tested versions
+- the second version sounded clearer/better
+- the second version seemed present on both channels
+- the first version seemed mostly on one channel
+
+This supports that the QGS decoded audio content is not merely hum/buzz. It also
+fits the audit result that real nonzero original MXF PCM content flows through
+the extraction, conversion, and buffer geometry path.
+
+This does not yet certify channel routing, monitor folding, production output,
+or full audio-device behavior. `AudioDeviceVerified` remains no. The result
+instead points the next diagnostic focus toward monitor routing, gain, source
+range selection, and explicit stereo monitor output.
+
+Recommended follow-up:
+
+```text
+M2 Step 21L — Monitor Routing / Stereo Diagnostic Boundary
+```
+
+Planned focus for Step 21L:
+
+- find or choose a more audible original-audio range
+- produce/report explicit stereo monitor output
+- compare 4-channel output vs stereo monitor output
+- report channel mapping/routing clearly
+- keep original MXF audio authoritative
+- keep proxy AAC diagnostic-only or unused
 
 ## Source And Metadata
 
@@ -210,8 +247,8 @@ The remaining likely causes are outside the proven byte path:
 
 ## Next Recommended Step
 
-Before adding scheduling or A/V sync, verify content audibility with the
-diagnostic WAV and/or add a diagnostic range selector plus explicit monitor
-routing report. Do not upgrade `AudioDeviceVerified` or original-content
-audibility until recognizable original audio content is heard and the routing
-policy is understood.
+Before adding scheduling or A/V sync, continue with Step 21L: choose a more
+audible original-audio range and add explicit monitor routing/stereo diagnostic
+output. Do not upgrade `AudioDeviceVerified`, channel certification, realtime
+playback, or production output claims until the device path and routing policy
+are understood.

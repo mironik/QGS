@@ -79,7 +79,7 @@ smoke-test confirmation label.
 
 Possible confirmation states:
 
-- `ManualAudibleSignalDetectedContentUnverified`
+- `ManualContentAudibilityPartiallyObserved`
 - `ManualAudibleSmokeTestNotHeard`
 - `ManualAudibleConfirmationRequired`
 
@@ -128,10 +128,13 @@ Observed local manual result:
 - drain completed: yes
 - PipeWire evidence level: `DrainCompleted`
 - manual confirmation answer: yes, later clarified
-- manual confirmation status: `ManualAudibleSignalDetectedContentUnverified`
-- smoke-test evidence level: `ManualAudibleSignalDetectedContentUnverified`
-- heard result: slight hum/buzz only
-- recognizable original audio content confirmed: no
+- manual confirmation status: originally recorded as
+  `ManualAudibleSignalDetectedContentUnverified`, later updated by Step 21K
+  listening follow-up to `ManualContentAudibilityPartiallyObserved`
+- smoke-test evidence level: `ManualContentAudibilityPartiallyObserved`
+- heard result: voice-like content partially observed, routing/gain unverified
+- recognizable original audio content confirmed: partially supported, not
+  production-certified
 - `AudioDeviceVerified`: no
 - `AudioDeviceVerified` scope: not upgraded by smoke test
 - audible signal detected: yes
@@ -144,6 +147,11 @@ clarified that the heard output was only a slight hum/buzz, not recognizable
 original audio content. The evidence is therefore corrected to
 `ManualAudibleSignalDetectedContentUnverified`.
 
+A later Step 21K listening follow-up further clarified that voice-like content
+was audible in both tested versions, with the second version sounding clearer
+and apparently present on both channels. The current matrix label is therefore
+`ManualContentAudibilityPartiallyObserved`.
+
 The positive evidence remains:
 
 - native PipeWire stream configured
@@ -152,15 +160,16 @@ The positive evidence remains:
 - original MXF path used
 - proxy AAC not used
 
-The correction means this smoke test does not verify PCM content correctness,
-channel routing, full audio device output, or full `AudioDeviceVerified`.
+The updated observation supports that the QGS decoded audio content is not
+merely hum/buzz. It still does not certify PCM content correctness, channel
+routing, full audio device output, or full `AudioDeviceVerified`.
 
 ## Verification Matrix
 
 Step 20Q now includes a separate `native PipeWire audible smoke test` row. Its
-current evidence is `ManualAudibleSignalDetectedContentUnverified`: a human
-detected a slight hum/buzz from the bounded original-audio-derived PipeWire
-smoke test, but recognizable original audio content was not confirmed.
+current evidence is `ManualContentAudibilityPartiallyObserved`: a human later
+heard voice-like content from the bounded original-audio-derived PipeWire smoke
+test path, but routing/gain and production output remain unverified.
 
 This remains separate from full Broadcast Player playback, realtime playback,
 A/V sync, full `AudioDeviceVerified`, channel certification, and speaker

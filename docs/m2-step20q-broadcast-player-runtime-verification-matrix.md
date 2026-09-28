@@ -34,6 +34,10 @@ and what remains unimplemented.
   hum/buzz from a native PipeWire path, but recognizable original audio content
   was not confirmed. This does not verify PCM content correctness, channel
   routing, full audio device output, or full audio-device verification.
+- `ManualContentAudibilityPartiallyObserved`: a human later heard voice-like
+  content from the original-audio-derived diagnostic/output path, but channel
+  routing, gain, production output, realtime playback, and full audio-device
+  verification remain unverified.
 - `VisualVerified`: visual/image correctness was verified by comparison or
   display evidence.
 - `AudioDeviceVerified`: a real audio device path was verified.
@@ -67,9 +71,9 @@ For Sony FX6 sample 002:
 | test video presenter evidence | `TestBoundaryEvidence` | Test presenter evidence gates `FramePresented`; this is not real display output. |
 | test audio sink evidence | `TestBoundaryEvidence` | Test audio sink evidence accepts original PCM; this is not real speaker output. |
 | native PipeWire buffer submission | `NativePostSubmitEvidence` | A 20 ms original-audio-derived f32 buffer was queued to a native PipeWire stream and a drain callback was observed; audible output and full playback are not claimed. |
-| native PipeWire audible smoke test | `ManualAudibleSignalDetectedContentUnverified` | Bounded original-audio-derived PipeWire smoke-test buffers submitted and drained; user later clarified the heard output was slight hum/buzz only, not recognizable original audio content. |
-| native PipeWire original-audio segment playback | `ManualAudibleSignalDetectedContentUnverified` | Bounded sequential original MXF audio segment submitted and drained; user later clarified the heard output was slight hum/buzz only, not recognizable original audio content. |
-| PipeWire audio content sanity audit | `MediaInspected` | Original MXF PCM statistics, endian/sign interpretation, f32 conversion, segment/runtime path equality, and PipeWire buffer geometry audited; recognizable content audibility remains unconfirmed. |
+| native PipeWire audible smoke test | `ManualContentAudibilityPartiallyObserved` | Bounded original-audio-derived PipeWire smoke-test buffers submitted and drained; later listening found voice-like content rather than only hum/buzz, but routing/gain and production output remain unverified. |
+| native PipeWire original-audio segment playback | `ManualContentAudibilityPartiallyObserved` | Bounded sequential original MXF audio segment submitted and drained; later listening found voice-like content in both tested versions, with the second clearer and apparently present on both channels. |
+| PipeWire audio content sanity audit | `MediaInspected` | Original MXF PCM statistics, endian/sign interpretation, f32 conversion, segment/runtime path equality, and PipeWire buffer geometry audited; manual listening partially supports content audibility, but routing and device-output correctness remain unverified. |
 | broadcast runtime audio payload to PipeWire | `RuntimeAudioPayloadDrainCompleted` | First prepared `ProxyPreview` Broadcast Player Runtime original-audio payload binding submits to native PipeWire and drains; an audible helper path exists but manual confirmation is tracked separately and does not imply full playback, realtime playback, A/V sync, channel certification, or full audio-device verification. |
 | simulated playback loop | `TestBoundaryEvidence` | Prepared slots flow through test audio/video boundaries deterministically. |
 | real speaker output | `NotImplemented` | No audible speaker output, audio-device clock, or full audio playback path exists; native PipeWire buffer submission is tracked separately. |
@@ -85,13 +89,10 @@ The matrix intentionally does not overstate these areas:
 - Test audio sink evidence is not real speaker output.
 - Native PipeWire buffer submission/drain evidence is not audible playback or
   `AudioDeviceVerified`.
-- PipeWire audible smoke-test manual evidence is slight hum/buzz only. It does
-  not confirm recognizable original audio content, PCM content correctness,
-  channel routing, realtime/full Broadcast Player playback, A/V sync, or full
-  `AudioDeviceVerified`.
-- Bounded original-audio segment playback manual evidence is slight hum/buzz
-  only. It does not confirm recognizable original audio content, full playback,
-  realtime playback, A/V sync, channel certification, or full
+- PipeWire audible smoke-test and bounded original-audio segment manual
+  evidence were later clarified as voice-like content partially observed, not
+  only hum/buzz. This still does not certify channel routing, gain, production
+  output, realtime/full Broadcast Player playback, A/V sync, or full
   `AudioDeviceVerified`.
 - Runtime-prepared audio payload submission/drain evidence is not full playback,
   realtime playback, A/V sync, channel certification, or full

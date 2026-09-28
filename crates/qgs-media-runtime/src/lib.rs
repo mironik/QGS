@@ -572,6 +572,7 @@ pub enum BroadcastRuntimeVerificationLevel {
     RuntimeAudioPayloadDrainCompleted,
     RuntimeAudioPayloadAudibleConfirmed,
     ManualAudibleSignalDetectedContentUnverified,
+    ManualContentAudibilityPartiallyObserved,
     VisualVerified,
     AudioDeviceVerified,
     RealtimeVerified,
@@ -594,6 +595,9 @@ impl BroadcastRuntimeVerificationLevel {
             Self::RuntimeAudioPayloadAudibleConfirmed => "RuntimeAudioPayloadAudibleConfirmed",
             Self::ManualAudibleSignalDetectedContentUnverified => {
                 "ManualAudibleSignalDetectedContentUnverified"
+            }
+            Self::ManualContentAudibilityPartiallyObserved => {
+                "ManualContentAudibilityPartiallyObserved"
             }
             Self::VisualVerified => "VisualVerified",
             Self::AudioDeviceVerified => "AudioDeviceVerified",
@@ -782,18 +786,18 @@ impl BroadcastRuntimeVerificationMatrix {
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::NativePipeWireAudibleSmokeTest,
-                    level: Level::ManualAudibleSignalDetectedContentUnverified,
-                    summary: "bounded original-audio-derived smoke-test buffers submit/drain; user later clarified the heard output was slight hum/buzz only, not recognizable original audio content",
+                    level: Level::ManualContentAudibilityPartiallyObserved,
+                    summary: "bounded original-audio-derived smoke-test buffers submit/drain; later listening found voice-like content but routing/gain and production output remain unverified",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::NativePipeWireOriginalAudioSegmentPlayback,
-                    level: Level::ManualAudibleSignalDetectedContentUnverified,
-                    summary: "bounded sequential original-audio segment submits/drains; user later clarified the heard output was slight hum/buzz only, not recognizable original audio content",
+                    level: Level::ManualContentAudibilityPartiallyObserved,
+                    summary: "bounded sequential original-audio segment submits/drains; later listening found voice-like content in both tested versions, with routing still unverified",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::PipeWireAudioContentSanityAudit,
                     level: Level::MediaInspected,
-                    summary: "original MXF PCM statistics, endian/sign interpretation, f32 conversion, segment/runtime path equality, and PipeWire buffer geometry audited; recognizable content audibility remains unconfirmed",
+                    summary: "original MXF PCM statistics, endian/sign interpretation, f32 conversion, segment/runtime path equality, and PipeWire buffer geometry audited; manual listening partially supports content audibility but routing remains unverified",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::BroadcastRuntimeAudioPayloadPipeWire,
@@ -4239,6 +4243,10 @@ mod tests {
             BroadcastRuntimeVerificationLevel::ManualAudibleSignalDetectedContentUnverified
                 < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
         );
+        assert!(
+            BroadcastRuntimeVerificationLevel::ManualContentAudibilityPartiallyObserved
+                < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
     }
 
     #[test]
@@ -4327,7 +4335,7 @@ mod tests {
                 .entry(BroadcastRuntimeVerifiedSubsystem::NativePipeWireAudibleSmokeTest)
                 .unwrap()
                 .level,
-            BroadcastRuntimeVerificationLevel::ManualAudibleSignalDetectedContentUnverified
+            BroadcastRuntimeVerificationLevel::ManualContentAudibilityPartiallyObserved
         );
         assert_ne!(
             matrix
@@ -4345,7 +4353,7 @@ mod tests {
                 )
                 .unwrap()
                 .level,
-            BroadcastRuntimeVerificationLevel::ManualAudibleSignalDetectedContentUnverified
+            BroadcastRuntimeVerificationLevel::ManualContentAudibilityPartiallyObserved
         );
         assert_eq!(
             matrix
