@@ -574,8 +574,8 @@ pub enum BroadcastRuntimeVerificationLevel {
     ManualAudibleSignalDetectedContentUnverified,
     ManualContentAudibilityPartiallyObserved,
     ManualMonitorPairPreferenceObserved,
-    MonoTrackMonitorDrainCompleted,
-    ManualMonoTrackMonitorHeard,
+    DesktopMonoListeningHelperDrainCompleted,
+    ManualDesktopMonoListeningHelperHeard,
     VisualVerified,
     AudioDeviceVerified,
     RealtimeVerified,
@@ -603,8 +603,10 @@ impl BroadcastRuntimeVerificationLevel {
                 "ManualContentAudibilityPartiallyObserved"
             }
             Self::ManualMonitorPairPreferenceObserved => "ManualMonitorPairPreferenceObserved",
-            Self::MonoTrackMonitorDrainCompleted => "MonoTrackMonitorDrainCompleted",
-            Self::ManualMonoTrackMonitorHeard => "ManualMonoTrackMonitorHeard",
+            Self::DesktopMonoListeningHelperDrainCompleted => {
+                "DesktopMonoListeningHelperDrainCompleted"
+            }
+            Self::ManualDesktopMonoListeningHelperHeard => "ManualDesktopMonoListeningHelperHeard",
             Self::VisualVerified => "VisualVerified",
             Self::AudioDeviceVerified => "AudioDeviceVerified",
             Self::RealtimeVerified => "RealtimeVerified",
@@ -637,7 +639,8 @@ pub enum BroadcastRuntimeVerifiedSubsystem {
     NativePipeWireOriginalAudioSegmentPlayback,
     PipeWireAudioContentSanityAudit,
     Mironik2002MonitorDiagnostic,
-    NativePipeWireMonoChannelMonitorDiagnostic,
+    NativePipeWireDesktopMonoListeningHelper,
+    NativePipeWireDiscrete4MonoOutputBoundary,
     BroadcastRuntimeAudioPayloadPipeWire,
     SimulatedPlaybackLoop,
     RealSpeakerOutput,
@@ -673,8 +676,11 @@ impl BroadcastRuntimeVerifiedSubsystem {
             }
             Self::PipeWireAudioContentSanityAudit => "PipeWire audio content sanity audit",
             Self::Mironik2002MonitorDiagnostic => "Mironik 2002 monitor diagnostic",
-            Self::NativePipeWireMonoChannelMonitorDiagnostic => {
-                "native PipeWire mono channel monitor diagnostic"
+            Self::NativePipeWireDesktopMonoListeningHelper => {
+                "native PipeWire desktop mono listening helper"
+            }
+            Self::NativePipeWireDiscrete4MonoOutputBoundary => {
+                "native PipeWire discrete 4-mono output boundary"
             }
             Self::BroadcastRuntimeAudioPayloadPipeWire => {
                 "broadcast runtime audio payload to PipeWire"
@@ -817,9 +823,14 @@ impl BroadcastRuntimeVerificationMatrix {
                     summary: "Mironik 2002 track 4 / track 1 diagnostic monitor pair preferred for the 0-1000 ms range; not channel certification or production routing",
                 },
                 BroadcastRuntimeVerificationEntry {
-                    subsystem: Subsystem::NativePipeWireMonoChannelMonitorDiagnostic,
-                    level: Level::MonoTrackMonitorDrainCompleted,
-                    summary: "single original mono track can be duplicated to L/R as a PipeWire desktop monitor diagnostic and drained; runtime mono-channel truth remains unchanged",
+                    subsystem: Subsystem::NativePipeWireDesktopMonoListeningHelper,
+                    level: Level::DesktopMonoListeningHelperDrainCompleted,
+                    summary: "single original mono track can be duplicated to L/R as an ad-hoc desktop listening helper and drained; not discrete mono output, channel certification, or production routing",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::NativePipeWireDiscrete4MonoOutputBoundary,
+                    level: Level::NotImplemented,
+                    summary: "discrete track 1/2/3/4 to output channel 1/2/3/4 PipeWire boundary is the required next direction and is not verified yet",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::BroadcastRuntimeAudioPayloadPipeWire,
@@ -4274,11 +4285,11 @@ mod tests {
                 < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
         );
         assert!(
-            BroadcastRuntimeVerificationLevel::MonoTrackMonitorDrainCompleted
+            BroadcastRuntimeVerificationLevel::DesktopMonoListeningHelperDrainCompleted
                 < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
         );
         assert!(
-            BroadcastRuntimeVerificationLevel::ManualMonoTrackMonitorHeard
+            BroadcastRuntimeVerificationLevel::ManualDesktopMonoListeningHelperHeard
                 < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
         );
     }
@@ -4405,12 +4416,17 @@ mod tests {
         );
         assert_eq!(
             matrix
-                .entry(
-                    BroadcastRuntimeVerifiedSubsystem::NativePipeWireMonoChannelMonitorDiagnostic
-                )
+                .entry(BroadcastRuntimeVerifiedSubsystem::NativePipeWireDesktopMonoListeningHelper)
                 .unwrap()
                 .level,
-            BroadcastRuntimeVerificationLevel::MonoTrackMonitorDrainCompleted
+            BroadcastRuntimeVerificationLevel::DesktopMonoListeningHelperDrainCompleted
+        );
+        assert_eq!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::NativePipeWireDiscrete4MonoOutputBoundary)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::NotImplemented
         );
         assert_ne!(
             matrix

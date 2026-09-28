@@ -1,16 +1,18 @@
-# M2 Step 21M — PipeWire Mono Channel Monitor Diagnostic
+# M2 Step 21M — PipeWire Desktop Mono Listening Helper
 
-Step 21M adds a diagnostic PipeWire monitor command for listening to one
-authoritative original MXF mono audio track at a time.
+Step 21M added a limited PipeWire desktop listening helper for one original MXF
+mono audio source track.
 
-This is not production routing and not a new Broadcast Player playback model.
-Broadcast/news audio remains mono-channel based:
+This is not the correct broadcast channel output model and must not be treated
+as production routing. Broadcast/news audio remains discrete mono-channel based:
 
 - original MXF audio consists of separate mono tracks
 - each original mono track remains individually addressable
 - QGS Broadcast Player Runtime preserves mono channel identity
+- correct broadcast direction is track 1 -> output channel 1, track 2 -> output
+  channel 2, track 3 -> output channel 3, and track 4 -> output channel 4
 - proxy AAC is not used as runtime audio
-- duplicated L/R output is only a temporary desktop monitor helper
+- duplicated L/R output is only an ad-hoc desktop listening helper
 
 ## Command
 
@@ -50,15 +52,17 @@ source: original mono track N
 monitor output: duplicated mono to L/R
 ```
 
-This duplication is a desktop listening helper. It does not alter the QGS
-runtime audio truth and does not define production routing.
+This duplication only proves that selected source samples can be made available
+to a desktop stereo monitor helper. It does not prove channel-correct broadcast
+output, discrete mono output, production routing, channel certification, or full
+audio device verification. It does not alter QGS runtime audio truth.
 
 ## Mironik 2002 Default
 
-Step 21L identified track 4 / track 1 as the preferred diagnostic stereo monitor
-pair for the Mironik 2002 0-1000 ms range. Step 21M narrows the next diagnostic
-boundary to individual mono sources, starting with track 4 because it was the
-loudest source in that range.
+Step 21L identified track 4 / track 1 as the preferred diagnostic desktop
+monitor pair for the Mironik 2002 0-1000 ms range. Step 21M narrowed the
+desktop listening helper to a single mono source, starting with track 4 because
+it was the loudest source in that range.
 
 For the default range:
 
@@ -78,14 +82,15 @@ evidence label.
 
 Possible evidence labels include:
 
-- `MonoTrackMonitorSubmitted`
-- `MonoTrackMonitorDrainCompleted`
-- `ManualMonoTrackMonitorHeard`
-- `ManualMonoTrackMonitorNotHeard`
-- `ManualMonoTrackMonitorConfirmationRequired`
+- `DesktopMonoListeningHelperSubmitted`
+- `DesktopMonoListeningHelperDrainCompleted`
+- `ManualDesktopMonoListeningHelperHeard`
+- `ManualDesktopMonoListeningHelperNotHeard`
+- `ManualDesktopMonoListeningHelperConfirmationRequired`
 
 These labels are below `AudioDeviceVerified`. They do not certify:
 
+- discrete 4-mono PipeWire output
 - channel routing
 - production routing
 - speaker calibration
@@ -97,6 +102,7 @@ These labels are below `AudioDeviceVerified`. They do not certify:
 
 Step 21M does not implement:
 
+- discrete track 1/2/3/4 to output channel 1/2/3/4 behavior
 - production audio routing
 - channel certification
 - full Broadcast Player playback
@@ -111,9 +117,11 @@ Step 21M does not implement:
 The next required diagnostic is:
 
 ```text
-M2 Step 21N — PipeWire Mono Channel Monitor Diagnostic
+M2 Step 21N — Discrete 4-Mono PipeWire Output Boundary
 ```
 
-Step 21N should continue individual mono-channel testing across the original
-MXF tracks and report which mono channels carry recognizable content for the
-selected Mironik 2002 ranges.
+Step 21N should output original MXF tracks 1, 2, 3, and 4 as four discrete mono
+channels using a 4-channel PipeWire boundary where possible. It must preserve
+channel identity, avoid stereo fold, avoid duplicated mono as proof, avoid L/R
+semantic claims, and still avoid production routing certification or
+`AudioDeviceVerified` upgrades until those are separately proven.

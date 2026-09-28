@@ -2511,9 +2511,9 @@ impl ManualAudibleConfirmation {
 
     const fn mono_monitor_label(self) -> &'static str {
         match self {
-            Self::Yes => "ManualMonoTrackMonitorHeard",
-            Self::No => "ManualMonoTrackMonitorNotHeard",
-            Self::Required => "ManualMonoTrackMonitorConfirmationRequired",
+            Self::Yes => "ManualDesktopMonoListeningHelperHeard",
+            Self::No => "ManualDesktopMonoListeningHelperNotHeard",
+            Self::Required => "ManualDesktopMonoListeningHelperConfirmationRequired",
         }
     }
 }
@@ -2596,7 +2596,7 @@ fn read_manual_mono_monitor_confirmation() -> io::Result<ManualAudibleConfirmati
         return Ok(ManualAudibleConfirmation::Required);
     }
     print!(
-        "Did you hear the mono channel monitor output from the default PipeWire output? yes/no: "
+        "Did you hear the desktop mono listening helper from the default PipeWire output? yes/no: "
     );
     io::stdout().flush()?;
     let mut input = String::new();
@@ -2626,11 +2626,13 @@ fn mono_monitor_diagnostic_evidence_label(
     confirmation: ManualAudibleConfirmation,
 ) -> &'static str {
     match (submitted, drain_completed, confirmation) {
-        (true, _, ManualAudibleConfirmation::Yes) => "ManualMonoTrackMonitorHeard",
-        (true, _, ManualAudibleConfirmation::No) => "ManualMonoTrackMonitorNotHeard",
-        (true, true, ManualAudibleConfirmation::Required) => "MonoTrackMonitorDrainCompleted",
-        (true, false, ManualAudibleConfirmation::Required) => "MonoTrackMonitorSubmitted",
-        _ => "MonoTrackMonitorNotSubmitted",
+        (true, _, ManualAudibleConfirmation::Yes) => "ManualDesktopMonoListeningHelperHeard",
+        (true, _, ManualAudibleConfirmation::No) => "ManualDesktopMonoListeningHelperNotHeard",
+        (true, true, ManualAudibleConfirmation::Required) => {
+            "DesktopMonoListeningHelperDrainCompleted"
+        }
+        (true, false, ManualAudibleConfirmation::Required) => "DesktopMonoListeningHelperSubmitted",
+        _ => "DesktopMonoListeningHelperNotSubmitted",
     }
 }
 
@@ -3721,8 +3723,8 @@ fn pipewire_audio_mono_monitor(
     };
     let report = inspect_native_pipewire_stream_boundary(&report_buffer)?;
 
-    println!("QGS PipeWire Mono Channel Monitor Diagnostic");
-    println!("--------------------------------------------");
+    println!("QGS PipeWire Desktop Mono Listening Helper");
+    println!("------------------------------------------");
     println!("Audio source: original MXF");
     println!("Source original path: {}", original_path.display());
     println!("Source proxy path: {}", proxy_path.display());
@@ -3733,8 +3735,9 @@ fn pipewire_audio_mono_monitor(
         "Selected source: original mono track {}",
         plan.source_track_number()
     );
-    println!("Monitor output: duplicated mono to L/R");
-    println!("Desktop monitor helper only: yes");
+    println!("Monitor output: duplicated mono to L/R for desktop listening only");
+    println!("Desktop listening helper only: yes");
+    println!("Discrete 4-mono broadcast output verified: no");
     println!("Production routing: no");
     println!("Channel certification: no");
     println!("Full playback: no");
@@ -3808,11 +3811,13 @@ fn pipewire_audio_mono_monitor(
         println!("Buffers submitted: 0");
         println!("Drain requested: no");
         println!("Drain completed: no");
-        println!("Manual confirmation status: ManualMonoTrackMonitorConfirmationRequired");
+        println!(
+            "Manual confirmation status: ManualDesktopMonoListeningHelperConfirmationRequired"
+        );
         println!("Evidence level: {:?}", report.evidence_level);
-        println!("AudioDeviceBoundaryEvidence: MonoTrackMonitorNotSubmitted");
+        println!("AudioDeviceBoundaryEvidence: DesktopMonoListeningHelperNotSubmitted");
         println!("AudioDeviceVerified: no");
-        println!("AudioDeviceVerified scope: not upgraded by mono channel monitor diagnostic");
+        println!("AudioDeviceVerified scope: not upgraded by desktop mono listening helper");
         println!("Audible output claimed: no");
         println!("Status: {}", report.status_message);
         return Ok(());
@@ -3889,16 +3894,16 @@ fn pipewire_audio_mono_monitor(
         "Manual confirmation status: {}",
         confirmation.mono_monitor_label()
     );
-    println!("Mono track monitor evidence level: {}", evidence);
+    println!("Desktop mono listening helper evidence level: {}", evidence);
     println!("AudioDeviceBoundaryEvidence: {}", evidence);
     println!("AudioDeviceVerified: no");
-    println!("AudioDeviceVerified scope: not upgraded by mono channel monitor diagnostic");
+    println!("AudioDeviceVerified scope: not upgraded by desktop mono listening helper");
     println!(
         "Audible output claimed: {}",
         yes_no(confirmation == ManualAudibleConfirmation::Yes)
     );
     println!(
-        "Status: mono channel monitor diagnostic completed; runtime mono-channel truth and production routing are unchanged"
+        "Status: desktop mono listening helper completed; discrete 4-mono output and production routing are not verified"
     );
     Ok(())
 }
@@ -13001,7 +13006,7 @@ mod tests {
     fn mono_monitor_evidence_stays_below_audio_device_verified() {
         assert_eq!(
             mono_monitor_diagnostic_evidence_label(true, true, ManualAudibleConfirmation::Required),
-            "MonoTrackMonitorDrainCompleted"
+            "DesktopMonoListeningHelperDrainCompleted"
         );
         assert_eq!(
             mono_monitor_diagnostic_evidence_label(
@@ -13009,15 +13014,15 @@ mod tests {
                 false,
                 ManualAudibleConfirmation::Required
             ),
-            "MonoTrackMonitorSubmitted"
+            "DesktopMonoListeningHelperSubmitted"
         );
         assert_eq!(
             mono_monitor_diagnostic_evidence_label(true, true, ManualAudibleConfirmation::No),
-            "ManualMonoTrackMonitorNotHeard"
+            "ManualDesktopMonoListeningHelperNotHeard"
         );
         assert_eq!(
             mono_monitor_diagnostic_evidence_label(true, true, ManualAudibleConfirmation::Yes),
-            "ManualMonoTrackMonitorHeard"
+            "ManualDesktopMonoListeningHelperHeard"
         );
     }
 
