@@ -2450,7 +2450,7 @@ enum ManualAudibleConfirmation {
 impl ManualAudibleConfirmation {
     const fn label(self) -> &'static str {
         match self {
-            Self::Yes => "ManualAudibleSmokeTestConfirmed",
+            Self::Yes => "ManualAudibleSignalDetectedContentUnverified",
             Self::No => "ManualAudibleSmokeTestNotHeard",
             Self::Required => "ManualAudibleConfirmationRequired",
         }
@@ -2458,7 +2458,7 @@ impl ManualAudibleConfirmation {
 
     const fn original_segment_label(self) -> &'static str {
         match self {
-            Self::Yes => "ManualOriginalSegmentAudibleConfirmed",
+            Self::Yes => "ManualAudibleSignalDetectedContentUnverified",
             Self::No => "ManualOriginalSegmentNotHeard",
             Self::Required => "ManualOriginalSegmentConfirmationRequired",
         }
@@ -2509,7 +2509,7 @@ fn audible_smoke_evidence_label(
     confirmation: ManualAudibleConfirmation,
 ) -> &'static str {
     match (submitted, drain_completed, confirmation) {
-        (true, _, ManualAudibleConfirmation::Yes) => "ManualAudibleSmokeTestConfirmed",
+        (true, _, ManualAudibleConfirmation::Yes) => "ManualAudibleSignalDetectedContentUnverified",
         (true, _, ManualAudibleConfirmation::No) => "ManualAudibleSmokeTestNotHeard",
         (true, true, ManualAudibleConfirmation::Required) => "ManualAudibleConfirmationRequired",
         (true, false, ManualAudibleConfirmation::Required) => "AudibleSmokeTestSubmitted",
@@ -2523,7 +2523,7 @@ fn original_segment_evidence_label(
     confirmation: ManualAudibleConfirmation,
 ) -> &'static str {
     match (submitted, drain_completed, confirmation) {
-        (true, _, ManualAudibleConfirmation::Yes) => "ManualOriginalSegmentAudibleConfirmed",
+        (true, _, ManualAudibleConfirmation::Yes) => "ManualAudibleSignalDetectedContentUnverified",
         (true, _, ManualAudibleConfirmation::No) => "ManualOriginalSegmentNotHeard",
         (true, true, ManualAudibleConfirmation::Required) => {
             "ManualOriginalSegmentConfirmationRequired"
@@ -11241,7 +11241,7 @@ mod tests {
         );
         assert_eq!(
             audible_smoke_evidence_label(true, true, ManualAudibleConfirmation::Yes),
-            "ManualAudibleSmokeTestConfirmed"
+            "ManualAudibleSignalDetectedContentUnverified"
         );
     }
 
@@ -11312,7 +11312,7 @@ mod tests {
         );
         assert_eq!(
             original_segment_evidence_label(true, true, ManualAudibleConfirmation::Yes),
-            "ManualOriginalSegmentAudibleConfirmed"
+            "ManualAudibleSignalDetectedContentUnverified"
         );
     }
 

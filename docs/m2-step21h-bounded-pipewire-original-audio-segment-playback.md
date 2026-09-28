@@ -14,7 +14,8 @@ Step 21G proved a bounded audible smoke test:
 - original MXF-derived audio
 - 500 ms
 - repeated 20 ms source segment
-- manual audible confirmation: `ManualAudibleSmokeTestConfirmed`
+- manual signal detection: `ManualAudibleSignalDetectedContentUnverified`
+- recognizable original audio content: not confirmed
 
 Step 21H is stronger because it does not loop one source block as primary
 evidence. It builds the submitted buffers from sequential original MXF PCM
@@ -113,7 +114,7 @@ The command reports:
 
 Manual confirmation labels are:
 
-- `ManualOriginalSegmentAudibleConfirmed`
+- `ManualAudibleSignalDetectedContentUnverified`
 - `ManualOriginalSegmentNotHeard`
 - `ManualOriginalSegmentConfirmationRequired`
 
@@ -157,18 +158,43 @@ Observed result:
 - post-submit callbacks observed: 0
 - post-submit timeout: no
 - PipeWire evidence level: `DrainCompleted`
-- manual confirmation answer: yes
-- manual confirmation status: `ManualOriginalSegmentAudibleConfirmed`
-- segment evidence level: `ManualOriginalSegmentAudibleConfirmed`
+- manual confirmation answer: yes, later clarified
+- manual confirmation status: `ManualAudibleSignalDetectedContentUnverified`
+- segment evidence level: `ManualAudibleSignalDetectedContentUnverified`
+- heard result: slight hum/buzz only
+- recognizable original audio content confirmed: no
 - `AudioDeviceVerified`: no
 - `AudioDeviceVerified` scope: not upgraded by bounded segment playback
-- audible output claimed: yes
+- audible signal detected: yes
+- audible original audio content claimed: no
+
+## Correction Note
+
+The earlier Step 21H note used `ManualOriginalSegmentAudibleConfirmed`. The
+user later clarified that the heard output was only a slight hum/buzz, not
+recognizable original audio content. The evidence is therefore corrected to
+`ManualAudibleSignalDetectedContentUnverified`.
+
+The positive evidence remains:
+
+- sequential original-audio segment was constructed from contiguous original MXF
+  PCM blocks
+- native PipeWire stream configured
+- buffers submitted
+- drain completed
+- original MXF path used
+- proxy AAC not used
+
+The correction means bounded original-audio segment playback is not yet
+content-audible verified. It does not verify PCM content correctness, channel
+routing, full audio device output, or full `AudioDeviceVerified`.
 
 ## Verification Matrix
 
 Step 20Q includes a separate `native PipeWire original-audio segment playback`
-row. Its current evidence is `ManualOriginalSegmentAudibleConfirmed`: a human
-confirmed hearing the bounded sequential original MXF audio segment.
+row. Its current evidence is `ManualAudibleSignalDetectedContentUnverified`: a
+human detected a slight hum/buzz from the bounded sequential original MXF audio
+segment, but recognizable original audio content was not confirmed.
 
 This remains separate from:
 

@@ -79,16 +79,17 @@ smoke-test confirmation label.
 
 Possible confirmation states:
 
-- `ManualAudibleSmokeTestConfirmed`
+- `ManualAudibleSignalDetectedContentUnverified`
 - `ManualAudibleSmokeTestNotHeard`
 - `ManualAudibleConfirmationRequired`
 
 Noninteractive runs report `ManualAudibleConfirmationRequired`. QGS does not
 silently assume that sound was heard.
 
-Even when a human answers yes, this remains a narrow smoke-test result. It is
-not full `AudioDeviceVerified`, realtime playback, A/V sync, broadcast timing
-verification, or speaker calibration.
+Even when a human answers yes, this remains a narrow signal-detection result.
+It does not confirm recognizable original audio content, PCM content
+correctness, channel routing, full `AudioDeviceVerified`, realtime playback,
+A/V sync, broadcast timing verification, or speaker calibration.
 
 ## Command
 
@@ -126,18 +127,40 @@ Observed local manual result:
 - drain requested: yes
 - drain completed: yes
 - PipeWire evidence level: `DrainCompleted`
-- manual confirmation answer: yes
-- manual confirmation status: `ManualAudibleSmokeTestConfirmed`
-- smoke-test evidence level: `ManualAudibleSmokeTestConfirmed`
+- manual confirmation answer: yes, later clarified
+- manual confirmation status: `ManualAudibleSignalDetectedContentUnverified`
+- smoke-test evidence level: `ManualAudibleSignalDetectedContentUnverified`
+- heard result: slight hum/buzz only
+- recognizable original audio content confirmed: no
 - `AudioDeviceVerified`: no
 - `AudioDeviceVerified` scope: not upgraded by smoke test
-- audible output claimed: yes
+- audible signal detected: yes
+- audible original audio content claimed: no
+
+## Correction Note
+
+The earlier Step 21G note used `ManualAudibleSmokeTestConfirmed`. The user later
+clarified that the heard output was only a slight hum/buzz, not recognizable
+original audio content. The evidence is therefore corrected to
+`ManualAudibleSignalDetectedContentUnverified`.
+
+The positive evidence remains:
+
+- native PipeWire stream configured
+- buffers submitted
+- drain completed
+- original MXF path used
+- proxy AAC not used
+
+The correction means this smoke test does not verify PCM content correctness,
+channel routing, full audio device output, or full `AudioDeviceVerified`.
 
 ## Verification Matrix
 
 Step 20Q now includes a separate `native PipeWire audible smoke test` row. Its
-current evidence is `ManualAudibleSmokeTestConfirmed`: a human confirmed hearing
-the bounded original-audio-derived PipeWire smoke test.
+current evidence is `ManualAudibleSignalDetectedContentUnverified`: a human
+detected a slight hum/buzz from the bounded original-audio-derived PipeWire
+smoke test, but recognizable original audio content was not confirmed.
 
 This remains separate from full Broadcast Player playback, realtime playback,
 A/V sync, full `AudioDeviceVerified`, channel certification, and speaker

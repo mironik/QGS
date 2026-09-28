@@ -571,6 +571,7 @@ pub enum BroadcastRuntimeVerificationLevel {
     NativePostSubmitEvidence,
     RuntimeAudioPayloadDrainCompleted,
     RuntimeAudioPayloadAudibleConfirmed,
+    ManualAudibleSignalDetectedContentUnverified,
     VisualVerified,
     AudioDeviceVerified,
     RealtimeVerified,
@@ -591,6 +592,9 @@ impl BroadcastRuntimeVerificationLevel {
             Self::NativePostSubmitEvidence => "NativePostSubmitEvidence",
             Self::RuntimeAudioPayloadDrainCompleted => "RuntimeAudioPayloadDrainCompleted",
             Self::RuntimeAudioPayloadAudibleConfirmed => "RuntimeAudioPayloadAudibleConfirmed",
+            Self::ManualAudibleSignalDetectedContentUnverified => {
+                "ManualAudibleSignalDetectedContentUnverified"
+            }
             Self::VisualVerified => "VisualVerified",
             Self::AudioDeviceVerified => "AudioDeviceVerified",
             Self::RealtimeVerified => "RealtimeVerified",
@@ -776,13 +780,13 @@ impl BroadcastRuntimeVerificationMatrix {
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::NativePipeWireAudibleSmokeTest,
-                    level: Level::NativePostSubmitEvidence,
-                    summary: "bounded original-audio-derived smoke-test buffers submit/drain; manual audible confirmation remains separate",
+                    level: Level::ManualAudibleSignalDetectedContentUnverified,
+                    summary: "bounded original-audio-derived smoke-test buffers submit/drain; user later clarified the heard output was slight hum/buzz only, not recognizable original audio content",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::NativePipeWireOriginalAudioSegmentPlayback,
-                    level: Level::NativePostSubmitEvidence,
-                    summary: "bounded sequential original-audio segment submits/drains; manual original-segment confirmation remains separate",
+                    level: Level::ManualAudibleSignalDetectedContentUnverified,
+                    summary: "bounded sequential original-audio segment submits/drains; user later clarified the heard output was slight hum/buzz only, not recognizable original audio content",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::BroadcastRuntimeAudioPayloadPipeWire,
@@ -4224,6 +4228,10 @@ mod tests {
             BroadcastRuntimeVerificationLevel::RuntimeAudioPayloadAudibleConfirmed
                 < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
         );
+        assert!(
+            BroadcastRuntimeVerificationLevel::ManualAudibleSignalDetectedContentUnverified
+                < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
     }
 
     #[test]
@@ -4307,6 +4315,13 @@ mod tests {
                 .level,
             BroadcastRuntimeVerificationLevel::AudioDeviceVerified
         );
+        assert_eq!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::NativePipeWireAudibleSmokeTest)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::ManualAudibleSignalDetectedContentUnverified
+        );
         assert_ne!(
             matrix
                 .entry(
@@ -4315,6 +4330,15 @@ mod tests {
                 .unwrap()
                 .level,
             BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
+        assert_eq!(
+            matrix
+                .entry(
+                    BroadcastRuntimeVerifiedSubsystem::NativePipeWireOriginalAudioSegmentPlayback
+                )
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::ManualAudibleSignalDetectedContentUnverified
         );
         assert_ne!(
             matrix
