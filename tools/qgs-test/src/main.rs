@@ -6,6 +6,9 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use qgs_audio_pipewire::{
+    create_native_pipewire_stream, PipeWireAudioSampleFormat, PipeWireStreamFormat,
+};
 use qgs_core::{BackendDecodedSurface, DecoderBackend, DeviceDiscovery, VideoCapabilityDiscovery};
 use qgs_linux::{
     connect_socket, default_socket_path, inspect_native_pipewire_stream_boundary,
@@ -2095,18 +2098,76 @@ fn pipewire_audio_native_prototype(path: &Path) -> Result<(), Box<dyn std::error
         "PipeWire headers available: {}",
         yes_no(report.headers_available)
     );
-    println!(
-        "Stream create attempted: {}",
-        yes_no(report.stream_create_attempted)
-    );
-    println!("Buffer dequeued: {}", yes_no(report.buffer_dequeued));
-    println!("Buffer submitted: {}", yes_no(report.buffer_submitted));
-    println!("Evidence level: {:?}", report.evidence_level);
-    println!(
-        "AudioDeviceVerified: {}",
-        yes_no(report.audio_device_verified)
-    );
-    println!("Status: {}", report.status_message);
+    if !report.pkg_config_entry_available || !report.headers_available {
+        println!(
+            "Stream create attempted: {}",
+            yes_no(report.stream_create_attempted)
+        );
+        println!("Buffer dequeued: {}", yes_no(report.buffer_dequeued));
+        println!("Buffer submitted: {}", yes_no(report.buffer_submitted));
+        println!("Evidence level: {:?}", report.evidence_level);
+        println!(
+            "AudioDeviceVerified: {}",
+            yes_no(report.audio_device_verified)
+        );
+        println!("Status: {}", report.status_message);
+        return Ok(());
+    }
+
+    let stream_format = PipeWireStreamFormat {
+        sample_rate: source_format.sample_rate,
+        channels: u32::from(buffer.channels),
+        sample_format: PipeWireAudioSampleFormat::F32Interleaved,
+    };
+    match create_native_pipewire_stream(stream_format, Duration::from_secs(2)) {
+        Ok(stream_report) => {
+            println!(
+                "Stream create attempted: {}",
+                yes_no(stream_report.stream_create_attempted)
+            );
+            println!("Stream created: {}", yes_no(stream_report.stream_created));
+            println!(
+                "Stream configured: {}",
+                yes_no(stream_report.stream_configured)
+            );
+            println!(
+                "Selected stream format: {:?} {}Hz channels={}",
+                stream_report.selected_format.sample_format,
+                stream_report.selected_format.sample_rate,
+                stream_report.selected_format.channels
+            );
+            println!(
+                "Observed stream states: {:?}",
+                stream_report.observed_states
+            );
+            println!("Final stream state: {:?}", stream_report.final_state);
+            println!("Buffer dequeued: no");
+            println!(
+                "Buffer submitted: {}",
+                yes_no(stream_report.buffer_submitted)
+            );
+            println!("Evidence level: {:?}", stream_report.evidence_level);
+            println!(
+                "AudioDeviceVerified: {}",
+                yes_no(stream_report.audio_device_verified)
+            );
+            println!("Status: {}", stream_report.status_message);
+        }
+        Err(err) => {
+            println!("Stream create attempted: yes");
+            println!("Stream created: no");
+            println!("Stream configured: no");
+            println!(
+                "Selected stream format: F32Interleaved {}Hz channels={}",
+                stream_format.sample_rate, stream_format.channels
+            );
+            println!("Buffer dequeued: no");
+            println!("Buffer submitted: no");
+            println!("Evidence level: NativeStreamCreateFailed");
+            println!("AudioDeviceVerified: no");
+            println!("Status: {err}");
+        }
+    }
 
     Ok(())
 }

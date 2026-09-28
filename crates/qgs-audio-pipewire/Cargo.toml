@@ -1,0 +1,9 @@
+[package]
+name = "qgs-audio-pipewire"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+pipewire = "0.10.1"
+spa-sys = { package = "libspa-sys", version = "0.10" }
