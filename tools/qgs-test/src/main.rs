@@ -13,14 +13,16 @@ use qgs_linux::{
 };
 use qgs_media_runtime::{
     audio_samples_for_duration, av_frame_audio_range, classify_presentation, duration_abs_delta,
-    duration_from_audio_samples, max_video_timestamp_outside_audio_range,
-    summarize_broadcast_runtime_contract, AudioFormat, AudioSampleFormat, AudioTimeline,
-    AudioTimingPacket, AvFrameAudioRange, BoundedQueue, BroadcastMediaSourceRole,
+    duration_from_audio_samples, evaluate_broadcast_preroll,
+    max_video_timestamp_outside_audio_range, summarize_broadcast_runtime_contract, AudioFormat,
+    AudioSampleFormat, AudioTimeline, AudioTimingPacket, AvFrameAudioRange, BoundedQueue,
+    BroadcastMediaSourceRole, BroadcastPrerollConfig, BroadcastPrerollPlan,
     BroadcastPreviewProfile, BroadcastRuntimeCapabilities, BroadcastRuntimePrepareFacts,
     BroadcastRuntimeQueueLimits, BroadcastRuntimeSessionDescription, BroadcastRuntimeStateMachine,
-    FrameIdentity as PlaybackFrameIdentity, OriginalAudioTrack, PcmAudioBlock, PcmAudioBlockLayout,
-    PcmAudioPacket, PcmEndian, PcmSampleFormat, PlaybackClock, PlaybackConfig, PlaybackState,
-    PresentationDecision, RationalRate, RealTimeClock, TestAudioSink, TestPresentationSink,
+    BroadcastVideoSourceMode, FrameIdentity as PlaybackFrameIdentity, OriginalAudioTrack,
+    PcmAudioBlock, PcmAudioBlockLayout, PcmAudioPacket, PcmEndian, PcmSampleFormat, PlaybackClock,
+    PlaybackConfig, PlaybackState, PresentationDecision, RationalRate, RealTimeClock,
+    TestAudioSink, TestPresentationSink,
 };
 use qgs_mp4::{
     classify_video_track, nearest_random_access_before, MediaHealth, Mp4Source, Mp4TrackKind,
@@ -67,6 +69,7 @@ const QNC_JOURNALIST_DEMO_ARG: &str = "--qnc-journalist-demo";
 const ORIGINAL_AUDIO_EXTRACT_ARG: &str = "--original-audio-extract";
 const BROADCAST_RUNTIME_CONTRACT_ARG: &str = "--broadcast-runtime-contract";
 const BROADCAST_RUNTIME_STATE_MACHINE_ARG: &str = "--broadcast-runtime-state-machine";
+const BROADCAST_RUNTIME_PREROLL_ARG: &str = "--broadcast-runtime-preroll";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -114,6 +117,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.broadcast_runtime_state_machine_paths {
         return broadcast_runtime_state_machine(&original, &proxy);
+    }
+    if let Some((original, proxy)) = args.broadcast_runtime_preroll_paths {
+        return broadcast_runtime_preroll(&original, &proxy);
     }
 
     let socket_path = args.socket_path;
@@ -1927,6 +1933,7 @@ fn broadcast_runtime_contract(
     let session = BroadcastRuntimeSessionDescription {
         audio_source: BroadcastMediaSourceRole::OriginalAuthoritativeAudio,
         video_source: BroadcastMediaSourceRole::ProxyPreviewVideo,
+        video_source_mode: BroadcastVideoSourceMode::ProxyPreview,
         preview_profile: BroadcastPreviewProfile::Journalist50iPreview,
         audio_sample_rate: sample_rate,
         audio_track_count: audio_tracks.len(),
@@ -1936,6 +1943,8 @@ fn broadcast_runtime_contract(
             preserves_original_pcm_format: true,
             preserves_track_channel_identity: true,
             proxy_video_preview: true,
+            original_media_video_source: !original.index.video.is_empty(),
+            original_media_realtime_supported: false,
             proxy_audio_primary: false,
             ui_dependent: false,
         },
@@ -1967,6 +1976,7 @@ fn broadcast_runtime_contract(
     println!("QGS Broadcast Runtime Contract Draft");
     println!("------------------------------------");
     println!("Audio source: original MXF");
+    println!("Video source mode: proxy-preview");
     println!("Video source: proxy MP4");
     println!("Proxy AAC: not used");
     println!("Preview profile: journalist-50i-preview");
@@ -2059,6 +2069,7 @@ fn broadcast_runtime_state_machine(
     let session = BroadcastRuntimeSessionDescription {
         audio_source: BroadcastMediaSourceRole::OriginalAuthoritativeAudio,
         video_source: BroadcastMediaSourceRole::ProxyPreviewVideo,
+        video_source_mode: BroadcastVideoSourceMode::ProxyPreview,
         preview_profile: BroadcastPreviewProfile::Journalist50iPreview,
         audio_sample_rate: sample_rate,
         audio_track_count: audio_tracks.len(),
@@ -2068,6 +2079,8 @@ fn broadcast_runtime_state_machine(
             preserves_original_pcm_format: true,
             preserves_track_channel_identity: true,
             proxy_video_preview: true,
+            original_media_video_source: !original.index.video.is_empty(),
+            original_media_realtime_supported: false,
             proxy_audio_primary: false,
             ui_dependent: false,
         },
@@ -2147,6 +2160,7 @@ fn broadcast_runtime_state_machine(
     println!("--------------------------------------------");
     println!("Not real playback: no speaker output, no display output, no real-time playout loop");
     println!("Audio source: original MXF");
+    println!("Video source mode: proxy-preview");
     println!("Video source: proxy MP4");
     println!("Proxy AAC: not used");
     println!("Preview profile: journalist-50i-preview");
@@ -2184,6 +2198,222 @@ fn broadcast_runtime_state_machine(
                 && accounting.intentional_profile_skips == intentional_skips
                 && accounting.lateness_drops == 0
         )
+    );
+
+    Ok(())
+}
+
+fn broadcast_runtime_preroll(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let original_bytes = std::fs::read(original_path)?;
+    let original = MediaSource::parse(&original_bytes)?;
+    let proxy = Mp4Source::open(proxy_path)?;
+    let proxy_video = proxy
+        .video
+        .as_ref()
+        .ok_or("proxy has no H.264 video track")?;
+    let audio_tracks = original
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Audio)
+        .collect::<Vec<_>>();
+    if audio_tracks.is_empty() {
+        return Err("original MXF has no audio tracks".into());
+    }
+
+    let sample_rate = original_audio_sample_rate(&audio_tracks)?;
+    let blocks = build_original_pcm_blocks(&original, &original_bytes)?;
+    let audio_duration = blocks
+        .iter()
+        .map(|block| block.end_time())
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .ok_or("no original PCM blocks available")?;
+    let queue_limits = BroadcastRuntimeQueueLimits {
+        audio_block_capacity: 8,
+        video_frame_capacity: 6,
+        processed_frame_capacity: 3,
+    };
+    let session = BroadcastRuntimeSessionDescription {
+        audio_source: BroadcastMediaSourceRole::OriginalAuthoritativeAudio,
+        video_source: BroadcastMediaSourceRole::ProxyPreviewVideo,
+        video_source_mode: BroadcastVideoSourceMode::ProxyPreview,
+        preview_profile: BroadcastPreviewProfile::Journalist50iPreview,
+        audio_sample_rate: sample_rate,
+        audio_track_count: audio_tracks.len(),
+        queue_limits,
+        capabilities: BroadcastRuntimeCapabilities {
+            sample_clock_aware: true,
+            preserves_original_pcm_format: true,
+            preserves_track_channel_identity: true,
+            proxy_video_preview: true,
+            original_media_video_source: !original.index.video.is_empty(),
+            original_media_realtime_supported: false,
+            proxy_audio_primary: false,
+            ui_dependent: false,
+        },
+    }
+    .validate()?;
+    let selected = selected_journalist_preview_frames(proxy_video)?;
+    let selected_frame_count = selected.len();
+    let intentional_skips = proxy_video
+        .samples
+        .len()
+        .saturating_sub(selected_frame_count);
+    let frame_duration = ProxyPlaybackProfile::Journalist50iPreview
+        .presentation_rate(RationalRate::new(
+            u64::from(proxy_video.frame_rate.numerator),
+            u64::from(proxy_video.frame_rate.denominator),
+        )?)?
+        .frame_duration()?;
+    let ranges = selected
+        .iter()
+        .map(|frame| {
+            av_frame_audio_range(
+                frame.preview_index,
+                frame.start_time,
+                frame_duration,
+                sample_rate,
+                &blocks,
+                audio_tracks.len(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let summary = summarize_broadcast_runtime_contract(&ranges, audio_duration);
+    let config = BroadcastPrerollConfig {
+        video_source_mode: BroadcastVideoSourceMode::ProxyPreview,
+        video_frames_required: 3,
+        audio_ranges_required: 3,
+        max_video_queue: 6,
+        max_audio_queue: 8,
+        max_presentation_queue: 3,
+    }
+    .validate()?;
+    let plan = BroadcastPrerollPlan {
+        video_source_mode: BroadcastVideoSourceMode::ProxyPreview,
+        selected_video_frames_planned: selected_frame_count,
+        audio_ranges_planned: ranges.len(),
+        intentional_skips_planned: intentional_skips,
+        duration_covered: audio_duration,
+        finite_queue_limits: queue_limits,
+        video_source_available: true,
+        video_runtime_supported: true,
+    };
+    let ready_status = evaluate_broadcast_preroll(
+        config,
+        plan,
+        config.video_frames_required,
+        config.audio_ranges_required,
+    );
+    let not_ready_status = evaluate_broadcast_preroll(
+        config,
+        plan,
+        config.video_frames_required.saturating_sub(1),
+        config.audio_ranges_required,
+    );
+    let original_media_config = BroadcastPrerollConfig {
+        video_source_mode: BroadcastVideoSourceMode::OriginalMedia,
+        ..config
+    };
+    let original_media_plan = BroadcastPrerollPlan {
+        video_source_mode: BroadcastVideoSourceMode::OriginalMedia,
+        selected_video_frames_planned: original.index.video.len(),
+        audio_ranges_planned: original.index.video.len(),
+        intentional_skips_planned: 0,
+        duration_covered: audio_duration,
+        finite_queue_limits: queue_limits,
+        video_source_available: !original.index.video.is_empty(),
+        video_runtime_supported: false,
+    };
+    let original_media_status = evaluate_broadcast_preroll(
+        original_media_config,
+        original_media_plan,
+        config.video_frames_required,
+        config.audio_ranges_required,
+    );
+
+    let mut not_ready_runtime = BroadcastRuntimeStateMachine::create(session)?;
+    not_ready_runtime.prepare_with_preroll(
+        BroadcastRuntimePrepareFacts {
+            selected_frame_count,
+            intentional_profile_skips: intentional_skips,
+            audio_ranges_complete: summary.incomplete_frames == 0,
+            frames_outside_audio_range: summary.frames_outside_audio_range,
+        },
+        not_ready_status,
+    )?;
+    let play_before_ready_rejected = not_ready_runtime.play().is_err();
+
+    let mut runtime = BroadcastRuntimeStateMachine::create(session)?;
+    runtime.prepare_with_preroll(
+        BroadcastRuntimePrepareFacts {
+            selected_frame_count,
+            intentional_profile_skips: intentional_skips,
+            audio_ranges_complete: summary.incomplete_frames == 0,
+            frames_outside_audio_range: summary.frames_outside_audio_range,
+        },
+        ready_status,
+    )?;
+    let ready_reached = runtime.state() == qgs_media_runtime::BroadcastRuntimeState::Ready;
+    let play_from_ready_succeeds = runtime.play().is_ok();
+
+    println!("QGS Broadcast Runtime Preroll Plan");
+    println!("-----------------------------------");
+    println!("Not real playback: no speaker output, no display output, no real-time playout loop");
+    println!("Audio source: original MXF");
+    println!("Video source mode: proxy-preview");
+    println!("Video source: proxy MP4");
+    println!("Proxy AAC: not used");
+    println!("Original media mode: available in contract, realtime support not claimed in this milestone");
+    println!("Preview profile: journalist-50i-preview");
+    println!(
+        "Preroll config: source_mode={:?} video_required={} audio_required={} max_video_queue={} max_audio_queue={} max_presentation_queue={}",
+        config.video_source_mode,
+        config.video_frames_required,
+        config.audio_ranges_required,
+        config.max_video_queue,
+        config.max_audio_queue,
+        config.max_presentation_queue
+    );
+    println!(
+        "Preroll plan: selected_frames={} intentional_skips={} audio_ranges={} duration={:.3}s",
+        plan.selected_video_frames_planned,
+        plan.intentional_skips_planned,
+        plan.audio_ranges_planned,
+        plan.duration_covered.as_secs_f64()
+    );
+    println!(
+        "Ready status: ready={} prepared_video={} prepared_audio={} missing_video={} missing_audio={} queue_limits_ok={}",
+        yes_no(ready_status.ready),
+        ready_status.prepared_video_frames,
+        ready_status.prepared_audio_ranges,
+        ready_status.missing_video_frames,
+        ready_status.missing_audio_ranges,
+        yes_no(ready_status.queue_limits_ok)
+    );
+    println!(
+        "Original media mode probe: ready={} reason={:?} original_video_frames={}",
+        yes_no(original_media_status.ready),
+        original_media_status.reason,
+        original_media_plan.selected_video_frames_planned
+    );
+    println!(
+        "Not-ready probe: ready={} reason={:?} play_before_ready_rejected={}",
+        yes_no(not_ready_status.ready),
+        not_ready_status.reason,
+        yes_no(play_before_ready_rejected)
+    );
+    println!(
+        "Queue peaks: video={} audio={} presentation={}",
+        config.video_frames_required, config.audio_ranges_required, 0
+    );
+    println!("Ready reached after preroll: {}", yes_no(ready_reached));
+    println!(
+        "Play from Ready succeeds: {}",
+        yes_no(play_from_ready_succeeds)
     );
 
     Ok(())
@@ -6942,6 +7172,7 @@ struct Args {
     original_audio_extract_path: Option<PathBuf>,
     broadcast_runtime_contract_paths: Option<(PathBuf, PathBuf)>,
     broadcast_runtime_state_machine_paths: Option<(PathBuf, PathBuf)>,
+    broadcast_runtime_preroll_paths: Option<(PathBuf, PathBuf)>,
 }
 
 impl Args {
@@ -6970,6 +7201,8 @@ impl Args {
         let mut broadcast_runtime_contract_paths = None;
         let mut broadcast_runtime_state_machine_original = None;
         let mut broadcast_runtime_state_machine_paths = None;
+        let mut broadcast_runtime_preroll_original = None;
+        let mut broadcast_runtime_preroll_paths = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
@@ -6984,9 +7217,22 @@ impl Args {
         let mut next_arg_is_broadcast_runtime_contract_proxy = false;
         let mut next_arg_is_broadcast_runtime_state_machine_original = false;
         let mut next_arg_is_broadcast_runtime_state_machine_proxy = false;
+        let mut next_arg_is_broadcast_runtime_preroll_original = false;
+        let mut next_arg_is_broadcast_runtime_preroll_proxy = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_broadcast_runtime_state_machine_proxy {
+            if next_arg_is_broadcast_runtime_preroll_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = broadcast_runtime_preroll_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                broadcast_runtime_preroll_paths = Some((original, proxy));
+                next_arg_is_broadcast_runtime_preroll_proxy = false;
+            } else if next_arg_is_broadcast_runtime_preroll_original {
+                broadcast_runtime_preroll_original = Some(PathBuf::from(arg));
+                next_arg_is_broadcast_runtime_preroll_original = false;
+                next_arg_is_broadcast_runtime_preroll_proxy = true;
+            } else if next_arg_is_broadcast_runtime_state_machine_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = broadcast_runtime_state_machine_original
                     .take()
@@ -7097,6 +7343,8 @@ impl Args {
                 next_arg_is_broadcast_runtime_contract_original = true;
             } else if arg == BROADCAST_RUNTIME_STATE_MACHINE_ARG {
                 next_arg_is_broadcast_runtime_state_machine_original = true;
+            } else if arg == BROADCAST_RUNTIME_PREROLL_ARG {
+                next_arg_is_broadcast_runtime_preroll_original = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -7118,6 +7366,7 @@ impl Args {
             original_audio_extract_path,
             broadcast_runtime_contract_paths,
             broadcast_runtime_state_machine_paths,
+            broadcast_runtime_preroll_paths,
         }
     }
 }

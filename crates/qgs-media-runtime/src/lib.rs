@@ -489,6 +489,12 @@ pub enum BroadcastPreviewProfile {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastVideoSourceMode {
+    ProxyPreview,
+    OriginalMedia,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BroadcastRuntimeState {
     Idle,
     Preparing,
@@ -563,6 +569,8 @@ pub struct BroadcastRuntimeCapabilities {
     pub preserves_original_pcm_format: bool,
     pub preserves_track_channel_identity: bool,
     pub proxy_video_preview: bool,
+    pub original_media_video_source: bool,
+    pub original_media_realtime_supported: bool,
     pub proxy_audio_primary: bool,
     pub ui_dependent: bool,
 }
@@ -571,6 +579,7 @@ pub struct BroadcastRuntimeCapabilities {
 pub struct BroadcastRuntimeSessionDescription {
     pub audio_source: BroadcastMediaSourceRole,
     pub video_source: BroadcastMediaSourceRole,
+    pub video_source_mode: BroadcastVideoSourceMode,
     pub preview_profile: BroadcastPreviewProfile,
     pub audio_sample_rate: u32,
     pub audio_track_count: usize,
@@ -581,14 +590,23 @@ pub struct BroadcastRuntimeSessionDescription {
 impl BroadcastRuntimeSessionDescription {
     pub fn validate(self) -> Result<Self, PlaybackError> {
         self.queue_limits.validate()?;
+        let video_source_valid = match self.video_source_mode {
+            BroadcastVideoSourceMode::ProxyPreview => {
+                self.video_source == BroadcastMediaSourceRole::ProxyPreviewVideo
+                    && self.capabilities.proxy_video_preview
+            }
+            BroadcastVideoSourceMode::OriginalMedia => {
+                self.video_source == BroadcastMediaSourceRole::OriginalFinishingMedia
+                    && self.capabilities.original_media_video_source
+            }
+        };
         if self.audio_source != BroadcastMediaSourceRole::OriginalAuthoritativeAudio
-            || self.video_source != BroadcastMediaSourceRole::ProxyPreviewVideo
+            || !video_source_valid
             || self.audio_sample_rate == 0
             || self.audio_track_count == 0
             || !self.capabilities.sample_clock_aware
             || !self.capabilities.preserves_original_pcm_format
             || !self.capabilities.preserves_track_channel_identity
-            || !self.capabilities.proxy_video_preview
             || self.capabilities.proxy_audio_primary
             || self.capabilities.ui_dependent
         {
@@ -604,6 +622,108 @@ pub struct BroadcastRuntimePrepareFacts {
     pub intentional_profile_skips: usize,
     pub audio_ranges_complete: bool,
     pub frames_outside_audio_range: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastPrerollNotReadyReason {
+    MissingVideoFrames,
+    MissingAudioRanges,
+    InvalidQueueLimits,
+    CapabilityMissing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BroadcastPrerollConfig {
+    pub video_source_mode: BroadcastVideoSourceMode,
+    pub video_frames_required: usize,
+    pub audio_ranges_required: usize,
+    pub max_video_queue: usize,
+    pub max_audio_queue: usize,
+    pub max_presentation_queue: usize,
+}
+
+impl BroadcastPrerollConfig {
+    pub fn validate(self) -> Result<Self, PlaybackError> {
+        if self.video_frames_required == 0
+            || self.audio_ranges_required == 0
+            || self.max_video_queue == 0
+            || self.max_audio_queue == 0
+            || self.max_presentation_queue == 0
+            || self.video_frames_required > self.max_video_queue
+            || self.audio_ranges_required > self.max_audio_queue
+        {
+            return Err(PlaybackError::InvalidCapacity);
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BroadcastPrerollPlan {
+    pub video_source_mode: BroadcastVideoSourceMode,
+    pub selected_video_frames_planned: usize,
+    pub audio_ranges_planned: usize,
+    pub intentional_skips_planned: usize,
+    pub duration_covered: Duration,
+    pub finite_queue_limits: BroadcastRuntimeQueueLimits,
+    pub video_source_available: bool,
+    pub video_runtime_supported: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BroadcastPrerollStatus {
+    pub ready: bool,
+    pub prepared_video_frames: usize,
+    pub prepared_audio_ranges: usize,
+    pub missing_video_frames: usize,
+    pub missing_audio_ranges: usize,
+    pub queue_limits_ok: bool,
+    pub reason: Option<BroadcastPrerollNotReadyReason>,
+}
+
+pub fn evaluate_broadcast_preroll(
+    config: BroadcastPrerollConfig,
+    plan: BroadcastPrerollPlan,
+    prepared_video_frames: usize,
+    prepared_audio_ranges: usize,
+) -> BroadcastPrerollStatus {
+    let queue_limits_ok = config.validate().is_ok()
+        && plan.finite_queue_limits.validate().is_ok()
+        && config.max_video_queue <= plan.finite_queue_limits.video_frame_capacity
+        && config.max_audio_queue <= plan.finite_queue_limits.audio_block_capacity
+        && config.max_presentation_queue <= plan.finite_queue_limits.processed_frame_capacity;
+    let missing_video_frames = config
+        .video_frames_required
+        .saturating_sub(prepared_video_frames);
+    let missing_audio_ranges = config
+        .audio_ranges_required
+        .saturating_sub(prepared_audio_ranges);
+    let capability_ok = config.video_source_mode == plan.video_source_mode
+        && plan.video_source_available
+        && match plan.video_source_mode {
+            BroadcastVideoSourceMode::ProxyPreview => plan.video_runtime_supported,
+            BroadcastVideoSourceMode::OriginalMedia => plan.video_runtime_supported,
+        };
+    let reason = if !queue_limits_ok {
+        Some(BroadcastPrerollNotReadyReason::InvalidQueueLimits)
+    } else if !capability_ok {
+        Some(BroadcastPrerollNotReadyReason::CapabilityMissing)
+    } else if missing_video_frames != 0 {
+        Some(BroadcastPrerollNotReadyReason::MissingVideoFrames)
+    } else if missing_audio_ranges != 0 {
+        Some(BroadcastPrerollNotReadyReason::MissingAudioRanges)
+    } else {
+        None
+    };
+    BroadcastPrerollStatus {
+        ready: reason.is_none(),
+        prepared_video_frames,
+        prepared_audio_ranges,
+        missing_video_frames,
+        missing_audio_ranges,
+        queue_limits_ok,
+        reason,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -666,6 +786,31 @@ impl BroadcastRuntimeStateMachine {
         {
             self.fail();
             return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        self.prepare_facts = Some(facts);
+        self.events.push(BroadcastRuntimeEvent::ContractPrepared);
+        self.events.push(BroadcastRuntimeEvent::Prepared);
+        self.state = BroadcastRuntimeState::Ready;
+        Ok(())
+    }
+
+    pub fn prepare_with_preroll(
+        &mut self,
+        facts: BroadcastRuntimePrepareFacts,
+        preroll_status: BroadcastPrerollStatus,
+    ) -> Result<(), PlaybackError> {
+        self.ensure_state(BroadcastRuntimeState::Idle)?;
+        self.events.push(BroadcastRuntimeEvent::PreparingStarted);
+        self.state = BroadcastRuntimeState::Preparing;
+        if facts.selected_frame_count == 0
+            || !facts.audio_ranges_complete
+            || facts.frames_outside_audio_range != 0
+        {
+            self.fail();
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        if !preroll_status.ready {
+            return Ok(());
         }
         self.prepare_facts = Some(facts);
         self.events.push(BroadcastRuntimeEvent::ContractPrepared);
@@ -1583,6 +1728,53 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_runtime_validates_proxy_preview_source_mode() {
+        let session = test_broadcast_session();
+
+        assert_eq!(
+            session.video_source_mode,
+            BroadcastVideoSourceMode::ProxyPreview
+        );
+        assert_eq!(
+            session.video_source,
+            BroadcastMediaSourceRole::ProxyPreviewVideo
+        );
+        assert!(session.validate().is_ok());
+    }
+
+    #[test]
+    fn broadcast_runtime_validates_original_media_source_mode_without_realtime_claim() {
+        let session = BroadcastRuntimeSessionDescription {
+            video_source: BroadcastMediaSourceRole::OriginalFinishingMedia,
+            video_source_mode: BroadcastVideoSourceMode::OriginalMedia,
+            capabilities: BroadcastRuntimeCapabilities {
+                original_media_video_source: true,
+                original_media_realtime_supported: false,
+                ..test_broadcast_session().capabilities
+            },
+            ..test_broadcast_session()
+        };
+
+        assert!(session.validate().is_ok());
+    }
+
+    #[test]
+    fn broadcast_runtime_rejects_mismatched_source_mode() {
+        assert!(BroadcastRuntimeSessionDescription {
+            video_source_mode: BroadcastVideoSourceMode::OriginalMedia,
+            ..test_broadcast_session()
+        }
+        .validate()
+        .is_err());
+        assert!(BroadcastRuntimeSessionDescription {
+            video_source: BroadcastMediaSourceRole::OriginalFinishingMedia,
+            ..test_broadcast_session()
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
     fn broadcast_runtime_rejects_play_without_prepare() {
         let mut machine = BroadcastRuntimeStateMachine::create(test_broadcast_session()).unwrap();
 
@@ -1663,10 +1855,139 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn broadcast_preroll_reports_ready_with_enough_audio_and_video() {
+        let status = evaluate_broadcast_preroll(test_preroll_config(), test_preroll_plan(), 3, 3);
+
+        assert!(status.ready);
+        assert_eq!(status.missing_video_frames, 0);
+        assert_eq!(status.missing_audio_ranges, 0);
+        assert!(status.queue_limits_ok);
+        assert_eq!(status.reason, None);
+    }
+
+    #[test]
+    fn broadcast_preroll_reports_original_media_capability_missing() {
+        let status = evaluate_broadcast_preroll(
+            BroadcastPrerollConfig {
+                video_source_mode: BroadcastVideoSourceMode::OriginalMedia,
+                ..test_preroll_config()
+            },
+            BroadcastPrerollPlan {
+                video_source_mode: BroadcastVideoSourceMode::OriginalMedia,
+                video_source_available: true,
+                video_runtime_supported: false,
+                selected_video_frames_planned: 106,
+                intentional_skips_planned: 0,
+                ..test_preroll_plan()
+            },
+            3,
+            3,
+        );
+
+        assert!(!status.ready);
+        assert_eq!(
+            status.reason,
+            Some(BroadcastPrerollNotReadyReason::CapabilityMissing)
+        );
+    }
+
+    #[test]
+    fn broadcast_preroll_does_not_count_intentional_skips_as_missing_frames() {
+        let status = evaluate_broadcast_preroll(
+            test_preroll_config(),
+            BroadcastPrerollPlan {
+                selected_video_frames_planned: 53,
+                intentional_skips_planned: 53,
+                ..test_preroll_plan()
+            },
+            3,
+            3,
+        );
+
+        assert!(status.ready);
+        assert_eq!(status.missing_video_frames, 0);
+    }
+
+    #[test]
+    fn broadcast_preroll_reports_missing_video_or_audio() {
+        let missing_video =
+            evaluate_broadcast_preroll(test_preroll_config(), test_preroll_plan(), 2, 3);
+        assert!(!missing_video.ready);
+        assert_eq!(
+            missing_video.reason,
+            Some(BroadcastPrerollNotReadyReason::MissingVideoFrames)
+        );
+        assert_eq!(missing_video.missing_video_frames, 1);
+
+        let missing_audio =
+            evaluate_broadcast_preroll(test_preroll_config(), test_preroll_plan(), 3, 2);
+        assert!(!missing_audio.ready);
+        assert_eq!(
+            missing_audio.reason,
+            Some(BroadcastPrerollNotReadyReason::MissingAudioRanges)
+        );
+        assert_eq!(missing_audio.missing_audio_ranges, 1);
+    }
+
+    #[test]
+    fn broadcast_preroll_rejects_invalid_queue_capacity() {
+        assert!(BroadcastPrerollConfig {
+            max_video_queue: 0,
+            ..test_preroll_config()
+        }
+        .validate()
+        .is_err());
+
+        let status = evaluate_broadcast_preroll(
+            BroadcastPrerollConfig {
+                max_video_queue: 12,
+                ..test_preroll_config()
+            },
+            test_preroll_plan(),
+            3,
+            3,
+        );
+        assert!(!status.ready);
+        assert_eq!(
+            status.reason,
+            Some(BroadcastPrerollNotReadyReason::InvalidQueueLimits)
+        );
+    }
+
+    #[test]
+    fn broadcast_runtime_remains_preparing_when_preroll_not_ready() {
+        let mut machine = BroadcastRuntimeStateMachine::create(test_broadcast_session()).unwrap();
+        let not_ready =
+            evaluate_broadcast_preroll(test_preroll_config(), test_preroll_plan(), 2, 3);
+
+        machine
+            .prepare_with_preroll(test_prepare_facts(), not_ready)
+            .unwrap();
+        assert_eq!(machine.state(), BroadcastRuntimeState::Preparing);
+        assert!(matches!(
+            machine.play(),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        ));
+    }
+
+    #[test]
+    fn broadcast_runtime_enters_ready_when_preroll_ready() {
+        let mut machine = BroadcastRuntimeStateMachine::create(test_broadcast_session()).unwrap();
+        let ready = evaluate_broadcast_preroll(test_preroll_config(), test_preroll_plan(), 3, 3);
+
+        machine
+            .prepare_with_preroll(test_prepare_facts(), ready)
+            .unwrap();
+        assert_eq!(machine.state(), BroadcastRuntimeState::Ready);
+        assert!(machine.play().is_ok());
+    }
+
     fn test_broadcast_session() -> BroadcastRuntimeSessionDescription {
         BroadcastRuntimeSessionDescription {
             audio_source: BroadcastMediaSourceRole::OriginalAuthoritativeAudio,
             video_source: BroadcastMediaSourceRole::ProxyPreviewVideo,
+            video_source_mode: BroadcastVideoSourceMode::ProxyPreview,
             preview_profile: BroadcastPreviewProfile::Journalist50iPreview,
             audio_sample_rate: 48_000,
             audio_track_count: 4,
@@ -1680,6 +2001,8 @@ mod tests {
                 preserves_original_pcm_format: true,
                 preserves_track_channel_identity: true,
                 proxy_video_preview: true,
+                original_media_video_source: true,
+                original_media_realtime_supported: false,
                 proxy_audio_primary: false,
                 ui_dependent: false,
             },
@@ -1692,6 +2015,34 @@ mod tests {
             intentional_profile_skips: 53,
             audio_ranges_complete: true,
             frames_outside_audio_range: 0,
+        }
+    }
+
+    fn test_preroll_config() -> BroadcastPrerollConfig {
+        BroadcastPrerollConfig {
+            video_source_mode: BroadcastVideoSourceMode::ProxyPreview,
+            video_frames_required: 3,
+            audio_ranges_required: 3,
+            max_video_queue: 6,
+            max_audio_queue: 8,
+            max_presentation_queue: 3,
+        }
+    }
+
+    fn test_preroll_plan() -> BroadcastPrerollPlan {
+        BroadcastPrerollPlan {
+            video_source_mode: BroadcastVideoSourceMode::ProxyPreview,
+            selected_video_frames_planned: 53,
+            audio_ranges_planned: 53,
+            intentional_skips_planned: 53,
+            duration_covered: Duration::from_millis(2120),
+            finite_queue_limits: BroadcastRuntimeQueueLimits {
+                audio_block_capacity: 8,
+                video_frame_capacity: 6,
+                processed_frame_capacity: 3,
+            },
+            video_source_available: true,
+            video_runtime_supported: true,
         }
     }
 
