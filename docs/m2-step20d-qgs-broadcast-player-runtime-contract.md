@@ -6,7 +6,7 @@ Existing QNC Broadcast Player concepts may be treated as reference material only
 
 QGS owns backend media readiness, source mode validation, original/proxy media mapping, original-audio/proxy-video timing facts, bounded prepared runtime state, and lower-level timing/accounting facts needed by future playback policy.
 
-Future QNC applications may issue transport/session commands, observe runtime events, present UI state, and store or read media snapshots. QNC UI policy remains in QNC. Media/backend timing facts and backend readiness remain in QGS.
+Future QNC applications may issue transport/session commands, observe runtime events, present UI state, and store or read media snapshots. QNC UI policy remains in QNC. Media/backend timing facts, future media clock policy, and backend readiness remain in the QGS Broadcast Player Runtime and device backends.
 
 ## Scope
 
@@ -25,7 +25,7 @@ Not implemented:
 
 - QNC UI integration
 - real playback loop
-- QGS-owned final playback clock
+- implemented final playback clock
 - real-time audio output
 - speaker output
 - display output
@@ -109,7 +109,7 @@ Audio source: original MXF
 Video source: proxy MP4
 Proxy AAC: not used
 Preview profile: journalist-50i-preview
-Clock owner: future QNC application/runtime policy, not QGS UI
+Clock policy: future QGS Broadcast Player Runtime/device backend policy; QNC apps observe/control through session and transport commands.
 Contract owner: QGS backend-neutral Broadcast Player Runtime
 Proxy video: 1920x1080 H.264 High 8-bit Cs420 source_frames=106 selected_preview_frames=53
 Original audio: tracks=4 sample_rate=48000Hz blocks=424 duration=2.120s
