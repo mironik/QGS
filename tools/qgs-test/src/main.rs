@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use qgs_core::{BackendDecodedSurface, DecoderBackend, DeviceDiscovery, VideoCapabilityDiscovery};
 use qgs_linux::{
-    connect_socket, default_socket_path, receive_message, receive_message_with_attachments,
-    send_message,
+    connect_socket, default_socket_path, probe_linux_audio_device_boundary, receive_message,
+    receive_message_with_attachments, send_message, LinuxAudioConversionNeed,
+    LinuxOriginalPcmAudioFormat,
 };
 use qgs_media_runtime::{
     audio_samples_for_duration, av_frame_audio_range, bind_broadcast_audio_payload,
@@ -103,6 +104,7 @@ const BROADCAST_PLAYER_RUNTIME_SIMULATE_ARG: &str = "--broadcast-player-runtime-
 const BROADCAST_PLAYER_RUNTIME_ORIGINAL_VIDEO_PAYLOADS_ARG: &str =
     "--broadcast-player-runtime-original-video-payloads";
 const BROADCAST_PLAYER_RUNTIME_VERIFICATION_ARG: &str = "--broadcast-player-runtime-verification";
+const LINUX_AUDIO_DEVICE_PROBE_ARG: &str = "--linux-audio-device-probe";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -219,6 +221,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.broadcast_player_runtime_verification_paths {
         return broadcast_player_runtime_verification(&original, &proxy);
+    }
+    if let Some(path) = args.linux_audio_device_probe_path {
+        return linux_audio_device_probe(&path);
     }
 
     let socket_path = args.socket_path;
@@ -1879,6 +1884,136 @@ fn original_audio_extract(path: &Path) -> Result<(), Box<dyn std::error::Error>>
     println!("Suitable for future audio clock: {}", yes_no(clock_ready));
 
     Ok(())
+}
+
+fn linux_audio_device_probe(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    let source = MediaSource::parse(&bytes)?;
+    let audio_tracks = source
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Audio)
+        .collect::<Vec<_>>();
+    if audio_tracks.is_empty() {
+        return Err("original MXF has no audio tracks".into());
+    }
+
+    let source_format = original_linux_pcm_audio_format(&audio_tracks)?;
+    let report = probe_linux_audio_device_boundary(source_format)?;
+
+    println!("Linux Audio Device Boundary Spike");
+    println!("----------------------------------");
+    println!("Audio source: original MXF");
+    println!("Proxy AAC: not used");
+    println!("Full playback: no");
+    println!(
+        "AudioDeviceVerified: {}",
+        yes_no(report.audio_device_verified)
+    );
+    println!(
+        "Original PCM: tracks={} channels_per_track={} sample_rate={}Hz bit_depth={}bit",
+        report.source_format.track_count,
+        report.source_format.channels_per_track,
+        report.source_format.sample_rate,
+        report.source_format.bits_per_sample
+    );
+    println!(
+        "PipeWire runtime socket: {}",
+        yes_no(report.pipewire_runtime_socket_available)
+    );
+    println!(
+        "pw-cli available: {}",
+        yes_no(report.pipewire_cli_available)
+    );
+    println!(
+        "PipeWire server reachable: {}",
+        optional_yes_no(report.pipewire_server_reachable)
+    );
+    println!(
+        "wpctl available: {}",
+        yes_no(report.wireplumber_cli_available)
+    );
+    println!(
+        "Default output device visible: {}",
+        optional_yes_no(report.default_output_device_available)
+    );
+    println!(
+        "Direct 48kHz 24-bit original PCM acceptance known: {}",
+        optional_yes_no(report.direct_original_pcm_acceptance_known)
+    );
+    println!(
+        "Device-boundary conversion needed: {}",
+        linux_audio_conversion_need_label(report.conversion_needed)
+    );
+    println!(
+        "Timing/playback-position evidence available: {}",
+        optional_yes_no(report.timing_evidence_available)
+    );
+    println!("Probe outcome: {:?}", report.outcome);
+    println!("Notes:");
+    for note in report.notes {
+        println!("  - {note}");
+    }
+
+    Ok(())
+}
+
+fn original_linux_pcm_audio_format(
+    audio_tracks: &[&qgs_mxf::MxfTrack],
+) -> Result<LinuxOriginalPcmAudioFormat, Box<dyn std::error::Error>> {
+    let mut sample_rate = None;
+    let mut bits_per_sample = None;
+    let mut channels_per_track = None;
+    for track in audio_tracks {
+        let audio = track.audio.as_ref().ok_or("audio descriptor missing")?;
+        let track_rate = rational_to_u32(audio.sample_rate.ok_or("audio sample rate missing")?)?;
+        let track_depth = audio.bit_depth.ok_or("audio bit depth missing")?;
+        let track_channels = audio.channels.ok_or("audio channel count missing")?;
+        if let Some(sample_rate) = sample_rate {
+            if sample_rate != track_rate {
+                return Err("mixed original audio sample rates are not supported yet".into());
+            }
+        } else {
+            sample_rate = Some(track_rate);
+        }
+        if let Some(bits_per_sample) = bits_per_sample {
+            if bits_per_sample != track_depth {
+                return Err("mixed original audio bit depths are not supported yet".into());
+            }
+        } else {
+            bits_per_sample = Some(track_depth);
+        }
+        if let Some(channels_per_track) = channels_per_track {
+            if channels_per_track != track_channels {
+                return Err("mixed original audio channel layouts are not supported yet".into());
+            }
+        } else {
+            channels_per_track = Some(track_channels);
+        }
+    }
+
+    Ok(LinuxOriginalPcmAudioFormat {
+        sample_rate: sample_rate.ok_or("original audio sample rate unavailable")?,
+        bits_per_sample: bits_per_sample.ok_or("original audio bit depth unavailable")?,
+        track_count: audio_tracks.len(),
+        channels_per_track: channels_per_track.ok_or("original audio channel count unavailable")?,
+    })
+}
+
+fn optional_yes_no(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    }
+}
+
+fn linux_audio_conversion_need_label(value: LinuxAudioConversionNeed) -> &'static str {
+    match value {
+        LinuxAudioConversionNeed::No => "no",
+        LinuxAudioConversionNeed::Yes => "yes",
+        LinuxAudioConversionNeed::Unknown => "unknown",
+    }
 }
 
 fn consume_pcm_payload_packet(
@@ -8916,6 +9051,7 @@ struct Args {
     broadcast_player_runtime_simulate_paths: Option<(PathBuf, PathBuf)>,
     broadcast_player_runtime_original_video_payloads_paths: Option<(PathBuf, PathBuf)>,
     broadcast_player_runtime_verification_paths: Option<(PathBuf, PathBuf)>,
+    linux_audio_device_probe_path: Option<PathBuf>,
 }
 
 impl Args {
@@ -8966,6 +9102,7 @@ impl Args {
         let mut broadcast_player_runtime_original_video_payloads_paths = None;
         let mut broadcast_player_runtime_verification_original = None;
         let mut broadcast_player_runtime_verification_paths = None;
+        let mut linux_audio_device_probe_path = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
@@ -9002,9 +9139,13 @@ impl Args {
         let mut next_arg_is_broadcast_player_runtime_original_video_payloads_proxy = false;
         let mut next_arg_is_broadcast_player_runtime_verification_original = false;
         let mut next_arg_is_broadcast_player_runtime_verification_proxy = false;
+        let mut next_arg_is_linux_audio_device_probe_path = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_broadcast_player_runtime_verification_proxy {
+            if next_arg_is_linux_audio_device_probe_path {
+                linux_audio_device_probe_path = Some(PathBuf::from(arg));
+                next_arg_is_linux_audio_device_probe_path = false;
+            } else if next_arg_is_broadcast_player_runtime_verification_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = broadcast_player_runtime_verification_original
                     .take()
@@ -9267,6 +9408,8 @@ impl Args {
                 next_arg_is_broadcast_player_runtime_original_video_payloads_original = true;
             } else if arg == BROADCAST_PLAYER_RUNTIME_VERIFICATION_ARG {
                 next_arg_is_broadcast_player_runtime_verification_original = true;
+            } else if arg == LINUX_AUDIO_DEVICE_PROBE_ARG {
+                next_arg_is_linux_audio_device_probe_path = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -9299,6 +9442,7 @@ impl Args {
             broadcast_player_runtime_simulate_paths,
             broadcast_player_runtime_original_video_payloads_paths,
             broadcast_player_runtime_verification_paths,
+            linux_audio_device_probe_path,
         }
     }
 }
