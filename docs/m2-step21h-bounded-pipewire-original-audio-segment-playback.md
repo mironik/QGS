@@ -121,7 +121,7 @@ Noninteractive runs report `ManualOriginalSegmentConfirmationRequired`.
 
 ## Observed Local Result
 
-Observed noninteractive command:
+Observed manual command:
 
 ```bash
 cargo run -q -p qgs-test -- --pipewire-audio-segment-playback "/home/miro/QGS-media-tests/sony-fx6/sample-002/Mironik 1560.MXF"
@@ -154,17 +154,21 @@ Observed result:
 - bytes copied: 768,000
 - drain requested: yes
 - drain completed: yes
+- post-submit callbacks observed: 0
+- post-submit timeout: no
 - PipeWire evidence level: `DrainCompleted`
-- manual confirmation status: `ManualOriginalSegmentConfirmationRequired`
-- segment evidence level: `ManualOriginalSegmentConfirmationRequired`
+- manual confirmation answer: yes
+- manual confirmation status: `ManualOriginalSegmentAudibleConfirmed`
+- segment evidence level: `ManualOriginalSegmentAudibleConfirmed`
 - `AudioDeviceVerified`: no
-- audible output claimed: no
+- `AudioDeviceVerified` scope: not upgraded by bounded segment playback
+- audible output claimed: yes
 
 ## Verification Matrix
 
 Step 20Q includes a separate `native PipeWire original-audio segment playback`
-row. The current automatic evidence level is `NativePostSubmitEvidence` until a
-manual original-segment confirmation is recorded.
+row. Its current evidence is `ManualOriginalSegmentAudibleConfirmed`: a human
+confirmed hearing the bounded sequential original MXF audio segment.
 
 This remains separate from:
 
