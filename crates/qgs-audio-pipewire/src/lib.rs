@@ -43,7 +43,11 @@ pub enum PipeWireNativeStreamEvidenceLevel {
     NativeStreamConfigured,
     BufferDequeued,
     BufferSubmitted,
+    PostSubmitTimeout,
+    PostSubmitCallbackObserved,
+    DrainCompleted,
     StreamError,
+    StreamErrorAfterSubmit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +86,12 @@ pub struct PipeWireBufferSubmissionReport {
     pub f32_samples_written: usize,
     pub bytes_copied: usize,
     pub buffer_submitted: bool,
+    pub post_submit_process_callbacks: u32,
+    pub stream_states_after_submit: Vec<PipeWireObservedStreamState>,
+    pub drain_requested: bool,
+    pub drain_completed: bool,
+    pub stream_error_after_submit: bool,
+    pub post_submit_timeout: bool,
     pub evidence_level: PipeWireNativeStreamEvidenceLevel,
     pub audio_device_verified: bool,
     pub status_message: String,
@@ -120,11 +130,18 @@ struct StreamObservation {
 #[derive(Default)]
 struct SubmissionObservation {
     states: Vec<PipeWireObservedStreamState>,
+    states_after_submit: Vec<PipeWireObservedStreamState>,
     process_callback_reached: bool,
+    process_callbacks: u32,
+    post_submit_process_callbacks: u32,
     buffer_dequeued: bool,
     buffer_capacity: usize,
     bytes_copied: usize,
     buffer_submitted: bool,
+    drain_requested: bool,
+    drain_request_failed: bool,
+    drain_completed: bool,
+    stream_error_after_submit: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -276,12 +293,14 @@ pub fn submit_native_pipewire_buffer(
     .map_err(|err| PipeWireStreamError::StreamCreate(err.to_string()))?;
 
     let observation = Rc::new(RefCell::new(SubmissionObservation::default()));
-    let listener_observation = Rc::clone(&observation);
+    let process_observation = Rc::clone(&observation);
+    let drained_observation = Rc::clone(&observation);
     let state_observation = Rc::clone(&observation);
     let payload = Rc::new(f32_interleaved_le);
     let process_payload = Rc::clone(&payload);
     let listener_mainloop = mainloop.clone();
-    let process_mainloop = mainloop.clone();
+    let dequeue_failure_mainloop = mainloop.clone();
+    let drained_mainloop = mainloop.clone();
     let stride = usize::try_from(format.channels)
         .ok()
         .and_then(|channels| channels.checked_mul(4))
@@ -291,34 +310,45 @@ pub fn submit_native_pipewire_buffer(
         .add_local_listener::<()>()
         .state_changed(move |_stream, _user_data, _old, new| {
             let observed = observed_stream_state(&new);
-            state_observation.borrow_mut().states.push(observed);
+            let mut observation = state_observation.borrow_mut();
+            observation.states.push(observed);
+            if observation.buffer_submitted {
+                observation.states_after_submit.push(observed);
+            }
+            if observation.buffer_submitted
+                && matches!(observed, PipeWireObservedStreamState::Error)
+            {
+                observation.stream_error_after_submit = true;
+            }
             if matches!(observed, PipeWireObservedStreamState::Error) {
                 listener_mainloop.quit();
             }
         })
         .process(move |stream, _user_data| {
-            let mut observation = listener_observation.borrow_mut();
+            let mut observation = process_observation.borrow_mut();
             observation.process_callback_reached = true;
+            observation.process_callbacks = observation.process_callbacks.saturating_add(1);
             if observation.buffer_submitted {
-                process_mainloop.quit();
+                observation.post_submit_process_callbacks =
+                    observation.post_submit_process_callbacks.saturating_add(1);
                 return;
             }
             let Some(mut buffer) = stream.dequeue_buffer() else {
-                process_mainloop.quit();
+                dequeue_failure_mainloop.quit();
                 return;
             };
             observation.buffer_dequeued = true;
             let Some(data) = buffer.datas_mut().get_mut(0) else {
-                process_mainloop.quit();
+                dequeue_failure_mainloop.quit();
                 return;
             };
             let Some(slice) = data.data() else {
-                process_mainloop.quit();
+                dequeue_failure_mainloop.quit();
                 return;
             };
             observation.buffer_capacity = slice.len();
             if slice.len() < process_payload.len() {
-                process_mainloop.quit();
+                dequeue_failure_mainloop.quit();
                 return;
             }
             slice[..process_payload.len()].copy_from_slice(&process_payload);
@@ -329,7 +359,19 @@ pub fn submit_native_pipewire_buffer(
             observation.bytes_copied = process_payload.len();
             observation.buffer_submitted = true;
             drop(buffer);
-            process_mainloop.quit();
+            match stream.flush(true) {
+                Ok(()) => {
+                    observation.drain_requested = true;
+                }
+                Err(_) => {
+                    observation.drain_request_failed = true;
+                }
+            }
+        })
+        .drained(move |_stream, _user_data| {
+            let mut observation = drained_observation.borrow_mut();
+            observation.drain_completed = true;
+            drained_mainloop.quit();
         })
         .register()
         .map_err(|err| PipeWireStreamError::StreamCreate(err.to_string()))?;
@@ -355,7 +397,8 @@ pub fn submit_native_pipewire_buffer(
         mainloop
             .loop_()
             .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(50)));
-        if observation.borrow().buffer_submitted {
+        let observation = observation.borrow();
+        if observation.drain_completed || observation.stream_error_after_submit {
             break;
         }
     }
@@ -372,6 +415,18 @@ pub fn submit_native_pipewire_buffer(
             PipeWireObservedStreamState::Paused | PipeWireObservedStreamState::Streaming
         )
     });
+    let post_submit_timeout = observation.buffer_submitted
+        && !observation.drain_completed
+        && !observation.stream_error_after_submit;
+    let evidence_level = classify_buffer_submission_evidence(
+        observation.buffer_submitted,
+        observation.buffer_dequeued,
+        stream_configured,
+        observation.post_submit_process_callbacks,
+        observation.drain_completed,
+        observation.stream_error_after_submit,
+        post_submit_timeout,
+    );
     let stream_report = PipeWireStreamCreationReport {
         connect_attempted: true,
         connected: true,
@@ -381,18 +436,14 @@ pub fn submit_native_pipewire_buffer(
         selected_format: format,
         observed_states: states,
         final_state,
-        evidence_level: if observation.buffer_submitted {
-            PipeWireNativeStreamEvidenceLevel::BufferSubmitted
-        } else if observation.buffer_dequeued {
-            PipeWireNativeStreamEvidenceLevel::BufferDequeued
-        } else if stream_configured {
-            PipeWireNativeStreamEvidenceLevel::NativeStreamConfigured
-        } else {
-            PipeWireNativeStreamEvidenceLevel::NativeStreamCreated
-        },
+        evidence_level,
         audio_device_verified: false,
         buffer_submitted: observation.buffer_submitted,
-        status_message: if observation.buffer_submitted {
+        status_message: if observation.drain_completed {
+            "native PipeWire buffer was queued and a drain callback was observed; audible playback is not verified".to_string()
+        } else if observation.post_submit_process_callbacks > 0 {
+            "native PipeWire buffer was queued and a post-submit process callback was observed; audible playback is not verified".to_string()
+        } else if observation.buffer_submitted {
             "native PipeWire buffer was queued; audible playback is not verified".to_string()
         } else {
             "native PipeWire stream did not accept the prototype buffer".to_string()
@@ -411,21 +462,54 @@ pub fn submit_native_pipewire_buffer(
             .saturating_mul(usize::try_from(format.channels).unwrap_or(0)),
         bytes_copied: observation.bytes_copied,
         buffer_submitted: observation.buffer_submitted,
-        evidence_level: if observation.buffer_submitted {
-            PipeWireNativeStreamEvidenceLevel::BufferSubmitted
-        } else if observation.buffer_dequeued {
-            PipeWireNativeStreamEvidenceLevel::BufferDequeued
-        } else {
-            PipeWireNativeStreamEvidenceLevel::NativeStreamConfigured
-        },
+        post_submit_process_callbacks: observation.post_submit_process_callbacks,
+        stream_states_after_submit: observation.states_after_submit.clone(),
+        drain_requested: observation.drain_requested,
+        drain_completed: observation.drain_completed,
+        stream_error_after_submit: observation.stream_error_after_submit,
+        post_submit_timeout,
+        evidence_level,
         audio_device_verified: false,
-        status_message: if observation.buffer_submitted {
-            "bounded prototype buffer queued to native PipeWire stream; no audible verification claimed"
-                .to_string()
+        status_message: if observation.drain_completed {
+            "bounded prototype buffer queued and PipeWire drained callback observed; no audible verification claimed".to_string()
+        } else if observation.post_submit_process_callbacks > 0 {
+            "bounded prototype buffer queued and post-submit process callback observed; no audible verification claimed".to_string()
+        } else if post_submit_timeout {
+            "bounded prototype buffer queued; no stronger post-submit evidence arrived before timeout".to_string()
+        } else if observation.buffer_submitted {
+            "bounded prototype buffer queued to native PipeWire stream; no audible verification claimed".to_string()
         } else {
             "bounded prototype buffer was not queued".to_string()
         },
     })
+}
+
+pub fn classify_buffer_submission_evidence(
+    buffer_submitted: bool,
+    buffer_dequeued: bool,
+    stream_configured: bool,
+    post_submit_process_callbacks: u32,
+    drain_completed: bool,
+    stream_error_after_submit: bool,
+    post_submit_timeout: bool,
+) -> PipeWireNativeStreamEvidenceLevel {
+    if stream_error_after_submit {
+        PipeWireNativeStreamEvidenceLevel::StreamErrorAfterSubmit
+    } else if drain_completed {
+        PipeWireNativeStreamEvidenceLevel::DrainCompleted
+    } else if post_submit_process_callbacks > 0 {
+        PipeWireNativeStreamEvidenceLevel::PostSubmitCallbackObserved
+    } else if post_submit_timeout {
+        PipeWireNativeStreamEvidenceLevel::PostSubmitTimeout
+    } else if buffer_submitted {
+        PipeWireNativeStreamEvidenceLevel::BufferSubmitted
+    } else if buffer_dequeued {
+        PipeWireNativeStreamEvidenceLevel::BufferDequeued
+    } else if stream_configured {
+        PipeWireNativeStreamEvidenceLevel::NativeStreamConfigured
+    } else {
+        PipeWireNativeStreamEvidenceLevel::NativeStreamCreated
+    }
 }
 
 pub fn f32_interleaved_from_s24le_mono_tracks(
@@ -671,5 +755,37 @@ mod tests {
     fn f32_interleaved_buffer_size_validation_is_exact() {
         assert!(validate_f32_interleaved_buffer(&vec![0_u8; 960 * 4 * 4], 960, 4).is_ok());
         assert!(validate_f32_interleaved_buffer(&vec![0_u8; 7], 960, 4).is_err());
+    }
+
+    #[test]
+    fn evidence_classification_keeps_submission_and_timeout_distinct() {
+        assert_eq!(
+            classify_buffer_submission_evidence(true, true, true, 0, false, false, false),
+            PipeWireNativeStreamEvidenceLevel::BufferSubmitted
+        );
+        assert_eq!(
+            classify_buffer_submission_evidence(true, true, true, 0, false, false, true),
+            PipeWireNativeStreamEvidenceLevel::PostSubmitTimeout
+        );
+    }
+
+    #[test]
+    fn evidence_classification_prefers_post_submit_callback_over_timeout() {
+        assert_eq!(
+            classify_buffer_submission_evidence(true, true, true, 1, false, false, true),
+            PipeWireNativeStreamEvidenceLevel::PostSubmitCallbackObserved
+        );
+    }
+
+    #[test]
+    fn evidence_classification_prefers_drain_and_error_over_callback() {
+        assert_eq!(
+            classify_buffer_submission_evidence(true, true, true, 3, true, false, true),
+            PipeWireNativeStreamEvidenceLevel::DrainCompleted
+        );
+        assert_eq!(
+            classify_buffer_submission_evidence(true, true, true, 3, true, true, true),
+            PipeWireNativeStreamEvidenceLevel::StreamErrorAfterSubmit
+        );
     }
 }

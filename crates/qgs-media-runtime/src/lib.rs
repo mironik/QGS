@@ -568,6 +568,7 @@ pub enum BroadcastRuntimeVerificationLevel {
     PayloadBound,
     TestBoundaryEvidence,
     NativeBufferSubmissionVerified,
+    NativePostSubmitEvidence,
     VisualVerified,
     AudioDeviceVerified,
     RealtimeVerified,
@@ -585,6 +586,7 @@ impl BroadcastRuntimeVerificationLevel {
             Self::PayloadBound => "PayloadBound",
             Self::TestBoundaryEvidence => "TestBoundaryEvidence",
             Self::NativeBufferSubmissionVerified => "NativeBufferSubmissionVerified",
+            Self::NativePostSubmitEvidence => "NativePostSubmitEvidence",
             Self::VisualVerified => "VisualVerified",
             Self::AudioDeviceVerified => "AudioDeviceVerified",
             Self::RealtimeVerified => "RealtimeVerified",
@@ -755,8 +757,8 @@ impl BroadcastRuntimeVerificationMatrix {
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::NativePipeWireBufferSubmission,
-                    level: Level::NativeBufferSubmissionVerified,
-                    summary: "tiny original-audio-derived buffer queued to native PipeWire stream; not audible/full playback verification",
+                    level: Level::NativePostSubmitEvidence,
+                    summary: "tiny original-audio-derived buffer queued to native PipeWire stream and drain callback observed; not audible/full playback verification",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::SimulatedPlaybackLoop,
@@ -4179,6 +4181,10 @@ mod tests {
         );
         assert!(
             BroadcastRuntimeVerificationLevel::NativeBufferSubmissionVerified
+                < BroadcastRuntimeVerificationLevel::NativePostSubmitEvidence
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::NativePostSubmitEvidence
                 < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
         );
     }
@@ -4248,7 +4254,7 @@ mod tests {
                 .entry(BroadcastRuntimeVerifiedSubsystem::NativePipeWireBufferSubmission)
                 .unwrap()
                 .level,
-            BroadcastRuntimeVerificationLevel::NativeBufferSubmissionVerified
+            BroadcastRuntimeVerificationLevel::NativePostSubmitEvidence
         );
         assert_ne!(
             matrix

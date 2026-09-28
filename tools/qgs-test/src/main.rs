@@ -2069,6 +2069,7 @@ fn pipewire_audio_native_prototype(path: &Path) -> Result<(), Box<dyn std::error
 
     println!("Native PipeWire Stream Prototype");
     println!("--------------------------------");
+    println!("Native PipeWire post-submit evidence: enabled");
     println!("Audio source: original MXF");
     println!("Proxy AAC: not used");
     println!("Full playback: no");
@@ -2111,6 +2112,12 @@ fn pipewire_audio_native_prototype(path: &Path) -> Result<(), Box<dyn std::error
         );
         println!("Buffer dequeued: {}", yes_no(report.buffer_dequeued));
         println!("Buffer submitted: {}", yes_no(report.buffer_submitted));
+        println!("Post-submit callbacks observed: 0");
+        println!("Stream states after submission: []");
+        println!("Drain requested: no");
+        println!("Drain completed: no");
+        println!("Stream error after submit: no");
+        println!("Post-submit timeout: no");
         println!("Evidence level: {:?}", report.evidence_level);
         println!(
             "AudioDeviceVerified: {}",
@@ -2176,6 +2183,30 @@ fn pipewire_audio_native_prototype(path: &Path) -> Result<(), Box<dyn std::error
                 "Buffer submitted: {}",
                 yes_no(submission_report.buffer_submitted)
             );
+            println!(
+                "Post-submit callbacks observed: {}",
+                submission_report.post_submit_process_callbacks
+            );
+            println!(
+                "Stream states after submission: {:?}",
+                submission_report.stream_states_after_submit
+            );
+            println!(
+                "Drain requested: {}",
+                yes_no(submission_report.drain_requested)
+            );
+            println!(
+                "Drain completed: {}",
+                yes_no(submission_report.drain_completed)
+            );
+            println!(
+                "Stream error after submit: {}",
+                yes_no(submission_report.stream_error_after_submit)
+            );
+            println!(
+                "Post-submit timeout: {}",
+                yes_no(submission_report.post_submit_timeout)
+            );
             println!("Evidence level: {:?}", submission_report.evidence_level);
             println!(
                 "AudioDeviceVerified: {}",
@@ -2194,6 +2225,12 @@ fn pipewire_audio_native_prototype(path: &Path) -> Result<(), Box<dyn std::error
             );
             println!("Buffer dequeued: no");
             println!("Buffer submitted: no");
+            println!("Post-submit callbacks observed: 0");
+            println!("Stream states after submission: []");
+            println!("Drain requested: no");
+            println!("Drain completed: no");
+            println!("Stream error after submit: no");
+            println!("Post-submit timeout: no");
             println!("Evidence level: NativeStreamCreateFailed");
             println!("AudioDeviceVerified: no");
             println!("Audible output claimed: no");

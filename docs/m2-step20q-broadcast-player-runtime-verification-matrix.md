@@ -19,6 +19,9 @@ and what remains unimplemented.
   returned explicit evidence.
 - `NativeBufferSubmissionVerified`: a tiny bounded payload was queued to a
   native device boundary, without claiming audible/visible output.
+- `NativePostSubmitEvidence`: a native device boundary accepted a tiny bounded
+  payload and provided bounded post-submit evidence such as a drain callback,
+  without claiming audible/visible output.
 - `VisualVerified`: visual/image correctness was verified by comparison or
   display evidence.
 - `AudioDeviceVerified`: a real audio device path was verified.
@@ -51,7 +54,7 @@ For Sony FX6 sample 002:
 | device boundary contract | `UnitTested` | `PayloadReady` and `DevicePayloadReady` remain distinct. |
 | test video presenter evidence | `TestBoundaryEvidence` | Test presenter evidence gates `FramePresented`; this is not real display output. |
 | test audio sink evidence | `TestBoundaryEvidence` | Test audio sink evidence accepts original PCM; this is not real speaker output. |
-| native PipeWire buffer submission | `NativeBufferSubmissionVerified` | A 20 ms original-audio-derived f32 buffer was queued to a native PipeWire stream; audible output and full playback are not claimed. |
+| native PipeWire buffer submission | `NativePostSubmitEvidence` | A 20 ms original-audio-derived f32 buffer was queued to a native PipeWire stream and a drain callback was observed; audible output and full playback are not claimed. |
 | simulated playback loop | `TestBoundaryEvidence` | Prepared slots flow through test audio/video boundaries deterministically. |
 | real speaker output | `NotImplemented` | No audible speaker output, audio-device clock, or full audio playback path exists; native PipeWire buffer submission is tracked separately. |
 | real display output | `NotImplemented` | No swapchain, Wayland, X11, DRM/KMS, or real display presenter exists. |
@@ -64,7 +67,7 @@ The matrix intentionally does not overstate these areas:
 
 - Test presenter evidence is not real display output.
 - Test audio sink evidence is not real speaker output.
-- Native PipeWire buffer submission is not audible playback or
+- Native PipeWire buffer submission/drain evidence is not audible playback or
   `AudioDeviceVerified`.
 - Haswell CPU-bridge 1080p50 is not marked realtime verified.
 - Modern-hardware zero-copy is not marked verified.
