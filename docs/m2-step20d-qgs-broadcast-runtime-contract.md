@@ -1,8 +1,10 @@
-# M2 Step 20D - QGS Broadcast Runtime Contract Draft
+# M2 Step 20D - QGS Broadcast Runtime Contract
 
-Step 20D drafts the first backend-neutral QGS Broadcast Runtime contract for future QNC OS applications. This is a QGS contract, not a port of an existing QNC Broadcast Player.
+Step 20D defines the first backend-neutral QGS Broadcast Runtime contract for future QNC OS applications. This is a QGS-owned contract, not a port, preservation effort, or adaptation of an existing QNC Broadcast Player.
 
-QGS provides backend facts and deterministic media-range mapping. A future QNC application/runtime remains responsible for transport commands, clock policy, presentation policy, UI, playout readiness, and user-facing sessions.
+Existing QNC Broadcast Player concepts may be treated as reference material only. QGS is free to define the best runtime contract for QGS/QNC OS without matching older player boundaries when those boundaries would compromise the media model.
+
+QGS provides backend facts, bounded runtime contract types, and deterministic media-range mapping. Future QNC applications may consume this through media snapshots, resolver/media identity, session/transport contracts, and runtime events. QNC applications remain responsible for final transport commands, clock policy, presentation policy, UI, playout readiness, and user-facing sessions.
 
 ## Scope
 
@@ -21,6 +23,7 @@ Not implemented:
 
 - QNC Broadcast Player
 - QNC UI integration
+- real playback loop
 - QGS-owned final playback clock
 - real-time audio output
 - speaker output
@@ -31,12 +34,13 @@ Not implemented:
 - resampling
 - drift correction
 - proxy AAC primary path
+- full interlaced field rendering
 
 No QNC crates are imported into QGS.
 
 ## Media Roles
 
-The drafted contract uses explicit source roles:
+The contract uses explicit source roles:
 
 - `OriginalAuthoritativeAudio`
 - `ProxyPreviewVideo`
@@ -45,7 +49,9 @@ The drafted contract uses explicit source roles:
 
 For the QNC Journalist workflow, original MXF audio is authoritative and proxy MP4 video is used for responsive preview/edit performance. Proxy MP4 AAC is not used as primary audio.
 
-## Runtime Contract Types
+`journalist-50i-preview` is a preview profile. It is not full interlaced rendering, does not implement field cadence, and does not produce interlaced output.
+
+## Broadcast Runtime Types
 
 `qgs-media-runtime` now includes small backend-neutral contract types:
 
@@ -132,7 +138,7 @@ Step 20D maps selected proxy-video preview frames to authoritative original-audi
 
 ## Limitations
 
-This is a contract draft and acceptance proof. It does not decide final QNC application architecture, real transport commands, speaker/audio-device behavior, video display behavior, or sync correction policy.
+This is a contract and acceptance proof for QGS backend behavior. It does not decide final QNC application architecture, real transport commands, speaker/audio-device behavior, video display behavior, or sync correction policy.
 
 The current Sony FX6 sample uses four mono 24-bit PCM tracks and a clean 1080p50 proxy. Broader media families may require additional source role metadata, edit-list handling, mixed-rate validation, or audio block layout variants.
 
