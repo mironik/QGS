@@ -2,7 +2,8 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 #[cfg(test)]
@@ -385,6 +386,16 @@ pub struct MxfPcmAudioPacket {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PcmAudioIndex {
+    pub file_len: u64,
+    pub tracks: Vec<MxfTrack>,
+    pub audio: Vec<AudioIndexEntry>,
+    pub partitions: Vec<PartitionInfo>,
+    pub metadata_set_count: usize,
+    pub klv_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaIndex {
     pub video: Vec<VideoIndexEntry>,
     pub audio: Vec<AudioIndexEntry>,
@@ -688,6 +699,126 @@ impl MediaSource {
             payload: payload.to_vec(),
         })
     }
+}
+
+pub fn open_pcm_audio_index(path: impl AsRef<Path>) -> Result<PcmAudioIndex, MxfError> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut offset = 0_u64;
+    let mut klv_count = 0_usize;
+    let mut partitions = Vec::new();
+    let mut primer_value = None;
+    let mut metadata_values: Vec<(Ul, Vec<u8>)> = Vec::new();
+    let mut audio_triplets = Vec::new();
+
+    while offset < file_len {
+        if file_len - offset < KLV_KEY_LEN as u64 {
+            break;
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut key = [0_u8; KLV_KEY_LEN];
+        file.read_exact(&mut key)?;
+        let (value_len, ber_width) = read_ber_length_from_reader(&mut file)?;
+        let value_offset = offset
+            .checked_add(KLV_KEY_LEN as u64)
+            .and_then(|value| value.checked_add(ber_width as u64))
+            .ok_or(MxfError::OffsetOverflow)?;
+        let next = value_offset
+            .checked_add(value_len)
+            .ok_or(MxfError::OffsetOverflow)?;
+        if next > file_len {
+            return Err(MxfError::KlvValueBeyondEof);
+        }
+
+        let key = Ul(key);
+        let triplet = KlvTriplet {
+            key,
+            offset,
+            value_offset,
+            value_len,
+        };
+        if matches!(
+            key,
+            HEADER_PARTITION_KEY | BODY_PARTITION_KEY | FOOTER_PARTITION_KEY
+        ) {
+            let value = read_klv_value_at(&mut file, value_offset, value_len)?;
+            if partitions.len() >= MAX_PARTITION_COUNT {
+                return Err(MxfError::ExcessivePartitionCount);
+            }
+            partitions.push(parse_partition_pack(&triplet, &value)?);
+        } else if key == PRIMER_PACK_KEY {
+            primer_value = Some(read_klv_value_at(&mut file, value_offset, value_len)?);
+        } else if is_metadata_set_key(key) {
+            if metadata_values.len() >= MAX_METADATA_SET_COUNT {
+                return Err(MxfError::ExcessiveMetadataSetCount);
+            }
+            metadata_values.push((key, read_klv_value_at(&mut file, value_offset, value_len)?));
+        } else if pcm_audio_channel_from_key(key).is_some() {
+            if value_len > MAX_AUDIO_PACKET_BYTES as u64 {
+                return Err(MxfError::AudioPacketTooLarge {
+                    len: value_len,
+                    max: MAX_AUDIO_PACKET_BYTES,
+                });
+            }
+            audio_triplets.push(triplet);
+        }
+
+        klv_count = klv_count.checked_add(1).ok_or(MxfError::OffsetOverflow)?;
+        offset = next;
+    }
+
+    if partitions.is_empty() {
+        return Err(MxfError::MissingHeaderPartition);
+    }
+    let primer = parse_primer_pack(&primer_value.ok_or(MxfError::MissingPrimerPack)?)?;
+    let metadata_sets = parse_metadata_sets_from_values(&metadata_values, &primer)?;
+    validate_metadata_graph(&metadata_sets)?;
+    let tracks = parse_tracks_from_metadata(&metadata_sets)?;
+    let audio = build_audio_index(&audio_triplets, &tracks)?;
+    Ok(PcmAudioIndex {
+        file_len,
+        tracks,
+        audio,
+        partitions,
+        metadata_set_count: metadata_sets.len(),
+        klv_count,
+    })
+}
+
+pub fn read_pcm_audio_packet_at(
+    path: impl AsRef<Path>,
+    entry: &AudioIndexEntry,
+) -> Result<MxfPcmAudioPacket, MxfError> {
+    if entry.payload_len > MAX_AUDIO_PACKET_BYTES as u64 {
+        return Err(MxfError::AudioPacketTooLarge {
+            len: entry.payload_len,
+            max: MAX_AUDIO_PACKET_BYTES,
+        });
+    }
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let end = entry
+        .payload_offset
+        .checked_add(entry.payload_len)
+        .ok_or(MxfError::OffsetOverflow)?;
+    if end > file_len {
+        return Err(MxfError::KlvValueBeyondEof);
+    }
+    file.seek(SeekFrom::Start(entry.payload_offset))?;
+    let mut payload = vec![
+        0_u8;
+        usize::try_from(entry.payload_len).map_err(|_| {
+            MxfError::AudioPacketTooLarge {
+                len: entry.payload_len,
+                max: MAX_AUDIO_PACKET_BYTES,
+            }
+        })?
+    ];
+    file.read_exact(&mut payload)?;
+    Ok(MxfPcmAudioPacket {
+        entry: entry.clone(),
+        payload,
+    })
 }
 
 impl VideoIndexEntry {
@@ -1026,6 +1157,51 @@ fn decode_ber_length(bytes: &[u8], offset: usize) -> Result<(u64, usize), MxfErr
     Ok((value, 1 + width))
 }
 
+fn read_ber_length_from_reader(reader: &mut impl Read) -> Result<(u64, usize), MxfError> {
+    let mut first = [0_u8; 1];
+    reader.read_exact(&mut first)?;
+    let first = first[0];
+    if first & 0x80 == 0 {
+        return Ok((u64::from(first), 1));
+    }
+    let width = usize::from(first & 0x7f);
+    if width == 0 || width > 8 {
+        return Err(MxfError::MalformedBerLength);
+    }
+    let mut buf = [0_u8; 8];
+    reader.read_exact(&mut buf[..width])?;
+    let mut value = 0_u64;
+    for byte in &buf[..width] {
+        value = value.checked_shl(8).ok_or(MxfError::BerLengthOverflow)? | u64::from(*byte);
+    }
+    Ok((value, 1 + width))
+}
+
+fn read_klv_value_at(
+    file: &mut File,
+    value_offset: u64,
+    value_len: u64,
+) -> Result<Vec<u8>, MxfError> {
+    if value_len > MAX_KLV_VALUE_BYTES {
+        return Err(MxfError::KlvValueTooLarge {
+            len: value_len,
+            max: MAX_KLV_VALUE_BYTES,
+        });
+    }
+    file.seek(SeekFrom::Start(value_offset))?;
+    let mut value = vec![
+        0_u8;
+        usize::try_from(value_len).map_err(|_| {
+            MxfError::KlvValueTooLarge {
+                len: value_len,
+                max: MAX_KLV_VALUE_BYTES,
+            }
+        })?
+    ];
+    file.read_exact(&mut value)?;
+    Ok(value)
+}
+
 fn parse_partition_pack(triplet: &KlvTriplet, value: &[u8]) -> Result<PartitionInfo, MxfError> {
     if value.len() < 88 {
         return Err(MxfError::InvalidPartitionPack);
@@ -1110,6 +1286,20 @@ fn parse_metadata_sets(
             triplet.value(bytes)?,
             primer,
         )?);
+    }
+    Ok(sets)
+}
+
+fn parse_metadata_sets_from_values(
+    values: &[(Ul, Vec<u8>)],
+    primer: &PrimerPack,
+) -> Result<Vec<MetadataSet>, MxfError> {
+    let mut sets = Vec::new();
+    for (key, value) in values {
+        if sets.len() >= MAX_METADATA_SET_COUNT {
+            return Err(MxfError::ExcessiveMetadataSetCount);
+        }
+        sets.push(parse_local_metadata_set(*key, value, primer)?);
     }
     Ok(sets)
 }
@@ -2171,6 +2361,56 @@ mod tests {
     }
 
     #[test]
+    fn streaming_pcm_audio_index_matches_full_parse_for_small_fixture() {
+        let path = write_temp_mxf("qgs-mxf-two-mono", H264_TWO_MONO_MXF);
+        let streaming = open_pcm_audio_index(&path).expect("streaming audio index");
+        let full = MediaSource::parse(H264_TWO_MONO_MXF).expect("full parse");
+
+        assert_eq!(streaming.tracks.len(), full.tracks.len());
+        assert_eq!(streaming.audio, full.index.audio);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_pcm_audio_packet_by_offset_without_full_file_buffer() {
+        let path = write_temp_mxf("qgs-mxf-packet", &[0xaa, 0xbb, 0x01, 0x02, 0x03, 0xcc]);
+        let entry = AudioIndexEntry {
+            track_id: TrackId(3),
+            channel_index: 0,
+            edit_unit: 0,
+            start_sample: 0,
+            sample_count: 1,
+            file_offset: 0,
+            payload_offset: 2,
+            payload_len: 3,
+            source: IndexSource::QgsDerived,
+        };
+
+        let packet = read_pcm_audio_packet_at(&path, &entry).expect("packet");
+
+        assert_eq!(packet.payload, vec![0x01, 0x02, 0x03]);
+        assert_eq!(packet.entry, entry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn streaming_pcm_audio_index_does_not_use_file_size_guard() {
+        let path = std::env::temp_dir().join(format!(
+            "qgs-mxf-large-sparse-{}-{}.mxf",
+            std::process::id(),
+            H264_TWO_MONO_MXF.len()
+        ));
+        let file = File::create(&path).expect("create sparse file");
+        file.set_len(MAX_MXF_FILE_BYTES + 1)
+            .expect("set sparse len");
+        drop(file);
+
+        let result = open_pcm_audio_index(&path);
+        assert!(!matches!(result, Err(MxfError::FileTooLarge { .. })));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn parses_data_essence_descriptor() {
         let set = MetadataSet {
             key: DATA_ESSENCE_DESCRIPTOR_SET_KEY,
@@ -2197,6 +2437,13 @@ mod tests {
         let data = tracks[0].data.as_ref().expect("data descriptor");
         assert_eq!(data.sample_rate, Some(Rational::new(50, 1).expect("rate")));
         assert_eq!(data.essence, Some(Ul([0x06_u8; 16])));
+    }
+
+    fn write_temp_mxf(stem: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("{stem}-{}-{}.mxf", std::process::id(), bytes.len()));
+        std::fs::write(&path, bytes).expect("write temp MXF");
+        path
     }
 
     #[test]

@@ -47,6 +47,23 @@ cargo run -q -p qgs-test -- \
   --output-dir target/qgs-audio-audit
 ```
 
+For long-form MXF files such as Mironik 2002, use explicit bounded extraction:
+
+```bash
+cargo run -q -p qgs-test -- \
+  --pipewire-audio-content-audit \
+  "/home/miro/QGS-media-tests/sony-fx6/mironik-2002/Mironik 2002.MXF" \
+  "/home/miro/QGS-media-tests/sony-fx6/mironik-2002/Mironik 2002S03.MP4" \
+  --start-ms 0 \
+  --duration-ms 1000 \
+  --output-dir "target/qgs-audio-audit/mironik-2002-start0"
+```
+
+This path uses a streaming MXF PCM audio index and reads only the PCM packets
+overlapping the selected sample range. It does not load the full MXF into
+memory, and it preserves the 64 MiB full-file guard used by older full-parse
+paths.
+
 To select the loudest contiguous diagnostic range by RMS:
 
 ```bash
@@ -58,6 +75,18 @@ cargo run -q -p qgs-test -- \
 ```
 
 The loudest-range scan is diagnostic only. It does not alter runtime behavior.
+
+As of the large-MXF fix, `--find-loudest-range-ms` remains available for small
+files but is intentionally not implemented for large MXF files. On Mironik 2002
+it fails with:
+
+```text
+loudest-range scan for large MXF is not implemented yet; use --start-ms with --duration-ms for bounded extraction
+```
+
+This is deliberate. It avoids faking a loudest-range result and avoids loading a
+large MXF or unbounded PCM into memory. A future streaming loudest-range scan can
+upgrade this.
 
 ## Diagnostic WAVs
 
@@ -89,8 +118,11 @@ These WAVs are diagnostics. They do not replace the runtime truth:
 The command reports:
 
 - selected original path
+- original MXF file size
 - selected proxy path
 - proxy AAC usage: no
+- bounded extraction: yes
+- full MXF loaded into memory: no
 - selected start/duration
 - source duration if known
 - track count
@@ -103,6 +135,29 @@ The command reports:
 - relative level in dBFS
 - suggested diagnostic monitor pair
 - diagnostic WAV paths
+
+For the Mironik 2002 start-0 bounded audit, QGS observed:
+
+- original MXF file size: 1,560,829,488 bytes
+- source duration: 203.880 s
+- audio packet index entries: 40,776
+- selected range: 0..48,000 samples
+- blocks extracted for selected range: 200
+- bytes extracted for selected range: 576,000
+- track 1 RMS: -26.71 dBFS
+- track 2 RMS: -44.34 dBFS
+- track 3 RMS: -85.04 dBFS, likely silent
+- track 4 RMS: -17.45 dBFS
+- loudest two tracks for monitoring: track 4 / track 1
+
+Diagnostic WAVs were written to:
+
+```text
+target/qgs-audio-audit/mironik-2002-start0/Mironik-2002-original-4ch-f32-start000000ms-dur001000ms.wav
+target/qgs-audio-audit/mironik-2002-start0/Mironik-2002-stereo-track12-f32-start000000ms-dur001000ms.wav
+target/qgs-audio-audit/mironik-2002-start0/Mironik-2002-stereo-track34-f32-start000000ms-dur001000ms.wav
+target/qgs-audio-audit/mironik-2002-start0/Mironik-2002-stereo-loudest-pair-f32-start000000ms-dur001000ms.wav
+```
 
 ## Interpretation
 
@@ -125,10 +180,9 @@ output, realtime playback, A/V sync, or full audio-device verification.
 
 ## Local Availability
 
-At the time this document was added, the local `/home/miro/QGS-media-tests`
-corpus contained Mironik 1560 and Mironik 1494, but no Mironik 2002 files. The
-command was therefore verified against the available corpus, and Mironik 2002
-acceptance should be run once that media pair is present.
+Mironik 2002 is now present in the local `/home/miro/QGS-media-tests` corpus and
+the explicit start/duration bounded audit has been run successfully without the
+old `FileTooLarge` failure.
 
 ## Next Step
 

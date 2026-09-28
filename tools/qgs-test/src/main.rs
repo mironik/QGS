@@ -48,7 +48,10 @@ use qgs_media_runtime::{
 use qgs_mp4::{
     classify_video_track, nearest_random_access_before, MediaHealth, Mp4Source, Mp4TrackKind,
 };
-use qgs_mxf::{IndexSource, MediaSource, RandomAccess, TrackKind};
+use qgs_mxf::{
+    open_pcm_audio_index, read_pcm_audio_packet_at, IndexSource, MediaSource, PcmAudioIndex,
+    RandomAccess, TrackKind, MAX_MXF_FILE_BYTES,
+};
 use qgs_protocol::{
     BitDepth, BufferDesc, BufferUsageFlags, ChromaSubsampling, CreateBufferRequest,
     CreateDecoderRequest, CreateImageRequest, CreateSyncRequest, DecoderConfig, DecoderId,
@@ -3300,9 +3303,9 @@ fn pipewire_audio_content_audit(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let duration_ms = bounded_audio_audit_duration_ms(options.duration_ms)?;
     let mut start_ms = options.start_ms;
-    let original_bytes = std::fs::read(original_path)?;
-    let original = MediaSource::parse(&original_bytes)?;
-    let audio_tracks = original
+    let audio_index = open_pcm_audio_index(original_path)?;
+    let original_file_size = audio_index.file_len;
+    let audio_tracks = audio_index
         .tracks
         .iter()
         .filter(|track| track.kind == TrackKind::Audio)
@@ -3311,19 +3314,28 @@ fn pipewire_audio_content_audit(
         return Err("original MXF has no audio tracks".into());
     }
     let source_format = original_linux_pcm_audio_format(&audio_tracks)?;
-    let blocks = build_original_pcm_blocks(&original, &original_bytes)?;
-    let track_groups = original_pcm_blocks_by_channel(&blocks, source_format.sample_rate)?;
-    let source_total_samples = audio_audit_total_samples(&track_groups, source_format.sample_rate)?;
+    let source_total_samples = audio_audit_total_samples_from_index(&audio_index)?;
     let source_duration =
         duration_from_audio_samples(source_total_samples, source_format.sample_rate)?;
     if let Some(loudest_duration_ms) = options.find_loudest_range_ms {
+        if original_file_size > MAX_MXF_FILE_BYTES {
+            return Err("loudest-range scan for large MXF is not implemented yet; use --start-ms with --duration-ms for bounded extraction".into());
+        }
         let loudest_duration_ms = bounded_audio_audit_duration_ms(loudest_duration_ms)?;
         let loudest_sample_count = u32::try_from(audio_samples_for_duration(
             Duration::from_millis(loudest_duration_ms),
             source_format.sample_rate,
         )?)?;
+        let all_blocks = build_original_pcm_blocks_from_index_range(
+            original_path,
+            &audio_index,
+            0,
+            source_total_samples,
+        )?;
+        let all_track_groups =
+            original_pcm_blocks_by_channel(&all_blocks, source_format.sample_rate)?;
         let loudest = find_loudest_audio_audit_range(
-            &track_groups,
+            &all_track_groups,
             source_format.sample_rate,
             loudest_sample_count,
         )?;
@@ -3352,6 +3364,13 @@ fn pipewire_audio_content_audit(
         )
         .into());
     }
+    let blocks = build_original_pcm_blocks_from_index_range(
+        original_path,
+        &audio_index,
+        start_sample,
+        end_sample,
+    )?;
+    let track_groups = original_pcm_blocks_by_channel(&blocks, source_format.sample_rate)?;
     let selected_duration =
         duration_from_audio_samples(u64::from(requested_sample_count), source_format.sample_rate)?;
     let all_channels = track_groups.keys().copied().collect::<Vec<_>>();
@@ -3454,20 +3473,27 @@ fn pipewire_audio_content_audit(
         diagnostic_wav_paths.push(("stereo loudest pair monitor", loudest_pair_path));
     }
 
-    let runtime_comparison = runtime_audio_audit_comparison(
-        original_path,
-        proxy_path,
-        &track_groups,
-        source_format.sample_rate,
-    );
+    let runtime_comparison = if original_file_size <= MAX_MXF_FILE_BYTES {
+        runtime_audio_audit_comparison(
+            original_path,
+            proxy_path,
+            &track_groups,
+            source_format.sample_rate,
+        )
+    } else {
+        Err("runtime prepared payload comparison skipped for large MXF because that legacy path still uses full-file parsing".into())
+    };
 
     println!("QGS PipeWire Audio Content Path Audit");
     println!("-------------------------------------");
     println!("Selected original path: {}", original_path.display());
+    println!("Original MXF file size: {}", original_file_size);
     println!("Selected proxy path: {}", proxy_path.display());
     println!("Audio source: original MXF");
     println!("Video source for runtime timing: proxy MP4");
     println!("Proxy AAC: not used");
+    println!("Bounded extraction: yes");
+    println!("Full MXF loaded into memory: no");
     println!("PipeWire playback required: no");
     println!("AudioDeviceVerified: no");
     println!("Original audio content audibility confirmed: partial manual observation only");
@@ -3495,7 +3521,15 @@ fn pipewire_audio_content_audit(
     println!("MXF declared byte order: not explicitly modeled by qgs-mxf descriptor");
     println!("QGS selected interpretation: signed 24-bit little-endian");
     println!("Selection reason: Step 20B/20C extraction stores Sony FX6 PCM payload as 24-bit little-endian runtime blocks");
-    println!("Block count total: {}", blocks.len());
+    println!("Audio packet index entries: {}", audio_index.audio.len());
+    println!("Blocks extracted for selected range: {}", blocks.len());
+    println!(
+        "Bytes extracted for selected range: {}",
+        blocks
+            .iter()
+            .map(|block| block.payload.len())
+            .sum::<usize>()
+    );
     println!("Blocks per track:");
     for (channel_index, channel_blocks) in &track_groups {
         println!("  channel {channel_index}: {}", channel_blocks.len());
@@ -3721,20 +3755,25 @@ fn audio_sample_to_ms(sample: u64, sample_rate: u32) -> Result<u64, Box<dyn std:
         .ok_or_else(|| "audio sample to ms overflow".into())
 }
 
-fn audio_audit_total_samples(
-    track_groups: &BTreeMap<u16, Vec<&PcmAudioBlock>>,
-    sample_rate: u32,
+fn audio_audit_total_samples_from_index(
+    index: &PcmAudioIndex,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    let mut min_total = None;
-    for blocks in track_groups.values() {
-        let last = blocks.last().ok_or("empty audio track group")?;
-        let start = audio_samples_for_duration(last.start_time, sample_rate)?;
-        let total = start
-            .checked_add(u64::from(last.sample_count))
-            .ok_or("audio track sample count overflow")?;
-        min_total = Some(min_total.map_or(total, |current: u64| current.min(total)));
+    let mut totals: BTreeMap<u16, u64> = BTreeMap::new();
+    for entry in &index.audio {
+        let end = entry
+            .start_sample
+            .checked_add(u64::from(entry.sample_count))
+            .ok_or("audio index sample range overflow")?;
+        totals
+            .entry(entry.channel_index)
+            .and_modify(|current| *current = (*current).max(end))
+            .or_insert(end);
     }
-    min_total.ok_or_else(|| "no audio track groups".into())
+    totals
+        .values()
+        .copied()
+        .min()
+        .ok_or_else(|| "audio index has no PCM entries".into())
 }
 
 fn audio_audit_track_summaries(
@@ -6910,6 +6949,54 @@ fn build_original_pcm_blocks(
             extracted.payload,
         )?;
         blocks.push(PcmAudioBlock::from_mono_packet(packet, sample_rate)?);
+    }
+    Ok(blocks)
+}
+
+fn build_original_pcm_blocks_from_index_range(
+    path: &Path,
+    index: &PcmAudioIndex,
+    start_sample: u64,
+    end_sample: u64,
+) -> Result<Vec<PcmAudioBlock>, Box<dyn std::error::Error>> {
+    let mut blocks = Vec::new();
+    for entry in &index.audio {
+        let entry_end = entry
+            .start_sample
+            .checked_add(u64::from(entry.sample_count))
+            .ok_or("audio index entry sample range overflow")?;
+        if entry_end <= start_sample || entry.start_sample >= end_sample {
+            continue;
+        }
+        let extracted = read_pcm_audio_packet_at(path, entry)?;
+        let track = index
+            .tracks
+            .iter()
+            .find(|track| track.id == extracted.entry.track_id)
+            .ok_or("PCM packet references missing audio track")?;
+        let audio = track
+            .audio
+            .as_ref()
+            .ok_or("PCM packet track has no audio descriptor")?;
+        let sample_rate = rational_to_u32(audio.sample_rate.ok_or("audio sample rate missing")?)?;
+        let bits_per_sample = audio.bit_depth.ok_or("audio bit depth missing")?;
+        let format = PcmSampleFormat::SignedInteger {
+            bits_per_sample,
+            endian: PcmEndian::Little,
+        };
+        let packet = PcmAudioPacket::new(
+            extracted.entry.track_id.0,
+            extracted.entry.channel_index,
+            duration_from_audio_samples(extracted.entry.start_sample, sample_rate)?,
+            duration_from_audio_samples(u64::from(extracted.entry.sample_count), sample_rate)?,
+            extracted.entry.sample_count,
+            format,
+            extracted.payload,
+        )?;
+        blocks.push(PcmAudioBlock::from_mono_packet(packet, sample_rate)?);
+    }
+    if blocks.is_empty() {
+        return Err("bounded audio audit range extracted no PCM blocks".into());
     }
     Ok(blocks)
 }
@@ -12147,7 +12234,9 @@ fn parse_u64_os_arg(value: &std::ffi::OsStr, flag: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        audible_smoke_evidence_label, audio_audit_track_summaries, bounded_audio_audit_duration_ms,
+        audible_smoke_evidence_label, audio_audit_total_samples_from_index,
+        audio_audit_track_summaries, bounded_audio_audit_duration_ms,
+        build_audio_audit_f32_interleaved_range, build_original_pcm_blocks_from_index_range,
         build_pipewire_f32_interleaved_prototype_buffer,
         build_runtime_audio_payload_pipewire_buffer,
         build_sequential_original_audio_segment_for_duration, decode_s24be_i32, decode_s24le_i32,
@@ -12163,6 +12252,10 @@ mod tests {
         BroadcastVideoSourceMode, PcmAudioBlock, PcmAudioBlockLayout, PcmEndian, PcmSampleFormat,
     };
     use qgs_mp4::{Mp4VideoSample, Mp4VideoTrack, Rational};
+    use qgs_mxf::{
+        AudioEssenceDescriptor, AudioIndexEntry, DescriptorSource, IndexSource, MxfTrack,
+        PcmAudioIndex, TrackId, TrackKind,
+    };
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -12543,6 +12636,58 @@ mod tests {
     }
 
     #[test]
+    fn audio_content_audit_estimates_bounded_f32_allocation() {
+        let sample_count = u32::try_from(
+            qgs_media_runtime::audio_samples_for_duration(Duration::from_secs(5), 48_000).unwrap(),
+        )
+        .unwrap();
+        let blocks = (0..4)
+            .map(|channel| mono_block(10 + u32::from(channel), channel, &[[0x01, 0x00, 0x00]; 4]))
+            .collect::<Vec<_>>();
+        let groups = original_pcm_blocks_by_channel(&blocks, 48_000).unwrap();
+
+        assert_eq!(usize::try_from(sample_count).unwrap() * 4 * 4, 3_840_000);
+        assert!(
+            build_audio_audit_f32_interleaved_range(&groups, &[0, 1, 2, 3], 48_000, 0, 4).is_ok()
+        );
+    }
+
+    #[test]
+    fn audio_content_audit_total_samples_comes_from_streaming_index() {
+        let index = synthetic_pcm_audio_index(vec![
+            audio_entry(3, 0, 0, 960, 0, 3),
+            audio_entry(4, 1, 0, 960, 3, 3),
+            audio_entry(3, 0, 960, 960, 6, 3),
+            audio_entry(4, 1, 960, 480, 9, 3),
+        ]);
+
+        assert_eq!(audio_audit_total_samples_from_index(&index).unwrap(), 1_440);
+    }
+
+    #[test]
+    fn audio_content_audit_extracts_only_overlapping_index_packets() {
+        let path =
+            std::env::temp_dir().join(format!("qgs-audit-range-{}-{}.pcm", std::process::id(), 2));
+        let mut bytes = Vec::new();
+        for value in [1_u8, 2, 3, 4] {
+            bytes.extend_from_slice(&[value, 0, 0]);
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        let index = synthetic_pcm_audio_index(vec![
+            audio_entry(3, 0, 0, 1, 0, 3),
+            audio_entry(4, 1, 0, 1, 3, 3),
+            audio_entry(3, 0, 1, 1, 6, 3),
+            audio_entry(4, 1, 1, 1, 9, 3),
+        ]);
+
+        let blocks = build_original_pcm_blocks_from_index_range(&path, &index, 1, 2).unwrap();
+
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks.iter().all(|block| block.start_time > Duration::ZERO));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn pipewire_prototype_rejects_short_blocks() {
         let blocks = vec![mono_block(10, 0, &[[0x00, 0x00, 0x00]])];
 
@@ -12602,5 +12747,66 @@ mod tests {
                 .collect(),
         )
         .unwrap()
+    }
+
+    fn synthetic_pcm_audio_index(audio: Vec<AudioIndexEntry>) -> PcmAudioIndex {
+        PcmAudioIndex {
+            file_len: audio
+                .iter()
+                .map(|entry| entry.payload_offset + entry.payload_len)
+                .max()
+                .unwrap_or(0),
+            tracks: vec![
+                audio_track(3, 0),
+                audio_track(4, 1),
+                audio_track(5, 2),
+                audio_track(6, 3),
+            ],
+            audio,
+            partitions: Vec::new(),
+            metadata_set_count: 0,
+            klv_count: 0,
+        }
+    }
+
+    fn audio_track(track_id: u32, _channel_index: u16) -> MxfTrack {
+        MxfTrack {
+            id: TrackId(track_id),
+            track_number: None,
+            kind: TrackKind::Audio,
+            edit_rate: None,
+            video: None,
+            audio: Some(AudioEssenceDescriptor {
+                source: DescriptorSource::MxfMetadata,
+                essence: None,
+                channels: Some(1),
+                sample_rate: Some(qgs_mxf::Rational::new(48_000, 1).unwrap()),
+                bit_depth: Some(24),
+                block_align: None,
+                average_bytes_per_second: None,
+            }),
+            data: None,
+        }
+    }
+
+    fn audio_entry(
+        track_id: u32,
+        channel_index: u16,
+        start_sample: u64,
+        sample_count: u32,
+        payload_offset: u64,
+        payload_len: u64,
+    ) -> AudioIndexEntry {
+        AudioIndexEntry {
+            track_id: TrackId(track_id),
+            channel_index,
+            edit_unit: start_sample / u64::from(sample_count.max(1)),
+            start_sample,
+            sample_count,
+            file_offset: payload_offset,
+            payload_offset,
+            payload_len,
+            source: IndexSource::QgsDerived,
+        }
     }
 }
