@@ -79,6 +79,7 @@ pub enum LinuxPipewirePrototypeEvidenceLevel {
 pub enum LinuxNativePipewireEvidenceLevel {
     PipeWireUnavailable,
     NativeDevelopmentBoundaryMissing,
+    NativeStreamNotImplemented,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -378,11 +379,10 @@ pub fn inspect_native_pipewire_stream_boundary(
     let pkg_config_entry_available = pipewire_pkg_config_entry_available();
     let headers_available = pipewire_headers_available();
     let pipewire_server_reachable = command_available("pw-cli") && pipewire_server_reachable();
-    let native_development_available = pkg_config_entry_available && headers_available;
-
     let evidence_level = native_pipewire_evidence_level(
         runtime_library_available || pipewire_server_reachable,
-        native_development_available,
+        pkg_config_entry_available,
+        headers_available,
     );
     let status_message = match evidence_level {
         LinuxNativePipewireEvidenceLevel::PipeWireUnavailable => {
@@ -390,6 +390,9 @@ pub fn inspect_native_pipewire_stream_boundary(
         }
         LinuxNativePipewireEvidenceLevel::NativeDevelopmentBoundaryMissing => {
             "native PipeWire headers/pkg-config metadata are missing; cannot build a safe Rust PipeWire stream module in this workspace".to_string()
+        }
+        LinuxNativePipewireEvidenceLevel::NativeStreamNotImplemented => {
+            "native PipeWire development boundary is available; native stream creation is not implemented yet".to_string()
         }
     };
 
@@ -409,15 +412,15 @@ pub fn inspect_native_pipewire_stream_boundary(
 
 pub fn native_pipewire_evidence_level(
     runtime_available: bool,
-    native_development_available: bool,
+    pkg_config_entry_available: bool,
+    headers_available: bool,
 ) -> LinuxNativePipewireEvidenceLevel {
     if !runtime_available {
         LinuxNativePipewireEvidenceLevel::PipeWireUnavailable
-    } else if !native_development_available {
+    } else if !pkg_config_entry_available || !headers_available {
         LinuxNativePipewireEvidenceLevel::NativeDevelopmentBoundaryMissing
     } else {
-        // Step 21C does not invent a native stream result without a compiled native backend.
-        LinuxNativePipewireEvidenceLevel::NativeDevelopmentBoundaryMissing
+        LinuxNativePipewireEvidenceLevel::NativeStreamNotImplemented
     }
 }
 
@@ -790,19 +793,25 @@ mod tests {
     }
 
     #[test]
-    fn native_pipewire_evidence_classifies_unavailable_and_missing_dev_boundary() {
+    fn native_pipewire_evidence_classifies_unavailable_missing_dev_and_unimplemented_stream() {
         assert_eq!(
-            native_pipewire_evidence_level(false, false),
+            native_pipewire_evidence_level(false, false, false),
             LinuxNativePipewireEvidenceLevel::PipeWireUnavailable
         );
         assert_eq!(
-            native_pipewire_evidence_level(true, false),
-            LinuxNativePipewireEvidenceLevel::NativeDevelopmentBoundaryMissing
+            native_pipewire_evidence_level(true, false, true),
+            LinuxNativePipewireEvidenceLevel::NativeDevelopmentBoundaryMissing,
+            "missing pkg-config keeps the native boundary unavailable"
         );
         assert_eq!(
-            native_pipewire_evidence_level(true, true),
+            native_pipewire_evidence_level(true, true, false),
             LinuxNativePipewireEvidenceLevel::NativeDevelopmentBoundaryMissing,
-            "without a compiled native backend, tests must not fabricate buffer submission"
+            "missing headers keeps the native boundary unavailable"
+        );
+        assert_eq!(
+            native_pipewire_evidence_level(true, true, true),
+            LinuxNativePipewireEvidenceLevel::NativeStreamNotImplemented,
+            "installed headers/pkg-config do not imply a native stream implementation exists"
         );
     }
 

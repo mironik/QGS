@@ -49,18 +49,32 @@ change the original PCM runtime model.
 
 No Rust PipeWire dependency was added.
 
-The local machine has the PipeWire runtime library, but it does not expose the
-native development boundary needed by the Rust `pipewire` crate or by a safe
-native wrapper in this workspace:
+Step 21C distinguishes the PipeWire runtime boundary from the native
+development boundary needed by the Rust `pipewire` crate or by a safe native
+wrapper in this workspace.
+
+Before PipeWire development packages were installed, the machine had the
+runtime library but not the native build surface:
 
 - `libpipewire-0.3.so.0`: available
 - `pkg-config --exists libpipewire-0.3`: unavailable
 - `/usr/include/pipewire-0.3`: unavailable
 - `/usr/include/spa-0.2`: unavailable
 
-Without headers and pkg-config metadata, adding the Rust `pipewire` crate would
-not provide a buildable isolated native module here. QGS therefore stops at a
-clean boundary report instead of inventing native stream success.
+That state is classified as `NativeDevelopmentBoundaryMissing`.
+
+After installing the PipeWire development packages, the native build surface is
+available:
+
+- `libpipewire-0.3.so.0`: available
+- `pkg-config --exists libpipewire-0.3`: available
+- `/usr/include/pipewire-0.3`: available
+- `/usr/include/spa-0.2`: available
+
+That state is classified as `NativeStreamNotImplemented`. It means the machine
+can now build a native PipeWire module, but QGS has not yet implemented stream
+creation, buffer dequeue, or buffer queueing. QGS therefore still stops before
+claiming buffer submission.
 
 ## Command
 
@@ -74,7 +88,7 @@ Observed local command:
 cargo run -q -p qgs-test -- --pipewire-audio-native-prototype "/home/miro/QGS-media-tests/sony-fx6/sample-002/Mironik 1560.MXF"
 ```
 
-Observed result:
+Observed result before PipeWire development packages:
 
 - PipeWire runtime library available: yes
 - PipeWire server reachable: yes
@@ -86,12 +100,24 @@ Observed result:
 - evidence level: `NativeDevelopmentBoundaryMissing`
 - `AudioDeviceVerified`: no
 
+Observed result after PipeWire development packages:
+
+- PipeWire runtime library available: yes
+- PipeWire server reachable: yes
+- PipeWire pkg-config entry available: yes
+- PipeWire headers available: yes
+- stream create attempted: no
+- buffer dequeued: no
+- buffer submitted: no
+- evidence level: `NativeStreamNotImplemented`
+- `AudioDeviceVerified`: no
+
 ## Evidence Result
 
 Step 21C does not upgrade evidence beyond the Step 21B command-backed
 `StreamOpened` result.
 
-The native boundary evidence is:
+The native boundary evidence before installing development packages was:
 
 - native module build boundary missing
 - no native stream created
@@ -99,8 +125,18 @@ The native boundary evidence is:
 - no PipeWire buffer queued
 - no audio device verification claimed
 
-This is an honest acceptance outcome under the milestone rules: the native
-PipeWire integration boundary is currently missing from the system.
+The native boundary evidence after installing development packages is:
+
+- native module build boundary available
+- native stream creation not implemented yet
+- no native stream created
+- no PipeWire buffer dequeued
+- no PipeWire buffer queued
+- no audio device verification claimed
+
+This remains an honest acceptance outcome under the milestone rules. Available
+headers and pkg-config metadata are necessary for native work, but they are not
+evidence that a buffer was submitted.
 
 ## Not Implemented
 
@@ -118,14 +154,7 @@ PipeWire integration boundary is currently missing from the system.
 
 ## Next Steps
 
-Before QGS can implement native PipeWire buffer submission, install or provide
-the PipeWire development boundary for the build environment:
-
-- `libpipewire-0.3` pkg-config metadata
-- PipeWire headers
-- SPA headers
-
-After that, the next milestone should add an isolated native PipeWire module
-that owns stream creation, callbacks, buffer lifecycle, and evidence reporting.
-Only a real queued buffer should be classified as `BufferSubmitted`; only
-stronger callback/device evidence should move toward `AudioDeviceVerified`.
+The next milestone can now add an isolated native PipeWire module that owns
+stream creation, callbacks, buffer lifecycle, and evidence reporting. Only a
+real queued buffer should be classified as `BufferSubmitted`; only stronger
+callback/device evidence should move toward `AudioDeviceVerified`.
