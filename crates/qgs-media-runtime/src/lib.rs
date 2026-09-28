@@ -462,6 +462,297 @@ impl PcmAudioBlock {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioRangeCoverage {
+    pub track_id: u32,
+    pub channel_index: u16,
+    pub blocks_used: u32,
+    pub bytes_covered: u64,
+    pub first_block_start: Option<Duration>,
+    pub last_block_end: Option<Duration>,
+    pub gaps: u32,
+    pub overlaps: u32,
+    pub complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastMediaSourceRole {
+    OriginalAuthoritativeAudio,
+    ProxyPreviewVideo,
+    OriginalFinishingMedia,
+    ProxyAudioDiagnosticOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastPreviewProfile {
+    Journalist50iPreview,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastRuntimeState {
+    Idle,
+    ContractReady,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastRuntimeEvent {
+    ContractPrepared,
+    QueueBackpressure { queue: BroadcastRuntimeQueueKind },
+    IncompleteAudioCoverage { frame_index: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastRuntimeQueueKind {
+    AudioBlocks,
+    VideoFrames,
+    ProcessedFrames,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BroadcastRuntimeQueueLimits {
+    pub audio_block_capacity: usize,
+    pub video_frame_capacity: usize,
+    pub processed_frame_capacity: usize,
+}
+
+impl BroadcastRuntimeQueueLimits {
+    pub fn validate(self) -> Result<Self, PlaybackError> {
+        if self.audio_block_capacity == 0
+            || self.video_frame_capacity == 0
+            || self.processed_frame_capacity == 0
+        {
+            return Err(PlaybackError::InvalidCapacity);
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BroadcastRuntimeCapabilities {
+    pub sample_clock_aware: bool,
+    pub preserves_original_pcm_format: bool,
+    pub preserves_track_channel_identity: bool,
+    pub proxy_video_preview: bool,
+    pub proxy_audio_primary: bool,
+    pub ui_dependent: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BroadcastRuntimeSessionDescription {
+    pub audio_source: BroadcastMediaSourceRole,
+    pub video_source: BroadcastMediaSourceRole,
+    pub preview_profile: BroadcastPreviewProfile,
+    pub audio_sample_rate: u32,
+    pub audio_track_count: usize,
+    pub queue_limits: BroadcastRuntimeQueueLimits,
+    pub capabilities: BroadcastRuntimeCapabilities,
+}
+
+impl BroadcastRuntimeSessionDescription {
+    pub fn validate(self) -> Result<Self, PlaybackError> {
+        self.queue_limits.validate()?;
+        if self.audio_source != BroadcastMediaSourceRole::OriginalAuthoritativeAudio
+            || self.video_source != BroadcastMediaSourceRole::ProxyPreviewVideo
+            || self.audio_sample_rate == 0
+            || self.audio_track_count == 0
+            || !self.capabilities.sample_clock_aware
+            || !self.capabilities.preserves_original_pcm_format
+            || !self.capabilities.preserves_track_channel_identity
+            || !self.capabilities.proxy_video_preview
+            || self.capabilities.proxy_audio_primary
+            || self.capabilities.ui_dependent
+        {
+            return Err(PlaybackError::InvalidAudioFormat);
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AvFrameAudioRange {
+    pub frame_index: u64,
+    pub frame_start_time: Duration,
+    pub frame_duration: Duration,
+    pub audio_start_sample: u64,
+    pub audio_sample_count: u64,
+    pub audio_start_time: Duration,
+    pub audio_duration: Duration,
+    pub covered_tracks: Vec<AudioRangeCoverage>,
+    pub complete: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastRuntimeContractSummary {
+    pub frames_checked: usize,
+    pub complete_frames: usize,
+    pub incomplete_frames: usize,
+    pub max_audio_video_delta: Duration,
+    pub frames_outside_audio_range: usize,
+    pub suitable_for_broadcast_runtime_contract: bool,
+}
+
+pub fn av_frame_audio_range(
+    frame_index: u64,
+    frame_start_time: Duration,
+    frame_duration: Duration,
+    sample_rate: u32,
+    blocks: &[PcmAudioBlock],
+    expected_track_count: usize,
+) -> Result<AvFrameAudioRange, PlaybackError> {
+    let audio_start_sample = audio_samples_for_duration(frame_start_time, sample_rate)?;
+    let audio_sample_count = audio_samples_for_duration(frame_duration, sample_rate)?;
+    let audio_start_time = duration_from_audio_samples(audio_start_sample, sample_rate)?;
+    let audio_duration = duration_from_audio_samples(audio_sample_count, sample_rate)?;
+    let covered_tracks =
+        audio_range_coverage(blocks, audio_start_sample, audio_sample_count, sample_rate)?;
+    let complete = expected_track_count != 0
+        && covered_tracks.len() == expected_track_count
+        && covered_tracks.iter().all(|coverage| coverage.complete);
+
+    Ok(AvFrameAudioRange {
+        frame_index,
+        frame_start_time,
+        frame_duration,
+        audio_start_sample,
+        audio_sample_count,
+        audio_start_time,
+        audio_duration,
+        covered_tracks,
+        complete,
+    })
+}
+
+pub fn audio_range_coverage(
+    blocks: &[PcmAudioBlock],
+    audio_start_sample: u64,
+    audio_sample_count: u64,
+    sample_rate: u32,
+) -> Result<Vec<AudioRangeCoverage>, PlaybackError> {
+    if sample_rate == 0 {
+        return Err(PlaybackError::InvalidAudioFormat);
+    }
+    let range_end = audio_start_sample
+        .checked_add(audio_sample_count)
+        .ok_or(PlaybackError::TimestampOverflow)?;
+    let mut groups = Vec::<((u32, u16), Vec<&PcmAudioBlock>)>::new();
+    for block in blocks {
+        let PcmAudioBlockLayout::MonoTrack {
+            track_id,
+            channel_index,
+        } = block.layout
+        else {
+            continue;
+        };
+        if let Some((_, group)) =
+            groups
+                .iter_mut()
+                .find(|((existing_track, existing_channel), _)| {
+                    *existing_track == track_id && *existing_channel == channel_index
+                })
+        {
+            group.push(block);
+        } else {
+            groups.push(((track_id, channel_index), vec![block]));
+        }
+    }
+
+    let mut coverage = Vec::with_capacity(groups.len());
+    for ((track_id, channel_index), mut group) in groups {
+        group.sort_by_key(|block| block.start_time);
+        let mut cursor = audio_start_sample;
+        let mut blocks_used = 0_u32;
+        let mut bytes_covered = 0_u64;
+        let mut first_block_start = None;
+        let mut last_block_end = None;
+        let mut gaps = 0_u32;
+        let mut overlaps = 0_u32;
+
+        for block in group {
+            let block_start = audio_samples_for_duration(block.start_time, sample_rate)?;
+            let block_end = block_start
+                .checked_add(u64::from(block.sample_count))
+                .ok_or(PlaybackError::TimestampOverflow)?;
+            if block_end <= audio_start_sample || block_start >= range_end {
+                continue;
+            }
+            if block_start > cursor {
+                gaps = gaps.saturating_add(1);
+            } else if block_start < cursor && blocks_used != 0 {
+                overlaps = overlaps.saturating_add(1);
+            }
+            let overlap_start = block_start.max(audio_start_sample);
+            let overlap_end = block_end.min(range_end);
+            let overlap_samples = overlap_end
+                .checked_sub(overlap_start)
+                .ok_or(PlaybackError::TimestampOverflow)?;
+            let bytes_per_sample = u64::try_from(block.format.bytes_per_sample()?)
+                .map_err(|_| PlaybackError::TimestampOverflow)?;
+            bytes_covered = bytes_covered
+                .checked_add(
+                    overlap_samples
+                        .checked_mul(bytes_per_sample)
+                        .ok_or(PlaybackError::TimestampOverflow)?,
+                )
+                .ok_or(PlaybackError::TimestampOverflow)?;
+            blocks_used = blocks_used.saturating_add(1);
+            first_block_start.get_or_insert(block.start_time);
+            last_block_end = Some(block.end_time()?);
+            cursor = cursor.max(overlap_end);
+        }
+
+        let complete = cursor >= range_end && gaps == 0 && blocks_used != 0;
+        coverage.push(AudioRangeCoverage {
+            track_id,
+            channel_index,
+            blocks_used,
+            bytes_covered,
+            first_block_start,
+            last_block_end,
+            gaps,
+            overlaps,
+            complete,
+        });
+    }
+    coverage.sort_by_key(|coverage| (coverage.track_id, coverage.channel_index));
+    Ok(coverage)
+}
+
+pub fn summarize_broadcast_runtime_contract(
+    ranges: &[AvFrameAudioRange],
+    audio_duration: Duration,
+) -> BroadcastRuntimeContractSummary {
+    let frames_checked = ranges.len();
+    let complete_frames = ranges.iter().filter(|range| range.complete).count();
+    let incomplete_frames = frames_checked.saturating_sub(complete_frames);
+    let mut max_audio_video_delta = Duration::ZERO;
+    let mut frames_outside_audio_range = 0_usize;
+
+    for range in ranges {
+        let start_delta = duration_abs_delta(range.frame_start_time, range.audio_start_time);
+        let duration_delta = duration_abs_delta(range.frame_duration, range.audio_duration);
+        max_audio_video_delta = max_audio_video_delta.max(start_delta).max(duration_delta);
+        let frame_end = range
+            .frame_start_time
+            .checked_add(range.frame_duration)
+            .unwrap_or(Duration::MAX);
+        if frame_end > audio_duration {
+            frames_outside_audio_range = frames_outside_audio_range.saturating_add(1);
+        }
+    }
+
+    BroadcastRuntimeContractSummary {
+        frames_checked,
+        complete_frames,
+        incomplete_frames,
+        max_audio_video_delta,
+        frames_outside_audio_range,
+        suitable_for_broadcast_runtime_contract: frames_checked != 0
+            && incomplete_frames == 0
+            && frames_outside_audio_range == 0,
+    }
+}
+
 pub fn pcm_payload_byte_len(
     sample_count: u32,
     channels: u16,
@@ -960,6 +1251,174 @@ mod tests {
         assert!(queue.try_push(block(2)).is_err());
         assert_eq!(queue.stats().peak_depth, 2);
         assert_eq!(queue.stats().backpressure_events, 1);
+    }
+
+    #[test]
+    fn frame_to_sample_mapping_uses_rational_audio_time() {
+        let start = Duration::from_millis(40);
+        let duration = Duration::from_millis(40);
+        let range = av_frame_audio_range(1, start, duration, 48_000, &clock_ready_blocks(), 2)
+            .expect("range");
+
+        assert_eq!(range.audio_start_sample, 1920);
+        assert_eq!(range.audio_sample_count, 1920);
+        assert_eq!(range.audio_start_time, start);
+        assert_eq!(range.audio_duration, duration);
+        assert!(range.complete);
+        assert_eq!(range.covered_tracks.len(), 2);
+    }
+
+    #[test]
+    fn audio_range_coverage_detects_gaps_and_overlaps() {
+        let gap_blocks = vec![
+            test_pcm_block(3, 0, 0, 960),
+            test_pcm_block(3, 0, 1920, 960),
+        ];
+        let gap = audio_range_coverage(&gap_blocks, 0, 2880, 48_000).expect("coverage");
+        assert_eq!(gap[0].gaps, 1);
+        assert!(!gap[0].complete);
+
+        let overlap_blocks = vec![test_pcm_block(3, 0, 0, 960), test_pcm_block(3, 0, 480, 960)];
+        let overlap = audio_range_coverage(&overlap_blocks, 0, 1440, 48_000).expect("coverage");
+        assert_eq!(overlap[0].overlaps, 1);
+        assert!(overlap[0].complete);
+    }
+
+    #[test]
+    fn av_sync_summary_rejects_outside_audio_range() {
+        let inside = av_frame_audio_range(
+            0,
+            Duration::ZERO,
+            Duration::from_millis(40),
+            48_000,
+            &clock_ready_blocks(),
+            2,
+        )
+        .unwrap();
+        let outside = av_frame_audio_range(
+            1,
+            Duration::from_millis(120),
+            Duration::from_millis(40),
+            48_000,
+            &clock_ready_blocks(),
+            2,
+        )
+        .unwrap();
+        let summary =
+            summarize_broadcast_runtime_contract(&[inside, outside], Duration::from_millis(120));
+
+        assert_eq!(summary.frames_checked, 2);
+        assert_eq!(summary.frames_outside_audio_range, 1);
+        assert!(!summary.suitable_for_broadcast_runtime_contract);
+    }
+
+    #[test]
+    fn av_sync_summary_accepts_complete_ranges() {
+        let ranges = vec![
+            av_frame_audio_range(
+                0,
+                Duration::ZERO,
+                Duration::from_millis(40),
+                48_000,
+                &clock_ready_blocks(),
+                2,
+            )
+            .unwrap(),
+            av_frame_audio_range(
+                1,
+                Duration::from_millis(40),
+                Duration::from_millis(40),
+                48_000,
+                &clock_ready_blocks(),
+                2,
+            )
+            .unwrap(),
+        ];
+        let summary = summarize_broadcast_runtime_contract(&ranges, Duration::from_millis(120));
+
+        assert_eq!(summary.complete_frames, 2);
+        assert_eq!(summary.incomplete_frames, 0);
+        assert_eq!(summary.frames_outside_audio_range, 0);
+        assert!(summary.suitable_for_broadcast_runtime_contract);
+    }
+
+    #[test]
+    fn broadcast_runtime_session_requires_authoritative_original_audio() {
+        let session = BroadcastRuntimeSessionDescription {
+            audio_source: BroadcastMediaSourceRole::OriginalAuthoritativeAudio,
+            video_source: BroadcastMediaSourceRole::ProxyPreviewVideo,
+            preview_profile: BroadcastPreviewProfile::Journalist50iPreview,
+            audio_sample_rate: 48_000,
+            audio_track_count: 4,
+            queue_limits: BroadcastRuntimeQueueLimits {
+                audio_block_capacity: 8,
+                video_frame_capacity: 6,
+                processed_frame_capacity: 3,
+            },
+            capabilities: BroadcastRuntimeCapabilities {
+                sample_clock_aware: true,
+                preserves_original_pcm_format: true,
+                preserves_track_channel_identity: true,
+                proxy_video_preview: true,
+                proxy_audio_primary: false,
+                ui_dependent: false,
+            },
+        };
+        assert_eq!(session.validate().unwrap(), session);
+
+        assert!(BroadcastRuntimeSessionDescription {
+            audio_source: BroadcastMediaSourceRole::ProxyAudioDiagnosticOnly,
+            ..session
+        }
+        .validate()
+        .is_err());
+        assert!(BroadcastRuntimeSessionDescription {
+            capabilities: BroadcastRuntimeCapabilities {
+                proxy_audio_primary: true,
+                ..session.capabilities
+            },
+            ..session
+        }
+        .validate()
+        .is_err());
+    }
+
+    fn clock_ready_blocks() -> Vec<PcmAudioBlock> {
+        vec![
+            test_pcm_block(3, 0, 0, 960),
+            test_pcm_block(3, 0, 960, 960),
+            test_pcm_block(3, 0, 1920, 960),
+            test_pcm_block(3, 0, 2880, 960),
+            test_pcm_block(4, 1, 0, 960),
+            test_pcm_block(4, 1, 960, 960),
+            test_pcm_block(4, 1, 1920, 960),
+            test_pcm_block(4, 1, 2880, 960),
+        ]
+    }
+
+    fn test_pcm_block(
+        track_id: u32,
+        channel_index: u16,
+        start_sample: u64,
+        sample_count: u32,
+    ) -> PcmAudioBlock {
+        let format = PcmSampleFormat::SignedInteger {
+            bits_per_sample: 24,
+            endian: PcmEndian::Little,
+        };
+        PcmAudioBlock::new(
+            duration_from_audio_samples(start_sample, 48_000).unwrap(),
+            duration_from_audio_samples(u64::from(sample_count), 48_000).unwrap(),
+            48_000,
+            sample_count,
+            format,
+            PcmAudioBlockLayout::MonoTrack {
+                track_id,
+                channel_index,
+            },
+            vec![0_u8; pcm_payload_byte_len(sample_count, 1, format).unwrap()],
+        )
+        .unwrap()
     }
 
     #[test]

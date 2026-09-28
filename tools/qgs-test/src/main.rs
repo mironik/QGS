@@ -12,12 +12,15 @@ use qgs_linux::{
     send_message,
 };
 use qgs_media_runtime::{
-    audio_samples_for_duration, classify_presentation, duration_abs_delta,
-    duration_from_audio_samples, max_video_timestamp_outside_audio_range, AudioFormat,
-    AudioSampleFormat, AudioTimeline, AudioTimingPacket, BoundedQueue,
-    FrameIdentity as PlaybackFrameIdentity, OriginalAudioTrack, PcmAudioBlock, PcmAudioBlockLayout,
-    PcmAudioPacket, PcmEndian, PcmSampleFormat, PlaybackClock, PlaybackConfig, PlaybackState,
-    PresentationDecision, RationalRate, RealTimeClock, TestAudioSink, TestPresentationSink,
+    audio_samples_for_duration, av_frame_audio_range, classify_presentation, duration_abs_delta,
+    duration_from_audio_samples, max_video_timestamp_outside_audio_range,
+    summarize_broadcast_runtime_contract, AudioFormat, AudioSampleFormat, AudioTimeline,
+    AudioTimingPacket, AvFrameAudioRange, BoundedQueue, BroadcastMediaSourceRole,
+    BroadcastPreviewProfile, BroadcastRuntimeCapabilities, BroadcastRuntimeQueueLimits,
+    BroadcastRuntimeSessionDescription, FrameIdentity as PlaybackFrameIdentity, OriginalAudioTrack,
+    PcmAudioBlock, PcmAudioBlockLayout, PcmAudioPacket, PcmEndian, PcmSampleFormat, PlaybackClock,
+    PlaybackConfig, PlaybackState, PresentationDecision, RationalRate, RealTimeClock,
+    TestAudioSink, TestPresentationSink,
 };
 use qgs_mp4::{
     classify_video_track, nearest_random_access_before, MediaHealth, Mp4Source, Mp4TrackKind,
@@ -62,6 +65,7 @@ const PROXY_PLAYBACK_ARG: &str = "--proxy-playback";
 const PROXY_PLAYBACK_PROFILE_ARG: &str = "--proxy-playback-profile";
 const QNC_JOURNALIST_DEMO_ARG: &str = "--qnc-journalist-demo";
 const ORIGINAL_AUDIO_EXTRACT_ARG: &str = "--original-audio-extract";
+const BROADCAST_RUNTIME_CONTRACT_ARG: &str = "--broadcast-runtime-contract";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -103,6 +107,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(path) = args.original_audio_extract_path {
         return original_audio_extract(&path);
+    }
+    if let Some((original, proxy)) = args.broadcast_runtime_contract_paths {
+        return broadcast_runtime_contract(&original, &proxy);
     }
 
     let socket_path = args.socket_path;
@@ -1876,6 +1883,280 @@ fn consume_pcm_audio_block(
         .checked_add(u64::try_from(block.payload_bytes()).map_err(|_| "payload size overflow")?)
         .ok_or("PCM track block payload byte count overflow")?;
     Ok(())
+}
+
+fn broadcast_runtime_contract(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let original_bytes = std::fs::read(original_path)?;
+    let original = MediaSource::parse(&original_bytes)?;
+    let proxy = Mp4Source::open(proxy_path)?;
+    let proxy_video = proxy
+        .video
+        .as_ref()
+        .ok_or("proxy has no H.264 video track")?;
+    let proxy_h264 = classify_video_track(proxy_video)?;
+    let audio_tracks = original
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Audio)
+        .collect::<Vec<_>>();
+    if audio_tracks.is_empty() {
+        return Err("original MXF has no audio tracks".into());
+    }
+
+    let sample_rate = original_audio_sample_rate(&audio_tracks)?;
+    let blocks = build_original_pcm_blocks(&original, &original_bytes)?;
+    let audio_duration = blocks
+        .iter()
+        .map(|block| block.end_time())
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .ok_or("no original PCM blocks available")?;
+    let queue_limits = BroadcastRuntimeQueueLimits {
+        audio_block_capacity: 8,
+        video_frame_capacity: 6,
+        processed_frame_capacity: 3,
+    };
+    let session = BroadcastRuntimeSessionDescription {
+        audio_source: BroadcastMediaSourceRole::OriginalAuthoritativeAudio,
+        video_source: BroadcastMediaSourceRole::ProxyPreviewVideo,
+        preview_profile: BroadcastPreviewProfile::Journalist50iPreview,
+        audio_sample_rate: sample_rate,
+        audio_track_count: audio_tracks.len(),
+        queue_limits,
+        capabilities: BroadcastRuntimeCapabilities {
+            sample_clock_aware: true,
+            preserves_original_pcm_format: true,
+            preserves_track_channel_identity: true,
+            proxy_video_preview: true,
+            proxy_audio_primary: false,
+            ui_dependent: false,
+        },
+    }
+    .validate()?;
+
+    let selected = selected_journalist_preview_frames(proxy_video)?;
+    let frame_duration = ProxyPlaybackProfile::Journalist50iPreview
+        .presentation_rate(RationalRate::new(
+            u64::from(proxy_video.frame_rate.numerator),
+            u64::from(proxy_video.frame_rate.denominator),
+        )?)?
+        .frame_duration()?;
+    let ranges = selected
+        .iter()
+        .map(|frame| {
+            av_frame_audio_range(
+                frame.preview_index,
+                frame.start_time,
+                frame_duration,
+                sample_rate,
+                &blocks,
+                audio_tracks.len(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let summary = summarize_broadcast_runtime_contract(&ranges, audio_duration);
+
+    println!("QGS Broadcast Runtime Contract Draft");
+    println!("------------------------------------");
+    println!("Audio source: original MXF");
+    println!("Video source: proxy MP4");
+    println!("Proxy AAC: not used");
+    println!("Preview profile: journalist-50i-preview");
+    println!("Clock owner: future QNC application/runtime policy, not QGS UI");
+    println!("Contract owner: QGS backend-neutral Broadcast Runtime");
+    println!(
+        "Session: audio_role={:?} video_role={:?} sample_clock_aware={} ui_dependent={}",
+        session.audio_source,
+        session.video_source,
+        yes_no(session.capabilities.sample_clock_aware),
+        yes_no(session.capabilities.ui_dependent)
+    );
+    println!(
+        "Proxy video: {}x{} H.264 {:?} {}-bit {:?} source_frames={} selected_preview_frames={}",
+        proxy_h264.width,
+        proxy_h264.height,
+        proxy_h264.profile,
+        proxy_h264.bit_depth,
+        proxy_h264.chroma,
+        proxy_video.samples.len(),
+        selected.len()
+    );
+    println!(
+        "Original audio: tracks={} sample_rate={}Hz blocks={} duration={:.3}s",
+        audio_tracks.len(),
+        sample_rate,
+        blocks.len(),
+        audio_duration.as_secs_f64()
+    );
+    println!(
+        "Queue limits: audio_blocks={} video_frames={} processed_frames={}",
+        queue_limits.audio_block_capacity,
+        queue_limits.video_frame_capacity,
+        queue_limits.processed_frame_capacity
+    );
+    println!(
+        "Frames checked: {} complete={} incomplete={} outside_audio_range={} max_av_delta_ms={:.3}",
+        summary.frames_checked,
+        summary.complete_frames,
+        summary.incomplete_frames,
+        summary.frames_outside_audio_range,
+        summary.max_audio_video_delta.as_secs_f64() * 1000.0
+    );
+    println!(
+        "Suitable for Broadcast Runtime contract: {}",
+        yes_no(summary.suitable_for_broadcast_runtime_contract)
+    );
+    println!("Representative frame-to-sample ranges:");
+    for index in representative_range_indices(ranges.len()) {
+        print_av_range(&selected[index], &ranges[index]);
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct SelectedPreviewFrame {
+    preview_index: u64,
+    source_presentation_index: u64,
+    sample_index: u32,
+    start_time: Duration,
+}
+
+fn selected_journalist_preview_frames(
+    proxy_video: &qgs_mp4::Mp4VideoTrack,
+) -> Result<Vec<SelectedPreviewFrame>, Box<dyn std::error::Error>> {
+    let mut ordered = proxy_video
+        .samples
+        .iter()
+        .map(|sample| (sample.pts, sample.sample_index, sample))
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(pts, sample_index, _)| (*pts, *sample_index));
+    let media_origin_pts = ordered
+        .first()
+        .map(|(pts, _, _)| *pts)
+        .ok_or("proxy video has no samples")?;
+    let mut selected = Vec::new();
+    for (source_presentation_index, (_, _, sample)) in ordered.into_iter().enumerate() {
+        let source_presentation_index = u64::try_from(source_presentation_index)?;
+        let Some(preview_index) = ProxyPlaybackProfile::Journalist50iPreview
+            .presentation_position(source_presentation_index)
+        else {
+            continue;
+        };
+        let relative_pts = sample
+            .pts
+            .checked_sub(media_origin_pts)
+            .ok_or("proxy PTS precedes media origin")?;
+        let pts = u64::try_from(relative_pts).map_err(|_| "negative proxy PTS is unsupported")?;
+        selected.push(SelectedPreviewFrame {
+            preview_index,
+            source_presentation_index,
+            sample_index: sample.sample_index,
+            start_time: duration_from_units(pts, u64::from(proxy_video.timescale), 1)?,
+        });
+    }
+    Ok(selected)
+}
+
+fn build_original_pcm_blocks(
+    source: &MediaSource,
+    bytes: &[u8],
+) -> Result<Vec<PcmAudioBlock>, Box<dyn std::error::Error>> {
+    let mut blocks = Vec::with_capacity(source.index.audio.len());
+    for entry_index in 0..source.index.audio.len() {
+        let extracted = source.extract_pcm_audio_packet(bytes, entry_index)?;
+        let track = source
+            .tracks
+            .iter()
+            .find(|track| track.id == extracted.entry.track_id)
+            .ok_or("PCM packet references missing audio track")?;
+        let audio = track
+            .audio
+            .as_ref()
+            .ok_or("PCM packet track has no audio descriptor")?;
+        let sample_rate = rational_to_u32(audio.sample_rate.ok_or("audio sample rate missing")?)?;
+        let bits_per_sample = audio.bit_depth.ok_or("audio bit depth missing")?;
+        let format = PcmSampleFormat::SignedInteger {
+            bits_per_sample,
+            endian: PcmEndian::Little,
+        };
+        let packet = PcmAudioPacket::new(
+            extracted.entry.track_id.0,
+            extracted.entry.channel_index,
+            duration_from_audio_samples(extracted.entry.start_sample, sample_rate)?,
+            duration_from_audio_samples(u64::from(extracted.entry.sample_count), sample_rate)?,
+            extracted.entry.sample_count,
+            format,
+            extracted.payload,
+        )?;
+        blocks.push(PcmAudioBlock::from_mono_packet(packet, sample_rate)?);
+    }
+    Ok(blocks)
+}
+
+fn original_audio_sample_rate(
+    audio_tracks: &[&qgs_mxf::MxfTrack],
+) -> Result<u32, Box<dyn std::error::Error>> {
+    let mut sample_rate = None;
+    for track in audio_tracks {
+        let audio = track.audio.as_ref().ok_or("audio descriptor missing")?;
+        let track_rate = rational_to_u32(audio.sample_rate.ok_or("audio sample rate missing")?)?;
+        if let Some(sample_rate) = sample_rate {
+            if sample_rate != track_rate {
+                return Err("mixed original audio sample rates are not supported yet".into());
+            }
+        } else {
+            sample_rate = Some(track_rate);
+        }
+    }
+    sample_rate.ok_or_else(|| "no original audio sample rate available".into())
+}
+
+fn representative_range_indices(len: usize) -> Vec<usize> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let mut indices = vec![0, len / 2, len - 1];
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
+fn print_av_range(frame: &SelectedPreviewFrame, range: &AvFrameAudioRange) {
+    let track_ids = range
+        .covered_tracks
+        .iter()
+        .map(|coverage| coverage.track_id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let total_gaps = range
+        .covered_tracks
+        .iter()
+        .map(|coverage| u64::from(coverage.gaps))
+        .sum::<u64>();
+    let total_overlaps = range
+        .covered_tracks
+        .iter()
+        .map(|coverage| u64::from(coverage.overlaps))
+        .sum::<u64>();
+    println!(
+        "  preview_frame={} source_presentation={} sample_index={} video_start={:.3}s audio_samples={}..{} sample_count={} tracks=[{}] complete={} gaps={} overlaps={}",
+        frame.preview_index,
+        frame.source_presentation_index,
+        frame.sample_index,
+        frame.start_time.as_secs_f64(),
+        range.audio_start_sample,
+        range.audio_start_sample + range.audio_sample_count,
+        range.audio_sample_count,
+        track_ids,
+        yes_no(range.complete),
+        total_gaps,
+        total_overlaps
+    );
 }
 
 fn duration_from_units(
@@ -6488,6 +6769,7 @@ struct Args {
     proxy_playback_profile: ProxyPlaybackProfile,
     qnc_journalist_demo_paths: Option<(PathBuf, PathBuf)>,
     original_audio_extract_path: Option<PathBuf>,
+    broadcast_runtime_contract_paths: Option<(PathBuf, PathBuf)>,
 }
 
 impl Args {
@@ -6512,6 +6794,8 @@ impl Args {
         let mut qnc_journalist_demo_original = None;
         let mut qnc_journalist_demo_paths = None;
         let mut original_audio_extract_path = None;
+        let mut broadcast_runtime_contract_original = None;
+        let mut broadcast_runtime_contract_paths = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
@@ -6522,9 +6806,22 @@ impl Args {
         let mut next_arg_is_qnc_journalist_demo_original = false;
         let mut next_arg_is_qnc_journalist_demo_proxy = false;
         let mut next_arg_is_original_audio_extract_path = false;
+        let mut next_arg_is_broadcast_runtime_contract_original = false;
+        let mut next_arg_is_broadcast_runtime_contract_proxy = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_original_audio_extract_path {
+            if next_arg_is_broadcast_runtime_contract_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = broadcast_runtime_contract_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                broadcast_runtime_contract_paths = Some((original, proxy));
+                next_arg_is_broadcast_runtime_contract_proxy = false;
+            } else if next_arg_is_broadcast_runtime_contract_original {
+                broadcast_runtime_contract_original = Some(PathBuf::from(arg));
+                next_arg_is_broadcast_runtime_contract_original = false;
+                next_arg_is_broadcast_runtime_contract_proxy = true;
+            } else if next_arg_is_original_audio_extract_path {
                 original_audio_extract_path = Some(PathBuf::from(arg));
                 next_arg_is_original_audio_extract_path = false;
             } else if next_arg_is_qnc_journalist_demo_proxy {
@@ -6609,6 +6906,8 @@ impl Args {
                 next_arg_is_qnc_journalist_demo_original = true;
             } else if arg == ORIGINAL_AUDIO_EXTRACT_ARG {
                 next_arg_is_original_audio_extract_path = true;
+            } else if arg == BROADCAST_RUNTIME_CONTRACT_ARG {
+                next_arg_is_broadcast_runtime_contract_original = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -6628,6 +6927,7 @@ impl Args {
             proxy_playback_profile,
             qnc_journalist_demo_paths,
             original_audio_extract_path,
+            broadcast_runtime_contract_paths,
         }
     }
 }
