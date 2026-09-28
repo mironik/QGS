@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
@@ -1181,6 +1181,310 @@ pub fn summarize_broadcast_player_runtime_events(
             .iter()
             .any(|event| matches!(event, BroadcastPlayerRuntimeEvent::CapabilityMissing { .. })),
         frame_presented_events: 0,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastAudioBlockCoverage {
+    pub track_id: u32,
+    pub channel_index: u16,
+    pub block_index: usize,
+    pub block_start_sample: u64,
+    pub block_sample_count: u64,
+    pub byte_offset_within_block: usize,
+    pub byte_count: usize,
+    pub full_block: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastAudioPayloadBinding {
+    pub audio_slot_index: usize,
+    pub source_mode: BroadcastVideoSourceMode,
+    pub start_sample: u64,
+    pub sample_count: u64,
+    pub sample_rate: u32,
+    pub track_count: usize,
+    pub block_coverage: Vec<BroadcastAudioBlockCoverage>,
+    pub total_referenced_payload_bytes: u64,
+    pub complete: bool,
+}
+
+pub fn bind_broadcast_audio_payload(
+    slot: &BroadcastPreparedAudioSlot,
+    blocks: &[PcmAudioBlock],
+) -> Result<BroadcastAudioPayloadBinding, PlaybackError> {
+    if slot.audio_source_role != BroadcastMediaSourceRole::OriginalAuthoritativeAudio {
+        return Err(PlaybackError::InvalidAudioFormat);
+    }
+    let first_block = blocks.first().ok_or(PlaybackError::InvalidAudioFormat)?;
+    let sample_rate = first_block.sample_rate;
+    let range_start = slot.start_sample;
+    let range_end = slot
+        .start_sample
+        .checked_add(slot.sample_count)
+        .ok_or(PlaybackError::TimestampOverflow)?;
+    let mut block_coverage = Vec::new();
+    let mut coverage_ranges: BTreeMap<(u32, u16), Vec<(u64, u64)>> = BTreeMap::new();
+    let mut total_referenced_payload_bytes = 0_u64;
+
+    for (block_index, block) in blocks.iter().enumerate() {
+        if block.sample_rate != sample_rate {
+            return Err(PlaybackError::InvalidAudioFormat);
+        }
+        let (track_id, channel_index) = match block.layout {
+            PcmAudioBlockLayout::MonoTrack {
+                track_id,
+                channel_index,
+            } => (track_id, channel_index),
+            PcmAudioBlockLayout::InterleavedChannels { .. } => {
+                return Err(PlaybackError::InvalidAudioFormat)
+            }
+        };
+        if !slot.track_coverage.iter().any(|coverage| {
+            coverage.track_id == track_id && coverage.channel_index == channel_index
+        }) {
+            continue;
+        }
+        let block_start = audio_samples_for_duration(block.start_time, sample_rate)?;
+        let block_sample_count = u64::from(block.sample_count);
+        let block_end = block_start
+            .checked_add(block_sample_count)
+            .ok_or(PlaybackError::TimestampOverflow)?;
+        let overlap_start = range_start.max(block_start);
+        let overlap_end = range_end.min(block_end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+        let overlap_samples = overlap_end - overlap_start;
+        let sample_offset = overlap_start - block_start;
+        let channel_count = block.layout.channel_count()?;
+        let overlap_samples_u32 =
+            u32::try_from(overlap_samples).map_err(|_| PlaybackError::TimestampOverflow)?;
+        let sample_offset_u32 =
+            u32::try_from(sample_offset).map_err(|_| PlaybackError::TimestampOverflow)?;
+        let byte_count = pcm_payload_byte_len(overlap_samples_u32, channel_count, block.format)?;
+        let byte_offset_within_block =
+            pcm_payload_byte_len(sample_offset_u32, channel_count, block.format)?;
+        total_referenced_payload_bytes = total_referenced_payload_bytes
+            .checked_add(u64::try_from(byte_count).map_err(|_| PlaybackError::TimestampOverflow)?)
+            .ok_or(PlaybackError::TimestampOverflow)?;
+        coverage_ranges
+            .entry((track_id, channel_index))
+            .or_default()
+            .push((overlap_start, overlap_end));
+        block_coverage.push(BroadcastAudioBlockCoverage {
+            track_id,
+            channel_index,
+            block_index,
+            block_start_sample: block_start,
+            block_sample_count,
+            byte_offset_within_block,
+            byte_count,
+            full_block: overlap_start == block_start && overlap_end == block_end,
+        });
+    }
+
+    let complete = slot.complete
+        && slot.track_coverage.iter().all(|coverage| {
+            coverage.complete
+                && coverage_ranges
+                    .get(&(coverage.track_id, coverage.channel_index))
+                    .map(|ranges| sample_range_is_covered(ranges, range_start, range_end))
+                    .unwrap_or(false)
+        });
+
+    Ok(BroadcastAudioPayloadBinding {
+        audio_slot_index: slot.slot_index,
+        source_mode: slot.source_mode,
+        start_sample: slot.start_sample,
+        sample_count: slot.sample_count,
+        sample_rate,
+        track_count: slot.track_coverage.len(),
+        block_coverage,
+        total_referenced_payload_bytes,
+        complete,
+    })
+}
+
+fn sample_range_is_covered(ranges: &[(u64, u64)], range_start: u64, range_end: u64) -> bool {
+    let mut sorted = ranges.to_vec();
+    sorted.sort_unstable_by_key(|(start, end)| (*start, *end));
+    let mut cursor = range_start;
+    for (start, end) in sorted {
+        if start > cursor {
+            return false;
+        }
+        if end > cursor {
+            cursor = end;
+            if cursor >= range_end {
+                return true;
+            }
+        }
+    }
+    cursor >= range_end
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastVideoPayloadBindingStatus {
+    AccountedOnly,
+    PayloadReady,
+    CapabilityMissing,
+    NotSupported,
+    Missing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastVideoPayloadBinding {
+    pub video_slot_index: usize,
+    pub source_mode: BroadcastVideoSourceMode,
+    pub video_source_role: BroadcastMediaSourceRole,
+    pub source_frame_index: Option<u64>,
+    pub selected_preview_frame_index: Option<u64>,
+    pub status: BroadcastVideoPayloadBindingStatus,
+    pub payload_id: Option<u64>,
+}
+
+pub fn bind_broadcast_video_payload_accounting(
+    slot: &BroadcastPreparedVideoSlot,
+) -> BroadcastVideoPayloadBinding {
+    let status = match slot.status {
+        BroadcastPreparedVideoSlotStatus::Prepared => {
+            if slot.source_mode == BroadcastVideoSourceMode::ProxyPreview {
+                BroadcastVideoPayloadBindingStatus::AccountedOnly
+            } else {
+                BroadcastVideoPayloadBindingStatus::PayloadReady
+            }
+        }
+        BroadcastPreparedVideoSlotStatus::CapabilityMissing => {
+            BroadcastVideoPayloadBindingStatus::CapabilityMissing
+        }
+        BroadcastPreparedVideoSlotStatus::NotSupported => {
+            BroadcastVideoPayloadBindingStatus::NotSupported
+        }
+        BroadcastPreparedVideoSlotStatus::Missing
+        | BroadcastPreparedVideoSlotStatus::IntentionalSkip => {
+            BroadcastVideoPayloadBindingStatus::Missing
+        }
+    };
+    BroadcastVideoPayloadBinding {
+        video_slot_index: slot.slot_index,
+        source_mode: slot.source_mode,
+        video_source_role: slot.video_source_role,
+        source_frame_index: slot.source_frame_index,
+        selected_preview_frame_index: slot.selected_preview_frame_index,
+        status,
+        payload_id: None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastPresentationPayloadReadiness {
+    RuntimeAccountingReady,
+    DevicePayloadReady,
+    CapabilityMissing,
+    NotReady,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastPresentationPayloadBinding {
+    pub presentation_slot_index: usize,
+    pub video_binding_index: usize,
+    pub audio_binding_index: usize,
+    pub presentation_time: Duration,
+    pub duration: Duration,
+    pub ready: bool,
+    pub readiness: BroadcastPresentationPayloadReadiness,
+}
+
+pub fn bind_broadcast_presentation_payload(
+    slot: &BroadcastPreparedPresentationSlot,
+    video_binding: &BroadcastVideoPayloadBinding,
+    audio_binding: &BroadcastAudioPayloadBinding,
+) -> BroadcastPresentationPayloadBinding {
+    let readiness = match (video_binding.status, audio_binding.complete) {
+        (BroadcastVideoPayloadBindingStatus::PayloadReady, true) => {
+            BroadcastPresentationPayloadReadiness::DevicePayloadReady
+        }
+        (BroadcastVideoPayloadBindingStatus::AccountedOnly, true) => {
+            BroadcastPresentationPayloadReadiness::RuntimeAccountingReady
+        }
+        (BroadcastVideoPayloadBindingStatus::CapabilityMissing, _) => {
+            BroadcastPresentationPayloadReadiness::CapabilityMissing
+        }
+        _ => BroadcastPresentationPayloadReadiness::NotReady,
+    };
+    BroadcastPresentationPayloadBinding {
+        presentation_slot_index: slot.presentation_index,
+        video_binding_index: video_binding.video_slot_index,
+        audio_binding_index: audio_binding.audio_slot_index,
+        presentation_time: slot.presentation_time,
+        duration: slot.duration,
+        ready: matches!(
+            readiness,
+            BroadcastPresentationPayloadReadiness::RuntimeAccountingReady
+                | BroadcastPresentationPayloadReadiness::DevicePayloadReady
+        ),
+        readiness,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastPayloadBindingSummary {
+    pub source_mode: BroadcastVideoSourceMode,
+    pub audio_binding_capacity: usize,
+    pub audio_binding_count: usize,
+    pub video_binding_capacity: usize,
+    pub video_binding_count: usize,
+    pub presentation_binding_capacity: usize,
+    pub presentation_binding_count: usize,
+    pub complete_audio_bindings: usize,
+    pub runtime_accounting_ready_presentations: usize,
+    pub device_payload_ready_presentations: usize,
+    pub capability_missing_presentations: usize,
+    pub total_referenced_audio_bytes: u64,
+}
+
+pub fn summarize_broadcast_payload_bindings(
+    source_mode: BroadcastVideoSourceMode,
+    config: BroadcastPrerollConfig,
+    audio_bindings: &[BroadcastAudioPayloadBinding],
+    video_bindings: &[BroadcastVideoPayloadBinding],
+    presentation_bindings: &[BroadcastPresentationPayloadBinding],
+) -> BroadcastPayloadBindingSummary {
+    BroadcastPayloadBindingSummary {
+        source_mode,
+        audio_binding_capacity: config.max_audio_queue,
+        audio_binding_count: audio_bindings.len(),
+        video_binding_capacity: config.max_video_queue,
+        video_binding_count: video_bindings.len(),
+        presentation_binding_capacity: config.max_presentation_queue,
+        presentation_binding_count: presentation_bindings.len(),
+        complete_audio_bindings: audio_bindings
+            .iter()
+            .filter(|binding| binding.complete)
+            .count(),
+        runtime_accounting_ready_presentations: presentation_bindings
+            .iter()
+            .filter(|binding| {
+                binding.readiness == BroadcastPresentationPayloadReadiness::RuntimeAccountingReady
+            })
+            .count(),
+        device_payload_ready_presentations: presentation_bindings
+            .iter()
+            .filter(|binding| {
+                binding.readiness == BroadcastPresentationPayloadReadiness::DevicePayloadReady
+            })
+            .count(),
+        capability_missing_presentations: presentation_bindings
+            .iter()
+            .filter(|binding| {
+                binding.readiness == BroadcastPresentationPayloadReadiness::CapabilityMissing
+            })
+            .count(),
+        total_referenced_audio_bytes: audio_bindings
+            .iter()
+            .map(|binding| binding.total_referenced_payload_bytes)
+            .sum(),
     }
 }
 
@@ -2550,6 +2854,150 @@ mod tests {
         assert!(presentation_slots
             .iter()
             .all(|slot| slot.selected_source_frame.unwrap().is_multiple_of(2)));
+    }
+
+    #[test]
+    fn audio_payload_binding_references_exact_blocks_without_copying_payload() {
+        let range = av_frame_audio_range(
+            0,
+            Duration::ZERO,
+            Duration::from_millis(40),
+            48_000,
+            &clock_ready_blocks(),
+            2,
+        )
+        .unwrap();
+        let slot = BroadcastPreparedAudioSlot::from_audio_range(
+            0,
+            BroadcastVideoSourceMode::ProxyPreview,
+            &range,
+        );
+        let binding = bind_broadcast_audio_payload(&slot, &clock_ready_blocks()).unwrap();
+
+        assert!(binding.complete);
+        assert_eq!(binding.track_count, 2);
+        assert_eq!(binding.block_coverage.len(), 4);
+        assert!(binding
+            .block_coverage
+            .iter()
+            .all(|coverage| coverage.full_block));
+        assert_eq!(binding.total_referenced_payload_bytes, 11_520);
+    }
+
+    #[test]
+    fn audio_payload_binding_handles_partial_leading_and_trailing_blocks() {
+        let range = av_frame_audio_range(
+            0,
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+            48_000,
+            &clock_ready_blocks(),
+            2,
+        )
+        .unwrap();
+        let slot = BroadcastPreparedAudioSlot::from_audio_range(
+            0,
+            BroadcastVideoSourceMode::ProxyPreview,
+            &range,
+        );
+        let binding = bind_broadcast_audio_payload(&slot, &clock_ready_blocks()).unwrap();
+
+        assert!(binding.complete);
+        assert_eq!(binding.sample_count, 960);
+        assert_eq!(binding.block_coverage.len(), 4);
+        assert!(binding
+            .block_coverage
+            .iter()
+            .any(|coverage| coverage.byte_offset_within_block == 1_440));
+        assert!(binding
+            .block_coverage
+            .iter()
+            .all(|coverage| !coverage.full_block));
+        assert_eq!(binding.total_referenced_payload_bytes, 5_760);
+    }
+
+    #[test]
+    fn audio_payload_binding_detects_missing_track_payload() {
+        let range = av_frame_audio_range(
+            0,
+            Duration::ZERO,
+            Duration::from_millis(40),
+            48_000,
+            &clock_ready_blocks(),
+            2,
+        )
+        .unwrap();
+        let slot = BroadcastPreparedAudioSlot::from_audio_range(
+            0,
+            BroadcastVideoSourceMode::ProxyPreview,
+            &range,
+        );
+        let missing_track_blocks = clock_ready_blocks()
+            .into_iter()
+            .filter(|block| block.track_id() == Some(3))
+            .collect::<Vec<_>>();
+        let binding = bind_broadcast_audio_payload(&slot, &missing_track_blocks).unwrap();
+
+        assert!(!binding.complete);
+        assert_eq!(binding.block_coverage.len(), 2);
+    }
+
+    #[test]
+    fn video_payload_binding_reports_accounted_only_and_capability_missing() {
+        let proxy_video = &test_prepared_video_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
+        let proxy_binding = bind_broadcast_video_payload_accounting(proxy_video);
+        assert_eq!(
+            proxy_binding.status,
+            BroadcastVideoPayloadBindingStatus::AccountedOnly
+        );
+        assert_eq!(proxy_binding.payload_id, None);
+
+        let original_video = BroadcastPreparedVideoSlot {
+            status: BroadcastPreparedVideoSlotStatus::CapabilityMissing,
+            ..test_prepared_video_slots(BroadcastVideoSourceMode::OriginalMedia)[0].clone()
+        };
+        let original_binding = bind_broadcast_video_payload_accounting(&original_video);
+        assert_eq!(
+            original_binding.status,
+            BroadcastVideoPayloadBindingStatus::CapabilityMissing
+        );
+    }
+
+    #[test]
+    fn presentation_payload_binding_classifies_readiness() {
+        let video_slot = &test_prepared_video_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
+        let video_binding = bind_broadcast_video_payload_accounting(video_slot);
+        let audio_slot = &test_prepared_audio_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
+        let audio_binding =
+            bind_broadcast_audio_payload(audio_slot, &clock_ready_blocks_120ms()).unwrap();
+        let presentation_slot =
+            &test_prepared_presentation_slots(BroadcastVideoSourceMode::ProxyPreview, true)[0];
+        let presentation_binding =
+            bind_broadcast_presentation_payload(presentation_slot, &video_binding, &audio_binding);
+
+        assert!(presentation_binding.ready);
+        assert_eq!(
+            presentation_binding.readiness,
+            BroadcastPresentationPayloadReadiness::RuntimeAccountingReady
+        );
+
+        let original_video = BroadcastPreparedVideoSlot {
+            status: BroadcastPreparedVideoSlotStatus::CapabilityMissing,
+            ..test_prepared_video_slots(BroadcastVideoSourceMode::OriginalMedia)[0].clone()
+        };
+        let original_video_binding = bind_broadcast_video_payload_accounting(&original_video);
+        let original_presentation =
+            &test_prepared_presentation_slots(BroadcastVideoSourceMode::OriginalMedia, false)[0];
+        let original_binding = bind_broadcast_presentation_payload(
+            original_presentation,
+            &original_video_binding,
+            &audio_binding,
+        );
+        assert!(!original_binding.ready);
+        assert_eq!(
+            original_binding.readiness,
+            BroadcastPresentationPayloadReadiness::CapabilityMissing
+        );
     }
 
     #[test]

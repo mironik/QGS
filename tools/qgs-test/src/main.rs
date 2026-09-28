@@ -12,9 +12,11 @@ use qgs_linux::{
     send_message,
 };
 use qgs_media_runtime::{
-    audio_samples_for_duration, av_frame_audio_range, build_broadcast_player_event_surface,
-    classify_presentation, duration_abs_delta, duration_from_audio_samples,
-    evaluate_broadcast_preroll, max_video_timestamp_outside_audio_range,
+    audio_samples_for_duration, av_frame_audio_range, bind_broadcast_audio_payload,
+    bind_broadcast_presentation_payload, bind_broadcast_video_payload_accounting,
+    build_broadcast_player_event_surface, classify_presentation, duration_abs_delta,
+    duration_from_audio_samples, evaluate_broadcast_preroll,
+    max_video_timestamp_outside_audio_range, summarize_broadcast_payload_bindings,
     summarize_broadcast_player_runtime_events, summarize_broadcast_prepared_slots,
     summarize_broadcast_runtime_contract, AudioFormat, AudioSampleFormat, AudioTimeline,
     AudioTimingPacket, AvFrameAudioRange, BoundedQueue, BroadcastMediaSourceRole,
@@ -22,10 +24,10 @@ use qgs_media_runtime::{
     BroadcastPreparedVideoSlotStatus, BroadcastPrerollConfig, BroadcastPrerollPlan,
     BroadcastPreviewProfile, BroadcastRuntimeCapabilities, BroadcastRuntimePrepareFacts,
     BroadcastRuntimeQueueLimits, BroadcastRuntimeSessionDescription, BroadcastRuntimeStateMachine,
-    BroadcastVideoSourceMode, FrameIdentity as PlaybackFrameIdentity, OriginalAudioTrack,
-    PcmAudioBlock, PcmAudioBlockLayout, PcmAudioPacket, PcmEndian, PcmSampleFormat, PlaybackClock,
-    PlaybackConfig, PlaybackState, PresentationDecision, RationalRate, RealTimeClock,
-    TestAudioSink, TestPresentationSink,
+    BroadcastVideoPayloadBindingStatus, BroadcastVideoSourceMode,
+    FrameIdentity as PlaybackFrameIdentity, OriginalAudioTrack, PcmAudioBlock, PcmAudioBlockLayout,
+    PcmAudioPacket, PcmEndian, PcmSampleFormat, PlaybackClock, PlaybackConfig, PlaybackState,
+    PresentationDecision, RationalRate, RealTimeClock, TestAudioSink, TestPresentationSink,
 };
 use qgs_mp4::{
     classify_video_track, nearest_random_access_before, MediaHealth, Mp4Source, Mp4TrackKind,
@@ -75,6 +77,7 @@ const BROADCAST_RUNTIME_STATE_MACHINE_ARG: &str = "--broadcast-runtime-state-mac
 const BROADCAST_RUNTIME_PREROLL_ARG: &str = "--broadcast-runtime-preroll";
 const BROADCAST_RUNTIME_PREPARED_SLOTS_ARG: &str = "--broadcast-runtime-prepared-slots";
 const BROADCAST_PLAYER_RUNTIME_EVENTS_ARG: &str = "--broadcast-player-runtime-events";
+const BROADCAST_PLAYER_RUNTIME_PAYLOADS_ARG: &str = "--broadcast-player-runtime-payloads";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -127,10 +130,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return broadcast_runtime_preroll(&original, &proxy);
     }
     if let Some((original, proxy)) = args.broadcast_runtime_prepared_slots_paths {
-        return broadcast_runtime_prepared_slots(&original, &proxy, false);
+        return broadcast_runtime_prepared_slots(
+            &original,
+            &proxy,
+            BroadcastRuntimeReportFocus::PreparedSlots,
+        );
     }
     if let Some((original, proxy)) = args.broadcast_player_runtime_events_paths {
-        return broadcast_runtime_prepared_slots(&original, &proxy, true);
+        return broadcast_runtime_prepared_slots(
+            &original,
+            &proxy,
+            BroadcastRuntimeReportFocus::Events,
+        );
+    }
+    if let Some((original, proxy)) = args.broadcast_player_runtime_payloads_paths {
+        return broadcast_runtime_prepared_slots(
+            &original,
+            &proxy,
+            BroadcastRuntimeReportFocus::Payloads,
+        );
     }
 
     let socket_path = args.socket_path;
@@ -2433,7 +2451,7 @@ fn broadcast_runtime_preroll(
 fn broadcast_runtime_prepared_slots(
     original_path: &Path,
     proxy_path: &Path,
-    event_surface_focus: bool,
+    report_focus: BroadcastRuntimeReportFocus,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let original_bytes = std::fs::read(original_path)?;
     let original = MediaSource::parse(&original_bytes)?;
@@ -2587,6 +2605,32 @@ fn broadcast_runtime_prepared_slots(
         &proxy_audio_slots,
         &proxy_presentation_slots,
     );
+    let proxy_audio_payload_bindings = proxy_audio_slots
+        .iter()
+        .map(|slot| bind_broadcast_audio_payload(slot, &blocks))
+        .collect::<Result<Vec<_>, _>>()?;
+    let proxy_video_payload_bindings = proxy_video_slots
+        .iter()
+        .map(bind_broadcast_video_payload_accounting)
+        .collect::<Vec<_>>();
+    let proxy_presentation_payload_bindings = proxy_presentation_slots
+        .iter()
+        .enumerate()
+        .map(|(slot_index, slot)| {
+            bind_broadcast_presentation_payload(
+                slot,
+                &proxy_video_payload_bindings[slot_index],
+                &proxy_audio_payload_bindings[slot_index],
+            )
+        })
+        .collect::<Vec<_>>();
+    let proxy_payload_summary = summarize_broadcast_payload_bindings(
+        BroadcastVideoSourceMode::ProxyPreview,
+        config,
+        &proxy_audio_payload_bindings,
+        &proxy_video_payload_bindings,
+        &proxy_presentation_payload_bindings,
+    );
 
     let original_config = BroadcastPrerollConfig {
         video_source_mode: BroadcastVideoSourceMode::OriginalMedia,
@@ -2659,6 +2703,32 @@ fn broadcast_runtime_prepared_slots(
         &original_audio_slots,
         &original_presentation_slots,
     );
+    let original_audio_payload_bindings = original_audio_slots
+        .iter()
+        .map(|slot| bind_broadcast_audio_payload(slot, &blocks))
+        .collect::<Result<Vec<_>, _>>()?;
+    let original_video_payload_bindings = original_video_slots
+        .iter()
+        .map(bind_broadcast_video_payload_accounting)
+        .collect::<Vec<_>>();
+    let original_presentation_payload_bindings = original_presentation_slots
+        .iter()
+        .enumerate()
+        .map(|(slot_index, slot)| {
+            bind_broadcast_presentation_payload(
+                slot,
+                &original_video_payload_bindings[slot_index],
+                &original_audio_payload_bindings[slot_index],
+            )
+        })
+        .collect::<Vec<_>>();
+    let original_payload_summary = summarize_broadcast_payload_bindings(
+        BroadcastVideoSourceMode::OriginalMedia,
+        original_config,
+        &original_audio_payload_bindings,
+        &original_video_payload_bindings,
+        &original_presentation_payload_bindings,
+    );
 
     let mut runtime = BroadcastRuntimeStateMachine::create(session)?;
     runtime.prepare_with_preroll(
@@ -2727,14 +2797,24 @@ fn broadcast_runtime_prepared_slots(
         },
     );
 
-    if event_surface_focus {
-        println!("QGS Broadcast Player Runtime Event Surface");
-        println!("------------------------------------------");
-    } else {
-        println!("QGS Broadcast Player Runtime Prepared Payload Slots");
-        println!("---------------------------------------------------");
+    match report_focus {
+        BroadcastRuntimeReportFocus::PreparedSlots => {
+            println!("QGS Broadcast Player Runtime Prepared Payload Slots");
+            println!("---------------------------------------------------");
+        }
+        BroadcastRuntimeReportFocus::Events => {
+            println!("QGS Broadcast Player Runtime Event Surface");
+            println!("------------------------------------------");
+        }
+        BroadcastRuntimeReportFocus::Payloads => {
+            println!("QGS Broadcast Player Runtime Payload Binding");
+            println!("--------------------------------------------");
+        }
     }
-    println!("Not real playback: no speaker output, no display output, no real-time Broadcast Player loop");
+    println!(
+        "Not real playback: no speaker output, no display output, no real-time Broadcast Player loop"
+    );
+    println!("No FramePresented event");
     println!("No QNC UI integration");
     println!("Audio source: original MXF");
     println!("Proxy AAC: not used");
@@ -2798,12 +2878,66 @@ fn broadcast_runtime_prepared_slots(
         yes_no(proxy_event_summary.runtime_completed),
         proxy_event_summary.frame_presented_events
     );
-    if event_surface_focus {
+    if report_focus == BroadcastRuntimeReportFocus::Events {
         println!(
             "  Event sequence summary: SessionCreated -> PrepareStarted -> PrerollPlanned -> PreparedSlotAvailable x{} -> RuntimeReady -> TransportStarted -> FrameAccounted/AudioRangeAccounted x{} -> IntentionalProfileSkip x{} -> RuntimeCompleted",
             proxy_event_summary.prepared_slot_events,
             proxy_event_summary.frame_accounted_events,
             proxy_event_summary.intentional_skip_events
+        );
+    }
+    if report_focus == BroadcastRuntimeReportFocus::Payloads {
+        let blocks_per_presentation = proxy_audio_payload_bindings
+            .first()
+            .map(|binding| binding.block_coverage.len())
+            .unwrap_or(0);
+        let bytes_per_presentation = proxy_audio_payload_bindings
+            .first()
+            .map(|binding| binding.total_referenced_payload_bytes)
+            .unwrap_or(0);
+        let video_binding_status = proxy_video_payload_bindings
+            .first()
+            .map(|binding| binding.status)
+            .unwrap_or(BroadcastVideoPayloadBindingStatus::Missing);
+        let presentation_readiness = proxy_presentation_payload_bindings
+            .first()
+            .map(|binding| binding.readiness);
+        let presentation_readiness_label = presentation_readiness
+            .map(|readiness| format!("{readiness:?}"))
+            .unwrap_or_else(|| "Missing".to_string());
+        println!(
+            "  Payload bindings: audio={}/{} video={}/{} presentation={}/{}",
+            proxy_payload_summary.audio_binding_count,
+            proxy_payload_summary.audio_binding_capacity,
+            proxy_payload_summary.video_binding_count,
+            proxy_payload_summary.video_binding_capacity,
+            proxy_payload_summary.presentation_binding_count,
+            proxy_payload_summary.presentation_binding_capacity
+        );
+        println!(
+            "  Audio blocks referenced per presentation: {}",
+            blocks_per_presentation
+        );
+        println!(
+            "  Audio bytes referenced per presentation: {}",
+            bytes_per_presentation
+        );
+        println!(
+            "  Total referenced audio bytes: {}",
+            proxy_payload_summary.total_referenced_audio_bytes
+        );
+        println!("  Video binding status: {:?}", video_binding_status);
+        println!(
+            "  Presentation binding readiness: {}",
+            presentation_readiness_label
+        );
+        println!(
+            "  Runtime-accounting-ready presentations: {}",
+            proxy_payload_summary.runtime_accounting_ready_presentations
+        );
+        println!(
+            "  Device-payload-ready presentations: {}",
+            proxy_payload_summary.device_payload_ready_presentations
         );
     }
     println!("OriginalMedia:");
@@ -2838,14 +2972,55 @@ fn broadcast_runtime_prepared_slots(
         yes_no(original_event_summary.capability_missing),
         yes_no(original_event_summary.runtime_ready)
     );
-    if event_surface_focus {
+    if report_focus == BroadcastRuntimeReportFocus::Events {
         println!(
             "  Event sequence summary: SessionCreated -> PrepareStarted -> PrerollPlanned -> CapabilityMissing"
+        );
+    }
+    if report_focus == BroadcastRuntimeReportFocus::Payloads {
+        let video_binding_status = original_video_payload_bindings
+            .first()
+            .map(|binding| binding.status)
+            .unwrap_or(BroadcastVideoPayloadBindingStatus::Missing);
+        let presentation_readiness = original_presentation_payload_bindings
+            .first()
+            .map(|binding| binding.readiness);
+        let presentation_readiness_label = presentation_readiness
+            .map(|readiness| format!("{readiness:?}"))
+            .unwrap_or_else(|| "Missing".to_string());
+        println!(
+            "  Payload bindings: audio={}/{} video={}/{} presentation={}/{}",
+            original_payload_summary.audio_binding_count,
+            original_payload_summary.audio_binding_capacity,
+            original_payload_summary.video_binding_count,
+            original_payload_summary.video_binding_capacity,
+            original_payload_summary.presentation_binding_count,
+            original_payload_summary.presentation_binding_capacity
+        );
+        println!(
+            "  Audio binding possible: {}",
+            yes_no(original_payload_summary.complete_audio_bindings > 0)
+        );
+        println!("  Video binding status: {:?}", video_binding_status);
+        println!(
+            "  Presentation binding readiness: {}",
+            presentation_readiness_label
+        );
+        println!(
+            "  Capability-missing presentations: {}",
+            original_payload_summary.capability_missing_presentations
         );
     }
     println!("  Original video runtime backend: capability missing in this milestone");
 
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BroadcastRuntimeReportFocus {
+    PreparedSlots,
+    Events,
+    Payloads,
 }
 
 #[derive(Clone, Debug)]
@@ -7604,6 +7779,7 @@ struct Args {
     broadcast_runtime_preroll_paths: Option<(PathBuf, PathBuf)>,
     broadcast_runtime_prepared_slots_paths: Option<(PathBuf, PathBuf)>,
     broadcast_player_runtime_events_paths: Option<(PathBuf, PathBuf)>,
+    broadcast_player_runtime_payloads_paths: Option<(PathBuf, PathBuf)>,
 }
 
 impl Args {
@@ -7638,6 +7814,8 @@ impl Args {
         let mut broadcast_runtime_prepared_slots_paths = None;
         let mut broadcast_player_runtime_events_original = None;
         let mut broadcast_player_runtime_events_paths = None;
+        let mut broadcast_player_runtime_payloads_original = None;
+        let mut broadcast_player_runtime_payloads_paths = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
@@ -7658,9 +7836,22 @@ impl Args {
         let mut next_arg_is_broadcast_runtime_prepared_slots_proxy = false;
         let mut next_arg_is_broadcast_player_runtime_events_original = false;
         let mut next_arg_is_broadcast_player_runtime_events_proxy = false;
+        let mut next_arg_is_broadcast_player_runtime_payloads_original = false;
+        let mut next_arg_is_broadcast_player_runtime_payloads_proxy = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_broadcast_player_runtime_events_proxy {
+            if next_arg_is_broadcast_player_runtime_payloads_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = broadcast_player_runtime_payloads_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                broadcast_player_runtime_payloads_paths = Some((original, proxy));
+                next_arg_is_broadcast_player_runtime_payloads_proxy = false;
+            } else if next_arg_is_broadcast_player_runtime_payloads_original {
+                broadcast_player_runtime_payloads_original = Some(PathBuf::from(arg));
+                next_arg_is_broadcast_player_runtime_payloads_original = false;
+                next_arg_is_broadcast_player_runtime_payloads_proxy = true;
+            } else if next_arg_is_broadcast_player_runtime_events_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = broadcast_player_runtime_events_original
                     .take()
@@ -7810,6 +8001,8 @@ impl Args {
                 next_arg_is_broadcast_runtime_prepared_slots_original = true;
             } else if arg == BROADCAST_PLAYER_RUNTIME_EVENTS_ARG {
                 next_arg_is_broadcast_player_runtime_events_original = true;
+            } else if arg == BROADCAST_PLAYER_RUNTIME_PAYLOADS_ARG {
+                next_arg_is_broadcast_player_runtime_payloads_original = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -7834,6 +8027,7 @@ impl Args {
             broadcast_runtime_preroll_paths,
             broadcast_runtime_prepared_slots_paths,
             broadcast_player_runtime_events_paths,
+            broadcast_player_runtime_payloads_paths,
         }
     }
 }
