@@ -160,6 +160,42 @@ Observed result:
 The fallback path is barely above source rate in the as-fast run. That is not
 enough margin for reliable realtime playback on this Haswell/i965 machine.
 
+## External FFplay Observation
+
+An external ffplay check was attempted on the same Sony FX6 sample 002 proxy:
+
+```text
+ffplay -hwaccel vaapi -sync video -stats "Sony FX6 sample 002 proxy"
+```
+
+This was a development observation only. It does not measure the QGS
+CPU-bridge path because ffplay uses a different playback and rendering
+pipeline.
+
+Observed behavior:
+
+- ffplay initialized the Vulkan/libplacebo renderer.
+- It selected Intel HD Graphics 4600 / Haswell.
+- It recognized the file as MP4 / XAVC brand.
+- It recognized H.264 High, yuv420p / bt709 / progressive video.
+- It reported 1920 x 1080, 50 fps video.
+- It reported AAC stereo audio.
+- It printed `MESA-INTEL: warning: Haswell Vulkan support is incomplete`.
+- It printed `FINISHME: support more multi-planar formats with DRM modifiers`.
+- It printed `Derive vaapi from vulkan not supported.`
+- The run ended with `Segmentation fault`.
+
+This ffplay VAAPI/Vulkan/libplacebo run did not prove stable 50p playback on
+the Haswell/i965 system. It also does not prove anything directly about QGS
+correctness or relative performance.
+
+The observation is consistent with the QGS Step 17 conclusion: Haswell/i965
+VAAPI + Vulkan interop is fragile, this machine should not be treated as the
+production zero-copy reference platform, and QGS should keep the CPU bridge as
+a compatibility fallback while moving production performance work to modern
+Intel/AMD zero-copy validation or to an explicitly approved lower-level VA
+transfer boundary.
+
 ## Decision
 
 This work should be retained as a compatibility fallback milestone.
