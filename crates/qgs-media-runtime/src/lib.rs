@@ -623,6 +623,25 @@ pub enum BroadcastPlayerRuntimeEvent {
         tracks_covered: usize,
         complete: bool,
     },
+    PayloadSubmittedToDevice {
+        device_kind: BroadcastDeviceKind,
+        presentation_slot_index: usize,
+        binding_index: usize,
+        status: BroadcastDevicePayloadStatus,
+    },
+    PresentationEvidenceReceived {
+        presentation_slot_index: usize,
+        media_time: Duration,
+        evidence_kind: BroadcastPresentationEvidenceKind,
+        source_device_kind: BroadcastDeviceKind,
+        payload_id: Option<u64>,
+    },
+    FramePresented {
+        presentation_slot_index: usize,
+        media_time: Duration,
+        evidence_kind: BroadcastPresentationEvidenceKind,
+        payload_id: Option<u64>,
+    },
     CapabilityMissing {
         source_mode: BroadcastVideoSourceMode,
         capability: BroadcastPlayerCapability,
@@ -1180,7 +1199,10 @@ pub fn summarize_broadcast_player_runtime_events(
         capability_missing: events
             .iter()
             .any(|event| matches!(event, BroadcastPlayerRuntimeEvent::CapabilityMissing { .. })),
-        frame_presented_events: 0,
+        frame_presented_events: events
+            .iter()
+            .filter(|event| matches!(event, BroadcastPlayerRuntimeEvent::FramePresented { .. }))
+            .count(),
     }
 }
 
@@ -1627,15 +1649,18 @@ pub struct BroadcastVideoPresenterSubmission {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BroadcastPresentationEvidenceKind {
     AudioAudible,
+    TestPresenterAccepted,
     VideoFramePresented,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BroadcastPresentationEvidence {
     pub presentation_slot_index: usize,
+    pub video_binding_index: Option<usize>,
     pub media_time: Duration,
     pub evidence_kind: BroadcastPresentationEvidenceKind,
     pub source_device_kind: BroadcastDeviceKind,
+    pub payload_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1714,8 +1739,11 @@ pub fn summarize_broadcast_device_boundary(
     let frame_presented_count = evidence
         .iter()
         .filter(|event| {
-            event.evidence_kind == BroadcastPresentationEvidenceKind::VideoFramePresented
-                && event.source_device_kind == BroadcastDeviceKind::VideoPresenter
+            matches!(
+                event.evidence_kind,
+                BroadcastPresentationEvidenceKind::TestPresenterAccepted
+                    | BroadcastPresentationEvidenceKind::VideoFramePresented
+            ) && event.source_device_kind == BroadcastDeviceKind::VideoPresenter
         })
         .count();
     let reason = if audio_device_status == BroadcastDeviceStatus::NotConfigured
@@ -1795,6 +1823,116 @@ fn device_payload_status_for_video(
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BroadcastTestVideoPresenterConfig {
+    pub accepted_kind: BroadcastVideoPayloadKind,
+    pub accepted_format: BroadcastVideoPayloadFormat,
+    pub visible_width: u32,
+    pub visible_height: u32,
+    pub coded_width: u32,
+    pub coded_height: u32,
+}
+
+impl BroadcastTestVideoPresenterConfig {
+    pub fn validate(self) -> Result<Self, PlaybackError> {
+        if self.visible_width == 0
+            || self.visible_height == 0
+            || self.coded_width < self.visible_width
+            || self.coded_height < self.visible_height
+        {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastTestVideoPresenter {
+    config: BroadcastTestVideoPresenterConfig,
+    accepted: usize,
+    rejected: usize,
+}
+
+impl BroadcastTestVideoPresenter {
+    pub fn new(config: BroadcastTestVideoPresenterConfig) -> Result<Self, PlaybackError> {
+        Ok(Self {
+            config: config.validate()?,
+            accepted: 0,
+            rejected: 0,
+        })
+    }
+
+    pub fn capabilities(&self) -> [BroadcastDeviceCapability; 2] {
+        [
+            BroadcastDeviceCapability::AcceptsProcessedGpuFrame,
+            BroadcastDeviceCapability::ProvidesPresentationEvidence,
+        ]
+    }
+
+    pub fn accepted_count(&self) -> usize {
+        self.accepted
+    }
+
+    pub fn rejected_count(&self) -> usize {
+        self.rejected
+    }
+
+    pub fn submit(
+        &mut self,
+        presentation_slot: &BroadcastPresentationPayloadBinding,
+        video_binding: &BroadcastVideoPayloadBinding,
+    ) -> Result<BroadcastPresentationEvidence, PlaybackError> {
+        let Some(payload) = video_binding.payload.as_ref() else {
+            self.rejected = self.rejected.saturating_add(1);
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        };
+        if video_binding.status != BroadcastVideoPayloadBindingStatus::PayloadReady
+            || payload.kind != self.config.accepted_kind
+            || payload.format != self.config.accepted_format
+            || payload.visible_width != self.config.visible_width
+            || payload.visible_height != self.config.visible_height
+            || payload.coded_width != self.config.coded_width
+            || payload.coded_height != self.config.coded_height
+        {
+            self.rejected = self.rejected.saturating_add(1);
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        self.accepted = self.accepted.saturating_add(1);
+        Ok(BroadcastPresentationEvidence {
+            presentation_slot_index: presentation_slot.presentation_slot_index,
+            video_binding_index: Some(video_binding.video_slot_index),
+            media_time: presentation_slot.presentation_time,
+            evidence_kind: BroadcastPresentationEvidenceKind::TestPresenterAccepted,
+            source_device_kind: BroadcastDeviceKind::VideoPresenter,
+            payload_id: video_binding.payload_id,
+        })
+    }
+}
+
+pub fn broadcast_player_events_from_presentation_evidence(
+    evidence: &[BroadcastPresentationEvidence],
+) -> Vec<BroadcastPlayerRuntimeEvent> {
+    let mut events = Vec::with_capacity(evidence.len() * 2);
+    for item in evidence {
+        events.push(BroadcastPlayerRuntimeEvent::PresentationEvidenceReceived {
+            presentation_slot_index: item.presentation_slot_index,
+            media_time: item.media_time,
+            evidence_kind: item.evidence_kind,
+            source_device_kind: item.source_device_kind,
+            payload_id: item.payload_id,
+        });
+        if item.source_device_kind == BroadcastDeviceKind::VideoPresenter {
+            events.push(BroadcastPlayerRuntimeEvent::FramePresented {
+                presentation_slot_index: item.presentation_slot_index,
+                media_time: item.media_time,
+                evidence_kind: item.evidence_kind,
+                payload_id: item.payload_id,
+            });
+        }
+    }
+    events
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3526,14 +3664,169 @@ mod tests {
             &video_submission,
             &[BroadcastPresentationEvidence {
                 presentation_slot_index: 0,
+                video_binding_index: Some(0),
                 media_time: Duration::ZERO,
                 evidence_kind: BroadcastPresentationEvidenceKind::VideoFramePresented,
                 source_device_kind: BroadcastDeviceKind::VideoPresenter,
+                payload_id: Some(1),
             }],
             BroadcastDeviceStatus::Ready,
             BroadcastDeviceStatus::Ready,
         );
         assert_eq!(with_evidence.frame_presented_count, 1);
+    }
+
+    #[test]
+    fn test_video_presenter_accepts_supported_processed_gpu_payload() {
+        let video_slot = &test_prepared_video_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
+        let video_binding = bind_broadcast_video_payload_ready(
+            video_slot,
+            BroadcastVideoPayloadReference {
+                payload_id: 21,
+                kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+                format: BroadcastVideoPayloadFormat::RgbaU16,
+                backend_path: BroadcastVideoPayloadBackendPath::VaapiCpuNv12Vulkan,
+                source_frame_index: video_slot.source_frame_index.unwrap(),
+                selected_preview_frame_index: video_slot.selected_preview_frame_index,
+                presentation_time: video_slot.presentation_time,
+                duration: video_slot.duration,
+                coded_width: 1920,
+                coded_height: 1088,
+                visible_width: 1920,
+                visible_height: 1080,
+                bounded_slot_index: video_slot.slot_index,
+                session_index: 0,
+            },
+        )
+        .unwrap();
+        let audio_slot = &test_prepared_audio_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
+        let audio_binding =
+            bind_broadcast_audio_payload(audio_slot, &clock_ready_blocks_120ms()).unwrap();
+        let presentation_slot =
+            &test_prepared_presentation_slots(BroadcastVideoSourceMode::ProxyPreview, true)[0];
+        let presentation_binding =
+            bind_broadcast_presentation_payload(presentation_slot, &video_binding, &audio_binding);
+        let mut presenter = BroadcastTestVideoPresenter::new(BroadcastTestVideoPresenterConfig {
+            accepted_kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+            accepted_format: BroadcastVideoPayloadFormat::RgbaU16,
+            visible_width: 1920,
+            visible_height: 1080,
+            coded_width: 1920,
+            coded_height: 1088,
+        })
+        .unwrap();
+
+        let evidence = presenter
+            .submit(&presentation_binding, &video_binding)
+            .unwrap();
+        let events = broadcast_player_events_from_presentation_evidence(&[evidence.clone()]);
+        let summary = summarize_broadcast_player_runtime_events(
+            &events,
+            BroadcastRuntimeAccounting {
+                selected_frames_accounted: 0,
+                audio_ranges_accounted: 0,
+                intentional_profile_skips: 0,
+                lateness_drops: 0,
+            },
+        );
+
+        assert_eq!(presenter.accepted_count(), 1);
+        assert_eq!(presenter.rejected_count(), 0);
+        assert_eq!(
+            evidence.evidence_kind,
+            BroadcastPresentationEvidenceKind::TestPresenterAccepted
+        );
+        assert_eq!(evidence.payload_id, Some(21));
+        assert_eq!(summary.frame_presented_events, 1);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                BroadcastPlayerRuntimeEvent::PresentationEvidenceReceived {
+                    evidence_kind: BroadcastPresentationEvidenceKind::TestPresenterAccepted,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn test_video_presenter_rejects_unsupported_payload_shape() {
+        let video_slot = &test_prepared_video_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
+        let video_binding = bind_broadcast_video_payload_ready(
+            video_slot,
+            BroadcastVideoPayloadReference {
+                payload_id: 22,
+                kind: BroadcastVideoPayloadKind::CpuNv12Surface,
+                format: BroadcastVideoPayloadFormat::Nv12,
+                backend_path: BroadcastVideoPayloadBackendPath::VaapiCpuNv12Vulkan,
+                source_frame_index: video_slot.source_frame_index.unwrap(),
+                selected_preview_frame_index: video_slot.selected_preview_frame_index,
+                presentation_time: video_slot.presentation_time,
+                duration: video_slot.duration,
+                coded_width: 1920,
+                coded_height: 1088,
+                visible_width: 1920,
+                visible_height: 1080,
+                bounded_slot_index: video_slot.slot_index,
+                session_index: 0,
+            },
+        )
+        .unwrap();
+        let audio_slot = &test_prepared_audio_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
+        let audio_binding =
+            bind_broadcast_audio_payload(audio_slot, &clock_ready_blocks_120ms()).unwrap();
+        let presentation_slot =
+            &test_prepared_presentation_slots(BroadcastVideoSourceMode::ProxyPreview, true)[0];
+        let presentation_binding =
+            bind_broadcast_presentation_payload(presentation_slot, &video_binding, &audio_binding);
+        let mut presenter = BroadcastTestVideoPresenter::new(BroadcastTestVideoPresenterConfig {
+            accepted_kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+            accepted_format: BroadcastVideoPayloadFormat::RgbaU16,
+            visible_width: 1920,
+            visible_height: 1080,
+            coded_width: 1920,
+            coded_height: 1088,
+        })
+        .unwrap();
+
+        assert_eq!(
+            presenter.submit(&presentation_binding, &video_binding),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+        assert_eq!(presenter.accepted_count(), 0);
+        assert_eq!(presenter.rejected_count(), 1);
+    }
+
+    #[test]
+    fn original_media_capability_missing_cannot_be_test_presented() {
+        let original_video = BroadcastPreparedVideoSlot {
+            status: BroadcastPreparedVideoSlotStatus::CapabilityMissing,
+            ..test_prepared_video_slots(BroadcastVideoSourceMode::OriginalMedia)[0].clone()
+        };
+        let video_binding = bind_broadcast_video_payload_accounting(&original_video);
+        let audio_slot = &test_prepared_audio_slots(BroadcastVideoSourceMode::OriginalMedia)[0];
+        let audio_binding =
+            bind_broadcast_audio_payload(audio_slot, &clock_ready_blocks_120ms()).unwrap();
+        let presentation_slot =
+            &test_prepared_presentation_slots(BroadcastVideoSourceMode::OriginalMedia, false)[0];
+        let presentation_binding =
+            bind_broadcast_presentation_payload(presentation_slot, &video_binding, &audio_binding);
+        let mut presenter = BroadcastTestVideoPresenter::new(BroadcastTestVideoPresenterConfig {
+            accepted_kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+            accepted_format: BroadcastVideoPayloadFormat::RgbaU16,
+            visible_width: 1920,
+            visible_height: 1080,
+            coded_width: 1920,
+            coded_height: 1088,
+        })
+        .unwrap();
+
+        assert_eq!(
+            presenter.submit(&presentation_binding, &video_binding),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+        assert_eq!(presenter.accepted_count(), 0);
+        assert_eq!(presenter.rejected_count(), 1);
     }
 
     #[test]
