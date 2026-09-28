@@ -1371,6 +1371,7 @@ pub enum BroadcastVideoPayloadFormat {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BroadcastVideoPayloadBackendPath {
     VaapiCpuNv12Vulkan,
+    SoftwareH264Yuv422P10Vulkan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1444,16 +1445,26 @@ pub fn bind_broadcast_video_payload_ready(
     if slot.status != BroadcastPreparedVideoSlotStatus::Prepared {
         return Err(PlaybackError::InvalidRuntimeTransition);
     }
-    if slot.source_mode != BroadcastVideoSourceMode::ProxyPreview {
+    let expected_role = match slot.source_mode {
+        BroadcastVideoSourceMode::ProxyPreview => BroadcastMediaSourceRole::ProxyPreviewVideo,
+        BroadcastVideoSourceMode::OriginalMedia => BroadcastMediaSourceRole::OriginalFinishingMedia,
+    };
+    if slot.video_source_role != expected_role {
         return Err(PlaybackError::InvalidRuntimeTransition);
     }
-    if slot.video_source_role != BroadcastMediaSourceRole::ProxyPreviewVideo {
-        return Err(PlaybackError::InvalidRuntimeTransition);
-    }
+    let expected_backend = match slot.source_mode {
+        BroadcastVideoSourceMode::ProxyPreview => {
+            BroadcastVideoPayloadBackendPath::VaapiCpuNv12Vulkan
+        }
+        BroadcastVideoSourceMode::OriginalMedia => {
+            BroadcastVideoPayloadBackendPath::SoftwareH264Yuv422P10Vulkan
+        }
+    };
     if slot.source_frame_index != Some(payload.source_frame_index)
         || slot.selected_preview_frame_index != payload.selected_preview_frame_index
         || slot.presentation_time != payload.presentation_time
         || slot.duration != payload.duration
+        || payload.backend_path != expected_backend
     {
         return Err(PlaybackError::InvalidRuntimeTransition);
     }
@@ -3821,6 +3832,70 @@ mod tests {
         assert_eq!(
             binding.payload.as_ref().map(|payload| payload.kind),
             Some(BroadcastVideoPayloadKind::ProcessedGpuFrame)
+        );
+    }
+
+    #[test]
+    fn original_media_video_payload_can_become_payload_ready_with_original_backend() {
+        let original_video = &test_prepared_video_slots(BroadcastVideoSourceMode::OriginalMedia)[0];
+        let payload = BroadcastVideoPayloadReference {
+            payload_id: 142,
+            kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+            format: BroadcastVideoPayloadFormat::RgbaU16,
+            backend_path: BroadcastVideoPayloadBackendPath::SoftwareH264Yuv422P10Vulkan,
+            source_frame_index: original_video.source_frame_index.unwrap(),
+            selected_preview_frame_index: original_video.selected_preview_frame_index,
+            presentation_time: original_video.presentation_time,
+            duration: original_video.duration,
+            coded_width: 1920,
+            coded_height: 1088,
+            visible_width: 1920,
+            visible_height: 1080,
+            bounded_slot_index: original_video.slot_index,
+            session_index: 1,
+        };
+        let binding = bind_broadcast_video_payload_ready(original_video, payload).unwrap();
+        let audio_slot = &test_prepared_audio_slots(BroadcastVideoSourceMode::OriginalMedia)[0];
+        let audio_binding =
+            bind_broadcast_audio_payload(audio_slot, &clock_ready_blocks_120ms()).unwrap();
+        let presentation_slot =
+            &test_prepared_presentation_slots(BroadcastVideoSourceMode::OriginalMedia, true)[0];
+        let presentation_binding =
+            bind_broadcast_presentation_payload(presentation_slot, &binding, &audio_binding);
+
+        assert_eq!(
+            binding.status,
+            BroadcastVideoPayloadBindingStatus::PayloadReady
+        );
+        assert_eq!(
+            presentation_binding.readiness,
+            BroadcastPresentationPayloadReadiness::PayloadReady
+        );
+    }
+
+    #[test]
+    fn original_media_video_payload_rejects_proxy_backend() {
+        let original_video = &test_prepared_video_slots(BroadcastVideoSourceMode::OriginalMedia)[0];
+        let payload = BroadcastVideoPayloadReference {
+            payload_id: 143,
+            kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+            format: BroadcastVideoPayloadFormat::RgbaU16,
+            backend_path: BroadcastVideoPayloadBackendPath::VaapiCpuNv12Vulkan,
+            source_frame_index: original_video.source_frame_index.unwrap(),
+            selected_preview_frame_index: original_video.selected_preview_frame_index,
+            presentation_time: original_video.presentation_time,
+            duration: original_video.duration,
+            coded_width: 1920,
+            coded_height: 1088,
+            visible_width: 1920,
+            visible_height: 1080,
+            bounded_slot_index: original_video.slot_index,
+            session_index: 1,
+        };
+
+        assert_eq!(
+            bind_broadcast_video_payload_ready(original_video, payload),
+            Err(PlaybackError::InvalidRuntimeTransition)
         );
     }
 

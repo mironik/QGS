@@ -94,6 +94,8 @@ const BROADCAST_PLAYER_RUNTIME_TEST_PRESENTER_ARG: &str =
 const BROADCAST_PLAYER_RUNTIME_TEST_AUDIO_SINK_ARG: &str =
     "--broadcast-player-runtime-test-audio-sink";
 const BROADCAST_PLAYER_RUNTIME_SIMULATE_ARG: &str = "--broadcast-player-runtime-simulate";
+const BROADCAST_PLAYER_RUNTIME_ORIGINAL_VIDEO_PAYLOADS_ARG: &str =
+    "--broadcast-player-runtime-original-video-payloads";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -199,6 +201,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &original,
             &proxy,
             BroadcastRuntimeReportFocus::SimulatedPlayback,
+        );
+    }
+    if let Some((original, proxy)) = args.broadcast_player_runtime_original_video_payloads_paths {
+        return broadcast_runtime_prepared_slots(
+            &original,
+            &proxy,
+            BroadcastRuntimeReportFocus::OriginalVideoPayloads,
         );
     }
 
@@ -2513,6 +2522,26 @@ impl ProxyVideoPayloadBindingProof {
     }
 }
 
+struct OriginalVideoPayloadBindingProof {
+    bindings: Vec<qgs_media_runtime::BroadcastVideoPayloadBinding>,
+    gpu_processor: GpuFrameProcessor,
+    target_frames: Vec<u64>,
+    random_access_start: u64,
+    decode_end: u64,
+    decoded_frames: usize,
+    gpu_submissions: usize,
+    gpu_completions: usize,
+    device_name: String,
+    source_format: String,
+    wall_elapsed: Duration,
+}
+
+impl OriginalVideoPayloadBindingProof {
+    fn bounded_gpu_slots(&self) -> usize {
+        usize::try_from(self.gpu_processor.counters().command_buffer_count).unwrap_or(0)
+    }
+}
+
 fn finish_proxy_video_payload_bindings(
     proxy_video_slots: &[BroadcastPreparedVideoSlot],
     bindings_by_source: &mut BTreeMap<u64, qgs_media_runtime::BroadcastVideoPayloadBinding>,
@@ -2743,6 +2772,176 @@ fn bind_proxy_preview_video_payloads(
     Err(format!("missing proxy video payload bindings for source frames: {missing}").into())
 }
 
+fn bind_original_media_video_payloads(
+    original: &MediaSource,
+    original_bytes: &[u8],
+    original_video_slots: &[BroadcastPreparedVideoSlot],
+) -> Result<OriginalVideoPayloadBindingProof, Box<dyn std::error::Error>> {
+    let binding_started = Instant::now();
+    if original_video_slots.is_empty() {
+        return Err("Broadcast Player original payload binding: no prepared video slots".into());
+    }
+    let first_access_unit = original.extract_video_access_unit(original_bytes, 0)?;
+    let parsed = qgs_codec_h264::parse_annex_b_access_unit(&first_access_unit)?;
+    let discovery = VulkanDeviceDiscovery::new()?;
+    let devices = discovery.enumerate_devices()?;
+    let Some(device) = devices
+        .iter()
+        .find(|device| {
+            device.vendor_id == 0x8086 && matches!(device.class, DeviceClass::IntegratedGpu)
+        })
+        .or_else(|| {
+            devices
+                .iter()
+                .find(|device| matches!(device.class, DeviceClass::IntegratedGpu))
+        })
+        .or_else(|| {
+            devices
+                .iter()
+                .find(|device| matches!(device.class, DeviceClass::DiscreteGpu))
+        })
+    else {
+        return Err("Broadcast Player original payload binding: no Vulkan GPU advertised".into());
+    };
+    let config = decoder_config_for_surface(
+        device.id,
+        parsed.profile,
+        parsed.desc.bit_depth,
+        parsed.desc.chroma,
+        parsed.desc.coded_width,
+        parsed.desc.coded_height,
+    );
+    if !SoftwareVideoBackend::supports_config(&config) {
+        return Err(
+            "Broadcast Player original payload binding: software backend does not support original stream"
+                .into(),
+        );
+    }
+    let target_frames = original_video_slots
+        .iter()
+        .map(|slot| {
+            slot.source_frame_index
+                .ok_or("original video payload slot missing source frame index")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let min_target = *target_frames
+        .iter()
+        .min()
+        .ok_or("original video payload binding has no targets")?;
+    let max_target = *target_frames
+        .iter()
+        .max()
+        .ok_or("original video payload binding has no targets")?;
+    let random_access_start = original
+        .index
+        .nearest_random_access_before(min_target)
+        .map(|entry| entry.edit_unit)
+        .unwrap_or(min_target);
+    let last_video_index = original.index.video.len().saturating_sub(1);
+    let decode_end = max_target
+        .saturating_add(16)
+        .min(u64::try_from(last_video_index)?);
+    let positioned = (random_access_start..=decode_end)
+        .map(|edit_unit| {
+            let index = usize::try_from(edit_unit)?;
+            Ok((
+                edit_unit,
+                original.extract_video_access_unit(original_bytes, index)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    let decode_start = Instant::now();
+    let decoded = decode_positioned_access_units_with_context(config, &positioned)?;
+    let _decode_elapsed = decode_start.elapsed();
+    let frames_by_presentation = decoded
+        .frames
+        .iter()
+        .map(|frame| (frame.presentation_index, frame))
+        .collect::<BTreeMap<_, _>>();
+    let first_frame = original_video_slots
+        .iter()
+        .filter_map(|slot| {
+            slot.source_frame_index
+                .and_then(|index| frames_by_presentation.get(&index).copied())
+        })
+        .next()
+        .ok_or("Broadcast Player original payload binding: no target decoded frames")?;
+    let first_upload = yuv422p10_upload_for_frame(device.id, first_frame)?;
+    let mut gpu_processor = GpuFrameProcessor::new(
+        &discovery,
+        GpuFrameProcessorConfig {
+            device_id: device.id,
+            width: first_upload.width,
+            height: first_upload.height,
+            slot_count: original_video_slots.len().max(1),
+            conversion: first_upload.conversion,
+        },
+    )?;
+    let mut bindings = Vec::new();
+    let mut gpu_submissions = 0_usize;
+    let mut gpu_completions = 0_usize;
+    for slot in original_video_slots {
+        let source_frame_index = slot
+            .source_frame_index
+            .ok_or("original video payload slot missing source frame index")?;
+        let frame = frames_by_presentation
+            .get(&source_frame_index)
+            .copied()
+            .or_else(|| {
+                source_frame_index
+                    .checked_sub(random_access_start)
+                    .and_then(|relative| usize::try_from(relative).ok())
+                    .and_then(|relative| decoded.frames.get(relative))
+            })
+            .ok_or_else(|| {
+                format!("missing decoded original frame for source frame {source_frame_index}")
+            })?;
+        let upload = yuv422p10_upload_for_frame(device.id, frame)?;
+        let identity = FrameIdentity {
+            presentation_position: source_frame_index,
+        };
+        let token = gpu_processor.submit_frame(&upload, identity)?;
+        gpu_submissions += 1;
+        gpu_processor.wait_for_frame(token)?;
+        gpu_completions += 1;
+        let payload = BroadcastVideoPayloadReference {
+            payload_id: token.get(),
+            kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+            format: BroadcastVideoPayloadFormat::RgbaU16,
+            backend_path: BroadcastVideoPayloadBackendPath::SoftwareH264Yuv422P10Vulkan,
+            source_frame_index,
+            selected_preview_frame_index: slot.selected_preview_frame_index,
+            presentation_time: slot.presentation_time,
+            duration: slot.duration,
+            coded_width: parsed.desc.coded_width,
+            coded_height: parsed.desc.coded_height,
+            visible_width: parsed.desc.visible_region.width,
+            visible_height: parsed.desc.visible_region.height,
+            bounded_slot_index: slot.slot_index,
+            session_index: 1,
+        };
+        bindings.push(bind_broadcast_video_payload_ready(slot, payload)?);
+    }
+    Ok(OriginalVideoPayloadBindingProof {
+        bindings,
+        gpu_processor,
+        target_frames,
+        random_access_start,
+        decode_end,
+        decoded_frames: decoded.frames.len(),
+        gpu_submissions,
+        gpu_completions,
+        device_name: device.name.clone(),
+        source_format: format!(
+            "H.264 {:?}, {}-bit {:?}",
+            parsed.profile,
+            parsed.desc.bit_depth.get(),
+            parsed.desc.chroma
+        ),
+        wall_elapsed: binding_started.elapsed(),
+    })
+}
+
 fn broadcast_runtime_prepared_slots(
     original_path: &Path,
     proxy_path: &Path,
@@ -2912,6 +3111,7 @@ fn broadcast_runtime_prepared_slots(
             | BroadcastRuntimeReportFocus::TestPresenter
             | BroadcastRuntimeReportFocus::TestAudioSink
             | BroadcastRuntimeReportFocus::SimulatedPlayback
+            | BroadcastRuntimeReportFocus::OriginalVideoPayloads
     ) {
         Some(bind_proxy_preview_video_payloads(
             proxy_video,
@@ -2953,6 +3153,8 @@ fn broadcast_runtime_prepared_slots(
         video_source_mode: BroadcastVideoSourceMode::OriginalMedia,
         ..config
     };
+    let original_payload_attempt =
+        report_focus == BroadcastRuntimeReportFocus::OriginalVideoPayloads;
     let original_plan = BroadcastPrerollPlan {
         video_source_mode: BroadcastVideoSourceMode::OriginalMedia,
         selected_video_frames_planned: original.index.video.len(),
@@ -2961,24 +3163,26 @@ fn broadcast_runtime_prepared_slots(
         duration_covered: audio_duration,
         finite_queue_limits: queue_limits,
         video_source_available: !original.index.video.is_empty(),
-        video_runtime_supported: false,
+        video_runtime_supported: original_payload_attempt,
     };
     let original_video_slots = (0..prepared_len)
         .map(|slot_index| {
-            let source_frame_index = u64::try_from(slot_index)?;
-            let duration_multiplier = u32::try_from(slot_index)?;
-            let presentation_time = frame_duration
-                .checked_mul(duration_multiplier)
-                .ok_or("original media slot timestamp overflow")?;
+            let selected_frame = selected
+                .get(slot_index)
+                .ok_or("missing selected frame for original media slot")?;
             Ok::<_, Box<dyn std::error::Error>>(BroadcastPreparedVideoSlot {
                 slot_index,
                 source_mode: BroadcastVideoSourceMode::OriginalMedia,
                 video_source_role: BroadcastMediaSourceRole::OriginalFinishingMedia,
-                source_frame_index: Some(source_frame_index),
+                source_frame_index: Some(selected_frame.source_presentation_index),
                 selected_preview_frame_index: None,
-                presentation_time,
+                presentation_time: selected_frame.start_time,
                 duration: frame_duration,
-                status: BroadcastPreparedVideoSlotStatus::CapabilityMissing,
+                status: if original_payload_attempt {
+                    BroadcastPreparedVideoSlotStatus::Prepared
+                } else {
+                    BroadcastPreparedVideoSlotStatus::CapabilityMissing
+                },
             })
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
@@ -2996,20 +3200,18 @@ fn broadcast_runtime_prepared_slots(
         .collect::<Vec<_>>();
     let original_presentation_slots = (0..prepared_len)
         .map(|slot_index| {
-            let selected_source_frame = u64::try_from(slot_index)?;
-            let duration_multiplier = u32::try_from(slot_index)?;
-            let presentation_time = frame_duration
-                .checked_mul(duration_multiplier)
-                .ok_or("original media presentation slot timestamp overflow")?;
+            let selected_frame = selected
+                .get(slot_index)
+                .ok_or("missing selected frame for original media presentation slot")?;
             Ok::<_, Box<dyn std::error::Error>>(BroadcastPreparedPresentationSlot {
                 presentation_index: slot_index,
                 source_mode: BroadcastVideoSourceMode::OriginalMedia,
-                selected_source_frame: Some(selected_source_frame),
+                selected_source_frame: Some(selected_frame.source_presentation_index),
                 video_slot_index: slot_index,
                 audio_slot_index: slot_index,
-                presentation_time,
+                presentation_time: selected_frame.start_time,
                 duration: frame_duration,
-                ready: false,
+                ready: original_payload_attempt,
             })
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
@@ -3024,10 +3226,24 @@ fn broadcast_runtime_prepared_slots(
         .iter()
         .map(|slot| bind_broadcast_audio_payload(slot, &blocks))
         .collect::<Result<Vec<_>, _>>()?;
-    let original_video_payload_bindings = original_video_slots
-        .iter()
-        .map(bind_broadcast_video_payload_accounting)
-        .collect::<Vec<_>>();
+    let original_video_payload_proof = if original_payload_attempt {
+        Some(bind_original_media_video_payloads(
+            &original,
+            &original_bytes,
+            &original_video_slots,
+        )?)
+    } else {
+        None
+    };
+    let original_video_payload_bindings = original_video_payload_proof
+        .as_ref()
+        .map(|proof| proof.bindings.clone())
+        .unwrap_or_else(|| {
+            original_video_slots
+                .iter()
+                .map(bind_broadcast_video_payload_accounting)
+                .collect::<Vec<_>>()
+        });
     let original_presentation_payload_bindings = original_presentation_slots
         .iter()
         .enumerate()
@@ -3147,6 +3363,10 @@ fn broadcast_runtime_prepared_slots(
             println!("QGS Broadcast Player Runtime Simulated Playback Loop");
             println!("----------------------------------------------------");
         }
+        BroadcastRuntimeReportFocus::OriginalVideoPayloads => {
+            println!("QGS Broadcast Player Runtime OriginalMedia Video Payload Binding");
+            println!("---------------------------------------------------------------");
+        }
     }
     println!(
         "Not real playback: no speaker output, no display output, no real-time Broadcast Player loop"
@@ -3158,6 +3378,9 @@ fn broadcast_runtime_prepared_slots(
     } else if report_focus == BroadcastRuntimeReportFocus::SimulatedPlayback {
         println!("Test boundaries only: no real speaker output or display output");
         println!("No realtime scheduler");
+    } else if report_focus == BroadcastRuntimeReportFocus::OriginalVideoPayloads {
+        println!("Not realtime playback: no display output, no speaker output");
+        println!("No FramePresented event");
     } else {
         println!("No FramePresented event");
     }
@@ -3240,6 +3463,7 @@ fn broadcast_runtime_prepared_slots(
             | BroadcastRuntimeReportFocus::TestPresenter
             | BroadcastRuntimeReportFocus::TestAudioSink
             | BroadcastRuntimeReportFocus::SimulatedPlayback
+            | BroadcastRuntimeReportFocus::OriginalVideoPayloads
     ) {
         let blocks_per_presentation = proxy_audio_payload_bindings
             .first()
@@ -3652,6 +3876,7 @@ fn broadcast_runtime_prepared_slots(
             | BroadcastRuntimeReportFocus::TestPresenter
             | BroadcastRuntimeReportFocus::TestAudioSink
             | BroadcastRuntimeReportFocus::SimulatedPlayback
+            | BroadcastRuntimeReportFocus::OriginalVideoPayloads
     ) {
         let video_binding_status = original_video_payload_bindings
             .first()
@@ -3781,8 +4006,66 @@ fn broadcast_runtime_prepared_slots(
             println!("  Original video payload: CapabilityMissing");
             println!("  Simulation result: not ready / capability missing");
         }
+        if report_focus == BroadcastRuntimeReportFocus::OriginalVideoPayloads {
+            if let Some(proof) = &original_video_payload_proof {
+                let target_frames = proof
+                    .target_frames
+                    .iter()
+                    .map(|frame| frame.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let first_payload = original_video_payload_bindings
+                    .first()
+                    .and_then(|binding| binding.payload.as_ref());
+                println!(
+                    "  Original video payloads: bound={} submissions={} completions={} bounded_gpu_slots={} device={}",
+                    proof.bindings.len(),
+                    proof.gpu_submissions,
+                    proof.gpu_completions,
+                    proof.bounded_gpu_slots(),
+                    proof.device_name
+                );
+                println!("  Target source frames: {target_frames}");
+                println!(
+                    "  Random access start: {} decode_end={} decoded_frames={}",
+                    proof.random_access_start, proof.decode_end, proof.decoded_frames
+                );
+                println!(
+                    "  DEVELOPMENT OBSERVATION - NOT A BENCHMARK: {:.3}s for bounded original payload binding",
+                    proof.wall_elapsed.as_secs_f64()
+                );
+                println!("  Source format: {}", proof.source_format);
+                if let Some(payload) = first_payload {
+                    println!(
+                        "  Payload kind: {:?} format={:?} backend={:?}",
+                        payload.kind, payload.format, payload.backend_path
+                    );
+                    println!(
+                        "  Payload dimensions: visible={}x{} coded={}x{}",
+                        payload.visible_width,
+                        payload.visible_height,
+                        payload.coded_width,
+                        payload.coded_height
+                    );
+                }
+                println!(
+                    "  Presentation payload-ready: {}",
+                    original_payload_summary.payload_ready_presentations
+                );
+                println!("  DevicePayloadReady: no");
+                println!("  FramePresented: 0");
+                println!("  Realtime support claimed: no");
+                println!("  Proxy video used for OriginalMedia payload: no");
+            }
+        }
     }
-    println!("  Original video runtime backend: capability missing in this milestone");
+    if report_focus == BroadcastRuntimeReportFocus::OriginalVideoPayloads {
+        println!(
+            "  Original video runtime backend: bounded payload binding only; realtime not claimed"
+        );
+    } else {
+        println!("  Original video runtime backend: capability missing in this milestone");
+    }
 
     Ok(())
 }
@@ -3797,6 +4080,7 @@ enum BroadcastRuntimeReportFocus {
     TestPresenter,
     TestAudioSink,
     SimulatedPlayback,
+    OriginalVideoPayloads,
 }
 
 #[derive(Clone, Debug)]
@@ -8561,6 +8845,7 @@ struct Args {
     broadcast_player_runtime_test_presenter_paths: Option<(PathBuf, PathBuf)>,
     broadcast_player_runtime_test_audio_sink_paths: Option<(PathBuf, PathBuf)>,
     broadcast_player_runtime_simulate_paths: Option<(PathBuf, PathBuf)>,
+    broadcast_player_runtime_original_video_payloads_paths: Option<(PathBuf, PathBuf)>,
 }
 
 impl Args {
@@ -8607,6 +8892,8 @@ impl Args {
         let mut broadcast_player_runtime_test_audio_sink_paths = None;
         let mut broadcast_player_runtime_simulate_original = None;
         let mut broadcast_player_runtime_simulate_paths = None;
+        let mut broadcast_player_runtime_original_video_payloads_original = None;
+        let mut broadcast_player_runtime_original_video_payloads_paths = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
@@ -8639,9 +8926,23 @@ impl Args {
         let mut next_arg_is_broadcast_player_runtime_test_audio_sink_proxy = false;
         let mut next_arg_is_broadcast_player_runtime_simulate_original = false;
         let mut next_arg_is_broadcast_player_runtime_simulate_proxy = false;
+        let mut next_arg_is_broadcast_player_runtime_original_video_payloads_original = false;
+        let mut next_arg_is_broadcast_player_runtime_original_video_payloads_proxy = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_broadcast_player_runtime_simulate_proxy {
+            if next_arg_is_broadcast_player_runtime_original_video_payloads_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = broadcast_player_runtime_original_video_payloads_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                broadcast_player_runtime_original_video_payloads_paths = Some((original, proxy));
+                next_arg_is_broadcast_player_runtime_original_video_payloads_proxy = false;
+            } else if next_arg_is_broadcast_player_runtime_original_video_payloads_original {
+                broadcast_player_runtime_original_video_payloads_original =
+                    Some(PathBuf::from(arg));
+                next_arg_is_broadcast_player_runtime_original_video_payloads_original = false;
+                next_arg_is_broadcast_player_runtime_original_video_payloads_proxy = true;
+            } else if next_arg_is_broadcast_player_runtime_simulate_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = broadcast_player_runtime_simulate_original
                     .take()
@@ -8869,6 +9170,8 @@ impl Args {
                 next_arg_is_broadcast_player_runtime_test_audio_sink_original = true;
             } else if arg == BROADCAST_PLAYER_RUNTIME_SIMULATE_ARG {
                 next_arg_is_broadcast_player_runtime_simulate_original = true;
+            } else if arg == BROADCAST_PLAYER_RUNTIME_ORIGINAL_VIDEO_PAYLOADS_ARG {
+                next_arg_is_broadcast_player_runtime_original_video_payloads_original = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -8899,6 +9202,7 @@ impl Args {
             broadcast_player_runtime_test_presenter_paths,
             broadcast_player_runtime_test_audio_sink_paths,
             broadcast_player_runtime_simulate_paths,
+            broadcast_player_runtime_original_video_payloads_paths,
         }
     }
 }
