@@ -1607,9 +1607,14 @@ pub enum BroadcastDeviceStatus {
 pub enum BroadcastDeviceCapability {
     AcceptsOriginalPcm,
     AcceptsF32Pcm,
+    AcceptsSignedIntegerPcm,
+    Accepts24BitPcm,
+    Accepts48000Hz,
+    AcceptsMonoTrackBlocks,
     AcceptsProcessedGpuFrame,
     AcceptsCpuImage,
     ProvidesPresentationEvidence,
+    ProvidesAudioSinkEvidence,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1648,7 +1653,7 @@ pub struct BroadcastVideoPresenterSubmission {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BroadcastPresentationEvidenceKind {
-    AudioAudible,
+    TestAudioSinkAccepted,
     TestPresenterAccepted,
     VideoFramePresented,
 }
@@ -1656,11 +1661,25 @@ pub enum BroadcastPresentationEvidenceKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BroadcastPresentationEvidence {
     pub presentation_slot_index: usize,
+    pub audio_binding_index: Option<usize>,
     pub video_binding_index: Option<usize>,
     pub media_time: Duration,
     pub evidence_kind: BroadcastPresentationEvidenceKind,
     pub source_device_kind: BroadcastDeviceKind,
     pub payload_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastAudioSinkEvidence {
+    pub presentation_slot_index: usize,
+    pub audio_binding_index: usize,
+    pub start_sample: u64,
+    pub sample_count: u64,
+    pub sample_rate: u32,
+    pub track_count: usize,
+    pub payload_bytes_accepted: u64,
+    pub evidence_kind: BroadcastPresentationEvidenceKind,
+    pub source_device_kind: BroadcastDeviceKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1826,6 +1845,129 @@ fn device_payload_status_for_video(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BroadcastTestAudioSinkConfig {
+    pub sample_rate: u32,
+    pub bits_per_sample: u8,
+    pub track_count: usize,
+}
+
+impl BroadcastTestAudioSinkConfig {
+    pub fn validate(self) -> Result<Self, PlaybackError> {
+        if self.sample_rate == 0 || self.bits_per_sample == 0 || self.track_count == 0 {
+            return Err(PlaybackError::InvalidAudioFormat);
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastTestAudioSink {
+    config: BroadcastTestAudioSinkConfig,
+    accepted: usize,
+    rejected: usize,
+    samples_accepted: u64,
+    bytes_accepted: u64,
+}
+
+impl BroadcastTestAudioSink {
+    pub fn new(config: BroadcastTestAudioSinkConfig) -> Result<Self, PlaybackError> {
+        Ok(Self {
+            config: config.validate()?,
+            accepted: 0,
+            rejected: 0,
+            samples_accepted: 0,
+            bytes_accepted: 0,
+        })
+    }
+
+    pub fn capabilities(&self) -> [BroadcastDeviceCapability; 6] {
+        [
+            BroadcastDeviceCapability::AcceptsOriginalPcm,
+            BroadcastDeviceCapability::AcceptsSignedIntegerPcm,
+            BroadcastDeviceCapability::Accepts24BitPcm,
+            BroadcastDeviceCapability::Accepts48000Hz,
+            BroadcastDeviceCapability::AcceptsMonoTrackBlocks,
+            BroadcastDeviceCapability::ProvidesAudioSinkEvidence,
+        ]
+    }
+
+    pub fn accepted_count(&self) -> usize {
+        self.accepted
+    }
+
+    pub fn rejected_count(&self) -> usize {
+        self.rejected
+    }
+
+    pub fn samples_accepted(&self) -> u64 {
+        self.samples_accepted
+    }
+
+    pub fn bytes_accepted(&self) -> u64 {
+        self.bytes_accepted
+    }
+
+    pub fn submit(
+        &mut self,
+        presentation_slot: &BroadcastPresentationPayloadBinding,
+        binding: &BroadcastAudioPayloadBinding,
+        format: PcmSampleFormat,
+    ) -> Result<BroadcastAudioSinkEvidence, PlaybackError> {
+        let PcmSampleFormat::SignedInteger {
+            bits_per_sample, ..
+        } = format;
+        let expected_bytes = u64::try_from(pcm_payload_byte_len(
+            u32::try_from(binding.sample_count).map_err(|_| PlaybackError::TimestampOverflow)?,
+            u16::try_from(binding.track_count).map_err(|_| PlaybackError::TimestampOverflow)?,
+            format,
+        )?)
+        .map_err(|_| PlaybackError::TimestampOverflow)?;
+        if !binding.complete
+            || binding.sample_rate != self.config.sample_rate
+            || bits_per_sample != self.config.bits_per_sample
+            || binding.track_count != self.config.track_count
+            || binding.total_referenced_payload_bytes != expected_bytes
+        {
+            self.rejected = self.rejected.saturating_add(1);
+            return Err(PlaybackError::InvalidAudioFormat);
+        }
+        self.accepted = self.accepted.saturating_add(1);
+        self.samples_accepted = self.samples_accepted.saturating_add(binding.sample_count);
+        self.bytes_accepted = self
+            .bytes_accepted
+            .saturating_add(binding.total_referenced_payload_bytes);
+        Ok(BroadcastAudioSinkEvidence {
+            presentation_slot_index: presentation_slot.presentation_slot_index,
+            audio_binding_index: binding.audio_slot_index,
+            start_sample: binding.start_sample,
+            sample_count: binding.sample_count,
+            sample_rate: binding.sample_rate,
+            track_count: binding.track_count,
+            payload_bytes_accepted: binding.total_referenced_payload_bytes,
+            evidence_kind: BroadcastPresentationEvidenceKind::TestAudioSinkAccepted,
+            source_device_kind: BroadcastDeviceKind::AudioSink,
+        })
+    }
+}
+
+pub fn broadcast_player_events_from_audio_sink_evidence(
+    evidence: &[BroadcastAudioSinkEvidence],
+) -> Vec<BroadcastPlayerRuntimeEvent> {
+    let mut events = Vec::with_capacity(evidence.len());
+    for item in evidence {
+        events.push(BroadcastPlayerRuntimeEvent::PresentationEvidenceReceived {
+            presentation_slot_index: item.presentation_slot_index,
+            media_time: duration_from_audio_samples(item.start_sample, item.sample_rate)
+                .unwrap_or(Duration::ZERO),
+            evidence_kind: item.evidence_kind,
+            source_device_kind: item.source_device_kind,
+            payload_id: None,
+        });
+    }
+    events
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BroadcastTestVideoPresenterConfig {
     pub accepted_kind: BroadcastVideoPayloadKind,
     pub accepted_format: BroadcastVideoPayloadFormat,
@@ -1902,6 +2044,7 @@ impl BroadcastTestVideoPresenter {
         self.accepted = self.accepted.saturating_add(1);
         Ok(BroadcastPresentationEvidence {
             presentation_slot_index: presentation_slot.presentation_slot_index,
+            audio_binding_index: None,
             video_binding_index: Some(video_binding.video_slot_index),
             media_time: presentation_slot.presentation_time,
             evidence_kind: BroadcastPresentationEvidenceKind::TestPresenterAccepted,
@@ -3664,6 +3807,7 @@ mod tests {
             &video_submission,
             &[BroadcastPresentationEvidence {
                 presentation_slot_index: 0,
+                audio_binding_index: None,
                 video_binding_index: Some(0),
                 media_time: Duration::ZERO,
                 evidence_kind: BroadcastPresentationEvidenceKind::VideoFramePresented,
@@ -3827,6 +3971,217 @@ mod tests {
         );
         assert_eq!(presenter.accepted_count(), 0);
         assert_eq!(presenter.rejected_count(), 1);
+    }
+
+    #[test]
+    fn test_audio_sink_accepts_supported_original_pcm_payload() {
+        let range = av_frame_audio_range(
+            0,
+            Duration::ZERO,
+            Duration::from_millis(40),
+            48_000,
+            &clock_ready_blocks(),
+            2,
+        )
+        .unwrap();
+        let audio_slot = BroadcastPreparedAudioSlot::from_audio_range(
+            0,
+            BroadcastVideoSourceMode::ProxyPreview,
+            &range,
+        );
+        let audio_binding =
+            bind_broadcast_audio_payload(&audio_slot, &clock_ready_blocks()).unwrap();
+        let video_slot = &test_prepared_video_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
+        let video_binding = bind_broadcast_video_payload_accounting(video_slot);
+        let presentation_slot =
+            &test_prepared_presentation_slots(BroadcastVideoSourceMode::ProxyPreview, true)[0];
+        let presentation_binding =
+            bind_broadcast_presentation_payload(presentation_slot, &video_binding, &audio_binding);
+        let format = PcmSampleFormat::SignedInteger {
+            bits_per_sample: 24,
+            endian: PcmEndian::Little,
+        };
+        let mut sink = BroadcastTestAudioSink::new(BroadcastTestAudioSinkConfig {
+            sample_rate: 48_000,
+            bits_per_sample: 24,
+            track_count: 2,
+        })
+        .unwrap();
+
+        let evidence = sink
+            .submit(&presentation_binding, &audio_binding, format)
+            .unwrap();
+        let events = broadcast_player_events_from_audio_sink_evidence(&[evidence.clone()]);
+        let summary = summarize_broadcast_player_runtime_events(
+            &events,
+            BroadcastRuntimeAccounting {
+                selected_frames_accounted: 0,
+                audio_ranges_accounted: 0,
+                intentional_profile_skips: 0,
+                lateness_drops: 0,
+            },
+        );
+
+        assert_eq!(sink.accepted_count(), 1);
+        assert_eq!(sink.rejected_count(), 0);
+        assert_eq!(sink.samples_accepted(), 1920);
+        assert_eq!(sink.bytes_accepted(), 11_520);
+        assert_eq!(
+            evidence.evidence_kind,
+            BroadcastPresentationEvidenceKind::TestAudioSinkAccepted
+        );
+        assert_eq!(evidence.payload_bytes_accepted, 11_520);
+        assert_eq!(summary.frame_presented_events, 0);
+    }
+
+    #[test]
+    fn test_audio_sink_rejects_wrong_sample_rate_or_bit_depth() {
+        let range = av_frame_audio_range(
+            0,
+            Duration::ZERO,
+            Duration::from_millis(40),
+            48_000,
+            &clock_ready_blocks(),
+            2,
+        )
+        .unwrap();
+        let audio_slot = BroadcastPreparedAudioSlot::from_audio_range(
+            0,
+            BroadcastVideoSourceMode::ProxyPreview,
+            &range,
+        );
+        let audio_binding =
+            bind_broadcast_audio_payload(&audio_slot, &clock_ready_blocks()).unwrap();
+        let presentation_slot =
+            &test_prepared_presentation_slots(BroadcastVideoSourceMode::ProxyPreview, true)[0];
+        let video_slot = &test_prepared_video_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
+        let video_binding = bind_broadcast_video_payload_accounting(video_slot);
+        let presentation_binding =
+            bind_broadcast_presentation_payload(presentation_slot, &video_binding, &audio_binding);
+        let format = PcmSampleFormat::SignedInteger {
+            bits_per_sample: 24,
+            endian: PcmEndian::Little,
+        };
+
+        let mut wrong_rate = BroadcastTestAudioSink::new(BroadcastTestAudioSinkConfig {
+            sample_rate: 44_100,
+            bits_per_sample: 24,
+            track_count: 2,
+        })
+        .unwrap();
+        assert_eq!(
+            wrong_rate.submit(&presentation_binding, &audio_binding, format),
+            Err(PlaybackError::InvalidAudioFormat)
+        );
+
+        let mut wrong_depth = BroadcastTestAudioSink::new(BroadcastTestAudioSinkConfig {
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            track_count: 2,
+        })
+        .unwrap();
+        assert_eq!(
+            wrong_depth.submit(&presentation_binding, &audio_binding, format),
+            Err(PlaybackError::InvalidAudioFormat)
+        );
+    }
+
+    #[test]
+    fn test_audio_sink_rejects_incomplete_tracks_and_bad_byte_count() {
+        let range = av_frame_audio_range(
+            0,
+            Duration::ZERO,
+            Duration::from_millis(40),
+            48_000,
+            &clock_ready_blocks(),
+            2,
+        )
+        .unwrap();
+        let audio_slot = BroadcastPreparedAudioSlot::from_audio_range(
+            0,
+            BroadcastVideoSourceMode::ProxyPreview,
+            &range,
+        );
+        let mut audio_binding =
+            bind_broadcast_audio_payload(&audio_slot, &clock_ready_blocks()).unwrap();
+        let presentation_slot =
+            &test_prepared_presentation_slots(BroadcastVideoSourceMode::ProxyPreview, true)[0];
+        let video_slot = &test_prepared_video_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
+        let video_binding = bind_broadcast_video_payload_accounting(video_slot);
+        let presentation_binding =
+            bind_broadcast_presentation_payload(presentation_slot, &video_binding, &audio_binding);
+        let format = PcmSampleFormat::SignedInteger {
+            bits_per_sample: 24,
+            endian: PcmEndian::Little,
+        };
+        let mut sink = BroadcastTestAudioSink::new(BroadcastTestAudioSinkConfig {
+            sample_rate: 48_000,
+            bits_per_sample: 24,
+            track_count: 2,
+        })
+        .unwrap();
+
+        audio_binding.complete = false;
+        assert_eq!(
+            sink.submit(&presentation_binding, &audio_binding, format),
+            Err(PlaybackError::InvalidAudioFormat)
+        );
+
+        audio_binding.complete = true;
+        audio_binding.total_referenced_payload_bytes = audio_binding
+            .total_referenced_payload_bytes
+            .saturating_sub(1);
+        assert_eq!(
+            sink.submit(&presentation_binding, &audio_binding, format),
+            Err(PlaybackError::InvalidAudioFormat)
+        );
+    }
+
+    #[test]
+    fn original_media_audio_sink_evidence_does_not_imply_video_readiness() {
+        let range = av_frame_audio_range(
+            0,
+            Duration::ZERO,
+            Duration::from_millis(40),
+            48_000,
+            &clock_ready_blocks(),
+            2,
+        )
+        .unwrap();
+        let audio_slot = BroadcastPreparedAudioSlot::from_audio_range(
+            0,
+            BroadcastVideoSourceMode::OriginalMedia,
+            &range,
+        );
+        let audio_binding =
+            bind_broadcast_audio_payload(&audio_slot, &clock_ready_blocks()).unwrap();
+        let video_slot = BroadcastPreparedVideoSlot {
+            status: BroadcastPreparedVideoSlotStatus::CapabilityMissing,
+            ..test_prepared_video_slots(BroadcastVideoSourceMode::OriginalMedia)[0].clone()
+        };
+        let video_binding = bind_broadcast_video_payload_accounting(&video_slot);
+        let presentation_slot =
+            &test_prepared_presentation_slots(BroadcastVideoSourceMode::OriginalMedia, false)[0];
+        let presentation_binding =
+            bind_broadcast_presentation_payload(presentation_slot, &video_binding, &audio_binding);
+        let format = PcmSampleFormat::SignedInteger {
+            bits_per_sample: 24,
+            endian: PcmEndian::Little,
+        };
+        let mut sink = BroadcastTestAudioSink::new(BroadcastTestAudioSinkConfig {
+            sample_rate: 48_000,
+            bits_per_sample: 24,
+            track_count: 2,
+        })
+        .unwrap();
+
+        assert!(sink
+            .submit(&presentation_binding, &audio_binding, format)
+            .is_ok());
+        assert_eq!(
+            presentation_binding.readiness,
+            BroadcastPresentationPayloadReadiness::CapabilityMissing
+        );
     }
 
     #[test]
