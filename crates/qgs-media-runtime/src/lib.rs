@@ -545,35 +545,102 @@ pub enum BroadcastPlayerPreparedSlotKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BroadcastPlayerEvent {
-    SessionCreated,
-    PrepareStarted,
-    PrerollReady,
+pub enum BroadcastPlayerCapability {
+    OriginalVideoRuntime,
+    PreparedVideoSlot,
+    PrerollReadiness,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastPlayerRuntimeFailureReason {
+    InvalidTransition,
+    IncompleteAudioCoverage,
+    CapabilityMissing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastPlayerRuntimeEvent {
+    SessionCreated {
+        session_index: u64,
+        source_mode: BroadcastVideoSourceMode,
+        preview_profile: BroadcastPreviewProfile,
+        audio_source_role: BroadcastMediaSourceRole,
+        video_source_role: BroadcastMediaSourceRole,
+    },
+    PrepareStarted {
+        source_mode: BroadcastVideoSourceMode,
+        queue_limits: BroadcastRuntimeQueueLimits,
+        preroll_config: BroadcastPrerollConfig,
+    },
+    PrerollPlanned {
+        source_mode: BroadcastVideoSourceMode,
+        selected_video_frames: usize,
+        audio_ranges: usize,
+        intentional_skips: usize,
+    },
+    PrerollReady {
+        prepared_video_slots: usize,
+        prepared_audio_slots: usize,
+        prepared_presentation_slots: usize,
+    },
     PreparedSlotAvailable {
         kind: BroadcastPlayerPreparedSlotKind,
         slot_index: usize,
+        source_mode: BroadcastVideoSourceMode,
+        ready: bool,
+        video_status: Option<BroadcastPreparedVideoSlotStatus>,
     },
-    BroadcastPlayerReady,
-    TransportStarted,
-    TransportPaused,
+    RuntimeReady {
+        state: BroadcastRuntimeState,
+        source_mode: BroadcastVideoSourceMode,
+    },
+    TransportStarted {
+        state: BroadcastRuntimeState,
+        media_time: Duration,
+    },
+    TransportPaused {
+        state: BroadcastRuntimeState,
+        media_time: Duration,
+    },
     SeekCompleted {
         target_time: Duration,
     },
     IntentionalProfileSkip {
         source_frame_index: u64,
+        profile: BroadcastPreviewProfile,
     },
-    SelectedFrameAccounted {
-        frame_index: u64,
+    FrameAccounted {
+        selected_preview_frame_index: u64,
+        source_frame_index: Option<u64>,
+        presentation_time: Duration,
+        duration: Duration,
+        video_source_role: BroadcastMediaSourceRole,
     },
     AudioRangeAccounted {
-        frame_index: u64,
+        presentation_index: u64,
+        start_sample: u64,
+        sample_count: u64,
+        tracks_covered: usize,
+        complete: bool,
     },
     CapabilityMissing {
         source_mode: BroadcastVideoSourceMode,
+        capability: BroadcastPlayerCapability,
+        reason: BroadcastPrerollNotReadyReason,
     },
-    RuntimeCompleted,
-    RuntimeFailed,
+    RuntimeCompleted {
+        selected_frames_accounted: usize,
+        audio_ranges_accounted: usize,
+        lateness_drops: usize,
+        intentional_skips: usize,
+        final_state: BroadcastRuntimeState,
+    },
+    RuntimeFailed {
+        reason: BroadcastPlayerRuntimeFailureReason,
+    },
 }
+
+pub type BroadcastPlayerEvent = BroadcastPlayerRuntimeEvent;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BroadcastRuntimeQueueKind {
@@ -893,41 +960,105 @@ pub fn summarize_broadcast_prepared_slots(
 }
 
 pub fn build_broadcast_player_event_surface(
+    session_index: u64,
+    session: BroadcastRuntimeSessionDescription,
+    preroll_config: BroadcastPrerollConfig,
+    preroll_plan: BroadcastPrerollPlan,
+    runtime_state: BroadcastRuntimeState,
+    runtime_accounting: BroadcastRuntimeAccounting,
     runtime_events: &[BroadcastRuntimeEvent],
     prepared_summary: &BroadcastPreparedSlotSummary,
     video_slots: &[BroadcastPreparedVideoSlot],
     audio_slots: &[BroadcastPreparedAudioSlot],
     presentation_slots: &[BroadcastPreparedPresentationSlot],
-) -> Vec<BroadcastPlayerEvent> {
+) -> Vec<BroadcastPlayerRuntimeEvent> {
     let mut events = Vec::new();
     for event in runtime_events {
         match *event {
             BroadcastRuntimeEvent::SessionCreated => {
-                events.push(BroadcastPlayerEvent::SessionCreated)
+                events.push(BroadcastPlayerRuntimeEvent::SessionCreated {
+                    session_index,
+                    source_mode: session.video_source_mode,
+                    preview_profile: session.preview_profile,
+                    audio_source_role: session.audio_source,
+                    video_source_role: session.video_source,
+                })
             }
             BroadcastRuntimeEvent::PreparingStarted => {
-                events.push(BroadcastPlayerEvent::PrepareStarted)
+                events.push(BroadcastPlayerRuntimeEvent::PrepareStarted {
+                    source_mode: session.video_source_mode,
+                    queue_limits: session.queue_limits,
+                    preroll_config,
+                });
+                events.push(BroadcastPlayerRuntimeEvent::PrerollPlanned {
+                    source_mode: preroll_plan.video_source_mode,
+                    selected_video_frames: preroll_plan.selected_video_frames_planned,
+                    audio_ranges: preroll_plan.audio_ranges_planned,
+                    intentional_skips: preroll_plan.intentional_skips_planned,
+                });
             }
             BroadcastRuntimeEvent::PlaybackStarted => {
-                events.push(BroadcastPlayerEvent::TransportStarted)
+                events.push(BroadcastPlayerRuntimeEvent::TransportStarted {
+                    state: BroadcastRuntimeState::Playing,
+                    media_time: Duration::ZERO,
+                })
             }
             BroadcastRuntimeEvent::PlaybackPaused => {
-                events.push(BroadcastPlayerEvent::TransportPaused)
+                events.push(BroadcastPlayerRuntimeEvent::TransportPaused {
+                    state: BroadcastRuntimeState::Paused,
+                    media_time: Duration::ZERO,
+                })
             }
             BroadcastRuntimeEvent::SeekCompleted { target_time } => {
-                events.push(BroadcastPlayerEvent::SeekCompleted { target_time })
+                events.push(BroadcastPlayerRuntimeEvent::SeekCompleted { target_time })
             }
             BroadcastRuntimeEvent::IntentionalProfileSkip { source_frame_index } => {
-                events.push(BroadcastPlayerEvent::IntentionalProfileSkip { source_frame_index })
+                events.push(BroadcastPlayerRuntimeEvent::IntentionalProfileSkip {
+                    source_frame_index,
+                    profile: session.preview_profile,
+                })
             }
             BroadcastRuntimeEvent::FrameAccounted { frame_index } => {
-                events.push(BroadcastPlayerEvent::SelectedFrameAccounted { frame_index })
+                let slot = presentation_slots.iter().find(|slot| {
+                    slot.presentation_index
+                        == usize::try_from(frame_index).ok().unwrap_or(usize::MAX)
+                });
+                events.push(BroadcastPlayerRuntimeEvent::FrameAccounted {
+                    selected_preview_frame_index: frame_index,
+                    source_frame_index: slot.and_then(|slot| slot.selected_source_frame),
+                    presentation_time: slot
+                        .map(|slot| slot.presentation_time)
+                        .unwrap_or(Duration::ZERO),
+                    duration: slot.map(|slot| slot.duration).unwrap_or(Duration::ZERO),
+                    video_source_role: session.video_source,
+                })
             }
             BroadcastRuntimeEvent::AudioRangeAccounted { frame_index } => {
-                events.push(BroadcastPlayerEvent::AudioRangeAccounted { frame_index })
+                let slot = audio_slots.iter().find(|slot| {
+                    slot.slot_index == usize::try_from(frame_index).ok().unwrap_or(usize::MAX)
+                });
+                events.push(BroadcastPlayerRuntimeEvent::AudioRangeAccounted {
+                    presentation_index: frame_index,
+                    start_sample: slot.map(|slot| slot.start_sample).unwrap_or(0),
+                    sample_count: slot.map(|slot| slot.sample_count).unwrap_or(0),
+                    tracks_covered: slot.map(|slot| slot.track_coverage.len()).unwrap_or(0),
+                    complete: slot.map(|slot| slot.complete).unwrap_or(false),
+                })
             }
-            BroadcastRuntimeEvent::Completed => events.push(BroadcastPlayerEvent::RuntimeCompleted),
-            BroadcastRuntimeEvent::Failed => events.push(BroadcastPlayerEvent::RuntimeFailed),
+            BroadcastRuntimeEvent::Completed => {
+                events.push(BroadcastPlayerRuntimeEvent::RuntimeCompleted {
+                    selected_frames_accounted: runtime_accounting.selected_frames_accounted,
+                    audio_ranges_accounted: runtime_accounting.audio_ranges_accounted,
+                    lateness_drops: runtime_accounting.lateness_drops,
+                    intentional_skips: runtime_accounting.intentional_profile_skips,
+                    final_state: runtime_state,
+                })
+            }
+            BroadcastRuntimeEvent::Failed => {
+                events.push(BroadcastPlayerRuntimeEvent::RuntimeFailed {
+                    reason: BroadcastPlayerRuntimeFailureReason::InvalidTransition,
+                })
+            }
             BroadcastRuntimeEvent::Prepared
             | BroadcastRuntimeEvent::ContractPrepared
             | BroadcastRuntimeEvent::QueueBackpressure { .. }
@@ -939,35 +1070,118 @@ pub fn build_broadcast_player_event_surface(
     }
 
     if prepared_summary.preroll_status.ready {
-        events.push(BroadcastPlayerEvent::PrerollReady);
+        events.push(BroadcastPlayerRuntimeEvent::PrerollReady {
+            prepared_video_slots: prepared_summary.video_slots_prepared,
+            prepared_audio_slots: prepared_summary.audio_slots_complete,
+            prepared_presentation_slots: prepared_summary.presentation_slots_ready,
+        });
         for slot in video_slots.iter().filter(|slot| slot.is_ready()) {
-            events.push(BroadcastPlayerEvent::PreparedSlotAvailable {
+            events.push(BroadcastPlayerRuntimeEvent::PreparedSlotAvailable {
                 kind: BroadcastPlayerPreparedSlotKind::Video,
                 slot_index: slot.slot_index,
+                source_mode: slot.source_mode,
+                ready: true,
+                video_status: Some(slot.status),
             });
         }
         for slot in audio_slots.iter().filter(|slot| slot.complete) {
-            events.push(BroadcastPlayerEvent::PreparedSlotAvailable {
+            events.push(BroadcastPlayerRuntimeEvent::PreparedSlotAvailable {
                 kind: BroadcastPlayerPreparedSlotKind::Audio,
                 slot_index: slot.slot_index,
+                source_mode: slot.source_mode,
+                ready: true,
+                video_status: None,
             });
         }
         for slot in presentation_slots.iter().filter(|slot| slot.ready) {
-            events.push(BroadcastPlayerEvent::PreparedSlotAvailable {
+            events.push(BroadcastPlayerRuntimeEvent::PreparedSlotAvailable {
                 kind: BroadcastPlayerPreparedSlotKind::Presentation,
                 slot_index: slot.presentation_index,
+                source_mode: slot.source_mode,
+                ready: slot.ready,
+                video_status: None,
             });
         }
-        events.push(BroadcastPlayerEvent::BroadcastPlayerReady);
+        events.push(BroadcastPlayerRuntimeEvent::RuntimeReady {
+            state: BroadcastRuntimeState::Ready,
+            source_mode: prepared_summary.source_mode,
+        });
     } else if prepared_summary.preroll_status.reason
         == Some(BroadcastPrerollNotReadyReason::CapabilityMissing)
     {
-        events.push(BroadcastPlayerEvent::CapabilityMissing {
+        events.push(BroadcastPlayerRuntimeEvent::CapabilityMissing {
             source_mode: prepared_summary.source_mode,
+            capability: BroadcastPlayerCapability::OriginalVideoRuntime,
+            reason: BroadcastPrerollNotReadyReason::CapabilityMissing,
         });
     }
 
     events
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BroadcastPlayerRuntimeEventSummary {
+    pub event_count: usize,
+    pub prepared_slot_events: usize,
+    pub frame_accounted_events: usize,
+    pub audio_range_accounted_events: usize,
+    pub intentional_skip_events: usize,
+    pub lateness_drops: usize,
+    pub runtime_ready: bool,
+    pub runtime_completed: bool,
+    pub capability_missing: bool,
+    pub frame_presented_events: usize,
+}
+
+pub fn summarize_broadcast_player_runtime_events(
+    events: &[BroadcastPlayerRuntimeEvent],
+    runtime_accounting: BroadcastRuntimeAccounting,
+) -> BroadcastPlayerRuntimeEventSummary {
+    BroadcastPlayerRuntimeEventSummary {
+        event_count: events.len(),
+        prepared_slot_events: events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    BroadcastPlayerRuntimeEvent::PreparedSlotAvailable { .. }
+                )
+            })
+            .count(),
+        frame_accounted_events: events
+            .iter()
+            .filter(|event| matches!(event, BroadcastPlayerRuntimeEvent::FrameAccounted { .. }))
+            .count(),
+        audio_range_accounted_events: events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    BroadcastPlayerRuntimeEvent::AudioRangeAccounted { .. }
+                )
+            })
+            .count(),
+        intentional_skip_events: events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    BroadcastPlayerRuntimeEvent::IntentionalProfileSkip { .. }
+                )
+            })
+            .count(),
+        lateness_drops: runtime_accounting.lateness_drops,
+        runtime_ready: events
+            .iter()
+            .any(|event| matches!(event, BroadcastPlayerRuntimeEvent::RuntimeReady { .. })),
+        runtime_completed: events
+            .iter()
+            .any(|event| matches!(event, BroadcastPlayerRuntimeEvent::RuntimeCompleted { .. })),
+        capability_missing: events
+            .iter()
+            .any(|event| matches!(event, BroadcastPlayerRuntimeEvent::CapabilityMissing { .. })),
+        frame_presented_events: 0,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2356,24 +2570,87 @@ mod tests {
             .prepare_with_preroll(test_prepare_facts(), summary.preroll_status)
             .unwrap();
         machine.play().unwrap();
+        machine.account_happy_path().unwrap();
+        machine.drain().unwrap();
+        machine.complete().unwrap();
         let events = build_broadcast_player_event_surface(
+            0,
+            test_broadcast_session(),
+            test_preroll_config(),
+            test_preroll_plan(),
+            machine.state(),
+            machine.accounting(),
             machine.events(),
             &summary,
             &video_slots,
             &audio_slots,
             &presentation_slots,
         );
+        let event_summary =
+            summarize_broadcast_player_runtime_events(&events, machine.accounting());
 
-        assert!(events.contains(&BroadcastPlayerEvent::SessionCreated));
-        assert!(events.contains(&BroadcastPlayerEvent::PrepareStarted));
-        assert!(events.contains(&BroadcastPlayerEvent::PrerollReady));
-        assert!(events.contains(&BroadcastPlayerEvent::BroadcastPlayerReady));
-        assert!(events.contains(&BroadcastPlayerEvent::TransportStarted));
         assert!(
-            events.contains(&BroadcastPlayerEvent::PreparedSlotAvailable {
-                kind: BroadcastPlayerPreparedSlotKind::Presentation,
-                slot_index: 0,
+            events.contains(&BroadcastPlayerRuntimeEvent::SessionCreated {
+                session_index: 0,
+                source_mode: BroadcastVideoSourceMode::ProxyPreview,
+                preview_profile: BroadcastPreviewProfile::Journalist50iPreview,
+                audio_source_role: BroadcastMediaSourceRole::OriginalAuthoritativeAudio,
+                video_source_role: BroadcastMediaSourceRole::ProxyPreviewVideo,
             })
+        );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                BroadcastPlayerRuntimeEvent::PrepareStarted {
+                    source_mode: BroadcastVideoSourceMode::ProxyPreview,
+                    ..
+                }
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                BroadcastPlayerRuntimeEvent::PrerollReady {
+                    prepared_video_slots: 3,
+                    prepared_audio_slots: 3,
+                    prepared_presentation_slots: 3,
+                }
+            )
+        }));
+        assert!(events.contains(&BroadcastPlayerRuntimeEvent::RuntimeReady {
+            state: BroadcastRuntimeState::Ready,
+            source_mode: BroadcastVideoSourceMode::ProxyPreview,
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                BroadcastPlayerRuntimeEvent::TransportStarted {
+                    state: BroadcastRuntimeState::Playing,
+                    ..
+                }
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                BroadcastPlayerRuntimeEvent::PreparedSlotAvailable {
+                    kind: BroadcastPlayerPreparedSlotKind::Presentation,
+                    slot_index: 0,
+                    source_mode: BroadcastVideoSourceMode::ProxyPreview,
+                    ready: true,
+                    ..
+                }
+            )
+        }));
+        assert_eq!(event_summary.frame_accounted_events, 53);
+        assert_eq!(event_summary.audio_range_accounted_events, 53);
+        assert_eq!(event_summary.intentional_skip_events, 53);
+        assert_eq!(event_summary.frame_presented_events, 0);
+        assert!(event_summary.runtime_ready);
+        assert!(event_summary.runtime_completed);
+        assert!(
+            !format!("{events:?}").contains("FramePresented"),
+            "event surface must not claim display presentation"
         );
     }
 
@@ -2412,6 +2689,31 @@ mod tests {
             &presentation_slots,
         );
         let events = build_broadcast_player_event_surface(
+            0,
+            BroadcastRuntimeSessionDescription {
+                video_source: BroadcastMediaSourceRole::OriginalFinishingMedia,
+                video_source_mode: BroadcastVideoSourceMode::OriginalMedia,
+                ..test_broadcast_session()
+            },
+            BroadcastPrerollConfig {
+                video_source_mode: BroadcastVideoSourceMode::OriginalMedia,
+                ..test_preroll_config()
+            },
+            BroadcastPrerollPlan {
+                video_source_mode: BroadcastVideoSourceMode::OriginalMedia,
+                video_source_available: true,
+                video_runtime_supported: false,
+                selected_video_frames_planned: 106,
+                intentional_skips_planned: 0,
+                ..test_preroll_plan()
+            },
+            BroadcastRuntimeState::Preparing,
+            BroadcastRuntimeAccounting {
+                selected_frames_accounted: 0,
+                audio_ranges_accounted: 0,
+                intentional_profile_skips: 0,
+                lateness_drops: 0,
+            },
             &[
                 BroadcastRuntimeEvent::SessionCreated,
                 BroadcastRuntimeEvent::PreparingStarted,
@@ -2421,11 +2723,25 @@ mod tests {
             &audio_slots,
             &presentation_slots,
         );
+        let event_summary = summarize_broadcast_player_runtime_events(
+            &events,
+            BroadcastRuntimeAccounting {
+                selected_frames_accounted: 0,
+                audio_ranges_accounted: 0,
+                intentional_profile_skips: 0,
+                lateness_drops: 0,
+            },
+        );
 
-        assert!(events.contains(&BroadcastPlayerEvent::CapabilityMissing {
-            source_mode: BroadcastVideoSourceMode::OriginalMedia,
-        }));
-        assert!(!events.contains(&BroadcastPlayerEvent::BroadcastPlayerReady));
+        assert!(
+            events.contains(&BroadcastPlayerRuntimeEvent::CapabilityMissing {
+                source_mode: BroadcastVideoSourceMode::OriginalMedia,
+                capability: BroadcastPlayerCapability::OriginalVideoRuntime,
+                reason: BroadcastPrerollNotReadyReason::CapabilityMissing,
+            })
+        );
+        assert!(!event_summary.runtime_ready);
+        assert!(event_summary.capability_missing);
     }
 
     fn test_broadcast_session() -> BroadcastRuntimeSessionDescription {
