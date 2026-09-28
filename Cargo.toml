@@ -5,6 +5,7 @@ members = [
     "crates/qgs-linux",
     "crates/qgs-mp4",
     "crates/qgs-mxf",
+    "crates/qgs-media-runtime",
     "crates/qgs-protocol",
     "crates/qgs-software-video",
     "crates/qgs-vaapi",

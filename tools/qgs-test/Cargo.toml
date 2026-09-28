@@ -8,6 +8,7 @@ version.workspace = true
 qgs-linux = { path = "../../crates/qgs-linux" }
 qgs-codec-h264 = { path = "../../crates/qgs-codec-h264" }
 qgs-core = { path = "../../crates/qgs-core" }
+qgs-media-runtime = { path = "../../crates/qgs-media-runtime" }
 qgs-mp4 = { path = "../../crates/qgs-mp4" }
 qgs-mxf = { path = "../../crates/qgs-mxf" }
 qgs-protocol = { path = "../../crates/qgs-protocol" }

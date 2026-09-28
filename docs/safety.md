@@ -7,6 +7,7 @@ QGS is safe Rust by default.
 - `qgs-protocol`
 - `qgs-core`
 - `qgs-linux`
+- `qgs-media-runtime`
 - `qgs-mp4`
 - `qgsd`
 - `qgs-test`

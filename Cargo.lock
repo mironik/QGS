@@ -493,6 +493,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "qgs-media-runtime"
+version = "0.1.0"
+
+[[package]]
 name = "qgs-mp4"
 version = "0.1.0"
 dependencies = [
@@ -529,6 +533,7 @@ dependencies = [
  "qgs-codec-h264",
  "qgs-core",
  "qgs-linux",
+ "qgs-media-runtime",
  "qgs-mp4",
  "qgs-mxf",
  "qgs-protocol",

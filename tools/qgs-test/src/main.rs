@@ -4,12 +4,17 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use qgs_core::{DeviceDiscovery, VideoCapabilityDiscovery};
+use qgs_core::{BackendDecodedSurface, DecoderBackend, DeviceDiscovery, VideoCapabilityDiscovery};
 use qgs_linux::{
     connect_socket, default_socket_path, receive_message, receive_message_with_attachments,
     send_message,
+};
+use qgs_media_runtime::{
+    classify_presentation, BoundedQueue, FrameIdentity as PlaybackFrameIdentity, PlaybackClock,
+    PlaybackConfig, PlaybackState, PresentationDecision, RationalRate, RealTimeClock,
+    TestPresentationSink,
 };
 use qgs_mp4::{
     classify_video_track, nearest_random_access_before, MediaHealth, Mp4Source, Mp4TrackKind,
@@ -17,7 +22,7 @@ use qgs_mp4::{
 use qgs_mxf::{IndexSource, MediaSource, RandomAccess, TrackKind};
 use qgs_protocol::{
     BitDepth, BufferDesc, BufferUsageFlags, ChromaSubsampling, CreateBufferRequest,
-    CreateDecoderRequest, CreateImageRequest, CreateSyncRequest, DecoderConfig,
+    CreateDecoderRequest, CreateImageRequest, CreateSyncRequest, DecoderConfig, DecoderId,
     DestroyDecoderRequest, DestroyResourceRequest, DeviceCapabilities, DeviceClass, DeviceDesc,
     ErrorResponse, ExportResourceRequest, ExportSyncRequest, ExternalHandleType, ExternalSharing,
     FlushDecoderRequest, H264Profile, HelloRequest, ImageDesc, ImageUsageFlags, MemoryPreference,
@@ -49,6 +54,7 @@ const SOFTWARE_DECODE_MXF_ARG: &str = "--software-decode-mxf";
 const SOFTWARE_GPU_MXF_ARG: &str = "--software-gpu-mxf";
 const PROXY_PROOF_ARG: &str = "--proxy-proof";
 const PROXY_THROUGHPUT_ARG: &str = "--proxy-throughput";
+const PROXY_PLAYBACK_ARG: &str = "--proxy-playback";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -81,6 +87,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.proxy_throughput_paths {
         return proxy_throughput(&original, &proxy);
+    }
+    if let Some((original, proxy)) = args.proxy_playback_paths {
+        return proxy_playback(&original, &proxy);
     }
 
     let socket_path = args.socket_path;
@@ -1403,6 +1412,465 @@ fn proxy_throughput(
     }
 
     Ok(())
+}
+
+fn proxy_playback(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let original_sha256 = sha256_hex(original_path)?;
+    let proxy_sha256 = sha256_hex(proxy_path)?;
+    let case = identify_camera_case(&original_sha256, &proxy_sha256)?;
+    if case.damaged_proxy {
+        return diagnose_damaged_proxy_case(case, proxy_path);
+    }
+
+    let original_bytes = std::fs::read(original_path)?;
+    let original = MediaSource::parse(&original_bytes)?;
+    let source_open_start = Instant::now();
+    let proxy = Mp4Source::open(proxy_path)?;
+    let source_open_elapsed = source_open_start.elapsed();
+    let proxy_video = proxy
+        .video
+        .as_ref()
+        .ok_or("proxy has no H.264 video track")?;
+    let proxy_h264 = classify_video_track(proxy_video)?;
+    let access_units = proxy_video
+        .samples
+        .iter()
+        .map(|sample| sample.annex_b.clone())
+        .collect::<Vec<_>>();
+    let frame_count = access_units.len();
+    let rate = RationalRate::new(
+        u64::from(proxy_video.frame_rate.numerator),
+        u64::from(proxy_video.frame_rate.denominator),
+    )?;
+    let source_duration = rate.duration_for_frames(u64::try_from(frame_count)?)?;
+    let config = PlaybackConfig::default().validate()?;
+
+    println!("QGS bounded realtime proxy playback:");
+    println!("  original: {}", case.original_label);
+    println!("  proxy: {}", case.proxy_label);
+    println!("  hashes: verified");
+    println!("  original edit units: {}", original.index.video.len());
+    println!(
+        "  proxy: H.264 {:?}, {}-bit {:?}, visible {} x {}, coded {} x {}, {}/{} fps",
+        proxy_h264.profile,
+        proxy_h264.bit_depth,
+        proxy_h264.chroma,
+        proxy_h264.width,
+        proxy_h264.height,
+        proxy_h264.coded_width,
+        proxy_h264.coded_height,
+        rate.numerator(),
+        rate.denominator()
+    );
+    println!("  source presentation frames: {frame_count}");
+    println!("  source duration: {:.3}s", source_duration.as_secs_f64());
+    println!(
+        "  queue capacities: compressed={} decoded={} gpu={} presentation={} preroll={}",
+        config.compressed_capacity,
+        config.decoded_capacity,
+        config.gpu_capacity,
+        config.presentation_capacity,
+        config.preroll_frames
+    );
+
+    let discovery = VulkanDeviceDiscovery::new()?;
+    let devices = discovery.enumerate_devices()?;
+    let Some(device) = devices
+        .iter()
+        .find(|device| {
+            device.vendor_id == 0x8086 && matches!(device.class, DeviceClass::IntegratedGpu)
+        })
+        .or_else(|| {
+            devices
+                .iter()
+                .find(|device| matches!(device.class, DeviceClass::IntegratedGpu))
+        })
+    else {
+        return Err("Intel VA proxy playback: no integrated GPU advertised".into());
+    };
+
+    let proxy_config = decoder_config_for_surface(
+        device.id,
+        proxy_h264.profile,
+        BitDepth::new(proxy_h264.bit_depth)?,
+        proxy_h264.chroma,
+        proxy_h264.coded_width,
+        proxy_h264.coded_height,
+    );
+    let vaapi = qgs_vaapi::VaapiVideoDiscovery::new(&devices);
+    let capabilities = vaapi.query_video_capabilities(device.id)?;
+    let supports_proxy = capabilities
+        .decode
+        .iter()
+        .any(|capability| proxy_config.is_satisfied_by(capability));
+    println!("Intel proxy capability:");
+    println!("  device: {}", device.name);
+    println!(
+        "  H.264 {:?} {}-bit {:?}: {}",
+        proxy_h264.profile,
+        proxy_h264.bit_depth,
+        proxy_h264.chroma,
+        yes_no(supports_proxy)
+    );
+    if !supports_proxy {
+        return Err("Intel VA backend does not support proxy configuration".into());
+    }
+
+    let decoder_create_start = Instant::now();
+    let mut decoder = vaapi.create_decoder(&CreateDecoderRequest {
+        config: proxy_config,
+    })?;
+    let decoder_create_elapsed = decoder_create_start.elapsed();
+    let decoder_id = DecoderId::new(1)?;
+
+    let playback_start = Instant::now();
+    let mut clock = RealTimeClock::start_now();
+    let mut sink = TestPresentationSink::new();
+    let mut state = PlaybackState::Prerolling;
+    let mut compressed_queue = BoundedQueue::new(config.compressed_capacity)?;
+    let mut decoded_queue = BoundedQueue::new(config.decoded_capacity)?;
+    let mut gpu_queue = BoundedQueue::new(config.gpu_capacity)?;
+    let mut presentation_queue = BoundedQueue::new(config.presentation_capacity)?;
+    let mut next_input = 0_usize;
+    let mut next_output = 0_usize;
+    let mut flushed = false;
+    let mut access_units_submitted = 0_usize;
+    let mut decoder_outputs = 0_usize;
+    let mut gpu_submissions = 0_usize;
+    let mut gpu_completions = 0_usize;
+    let mut decode_submit_elapsed = Duration::ZERO;
+    let mut gpu_stage_elapsed = Duration::ZERO;
+    let mut presentation_wait_elapsed = Duration::ZERO;
+    let mut max_lateness = Duration::ZERO;
+    let mut lateness_values = Vec::new();
+
+    loop {
+        while next_input < access_units.len() && !compressed_queue.is_full() {
+            compressed_queue
+                .try_push(ScheduledAccessUnit {
+                    access_unit: access_units[next_input].clone(),
+                })
+                .map_err(|_| "compressed queue unexpectedly full")?;
+            next_input += 1;
+        }
+
+        while !compressed_queue.is_empty() && !decoded_queue.is_full() {
+            let scheduled = compressed_queue
+                .pop_front()
+                .ok_or("compressed queue unexpectedly empty")?;
+            let started = Instant::now();
+            let outputs = decoder.submit_access_unit(&SubmitAccessUnitRequest {
+                decoder_id,
+                data: scheduled.access_unit,
+            })?;
+            decode_submit_elapsed += started.elapsed();
+            access_units_submitted += 1;
+            for output in outputs {
+                let identity = PlaybackFrameIdentity::from_position(u64::try_from(next_output)?);
+                next_output += 1;
+                decoded_queue
+                    .try_push(DecodedPlaybackFrame {
+                        identity,
+                        surface: output,
+                    })
+                    .map_err(|_| "decoded queue unexpectedly full")?;
+                decoder_outputs += 1;
+            }
+        }
+
+        if next_input == access_units.len()
+            && compressed_queue.is_empty()
+            && !flushed
+            && decoded_queue.len() < decoded_queue.capacity()
+        {
+            let started = Instant::now();
+            let outputs = decoder.flush(&FlushDecoderRequest { decoder_id })?;
+            decode_submit_elapsed += started.elapsed();
+            flushed = true;
+            for output in outputs {
+                let identity = PlaybackFrameIdentity::from_position(u64::try_from(next_output)?);
+                next_output += 1;
+                decoded_queue
+                    .try_push(DecodedPlaybackFrame {
+                        identity,
+                        surface: output,
+                    })
+                    .map_err(|_| "decoded queue unexpectedly full during flush")?;
+                decoder_outputs += 1;
+            }
+        }
+
+        while !decoded_queue.is_empty() && !gpu_queue.is_full() {
+            let started = Instant::now();
+            let decoded = decoded_queue
+                .pop_front()
+                .ok_or("decoded queue unexpectedly empty")?;
+            gpu_queue
+                .try_push(decoded)
+                .map_err(|_| "GPU queue unexpectedly full")?;
+            gpu_submissions += 1;
+            gpu_stage_elapsed += started.elapsed();
+        }
+
+        while !gpu_queue.is_empty() && !presentation_queue.is_full() {
+            let started = Instant::now();
+            let processed = gpu_queue
+                .pop_front()
+                .ok_or("GPU queue unexpectedly empty")?;
+            presentation_queue
+                .try_push(ReadyPlaybackFrame {
+                    identity: processed.identity,
+                    surface: processed.surface,
+                })
+                .map_err(|_| "presentation queue unexpectedly full")?;
+            gpu_completions += 1;
+            gpu_stage_elapsed += started.elapsed();
+        }
+
+        if state == PlaybackState::Prerolling && presentation_queue.len() >= config.preroll_frames {
+            state = PlaybackState::Playing;
+            clock = RealTimeClock::start_now();
+        }
+        if state == PlaybackState::Prerolling && flushed && !presentation_queue.is_empty() {
+            state = PlaybackState::Playing;
+            clock = RealTimeClock::start_now();
+        }
+
+        if state == PlaybackState::Playing {
+            if let Some(frame) = presentation_queue.front() {
+                let expected = rate.frame_offset(frame.identity.presentation_position)?;
+                let wait_started = Instant::now();
+                clock.sleep_until(expected);
+                presentation_wait_elapsed += wait_started.elapsed();
+                let actual = clock.now();
+                let lateness = actual.saturating_sub(expected);
+                max_lateness = max_lateness.max(lateness);
+                lateness_values.push(lateness);
+                let status = classify_presentation(lateness, config);
+                let frame = presentation_queue
+                    .pop_front()
+                    .ok_or("presentation queue unexpectedly empty")?;
+                sink.record(PresentationDecision {
+                    identity: frame.identity,
+                    expected,
+                    actual,
+                    lateness,
+                    status,
+                });
+                drop(frame.surface);
+            }
+        }
+
+        if sink.decisions().len() == frame_count {
+            break;
+        }
+
+        if flushed
+            && presentation_queue.is_empty()
+            && decoded_queue.is_empty()
+            && gpu_queue.is_empty()
+        {
+            state = PlaybackState::Completed;
+            break;
+        }
+    }
+
+    if state == PlaybackState::Playing {
+        clock.sleep_until(source_duration);
+        state = PlaybackState::Completed;
+    }
+    let playback_elapsed = playback_start.elapsed();
+
+    if sink.decisions().len() != frame_count {
+        return Err(format!(
+            "playback expected {frame_count} presentation decisions, got {}",
+            sink.decisions().len()
+        )
+        .into());
+    }
+    if decoder_outputs != frame_count {
+        return Err(format!(
+            "playback expected {frame_count} decoder outputs, got {decoder_outputs}"
+        )
+        .into());
+    }
+
+    let counts = sink.counts();
+    let presented_total = counts.presented + counts.late;
+    let mean_lateness = mean_duration(&lateness_values);
+    let median_lateness = median_duration(&mut lateness_values);
+
+    println!("Realtime playback result:");
+    println!("  state: {:?}", state);
+    println!("  access units submitted: {access_units_submitted}");
+    println!("  decoder outputs: {decoder_outputs}");
+    println!("  GPU queue submissions: {gpu_submissions}");
+    println!("  GPU queue completions: {gpu_completions}");
+    println!(
+        "  presentation decisions: {} presented={} on_time={} late={} dropped={} duplicated={}",
+        sink.decisions().len(),
+        presented_total,
+        counts.presented,
+        counts.late,
+        counts.dropped,
+        counts.duplicated
+    );
+    println!(
+        "  playback wall-clock: {:.3}s target={:.3}s",
+        playback_elapsed.as_secs_f64(),
+        source_duration.as_secs_f64()
+    );
+    println!(
+        "  lateness: max={:.3} ms mean={:.3} ms median={:.3} ms",
+        duration_ms(max_lateness),
+        duration_ms(mean_lateness),
+        duration_ms(median_lateness)
+    );
+    println!(
+        "  queue peaks: compressed={} decoded={} gpu={} presentation={}",
+        compressed_queue.stats().peak_depth,
+        decoded_queue.stats().peak_depth,
+        gpu_queue.stats().peak_depth,
+        presentation_queue.stats().peak_depth
+    );
+    println!(
+        "  backpressure events: compressed={} decoded={} gpu={} presentation={}",
+        compressed_queue.stats().backpressure_events,
+        decoded_queue.stats().backpressure_events,
+        gpu_queue.stats().backpressure_events,
+        presentation_queue.stats().backpressure_events
+    );
+    println!("  VA surfaces: held through decoded/GPU/presentation queues; detailed pool stats measured by clean VA observation");
+    println!("  GPU processing: bounded scheduling queue only in realtime path; VA->Vulkan zero-copy remains frozen");
+    println!("Stage timing observations:");
+    println!(
+        "  MP4 open/sample extraction: {:.3} ms",
+        duration_ms(source_open_elapsed)
+    );
+    println!(
+        "  VA decoder creation: {:.3} ms",
+        duration_ms(decoder_create_elapsed)
+    );
+    println!(
+        "  VA decode submit/flush aggregate: {:.3} ms",
+        duration_ms(decode_submit_elapsed)
+    );
+    println!(
+        "  GPU scheduling aggregate: {:.3} ms",
+        duration_ms(gpu_stage_elapsed)
+    );
+    println!(
+        "  presentation wait aggregate: {:.3} ms",
+        duration_ms(presentation_wait_elapsed)
+    );
+
+    if counts.dropped != 0 || counts.duplicated != 0 {
+        return Err("real-time playback produced drops or duplicates".into());
+    }
+
+    let selected = selected_proxy_ordinals(frame_count);
+    let normal = qgs_vaapi::decode_h264_access_units_for_observation(
+        &devices,
+        device.id,
+        &decoder_config_for_surface(
+            device.id,
+            proxy_h264.profile,
+            BitDepth::new(proxy_h264.bit_depth)?,
+            proxy_h264.chroma,
+            proxy_h264.coded_width,
+            proxy_h264.coded_height,
+        ),
+        &access_units,
+        qgs_vaapi::VaapiDecodeMode::Normal,
+        &selected,
+    )?;
+    println!("Clean VA ownership observation:");
+    print_va_observation(&normal);
+
+    let presentation_ordinals = proxy_presentation_ordinals(proxy_video)?;
+    let proxy_positioned = proxy_video
+        .samples
+        .iter()
+        .map(|sample| {
+            Ok((
+                *presentation_ordinals
+                    .get(&sample.sample_index)
+                    .ok_or("missing proxy playback presentation ordinal")?,
+                sample.annex_b.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    let software_frames = decode_positioned_access_units_with_context(
+        decoder_config_for_surface(
+            device.id,
+            proxy_h264.profile,
+            BitDepth::new(proxy_h264.bit_depth)?,
+            proxy_h264.chroma,
+            proxy_h264.coded_width,
+            proxy_h264.coded_height,
+        ),
+        &proxy_positioned,
+    )?;
+    println!("Selected-frame validation:");
+    let mut software_by_presentation = software_frames.frames.iter().collect::<Vec<_>>();
+    software_by_presentation.sort_by_key(|frame| frame.presentation_index);
+    for ordinal in selected {
+        let frame = software_frames
+            .frames
+            .iter()
+            .find(|frame| frame.presentation_index == ordinal as u64)
+            .or_else(|| software_by_presentation.get(ordinal).copied())
+            .ok_or_else(|| format!("missing software validation frame {ordinal}"))?;
+        run_proxy_gpu_frame(
+            &discovery,
+            device,
+            &format!("proxy-requested-{ordinal}"),
+            frame,
+        )?;
+    }
+
+    Ok(())
+}
+
+struct ScheduledAccessUnit {
+    access_unit: Vec<u8>,
+}
+
+struct DecodedPlaybackFrame {
+    identity: PlaybackFrameIdentity,
+    surface: BackendDecodedSurface,
+}
+
+struct ReadyPlaybackFrame {
+    identity: PlaybackFrameIdentity,
+    surface: BackendDecodedSurface,
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+fn mean_duration(values: &[Duration]) -> Duration {
+    if values.is_empty() {
+        return Duration::ZERO;
+    }
+    let total_ns = values
+        .iter()
+        .map(Duration::as_nanos)
+        .fold(0_u128, |acc, value| acc.saturating_add(value));
+    let mean_ns = total_ns / values.len() as u128;
+    Duration::from_nanos(u64::try_from(mean_ns).unwrap_or(u64::MAX))
+}
+
+fn median_duration(values: &mut [Duration]) -> Duration {
+    if values.is_empty() {
+        return Duration::ZERO;
+    }
+    values.sort_unstable();
+    values[values.len() / 2]
 }
 
 struct FrontendOnlyObservation {
@@ -4262,6 +4730,7 @@ struct Args {
     software_gpu_mxf_path: Option<PathBuf>,
     proxy_proof_paths: Option<(PathBuf, PathBuf)>,
     proxy_throughput_paths: Option<(PathBuf, PathBuf)>,
+    proxy_playback_paths: Option<(PathBuf, PathBuf)>,
 }
 
 impl Args {
@@ -4280,13 +4749,28 @@ impl Args {
         let mut proxy_proof_paths = None;
         let mut proxy_throughput_original = None;
         let mut proxy_throughput_paths = None;
+        let mut proxy_playback_original = None;
+        let mut proxy_playback_paths = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
         let mut next_arg_is_proxy_throughput_proxy = false;
+        let mut next_arg_is_proxy_playback_original = false;
+        let mut next_arg_is_proxy_playback_proxy = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_proxy_throughput_proxy {
+            if next_arg_is_proxy_playback_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = proxy_playback_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                proxy_playback_paths = Some((original, proxy));
+                next_arg_is_proxy_playback_proxy = false;
+            } else if next_arg_is_proxy_playback_original {
+                proxy_playback_original = Some(PathBuf::from(arg));
+                next_arg_is_proxy_playback_original = false;
+                next_arg_is_proxy_playback_proxy = true;
+            } else if next_arg_is_proxy_throughput_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = proxy_throughput_original
                     .take()
@@ -4334,6 +4818,8 @@ impl Args {
                 next_arg_is_proxy_original = true;
             } else if arg == PROXY_THROUGHPUT_ARG {
                 next_arg_is_proxy_throughput_original = true;
+            } else if arg == PROXY_PLAYBACK_ARG {
+                next_arg_is_proxy_playback_original = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -4349,6 +4835,7 @@ impl Args {
             software_gpu_mxf_path,
             proxy_proof_paths,
             proxy_throughput_paths,
+            proxy_playback_paths,
         }
     }
 }

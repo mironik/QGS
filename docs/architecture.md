@@ -559,6 +559,47 @@ without introducing a playback scheduler. It deliberately remains separate from
 Qnc timeline concepts, final presentation, performance scheduling, and the
 frozen Haswell VA -> Vulkan zero-copy path.
 
+M2 Step 16 introduces the first bounded media playback runtime skeleton:
+
+```text
+MediaSource
+    |
+compressed access-unit scheduling
+    |
+decoder backend
+    |
+decoded-frame queue
+    |
+bounded GPU-processing queue
+    |
+presentation-ready queue
+    |
+TestPresentationSink
+```
+
+The runtime lives in `qgs-media-runtime`, not in the MP4/MXF, codec, VA, or
+Vulkan backend crates. It provides exact rational playback-rate math,
+monotonic real-time and deterministic test clocks, bounded queues,
+presentation decisions, preroll policy, late/drop classification, and
+development counters. It does not add Qnc timeline concepts, UI transport
+controls, display presentation, audio playback, or public protocol playback
+commands.
+
+The Step 16 acceptance path uses the clean camera proxy as a media-runtime
+source, decodes H.264 through Intel VA-API, carries decoded `VideoSurface`
+ownership through bounded queues, and presents according to media presentation
+time through a deterministic test sink. The normal timed path does not perform
+per-frame VA diagnostic readback, GPU validation readback, Vulkan validation,
+or CPU reference conversion.
+
+Because VA -> Vulkan zero-copy remains frozen, Step 16 does not pretend VA
+surfaces are GPU-processable Vulkan resources. The real-time path contains a
+bounded GPU scheduling queue, while selected-frame pixel validation continues
+to use the existing CPU-backed proxy bridge into the reusable
+`GpuFrameProcessor`. A future milestone must add either a clean VA readback to
+CPU surface path for playback or a new approved hardware-surface GPU ingestion
+path before normal proxy playback can include per-frame pixel GPU processing.
+
 M2 Step 2 adds real VA-API decode capability discovery through a backend
 boundary:
 
@@ -597,10 +638,12 @@ image-processing proofs against imported shared resources. It also defines the
 video capability and `VideoSurface` model and can perform narrow H.264
 VA-API hardware decode proofs on supported hardware. It can also process
 software-decoded YUV422P10LE frames through a bounded reusable GPU frame
-processor. It does not include an async runtime, daemonization, DRM/KMS, video
-encode, a public compute or shader API, reusable semaphore workflows, general
-workload scheduling, performance benchmarking, telemetry, free-memory reporting,
-or resumed VA -> Vulkan zero-copy video processing.
+processor and can run a bounded real-time proxy playback skeleton into a test
+presentation sink. It does not include an async runtime, daemonization,
+DRM/KMS, video encode, a public compute or shader API, reusable semaphore
+workflows, final playback scheduling, performance benchmarking, telemetry,
+free-memory reporting, display presentation, audio playback, Qnc timeline
+integration, or resumed VA -> Vulkan zero-copy video processing.
 
 Capability discovery is static information reported by the backend. It is not a
 measurement of current load, available/free VRAM, throughput, or scheduling
