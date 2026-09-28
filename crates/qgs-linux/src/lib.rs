@@ -6,7 +6,8 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::{AsFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use qgs_protocol::{
     decode_wire_header, decode_wire_message_parts, encode_wire_message, ProtocolError, WireMessage,
@@ -66,6 +67,71 @@ pub enum LinuxAudioConversionNeed {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinuxPipewirePrototypeEvidenceLevel {
+    PipeWireUnavailable,
+    StreamOpenFailed,
+    StreamOpened,
+    BufferSubmitted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinuxPipewirePrototypeSampleFormat {
+    F32Interleaved,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinuxPipewirePrototypeBuffer {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub sample_count: u32,
+    pub sample_format: LinuxPipewirePrototypeSampleFormat,
+    pub bytes: Vec<u8>,
+}
+
+impl LinuxPipewirePrototypeBuffer {
+    pub fn validate(&self) -> Result<(), LinuxAudioProbeError> {
+        if self.sample_rate == 0 || self.channels == 0 || self.sample_count == 0 {
+            return Err(LinuxAudioProbeError::InvalidPrototypeBuffer(
+                "sample rate, channel count, and sample count must be non-zero",
+            ));
+        }
+        let bytes_per_sample = match self.sample_format {
+            LinuxPipewirePrototypeSampleFormat::F32Interleaved => 4_usize,
+        };
+        let expected = usize::try_from(self.sample_count)
+            .ok()
+            .and_then(|samples| samples.checked_mul(usize::from(self.channels)))
+            .and_then(|values| values.checked_mul(bytes_per_sample))
+            .ok_or(LinuxAudioProbeError::InvalidPrototypeBuffer(
+                "prototype buffer byte count overflowed",
+            ))?;
+        if self.bytes.len() != expected {
+            return Err(LinuxAudioProbeError::InvalidPrototypeBuffer(
+                "prototype buffer byte count does not match format",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinuxPipewirePrototypeReport {
+    pub pipewire_cli_available: bool,
+    pub pipewire_server_reachable: bool,
+    pub stream_open_attempted: bool,
+    pub stream_opened: bool,
+    pub buffer_submitted: bool,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub sample_format: LinuxPipewirePrototypeSampleFormat,
+    pub sample_count: u32,
+    pub bytes_submitted: usize,
+    pub evidence_level: LinuxPipewirePrototypeEvidenceLevel,
+    pub audio_device_verified: bool,
+    pub status_message: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LinuxAudioDeviceProbeReport {
     pub source_format: LinuxOriginalPcmAudioFormat,
@@ -82,15 +148,21 @@ pub struct LinuxAudioDeviceProbeReport {
     pub notes: Vec<&'static str>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LinuxAudioProbeError {
     InvalidSourceFormat(&'static str),
+    InvalidPrototypeBuffer(&'static str),
+    Io(String),
 }
 
 impl std::fmt::Display for LinuxAudioProbeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidSourceFormat(message) => write!(f, "invalid source format: {message}"),
+            Self::InvalidPrototypeBuffer(message) => {
+                write!(f, "invalid prototype buffer: {message}")
+            }
+            Self::Io(message) => write!(f, "audio prototype I/O error: {message}"),
         }
     }
 }
@@ -148,6 +220,133 @@ pub fn probe_linux_audio_device_boundary(
             LinuxAudioProbeOutcome::Unavailable
         },
         notes,
+    })
+}
+
+pub fn submit_pipewire_audio_prototype(
+    buffer: &LinuxPipewirePrototypeBuffer,
+) -> Result<LinuxPipewirePrototypeReport, LinuxAudioProbeError> {
+    buffer.validate()?;
+    let pipewire_cli_available = command_available("pw-cat");
+    let pipewire_server_reachable = command_available("pw-cli") && pipewire_server_reachable();
+    if !pipewire_cli_available || !pipewire_server_reachable {
+        return Ok(LinuxPipewirePrototypeReport {
+            pipewire_cli_available,
+            pipewire_server_reachable,
+            stream_open_attempted: false,
+            stream_opened: false,
+            buffer_submitted: false,
+            sample_rate: buffer.sample_rate,
+            channels: buffer.channels,
+            sample_format: buffer.sample_format,
+            sample_count: buffer.sample_count,
+            bytes_submitted: 0,
+            evidence_level: LinuxPipewirePrototypeEvidenceLevel::PipeWireUnavailable,
+            audio_device_verified: false,
+            status_message: "PipeWire command path is unavailable".to_string(),
+        });
+    }
+
+    let mut child = Command::new("pw-cat")
+        .arg("--playback")
+        .arg("--verbose")
+        .arg("--raw")
+        .arg("--rate")
+        .arg(buffer.sample_rate.to_string())
+        .arg("--channels")
+        .arg(buffer.channels.to_string())
+        .arg("--format")
+        .arg(match buffer.sample_format {
+            LinuxPipewirePrototypeSampleFormat::F32Interleaved => "f32",
+        })
+        .arg("--sample-count")
+        .arg(buffer.sample_count.to_string())
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| LinuxAudioProbeError::Io(format!("spawn pw-cat: {err}")))?;
+
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| LinuxAudioProbeError::Io("pw-cat stdin unavailable".to_string()))?;
+        stdin
+            .write_all(&buffer.bytes)
+            .map_err(|err| LinuxAudioProbeError::Io(format!("write pw-cat stdin: {err}")))?;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|err| LinuxAudioProbeError::Io(format!("poll pw-cat: {err}")))?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(LinuxPipewirePrototypeReport {
+                pipewire_cli_available,
+                pipewire_server_reachable,
+                stream_open_attempted: true,
+                stream_opened: false,
+                buffer_submitted: false,
+                sample_rate: buffer.sample_rate,
+                channels: buffer.channels,
+                sample_format: buffer.sample_format,
+                sample_count: buffer.sample_count,
+                bytes_submitted: 0,
+                evidence_level: LinuxPipewirePrototypeEvidenceLevel::StreamOpenFailed,
+                audio_device_verified: false,
+                status_message: "pw-cat did not complete before timeout".to_string(),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+
+    let stream_opened = stderr.contains("stream state changed paused -> streaming")
+        || stderr.contains("stream state changed connecting -> paused")
+        || stderr.contains("stream node ");
+    let success = status.success();
+    Ok(LinuxPipewirePrototypeReport {
+        pipewire_cli_available,
+        pipewire_server_reachable,
+        stream_open_attempted: true,
+        stream_opened,
+        buffer_submitted: success,
+        sample_rate: buffer.sample_rate,
+        channels: buffer.channels,
+        sample_format: buffer.sample_format,
+        sample_count: buffer.sample_count,
+        bytes_submitted: if success { buffer.bytes.len() } else { 0 },
+        evidence_level: if success {
+            LinuxPipewirePrototypeEvidenceLevel::BufferSubmitted
+        } else if stream_opened {
+            LinuxPipewirePrototypeEvidenceLevel::StreamOpened
+        } else {
+            LinuxPipewirePrototypeEvidenceLevel::StreamOpenFailed
+        },
+        audio_device_verified: success,
+        status_message: if success {
+            "pw-cat accepted the bounded prototype buffer".to_string()
+        } else if stream_opened {
+            format!(
+                "pw-cat opened a PipeWire stream but exited with status {status}; buffer submission is not verified"
+            )
+        } else if stderr.trim().is_empty() {
+            format!("pw-cat exited with status {status}")
+        } else {
+            format!("pw-cat exited with status {status}: {}", stderr.trim())
+        },
     })
 }
 
@@ -472,6 +671,27 @@ mod tests {
             ),
             "probe is not allowed to claim real playback"
         );
+    }
+
+    #[test]
+    fn pipewire_prototype_buffer_validates_byte_count() {
+        let valid = LinuxPipewirePrototypeBuffer {
+            sample_rate: 48_000,
+            channels: 4,
+            sample_count: 960,
+            sample_format: LinuxPipewirePrototypeSampleFormat::F32Interleaved,
+            bytes: vec![0_u8; 960 * 4 * 4],
+        };
+        valid.validate().expect("valid f32 interleaved buffer");
+
+        let invalid = LinuxPipewirePrototypeBuffer {
+            bytes: vec![0_u8; 7],
+            ..valid
+        };
+        assert!(matches!(
+            invalid.validate(),
+            Err(LinuxAudioProbeError::InvalidPrototypeBuffer(_))
+        ));
     }
 
     fn unique_socket_path() -> PathBuf {

@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use qgs_core::{BackendDecodedSurface, DecoderBackend, DeviceDiscovery, VideoCapabilityDiscovery};
 use qgs_linux::{
     connect_socket, default_socket_path, probe_linux_audio_device_boundary, receive_message,
-    receive_message_with_attachments, send_message, LinuxAudioConversionNeed,
-    LinuxOriginalPcmAudioFormat,
+    receive_message_with_attachments, send_message, submit_pipewire_audio_prototype,
+    LinuxAudioConversionNeed, LinuxOriginalPcmAudioFormat, LinuxPipewirePrototypeBuffer,
+    LinuxPipewirePrototypeSampleFormat,
 };
 use qgs_media_runtime::{
     audio_samples_for_duration, av_frame_audio_range, bind_broadcast_audio_payload,
@@ -105,6 +106,7 @@ const BROADCAST_PLAYER_RUNTIME_ORIGINAL_VIDEO_PAYLOADS_ARG: &str =
     "--broadcast-player-runtime-original-video-payloads";
 const BROADCAST_PLAYER_RUNTIME_VERIFICATION_ARG: &str = "--broadcast-player-runtime-verification";
 const LINUX_AUDIO_DEVICE_PROBE_ARG: &str = "--linux-audio-device-probe";
+const PIPEWIRE_AUDIO_PROTOTYPE_ARG: &str = "--pipewire-audio-prototype";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -224,6 +226,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(path) = args.linux_audio_device_probe_path {
         return linux_audio_device_probe(&path);
+    }
+    if let Some(path) = args.pipewire_audio_prototype_path {
+        return pipewire_audio_prototype(&path);
     }
 
     let socket_path = args.socket_path;
@@ -1956,6 +1961,151 @@ fn linux_audio_device_probe(path: &Path) -> Result<(), Box<dyn std::error::Error
     }
 
     Ok(())
+}
+
+fn pipewire_audio_prototype(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    let source = MediaSource::parse(&bytes)?;
+    let audio_tracks = source
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Audio)
+        .collect::<Vec<_>>();
+    if audio_tracks.is_empty() {
+        return Err("original MXF has no audio tracks".into());
+    }
+
+    let source_format = original_linux_pcm_audio_format(&audio_tracks)?;
+    let blocks = build_original_pcm_blocks(&source, &bytes)?;
+    let prototype_sample_count = 960_u32;
+    let buffer = build_pipewire_f32_interleaved_prototype_buffer(
+        &blocks,
+        source_format.sample_rate,
+        prototype_sample_count,
+    )?;
+    let report = submit_pipewire_audio_prototype(&buffer)?;
+
+    println!("PipeWire Audio Device Prototype");
+    println!("-------------------------------");
+    println!("Audio source: original MXF");
+    println!("Proxy AAC: not used");
+    println!("Full playback: no");
+    println!("Realtime Broadcast Player playback: no");
+    println!(
+        "Input PCM: tracks={} channels_per_track={} sample_rate={}Hz bit_depth={}bit",
+        source_format.track_count,
+        source_format.channels_per_track,
+        source_format.sample_rate,
+        source_format.bits_per_sample
+    );
+    println!("Device-boundary conversion: original 24-bit mono tracks -> f32 interleaved");
+    println!(
+        "Prototype buffer: channels={} sample_rate={}Hz samples={} bytes={}",
+        buffer.channels,
+        buffer.sample_rate,
+        buffer.sample_count,
+        buffer.bytes.len()
+    );
+    println!(
+        "PipeWire available: {}",
+        yes_no(report.pipewire_cli_available && report.pipewire_server_reachable)
+    );
+    println!(
+        "Stream open attempted: {}",
+        yes_no(report.stream_open_attempted)
+    );
+    println!("Stream opened: {}", yes_no(report.stream_opened));
+    println!("Buffer submitted: {}", yes_no(report.buffer_submitted));
+    println!("Bytes submitted: {}", report.bytes_submitted);
+    println!("Evidence level: {:?}", report.evidence_level);
+    println!(
+        "AudioDeviceVerified: {}{}",
+        yes_no(report.audio_device_verified),
+        if report.audio_device_verified {
+            " (tiny bounded PipeWire prototype buffer only)"
+        } else {
+            ""
+        }
+    );
+    println!("Status: {}", report.status_message);
+
+    Ok(())
+}
+
+fn build_pipewire_f32_interleaved_prototype_buffer(
+    blocks: &[PcmAudioBlock],
+    sample_rate: u32,
+    sample_count: u32,
+) -> Result<LinuxPipewirePrototypeBuffer, Box<dyn std::error::Error>> {
+    let mut mono_blocks = blocks
+        .iter()
+        .filter_map(|block| {
+            let PcmAudioBlockLayout::MonoTrack {
+                track_id,
+                channel_index,
+            } = block.layout
+            else {
+                return None;
+            };
+            Some((track_id, channel_index, block))
+        })
+        .filter(|(_, _, block)| block.start_time == Duration::ZERO)
+        .collect::<Vec<_>>();
+    mono_blocks.sort_by_key(|(track_id, channel_index, _)| (*channel_index, *track_id));
+    mono_blocks.dedup_by_key(|(track_id, channel_index, _)| (*track_id, *channel_index));
+
+    if mono_blocks.is_empty() {
+        return Err("no mono PCM blocks starting at zero for PipeWire prototype".into());
+    }
+    for (_, _, block) in &mono_blocks {
+        let PcmSampleFormat::SignedInteger {
+            bits_per_sample,
+            endian,
+        } = block.format;
+        if bits_per_sample != 24 || endian != PcmEndian::Little || block.sample_rate != sample_rate
+        {
+            return Err("PipeWire prototype currently expects 24-bit little-endian PCM blocks at the source sample rate".into());
+        }
+        if block.sample_count < sample_count {
+            return Err("PCM block is shorter than requested prototype sample count".into());
+        }
+    }
+
+    let channel_count = u16::try_from(mono_blocks.len())?;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(sample_count)?
+            .checked_mul(usize::from(channel_count))
+            .and_then(|values| values.checked_mul(4))
+            .ok_or("prototype output size overflow")?,
+    );
+    for sample_index in 0..usize::try_from(sample_count)? {
+        for (_, _, block) in &mono_blocks {
+            let sample = pcm_s24le_sample_to_f32(&block.payload, sample_index)?;
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+    }
+
+    Ok(LinuxPipewirePrototypeBuffer {
+        sample_rate,
+        channels: channel_count,
+        sample_count,
+        sample_format: LinuxPipewirePrototypeSampleFormat::F32Interleaved,
+        bytes,
+    })
+}
+
+fn pcm_s24le_sample_to_f32(payload: &[u8], sample_index: usize) -> Result<f32, &'static str> {
+    let offset = sample_index
+        .checked_mul(3)
+        .ok_or("24-bit sample offset overflow")?;
+    let bytes = payload
+        .get(offset..offset + 3)
+        .ok_or("24-bit sample index out of range")?;
+    let mut value = i32::from(bytes[0]) | (i32::from(bytes[1]) << 8) | (i32::from(bytes[2]) << 16);
+    if value & 0x0080_0000 != 0 {
+        value |= !0x00ff_ffff;
+    }
+    Ok((value as f32 / 8_388_608.0).clamp(-1.0, 1.0))
 }
 
 fn original_linux_pcm_audio_format(
@@ -9052,6 +9202,7 @@ struct Args {
     broadcast_player_runtime_original_video_payloads_paths: Option<(PathBuf, PathBuf)>,
     broadcast_player_runtime_verification_paths: Option<(PathBuf, PathBuf)>,
     linux_audio_device_probe_path: Option<PathBuf>,
+    pipewire_audio_prototype_path: Option<PathBuf>,
 }
 
 impl Args {
@@ -9103,6 +9254,7 @@ impl Args {
         let mut broadcast_player_runtime_verification_original = None;
         let mut broadcast_player_runtime_verification_paths = None;
         let mut linux_audio_device_probe_path = None;
+        let mut pipewire_audio_prototype_path = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
@@ -9140,9 +9292,13 @@ impl Args {
         let mut next_arg_is_broadcast_player_runtime_verification_original = false;
         let mut next_arg_is_broadcast_player_runtime_verification_proxy = false;
         let mut next_arg_is_linux_audio_device_probe_path = false;
+        let mut next_arg_is_pipewire_audio_prototype_path = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_linux_audio_device_probe_path {
+            if next_arg_is_pipewire_audio_prototype_path {
+                pipewire_audio_prototype_path = Some(PathBuf::from(arg));
+                next_arg_is_pipewire_audio_prototype_path = false;
+            } else if next_arg_is_linux_audio_device_probe_path {
                 linux_audio_device_probe_path = Some(PathBuf::from(arg));
                 next_arg_is_linux_audio_device_probe_path = false;
             } else if next_arg_is_broadcast_player_runtime_verification_proxy {
@@ -9410,6 +9566,8 @@ impl Args {
                 next_arg_is_broadcast_player_runtime_verification_original = true;
             } else if arg == LINUX_AUDIO_DEVICE_PROBE_ARG {
                 next_arg_is_linux_audio_device_probe_path = true;
+            } else if arg == PIPEWIRE_AUDIO_PROTOTYPE_ARG {
+                next_arg_is_pipewire_audio_prototype_path = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -9443,6 +9601,7 @@ impl Args {
             broadcast_player_runtime_original_video_payloads_paths,
             broadcast_player_runtime_verification_paths,
             linux_audio_device_probe_path,
+            pipewire_audio_prototype_path,
         }
     }
 }
@@ -9450,10 +9609,13 @@ impl Args {
 #[cfg(test)]
 mod tests {
     use super::{
-        mxf_file_label, proxy_presentation_ordinals, selected_proxy_ordinals, SonyXmlSummary,
+        build_pipewire_f32_interleaved_prototype_buffer, mxf_file_label, pcm_s24le_sample_to_f32,
+        proxy_presentation_ordinals, selected_proxy_ordinals, SonyXmlSummary,
     };
+    use qgs_media_runtime::{PcmAudioBlock, PcmAudioBlockLayout, PcmEndian, PcmSampleFormat};
     use qgs_mp4::{Mp4VideoSample, Mp4VideoTrack, Rational};
     use std::path::PathBuf;
+    use std::time::Duration;
 
     #[test]
     fn sony_xml_summary_extracts_technical_fields_without_private_ids() {
@@ -9540,6 +9702,48 @@ mod tests {
         assert_eq!(selected_proxy_ordinals(106), vec![0, 53, 105]);
     }
 
+    #[test]
+    fn pipewire_prototype_converts_s24le_to_f32_interleaved() {
+        let blocks = vec![
+            mono_block(10, 0, &[[0x00, 0x00, 0x00], [0xff, 0xff, 0x7f]]),
+            mono_block(11, 1, &[[0x00, 0x00, 0x80], [0x00, 0x00, 0x40]]),
+        ];
+
+        let buffer = build_pipewire_f32_interleaved_prototype_buffer(&blocks, 48_000, 2).unwrap();
+
+        assert_eq!(buffer.channels, 2);
+        assert_eq!(buffer.sample_count, 2);
+        assert_eq!(buffer.bytes.len(), 2 * 2 * 4);
+        let values = buffer
+            .bytes
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(values[0], 0.0);
+        assert_eq!(values[1], -1.0);
+        assert!(values[2] > 0.999_999 && values[2] <= 1.0);
+        assert_eq!(values[3], 0.5);
+    }
+
+    #[test]
+    fn pipewire_prototype_rejects_short_blocks() {
+        let blocks = vec![mono_block(10, 0, &[[0x00, 0x00, 0x00]])];
+
+        assert!(build_pipewire_f32_interleaved_prototype_buffer(&blocks, 48_000, 2).is_err());
+    }
+
+    #[test]
+    fn s24le_sample_conversion_sign_extends() {
+        assert_eq!(
+            pcm_s24le_sample_to_f32(&[0x00, 0x00, 0x80], 0).unwrap(),
+            -1.0
+        );
+        assert_eq!(
+            pcm_s24le_sample_to_f32(&[0x00, 0x00, 0x40], 0).unwrap(),
+            0.5
+        );
+    }
+
     fn sample(sample_index: u32, pts: i64) -> Mp4VideoSample {
         Mp4VideoSample {
             sample_index,
@@ -9550,5 +9754,27 @@ mod tests {
             is_sync: sample_index == 0,
             annex_b: vec![0, 0, 0, 1, 0x65],
         }
+    }
+
+    fn mono_block(track_id: u32, channel_index: u16, samples: &[[u8; 3]]) -> PcmAudioBlock {
+        PcmAudioBlock::new(
+            Duration::ZERO,
+            Duration::from_nanos(u64::try_from(samples.len()).unwrap() * 1_000_000_000 / 48_000),
+            48_000,
+            u32::try_from(samples.len()).unwrap(),
+            PcmSampleFormat::SignedInteger {
+                bits_per_sample: 24,
+                endian: PcmEndian::Little,
+            },
+            PcmAudioBlockLayout::MonoTrack {
+                track_id,
+                channel_index,
+            },
+            samples
+                .iter()
+                .flat_map(|sample| sample.iter().copied())
+                .collect(),
+        )
+        .unwrap()
     }
 }
