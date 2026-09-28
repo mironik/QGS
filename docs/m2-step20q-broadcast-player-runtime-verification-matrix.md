@@ -59,6 +59,7 @@ For Sony FX6 sample 002:
 | test audio sink evidence | `TestBoundaryEvidence` | Test audio sink evidence accepts original PCM; this is not real speaker output. |
 | native PipeWire buffer submission | `NativePostSubmitEvidence` | A 20 ms original-audio-derived f32 buffer was queued to a native PipeWire stream and a drain callback was observed; audible output and full playback are not claimed. |
 | native PipeWire audible smoke test | `ManualAudibleSmokeTestConfirmed` | Human-confirmed bounded original-audio-derived PipeWire smoke test; not full playback, realtime playback, A/V sync, channel certification, or full audio-device verification. |
+| native PipeWire original-audio segment playback | `NativePostSubmitEvidence` | Bounded sequential original MXF audio segment submits/drains; manual original-segment confirmation remains separate from full playback and full audio-device verification. |
 | simulated playback loop | `TestBoundaryEvidence` | Prepared slots flow through test audio/video boundaries deterministically. |
 | real speaker output | `NotImplemented` | No audible speaker output, audio-device clock, or full audio playback path exists; native PipeWire buffer submission is tracked separately. |
 | real display output | `NotImplemented` | No swapchain, Wayland, X11, DRM/KMS, or real display presenter exists. |
@@ -76,6 +77,8 @@ The matrix intentionally does not overstate these areas:
 - PipeWire audible smoke-test confirmation is a narrow manual smoke result and
   is not realtime/full Broadcast Player playback, A/V sync, channel
   certification, or full `AudioDeviceVerified`.
+- Bounded original-audio segment playback is not full playback, realtime
+  playback, A/V sync, channel certification, or full `AudioDeviceVerified`.
 - Haswell CPU-bridge 1080p50 is not marked realtime verified.
 - Modern-hardware zero-copy is not marked verified.
 - `FramePresented` from the current test presenter remains test evidence, not

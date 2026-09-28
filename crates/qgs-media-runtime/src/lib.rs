@@ -616,6 +616,7 @@ pub enum BroadcastRuntimeVerifiedSubsystem {
     TestAudioSinkEvidence,
     NativePipeWireBufferSubmission,
     NativePipeWireAudibleSmokeTest,
+    NativePipeWireOriginalAudioSegmentPlayback,
     SimulatedPlaybackLoop,
     RealSpeakerOutput,
     RealDisplayOutput,
@@ -645,6 +646,9 @@ impl BroadcastRuntimeVerifiedSubsystem {
             Self::TestAudioSinkEvidence => "test audio sink evidence",
             Self::NativePipeWireBufferSubmission => "native PipeWire buffer submission",
             Self::NativePipeWireAudibleSmokeTest => "native PipeWire audible smoke test",
+            Self::NativePipeWireOriginalAudioSegmentPlayback => {
+                "native PipeWire original-audio segment playback"
+            }
             Self::SimulatedPlaybackLoop => "simulated playback loop",
             Self::RealSpeakerOutput => "real speaker output",
             Self::RealDisplayOutput => "real display output",
@@ -766,6 +770,11 @@ impl BroadcastRuntimeVerificationMatrix {
                     subsystem: Subsystem::NativePipeWireAudibleSmokeTest,
                     level: Level::NativePostSubmitEvidence,
                     summary: "bounded original-audio-derived smoke-test buffers submit/drain; manual audible confirmation remains separate",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::NativePipeWireOriginalAudioSegmentPlayback,
+                    level: Level::NativePostSubmitEvidence,
+                    summary: "bounded sequential original-audio segment submits/drains; manual original-segment confirmation remains separate",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::SimulatedPlaybackLoop,
@@ -4273,6 +4282,15 @@ mod tests {
         assert_ne!(
             matrix
                 .entry(BroadcastRuntimeVerifiedSubsystem::NativePipeWireAudibleSmokeTest)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
+        assert_ne!(
+            matrix
+                .entry(
+                    BroadcastRuntimeVerifiedSubsystem::NativePipeWireOriginalAudioSegmentPlayback
+                )
                 .unwrap()
                 .level,
             BroadcastRuntimeVerificationLevel::AudioDeviceVerified

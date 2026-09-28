@@ -115,6 +115,7 @@ const LINUX_AUDIO_DEVICE_PROBE_ARG: &str = "--linux-audio-device-probe";
 const PIPEWIRE_AUDIO_PROTOTYPE_ARG: &str = "--pipewire-audio-prototype";
 const PIPEWIRE_AUDIO_NATIVE_PROTOTYPE_ARG: &str = "--pipewire-audio-native-prototype";
 const PIPEWIRE_AUDIO_AUDIBLE_SMOKE_TEST_ARG: &str = "--pipewire-audio-audible-smoke-test";
+const PIPEWIRE_AUDIO_SEGMENT_PLAYBACK_ARG: &str = "--pipewire-audio-segment-playback";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -243,6 +244,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(path) = args.pipewire_audio_audible_smoke_test_path {
         return pipewire_audio_audible_smoke_test(&path);
+    }
+    if let Some(path) = args.pipewire_audio_segment_playback_path {
+        return pipewire_audio_segment_playback(&path);
     }
 
     let socket_path = args.socket_path;
@@ -2442,6 +2446,14 @@ impl ManualAudibleConfirmation {
             Self::Required => "ManualAudibleConfirmationRequired",
         }
     }
+
+    const fn original_segment_label(self) -> &'static str {
+        match self {
+            Self::Yes => "ManualOriginalSegmentAudibleConfirmed",
+            Self::No => "ManualOriginalSegmentNotHeard",
+            Self::Required => "ManualOriginalSegmentConfirmationRequired",
+        }
+    }
 }
 
 fn read_manual_audible_confirmation() -> io::Result<ManualAudibleConfirmation> {
@@ -2449,6 +2461,17 @@ fn read_manual_audible_confirmation() -> io::Result<ManualAudibleConfirmation> {
         return Ok(ManualAudibleConfirmation::Required);
     }
     print!("Did you hear audio from the default PipeWire output? yes/no: ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(parse_manual_audible_confirmation(&input))
+}
+
+fn read_manual_original_segment_confirmation() -> io::Result<ManualAudibleConfirmation> {
+    if !io::stdin().is_terminal() {
+        return Ok(ManualAudibleConfirmation::Required);
+    }
+    print!("Did you hear the bounded original-audio segment from the default PipeWire output? yes/no: ");
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
@@ -2477,6 +2500,22 @@ fn audible_smoke_evidence_label(
     }
 }
 
+fn original_segment_evidence_label(
+    submitted: bool,
+    drain_completed: bool,
+    confirmation: ManualAudibleConfirmation,
+) -> &'static str {
+    match (submitted, drain_completed, confirmation) {
+        (true, _, ManualAudibleConfirmation::Yes) => "ManualOriginalSegmentAudibleConfirmed",
+        (true, _, ManualAudibleConfirmation::No) => "ManualOriginalSegmentNotHeard",
+        (true, true, ManualAudibleConfirmation::Required) => {
+            "ManualOriginalSegmentConfirmationRequired"
+        }
+        (true, false, ManualAudibleConfirmation::Required) => "OriginalSegmentSubmitted",
+        _ => "OriginalSegmentNotSubmitted",
+    }
+}
+
 fn smoke_test_buffer_count(
     target_duration: Duration,
     sample_rate: u32,
@@ -2499,6 +2538,298 @@ fn repeated_smoke_test_buffers(
         return Err("smoke-test segment and count must be non-zero".into());
     }
     Ok((0..count).map(|_| segment.to_vec()).collect())
+}
+
+fn pipewire_audio_segment_playback(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    let source = MediaSource::parse(&bytes)?;
+    let audio_tracks = source
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Audio)
+        .collect::<Vec<_>>();
+    if audio_tracks.is_empty() {
+        return Err("original MXF has no audio tracks".into());
+    }
+
+    let source_format = original_linux_pcm_audio_format(&audio_tracks)?;
+    let blocks = build_original_pcm_blocks(&source, &bytes)?;
+    let segment = build_sequential_original_audio_segment(
+        &blocks,
+        source_format.sample_rate,
+        Duration::from_secs(1),
+        Duration::from_millis(500),
+    )?;
+    let report_buffer = LinuxPipewirePrototypeBuffer {
+        sample_rate: source_format.sample_rate,
+        channels: u16::try_from(segment.channels)?,
+        sample_count: segment.samples_per_buffer,
+        sample_format: LinuxPipewirePrototypeSampleFormat::F32Interleaved,
+        bytes: segment
+            .buffers
+            .first()
+            .cloned()
+            .ok_or("empty segment buffer plan")?,
+    };
+    let report = inspect_native_pipewire_stream_boundary(&report_buffer)?;
+
+    println!("Native PipeWire Bounded Original-Audio Segment Playback");
+    println!("------------------------------------------------------");
+    println!("Audio source: original MXF");
+    println!("Proxy AAC: not used");
+    println!("Sequential original blocks: yes");
+    println!("Full playback: no");
+    println!("Realtime Broadcast Player playback: no");
+    println!("A/V sync: no");
+    println!(
+        "Input PCM: tracks={} channels_per_track={} sample_rate={}Hz bit_depth={}bit",
+        source_format.track_count,
+        source_format.channels_per_track,
+        source_format.sample_rate,
+        source_format.bits_per_sample
+    );
+    println!("Device-boundary conversion: original 24-bit mono tracks -> f32 interleaved");
+    println!("Routing: track 1 -> FL, track 2 -> FR, track 3 -> RL, track 4 -> RR");
+    println!("Selected segment start sample: {}", segment.start_sample);
+    println!(
+        "Selected segment duration: {:.3} ms",
+        segment.duration.as_secs_f64() * 1000.0
+    );
+    println!("Source blocks per track: {}", segment.blocks_per_track);
+    println!("Samples per track: {}", segment.samples_per_track);
+    println!("Continuity status: {}", segment.continuity_status);
+    println!("Output buffers planned: {}", segment.buffers.len());
+    println!("Output bytes planned: {}", segment.total_bytes);
+    println!("Manual audible confirmation required: yes");
+    println!(
+        "PipeWire runtime library available: {}",
+        yes_no(report.runtime_library_available)
+    );
+    println!(
+        "PipeWire server reachable: {}",
+        yes_no(report.pipewire_server_reachable)
+    );
+    println!(
+        "PipeWire pkg-config entry available: {}",
+        yes_no(report.pkg_config_entry_available)
+    );
+    println!(
+        "PipeWire headers available: {}",
+        yes_no(report.headers_available)
+    );
+    if !report.pkg_config_entry_available || !report.headers_available {
+        println!(
+            "Stream create attempted: {}",
+            yes_no(report.stream_create_attempted)
+        );
+        println!("Buffers submitted: 0");
+        println!("Drain requested: no");
+        println!("Drain completed: no");
+        println!("Manual confirmation status: ManualOriginalSegmentConfirmationRequired");
+        println!("Evidence level: {:?}", report.evidence_level);
+        println!("AudioDeviceVerified: no");
+        println!("Audible output claimed: no");
+        println!("Status: {}", report.status_message);
+        return Ok(());
+    }
+
+    let stream_format = PipeWireStreamFormat {
+        sample_rate: source_format.sample_rate,
+        channels: u32::try_from(segment.channels)?,
+        sample_format: PipeWireAudioSampleFormat::F32Interleaved,
+    };
+    let submission_report = submit_native_pipewire_buffers(
+        stream_format,
+        segment.buffers,
+        segment.samples_per_buffer,
+        Duration::from_secs(5),
+    )?;
+    let confirmation = read_manual_original_segment_confirmation()?;
+    let evidence = original_segment_evidence_label(
+        submission_report.buffer_submitted,
+        submission_report.drain_completed,
+        confirmation,
+    );
+
+    println!(
+        "Stream configured: {}",
+        yes_no(submission_report.stream_report.stream_configured)
+    );
+    println!(
+        "Observed stream states: {:?}",
+        submission_report.stream_report.observed_states
+    );
+    println!(
+        "Final stream state: {:?}",
+        submission_report.stream_report.final_state
+    );
+    println!(
+        "Process callback reached: {}",
+        yes_no(submission_report.process_callback_reached)
+    );
+    println!("Buffer capacity: {}", submission_report.buffer_capacity);
+    println!("Buffers planned: {}", submission_report.buffers_planned);
+    println!("Buffers submitted: {}", submission_report.buffers_submitted);
+    println!(
+        "Samples submitted per track: {}",
+        submission_report.samples_converted
+    );
+    println!("Output channels: {}", submission_report.output_channels);
+    println!(
+        "F32 samples written: {}",
+        submission_report.f32_samples_written
+    );
+    println!("Bytes copied: {}", submission_report.bytes_copied);
+    println!(
+        "Drain requested: {}",
+        yes_no(submission_report.drain_requested)
+    );
+    println!(
+        "Drain completed: {}",
+        yes_no(submission_report.drain_completed)
+    );
+    println!(
+        "Post-submit callbacks observed: {}",
+        submission_report.post_submit_process_callbacks
+    );
+    println!(
+        "Post-submit timeout: {}",
+        yes_no(submission_report.post_submit_timeout)
+    );
+    println!(
+        "PipeWire evidence level: {:?}",
+        submission_report.evidence_level
+    );
+    println!(
+        "Manual confirmation status: {}",
+        confirmation.original_segment_label()
+    );
+    println!("Segment evidence level: {}", evidence);
+    println!("AudioDeviceVerified: no");
+    println!("AudioDeviceVerified scope: not upgraded by bounded segment playback");
+    println!(
+        "Audible output claimed: {}",
+        yes_no(confirmation == ManualAudibleConfirmation::Yes)
+    );
+    println!(
+        "Status: bounded sequential original-audio segment completed; full playback is not claimed"
+    );
+    Ok(())
+}
+
+struct OriginalAudioSegmentPlan {
+    buffers: Vec<Vec<u8>>,
+    start_sample: u64,
+    duration: Duration,
+    blocks_per_track: usize,
+    samples_per_buffer: u32,
+    samples_per_track: u32,
+    channels: usize,
+    total_bytes: usize,
+    continuity_status: &'static str,
+}
+
+fn build_sequential_original_audio_segment(
+    blocks: &[PcmAudioBlock],
+    sample_rate: u32,
+    preferred_duration: Duration,
+    fallback_duration: Duration,
+) -> Result<OriginalAudioSegmentPlan, Box<dyn std::error::Error>> {
+    build_sequential_original_audio_segment_for_duration(blocks, sample_rate, preferred_duration)
+        .or_else(|_| {
+            build_sequential_original_audio_segment_for_duration(
+                blocks,
+                sample_rate,
+                fallback_duration,
+            )
+        })
+}
+
+fn build_sequential_original_audio_segment_for_duration(
+    blocks: &[PcmAudioBlock],
+    sample_rate: u32,
+    duration: Duration,
+) -> Result<OriginalAudioSegmentPlan, Box<dyn std::error::Error>> {
+    let mut by_channel: BTreeMap<u16, Vec<&PcmAudioBlock>> = BTreeMap::new();
+    for block in blocks {
+        let PcmAudioBlockLayout::MonoTrack { channel_index, .. } = block.layout else {
+            continue;
+        };
+        if block.sample_rate != sample_rate {
+            return Err("segment contains mixed sample rates".into());
+        }
+        let PcmSampleFormat::SignedInteger {
+            bits_per_sample,
+            endian,
+        } = block.format;
+        if bits_per_sample != 24 || endian != PcmEndian::Little {
+            return Err("segment playback requires 24-bit little-endian original PCM".into());
+        }
+        by_channel.entry(channel_index).or_default().push(block);
+    }
+    if by_channel.len() != 4 {
+        return Err("segment playback requires four original mono tracks".into());
+    }
+    for channel_blocks in by_channel.values_mut() {
+        channel_blocks.sort_by_key(|block| block.start_time);
+    }
+
+    let first_channel = by_channel.values().next().ok_or("no original PCM blocks")?;
+    let first_block = first_channel.first().ok_or("no original PCM blocks")?;
+    let samples_per_buffer = first_block.sample_count;
+    if samples_per_buffer == 0 {
+        return Err("original PCM block has zero samples".into());
+    }
+    let target_samples = audio_samples_for_duration(duration, sample_rate)?;
+    let blocks_needed = usize::try_from(target_samples.div_ceil(u64::from(samples_per_buffer)))?;
+    if blocks_needed == 0 {
+        return Err("segment duration selected zero blocks".into());
+    }
+
+    let mut output_buffers = Vec::with_capacity(blocks_needed);
+    for block_index in 0..blocks_needed {
+        let mut tracks = Vec::with_capacity(by_channel.len());
+        let expected_start = u64::from(samples_per_buffer)
+            .checked_mul(u64::try_from(block_index)?)
+            .ok_or("segment sample offset overflow")?;
+        for (channel_index, channel_blocks) in &by_channel {
+            let block = channel_blocks
+                .get(block_index)
+                .ok_or("not enough sequential original PCM blocks for selected segment")?;
+            if block.sample_count != samples_per_buffer {
+                return Err("original PCM block sample count changed within segment".into());
+            }
+            let block_start = audio_samples_for_duration(block.start_time, sample_rate)?;
+            if block_start != expected_start {
+                return Err("original PCM block continuity check failed".into());
+            }
+            tracks.push(MonoS24LeTrack {
+                channel_index: *channel_index,
+                payload: &block.payload,
+            });
+        }
+        output_buffers.push(f32_interleaved_from_s24le_mono_tracks(
+            &tracks,
+            samples_per_buffer,
+        )?);
+    }
+
+    let samples_per_track = samples_per_buffer
+        .checked_mul(u32::try_from(blocks_needed)?)
+        .ok_or("segment sample count overflow")?;
+    let duration = duration_from_audio_samples(u64::from(samples_per_track), sample_rate)?;
+    let total_bytes = output_buffers.iter().map(Vec::len).sum();
+    Ok(OriginalAudioSegmentPlan {
+        buffers: output_buffers,
+        start_sample: 0,
+        duration,
+        blocks_per_track: blocks_needed,
+        samples_per_buffer,
+        samples_per_track,
+        channels: by_channel.len(),
+        total_bytes,
+        continuity_status: "contiguous/no gaps/no overlaps",
+    })
 }
 
 fn build_pipewire_f32_interleaved_prototype_buffer(
@@ -9718,6 +10049,7 @@ struct Args {
     pipewire_audio_prototype_path: Option<PathBuf>,
     pipewire_audio_native_prototype_path: Option<PathBuf>,
     pipewire_audio_audible_smoke_test_path: Option<PathBuf>,
+    pipewire_audio_segment_playback_path: Option<PathBuf>,
 }
 
 impl Args {
@@ -9772,6 +10104,7 @@ impl Args {
         let mut pipewire_audio_prototype_path = None;
         let mut pipewire_audio_native_prototype_path = None;
         let mut pipewire_audio_audible_smoke_test_path = None;
+        let mut pipewire_audio_segment_playback_path = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
@@ -9812,9 +10145,13 @@ impl Args {
         let mut next_arg_is_pipewire_audio_prototype_path = false;
         let mut next_arg_is_pipewire_audio_native_prototype_path = false;
         let mut next_arg_is_pipewire_audio_audible_smoke_test_path = false;
+        let mut next_arg_is_pipewire_audio_segment_playback_path = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_pipewire_audio_audible_smoke_test_path {
+            if next_arg_is_pipewire_audio_segment_playback_path {
+                pipewire_audio_segment_playback_path = Some(PathBuf::from(arg));
+                next_arg_is_pipewire_audio_segment_playback_path = false;
+            } else if next_arg_is_pipewire_audio_audible_smoke_test_path {
                 pipewire_audio_audible_smoke_test_path = Some(PathBuf::from(arg));
                 next_arg_is_pipewire_audio_audible_smoke_test_path = false;
             } else if next_arg_is_pipewire_audio_native_prototype_path {
@@ -10097,6 +10434,8 @@ impl Args {
                 next_arg_is_pipewire_audio_native_prototype_path = true;
             } else if arg == PIPEWIRE_AUDIO_AUDIBLE_SMOKE_TEST_ARG {
                 next_arg_is_pipewire_audio_audible_smoke_test_path = true;
+            } else if arg == PIPEWIRE_AUDIO_SEGMENT_PLAYBACK_ARG {
+                next_arg_is_pipewire_audio_segment_playback_path = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -10133,6 +10472,7 @@ impl Args {
             pipewire_audio_prototype_path,
             pipewire_audio_native_prototype_path,
             pipewire_audio_audible_smoke_test_path,
+            pipewire_audio_segment_playback_path,
         }
     }
 }
@@ -10141,9 +10481,11 @@ impl Args {
 mod tests {
     use super::{
         audible_smoke_evidence_label, build_pipewire_f32_interleaved_prototype_buffer,
-        mxf_file_label, parse_manual_audible_confirmation, pcm_s24le_sample_to_f32,
-        proxy_presentation_ordinals, repeated_smoke_test_buffers, selected_proxy_ordinals,
-        smoke_test_buffer_count, ManualAudibleConfirmation, SonyXmlSummary,
+        build_sequential_original_audio_segment_for_duration, mxf_file_label,
+        original_segment_evidence_label, parse_manual_audible_confirmation,
+        pcm_s24le_sample_to_f32, proxy_presentation_ordinals, repeated_smoke_test_buffers,
+        selected_proxy_ordinals, smoke_test_buffer_count, ManualAudibleConfirmation,
+        SonyXmlSummary,
     };
     use qgs_media_runtime::{PcmAudioBlock, PcmAudioBlockLayout, PcmEndian, PcmSampleFormat};
     use qgs_mp4::{Mp4VideoSample, Mp4VideoTrack, Rational};
@@ -10307,6 +10649,77 @@ mod tests {
     }
 
     #[test]
+    fn sequential_original_audio_segment_uses_timeline_blocks_without_repeating() {
+        let mut blocks = Vec::new();
+        for block_index in 0..2 {
+            for channel in 0..4 {
+                let byte = u8::try_from(1 + block_index * 4 + channel).unwrap();
+                let samples = [[byte, 0x00, 0x00]; 960];
+                blocks.push(mono_block_at(
+                    10 + u32::from(channel),
+                    channel,
+                    u64::from(block_index) * 960,
+                    &samples,
+                ));
+            }
+        }
+
+        let plan = build_sequential_original_audio_segment_for_duration(
+            &blocks,
+            48_000,
+            Duration::from_millis(40),
+        )
+        .unwrap();
+
+        assert_eq!(plan.blocks_per_track, 2);
+        assert_eq!(plan.samples_per_buffer, 960);
+        assert_eq!(plan.samples_per_track, 1920);
+        assert_eq!(plan.buffers.len(), 2);
+        assert_eq!(plan.total_bytes, 2 * 960 * 4 * 4);
+        assert_eq!(plan.continuity_status, "contiguous/no gaps/no overlaps");
+        assert_ne!(plan.buffers[0], plan.buffers[1]);
+    }
+
+    #[test]
+    fn sequential_original_audio_segment_rejects_gaps() {
+        let mut blocks = Vec::new();
+        for channel in 0..4 {
+            let first = [[0x01, 0x00, 0x00]; 960];
+            let second = [[0x02, 0x00, 0x00]; 960];
+            blocks.push(mono_block_at(10 + u32::from(channel), channel, 0, &first));
+            blocks.push(mono_block_at(
+                10 + u32::from(channel),
+                channel,
+                1920,
+                &second,
+            ));
+        }
+
+        assert!(build_sequential_original_audio_segment_for_duration(
+            &blocks,
+            48_000,
+            Duration::from_millis(40),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn original_segment_evidence_requires_manual_yes_for_audible_confirmation() {
+        assert_eq!(
+            original_segment_evidence_label(true, true, ManualAudibleConfirmation::Required),
+            "ManualOriginalSegmentConfirmationRequired"
+        );
+        assert_eq!(
+            original_segment_evidence_label(true, true, ManualAudibleConfirmation::No),
+            "ManualOriginalSegmentNotHeard"
+        );
+        assert_eq!(
+            original_segment_evidence_label(true, true, ManualAudibleConfirmation::Yes),
+            "ManualOriginalSegmentAudibleConfirmed"
+        );
+    }
+
+    #[test]
     fn pipewire_prototype_rejects_short_blocks() {
         let blocks = vec![mono_block(10, 0, &[[0x00, 0x00, 0x00]])];
 
@@ -10338,8 +10751,17 @@ mod tests {
     }
 
     fn mono_block(track_id: u32, channel_index: u16, samples: &[[u8; 3]]) -> PcmAudioBlock {
+        mono_block_at(track_id, channel_index, 0, samples)
+    }
+
+    fn mono_block_at(
+        track_id: u32,
+        channel_index: u16,
+        start_sample: u64,
+        samples: &[[u8; 3]],
+    ) -> PcmAudioBlock {
         PcmAudioBlock::new(
-            Duration::ZERO,
+            Duration::from_nanos(start_sample * 1_000_000_000 / 48_000),
             Duration::from_nanos(u64::try_from(samples.len()).unwrap() * 1_000_000_000 / 48_000),
             48_000,
             u32::try_from(samples.len()).unwrap(),
