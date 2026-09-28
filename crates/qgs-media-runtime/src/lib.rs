@@ -573,6 +573,9 @@ pub enum BroadcastRuntimeVerificationLevel {
     RuntimeAudioPayloadAudibleConfirmed,
     ManualAudibleSignalDetectedContentUnverified,
     ManualContentAudibilityPartiallyObserved,
+    ManualMonitorPairPreferenceObserved,
+    MonoTrackMonitorDrainCompleted,
+    ManualMonoTrackMonitorHeard,
     VisualVerified,
     AudioDeviceVerified,
     RealtimeVerified,
@@ -599,6 +602,9 @@ impl BroadcastRuntimeVerificationLevel {
             Self::ManualContentAudibilityPartiallyObserved => {
                 "ManualContentAudibilityPartiallyObserved"
             }
+            Self::ManualMonitorPairPreferenceObserved => "ManualMonitorPairPreferenceObserved",
+            Self::MonoTrackMonitorDrainCompleted => "MonoTrackMonitorDrainCompleted",
+            Self::ManualMonoTrackMonitorHeard => "ManualMonoTrackMonitorHeard",
             Self::VisualVerified => "VisualVerified",
             Self::AudioDeviceVerified => "AudioDeviceVerified",
             Self::RealtimeVerified => "RealtimeVerified",
@@ -630,6 +636,8 @@ pub enum BroadcastRuntimeVerifiedSubsystem {
     NativePipeWireAudibleSmokeTest,
     NativePipeWireOriginalAudioSegmentPlayback,
     PipeWireAudioContentSanityAudit,
+    Mironik2002MonitorDiagnostic,
+    NativePipeWireMonoChannelMonitorDiagnostic,
     BroadcastRuntimeAudioPayloadPipeWire,
     SimulatedPlaybackLoop,
     RealSpeakerOutput,
@@ -664,6 +672,10 @@ impl BroadcastRuntimeVerifiedSubsystem {
                 "native PipeWire original-audio segment playback"
             }
             Self::PipeWireAudioContentSanityAudit => "PipeWire audio content sanity audit",
+            Self::Mironik2002MonitorDiagnostic => "Mironik 2002 monitor diagnostic",
+            Self::NativePipeWireMonoChannelMonitorDiagnostic => {
+                "native PipeWire mono channel monitor diagnostic"
+            }
             Self::BroadcastRuntimeAudioPayloadPipeWire => {
                 "broadcast runtime audio payload to PipeWire"
             }
@@ -798,6 +810,16 @@ impl BroadcastRuntimeVerificationMatrix {
                     subsystem: Subsystem::PipeWireAudioContentSanityAudit,
                     level: Level::MediaInspected,
                     summary: "original MXF PCM statistics, endian/sign interpretation, f32 conversion, segment/runtime path equality, and PipeWire buffer geometry audited; manual listening partially supports content audibility but routing remains unverified",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::Mironik2002MonitorDiagnostic,
+                    level: Level::ManualMonitorPairPreferenceObserved,
+                    summary: "Mironik 2002 track 4 / track 1 diagnostic monitor pair preferred for the 0-1000 ms range; not channel certification or production routing",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::NativePipeWireMonoChannelMonitorDiagnostic,
+                    level: Level::MonoTrackMonitorDrainCompleted,
+                    summary: "single original mono track can be duplicated to L/R as a PipeWire desktop monitor diagnostic and drained; runtime mono-channel truth remains unchanged",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::BroadcastRuntimeAudioPayloadPipeWire,
@@ -4247,6 +4269,18 @@ mod tests {
             BroadcastRuntimeVerificationLevel::ManualContentAudibilityPartiallyObserved
                 < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
         );
+        assert!(
+            BroadcastRuntimeVerificationLevel::ManualMonitorPairPreferenceObserved
+                < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::MonoTrackMonitorDrainCompleted
+                < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::ManualMonoTrackMonitorHeard
+                < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
     }
 
     #[test]
@@ -4361,6 +4395,22 @@ mod tests {
                 .unwrap()
                 .level,
             BroadcastRuntimeVerificationLevel::MediaInspected
+        );
+        assert_eq!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::Mironik2002MonitorDiagnostic)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::ManualMonitorPairPreferenceObserved
+        );
+        assert_eq!(
+            matrix
+                .entry(
+                    BroadcastRuntimeVerifiedSubsystem::NativePipeWireMonoChannelMonitorDiagnostic
+                )
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::MonoTrackMonitorDrainCompleted
         );
         assert_ne!(
             matrix

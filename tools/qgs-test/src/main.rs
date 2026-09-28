@@ -123,11 +123,13 @@ const BROADCAST_RUNTIME_AUDIO_PIPEWIRE_ARG: &str = "--broadcast-runtime-audio-pi
 const BROADCAST_RUNTIME_AUDIO_PIPEWIRE_AUDIBLE_ARG: &str =
     "--broadcast-runtime-audio-pipewire-audible";
 const PIPEWIRE_AUDIO_CONTENT_AUDIT_ARG: &str = "--pipewire-audio-content-audit";
+const PIPEWIRE_AUDIO_MONO_MONITOR_ARG: &str = "--pipewire-audio-mono-monitor";
 const WRITE_DIAGNOSTIC_WAV_ARG: &str = "--write-diagnostic-wav";
 const AUDIO_AUDIT_START_MS_ARG: &str = "--start-ms";
 const AUDIO_AUDIT_DURATION_MS_ARG: &str = "--duration-ms";
 const AUDIO_AUDIT_OUTPUT_DIR_ARG: &str = "--output-dir";
 const AUDIO_AUDIT_FIND_LOUDEST_RANGE_MS_ARG: &str = "--find-loudest-range-ms";
+const AUDIO_MONITOR_TRACK_ARG: &str = "--track";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -278,6 +280,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or_else(|| PathBuf::from("target/qgs-audio-audit")),
                 find_loudest_range_ms: args.audio_content_audit_find_loudest_range_ms,
                 diagnostic_wav_path: args.diagnostic_wav_path,
+            },
+        );
+    }
+    if let Some((original, proxy)) = args.pipewire_audio_mono_monitor_paths {
+        return pipewire_audio_mono_monitor(
+            &original,
+            &proxy,
+            AudioMonoMonitorOptions {
+                start_ms: args.audio_content_audit_start_ms.unwrap_or(0),
+                duration_ms: args.audio_content_audit_duration_ms.unwrap_or(1_000),
+                source_channel_index: args.audio_monitor_track.unwrap_or(3),
             },
         );
     }
@@ -2495,6 +2508,14 @@ impl ManualAudibleConfirmation {
             Self::Required => "RuntimeAudioPayloadConfirmationRequired",
         }
     }
+
+    const fn mono_monitor_label(self) -> &'static str {
+        match self {
+            Self::Yes => "ManualMonoTrackMonitorHeard",
+            Self::No => "ManualMonoTrackMonitorNotHeard",
+            Self::Required => "ManualMonoTrackMonitorConfirmationRequired",
+        }
+    }
 }
 
 fn read_manual_audible_confirmation() -> io::Result<ManualAudibleConfirmation> {
@@ -2570,6 +2591,19 @@ fn read_manual_runtime_payload_confirmation() -> io::Result<ManualAudibleConfirm
     Ok(parse_manual_audible_confirmation(&input))
 }
 
+fn read_manual_mono_monitor_confirmation() -> io::Result<ManualAudibleConfirmation> {
+    if !io::stdin().is_terminal() {
+        return Ok(ManualAudibleConfirmation::Required);
+    }
+    print!(
+        "Did you hear the mono channel monitor output from the default PipeWire output? yes/no: "
+    );
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(parse_manual_audible_confirmation(&input))
+}
+
 fn runtime_audio_payload_evidence_label(
     submitted: bool,
     drain_completed: bool,
@@ -2583,6 +2617,20 @@ fn runtime_audio_payload_evidence_label(
             "RuntimeAudioPayloadSubmittedToPipeWire"
         }
         _ => "RuntimeAudioPayloadNotSubmitted",
+    }
+}
+
+fn mono_monitor_diagnostic_evidence_label(
+    submitted: bool,
+    drain_completed: bool,
+    confirmation: ManualAudibleConfirmation,
+) -> &'static str {
+    match (submitted, drain_completed, confirmation) {
+        (true, _, ManualAudibleConfirmation::Yes) => "ManualMonoTrackMonitorHeard",
+        (true, _, ManualAudibleConfirmation::No) => "ManualMonoTrackMonitorNotHeard",
+        (true, true, ManualAudibleConfirmation::Required) => "MonoTrackMonitorDrainCompleted",
+        (true, false, ManualAudibleConfirmation::Required) => "MonoTrackMonitorSubmitted",
+        _ => "MonoTrackMonitorNotSubmitted",
     }
 }
 
@@ -3653,12 +3701,363 @@ fn pipewire_audio_content_audit(
     Ok(())
 }
 
+fn pipewire_audio_mono_monitor(
+    original_path: &Path,
+    proxy_path: &Path,
+    options: AudioMonoMonitorOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let plan = build_mono_monitor_diagnostic_plan(original_path, options)?;
+    let first_buffer = plan
+        .buffers
+        .first()
+        .cloned()
+        .ok_or("mono monitor diagnostic produced no buffers")?;
+    let report_buffer = LinuxPipewirePrototypeBuffer {
+        sample_rate: plan.sample_rate,
+        channels: 2,
+        sample_count: plan.samples_per_buffer,
+        sample_format: LinuxPipewirePrototypeSampleFormat::F32Interleaved,
+        bytes: first_buffer,
+    };
+    let report = inspect_native_pipewire_stream_boundary(&report_buffer)?;
+
+    println!("QGS PipeWire Mono Channel Monitor Diagnostic");
+    println!("--------------------------------------------");
+    println!("Audio source: original MXF");
+    println!("Source original path: {}", original_path.display());
+    println!("Source proxy path: {}", proxy_path.display());
+    println!("Proxy AAC: not used");
+    println!("Original MXF audio authoritative: yes");
+    println!("Original audio model: separate mono tracks remain runtime truth");
+    println!(
+        "Selected source: original mono track {}",
+        plan.source_track_number()
+    );
+    println!("Monitor output: duplicated mono to L/R");
+    println!("Desktop monitor helper only: yes");
+    println!("Production routing: no");
+    println!("Channel certification: no");
+    println!("Full playback: no");
+    println!("Realtime playback: no");
+    println!("A/V sync: no");
+    println!("AudioDeviceVerified: no");
+    println!("Bounded extraction: yes");
+    println!("Full MXF loaded into memory: no");
+    println!(
+        "Source duration: {:.3} ms",
+        plan.source_duration.as_secs_f64() * 1000.0
+    );
+    println!("Selected start: {} ms", plan.start_ms);
+    println!("Selected duration: {} ms", plan.duration_ms);
+    println!(
+        "Selected duration exact: {:.3} ms",
+        plan.selected_duration.as_secs_f64() * 1000.0
+    );
+    println!(
+        "Selected sample range: {}..{}",
+        plan.start_sample, plan.end_sample
+    );
+    println!(
+        "Selected source track: track {}",
+        plan.source_track_number()
+    );
+    println!("Selected source track is mono source: yes");
+    println!(
+        "Output routing: track {} mono duplicated -> FL/FR",
+        plan.source_track_number()
+    );
+    println!("Output format: F32Interleaved 48000Hz 2ch");
+    println!("Output frames: {}", plan.output_frames);
+    println!("Output bytes planned: {}", plan.total_bytes);
+    println!("Output buffers planned: {}", plan.buffers.len());
+    println!("Samples per selected source track: {}", plan.output_frames);
+    println!("Manual confirmation required: yes");
+    for summary in &plan.selected_track_summaries {
+        println!("Selected mono track audit:");
+        println!(
+            "  track {} channel_index={}",
+            u32::from(summary.channel_index) + 1,
+            summary.channel_index
+        );
+        println!("  peak_f32={:.6}", summary.stats.peak_f32);
+        println!("  rms_f32={:.6}", summary.stats.rms_f32);
+        println!("  relative level: {:.2} dBFS", summary.stats.rms_dbfs);
+        println!("  likely silent: {}", yes_no(summary.stats.likely_silent));
+    }
+    println!(
+        "PipeWire runtime library available: {}",
+        yes_no(report.runtime_library_available)
+    );
+    println!(
+        "PipeWire server reachable: {}",
+        yes_no(report.pipewire_server_reachable)
+    );
+    println!(
+        "PipeWire pkg-config entry available: {}",
+        yes_no(report.pkg_config_entry_available)
+    );
+    println!(
+        "PipeWire headers available: {}",
+        yes_no(report.headers_available)
+    );
+    if !report.pkg_config_entry_available || !report.headers_available {
+        println!(
+            "Stream create attempted: {}",
+            yes_no(report.stream_create_attempted)
+        );
+        println!("Buffers submitted: 0");
+        println!("Drain requested: no");
+        println!("Drain completed: no");
+        println!("Manual confirmation status: ManualMonoTrackMonitorConfirmationRequired");
+        println!("Evidence level: {:?}", report.evidence_level);
+        println!("AudioDeviceBoundaryEvidence: MonoTrackMonitorNotSubmitted");
+        println!("AudioDeviceVerified: no");
+        println!("AudioDeviceVerified scope: not upgraded by mono channel monitor diagnostic");
+        println!("Audible output claimed: no");
+        println!("Status: {}", report.status_message);
+        return Ok(());
+    }
+
+    let stream_format = PipeWireStreamFormat {
+        sample_rate: plan.sample_rate,
+        channels: 2,
+        sample_format: PipeWireAudioSampleFormat::F32Interleaved,
+    };
+    let submission_report = submit_native_pipewire_buffers(
+        stream_format,
+        plan.buffers,
+        plan.samples_per_buffer,
+        Duration::from_secs(5),
+    )?;
+    let confirmation = read_manual_mono_monitor_confirmation()?;
+    let evidence = mono_monitor_diagnostic_evidence_label(
+        submission_report.buffer_submitted,
+        submission_report.drain_completed,
+        confirmation,
+    );
+
+    println!(
+        "Stream configured: {}",
+        yes_no(submission_report.stream_report.stream_configured)
+    );
+    println!(
+        "Observed stream states: {:?}",
+        submission_report.stream_report.observed_states
+    );
+    println!(
+        "Final stream state: {:?}",
+        submission_report.stream_report.final_state
+    );
+    println!(
+        "Process callback reached: {}",
+        yes_no(submission_report.process_callback_reached)
+    );
+    println!("Buffer capacity: {}", submission_report.buffer_capacity);
+    println!("Buffers planned: {}", submission_report.buffers_planned);
+    println!("Buffers submitted: {}", submission_report.buffers_submitted);
+    println!(
+        "Samples submitted for selected mono source track: {}",
+        submission_report.samples_converted
+    );
+    println!("Output channels: {}", submission_report.output_channels);
+    println!(
+        "F32 samples written: {}",
+        submission_report.f32_samples_written
+    );
+    println!("Bytes copied: {}", submission_report.bytes_copied);
+    println!(
+        "Drain requested: {}",
+        yes_no(submission_report.drain_requested)
+    );
+    println!(
+        "Drain completed: {}",
+        yes_no(submission_report.drain_completed)
+    );
+    println!(
+        "Post-submit callbacks observed: {}",
+        submission_report.post_submit_process_callbacks
+    );
+    println!(
+        "Post-submit timeout: {}",
+        yes_no(submission_report.post_submit_timeout)
+    );
+    println!(
+        "PipeWire evidence level: {:?}",
+        submission_report.evidence_level
+    );
+    println!(
+        "Manual confirmation status: {}",
+        confirmation.mono_monitor_label()
+    );
+    println!("Mono track monitor evidence level: {}", evidence);
+    println!("AudioDeviceBoundaryEvidence: {}", evidence);
+    println!("AudioDeviceVerified: no");
+    println!("AudioDeviceVerified scope: not upgraded by mono channel monitor diagnostic");
+    println!(
+        "Audible output claimed: {}",
+        yes_no(confirmation == ManualAudibleConfirmation::Yes)
+    );
+    println!(
+        "Status: mono channel monitor diagnostic completed; runtime mono-channel truth and production routing are unchanged"
+    );
+    Ok(())
+}
+
 struct AudioContentAuditOptions {
     start_ms: u64,
     duration_ms: u64,
     output_dir: PathBuf,
     find_loudest_range_ms: Option<u64>,
     diagnostic_wav_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+struct AudioMonoMonitorOptions {
+    start_ms: u64,
+    duration_ms: u64,
+    source_channel_index: u16,
+}
+
+struct MonoMonitorDiagnosticPlan {
+    sample_rate: u32,
+    start_ms: u64,
+    duration_ms: u64,
+    start_sample: u64,
+    end_sample: u64,
+    source_duration: Duration,
+    selected_duration: Duration,
+    source_channel_index: u16,
+    samples_per_buffer: u32,
+    output_frames: u32,
+    total_bytes: usize,
+    buffers: Vec<Vec<u8>>,
+    selected_track_summaries: Vec<AudioAuditTrackSummary>,
+}
+
+impl MonoMonitorDiagnosticPlan {
+    const fn source_track_number(&self) -> u16 {
+        self.source_channel_index + 1
+    }
+}
+
+fn build_mono_monitor_diagnostic_plan(
+    original_path: &Path,
+    options: AudioMonoMonitorOptions,
+) -> Result<MonoMonitorDiagnosticPlan, Box<dyn std::error::Error>> {
+    let duration_ms = bounded_audio_audit_duration_ms(options.duration_ms)?;
+    let audio_index = open_pcm_audio_index(original_path)?;
+    let audio_tracks = audio_index
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Audio)
+        .collect::<Vec<_>>();
+    if audio_tracks.is_empty() {
+        return Err("original MXF has no audio tracks".into());
+    }
+    let source_format = original_linux_pcm_audio_format(&audio_tracks)?;
+    if source_format.sample_rate != 48_000 {
+        return Err("mono monitor diagnostic currently expects 48 kHz original PCM".into());
+    }
+    let source_total_samples = audio_audit_total_samples_from_index(&audio_index)?;
+    let source_duration =
+        duration_from_audio_samples(source_total_samples, source_format.sample_rate)?;
+    let requested_sample_count = u32::try_from(audio_samples_for_duration(
+        Duration::from_millis(duration_ms),
+        source_format.sample_rate,
+    )?)?;
+    let start_sample = audio_samples_for_duration(
+        Duration::from_millis(options.start_ms),
+        source_format.sample_rate,
+    )?;
+    let end_sample = start_sample
+        .checked_add(u64::from(requested_sample_count))
+        .ok_or("mono monitor sample range overflow")?;
+    if end_sample > source_total_samples {
+        return Err(format!(
+            "mono monitor range {}..{} exceeds source duration {} samples",
+            start_sample, end_sample, source_total_samples
+        )
+        .into());
+    }
+    let blocks = build_original_pcm_blocks_from_index_range(
+        original_path,
+        &audio_index,
+        start_sample,
+        end_sample,
+    )?;
+    let track_groups = original_pcm_blocks_by_channel(&blocks, source_format.sample_rate)?;
+    if !track_groups.contains_key(&options.source_channel_index) {
+        return Err(format!(
+            "requested mono monitor track {} is missing",
+            u32::from(options.source_channel_index) + 1
+        )
+        .into());
+    }
+    let source_blocks = track_groups
+        .get(&options.source_channel_index)
+        .ok_or("requested mono monitor track is missing")?;
+    let samples_per_buffer = source_blocks
+        .first()
+        .ok_or("requested mono monitor track has no blocks")?
+        .sample_count;
+    if samples_per_buffer == 0 {
+        return Err("mono monitor source block has zero samples".into());
+    }
+    if requested_sample_count % samples_per_buffer != 0 {
+        return Err("mono monitor duration must align to source PCM block size".into());
+    }
+    let buffers_needed = usize::try_from(requested_sample_count / samples_per_buffer)?;
+    if source_blocks.len() != buffers_needed {
+        return Err("mono monitor selected range is not fully covered by source blocks".into());
+    }
+    let mut buffers = Vec::with_capacity(buffers_needed);
+    for block_index in 0..buffers_needed {
+        let block_start = start_sample
+            .checked_add(
+                u64::try_from(block_index)?
+                    .checked_mul(u64::from(samples_per_buffer))
+                    .ok_or("mono monitor block start overflow")?,
+            )
+            .ok_or("mono monitor block start overflow")?;
+        let channels = [options.source_channel_index, options.source_channel_index];
+        buffers.push(build_audio_audit_f32_interleaved_range(
+            &track_groups,
+            &channels,
+            source_format.sample_rate,
+            block_start,
+            samples_per_buffer,
+        )?);
+    }
+    let selected_duration =
+        duration_from_audio_samples(u64::from(requested_sample_count), source_format.sample_rate)?;
+    let selected_track_summaries = audio_audit_track_summaries(
+        &track_groups,
+        source_format.sample_rate,
+        start_sample,
+        requested_sample_count,
+    )?
+    .into_iter()
+    .filter(|summary| summary.channel_index == options.source_channel_index)
+    .collect::<Vec<_>>();
+    if selected_track_summaries.len() != 1 {
+        return Err("mono monitor selected track summary is missing".into());
+    }
+    let total_bytes = buffers.iter().map(Vec::len).sum();
+    Ok(MonoMonitorDiagnosticPlan {
+        sample_rate: source_format.sample_rate,
+        start_ms: options.start_ms,
+        duration_ms,
+        start_sample,
+        end_sample,
+        source_duration,
+        selected_duration,
+        source_channel_index: options.source_channel_index,
+        samples_per_buffer,
+        output_frames: requested_sample_count,
+        total_bytes,
+        buffers,
+        selected_track_summaries,
+    })
 }
 
 struct TrackContentStats {
@@ -11693,11 +12092,13 @@ struct Args {
     broadcast_runtime_audio_pipewire_paths: Option<(PathBuf, PathBuf)>,
     broadcast_runtime_audio_pipewire_audible_paths: Option<(PathBuf, PathBuf)>,
     pipewire_audio_content_audit_paths: Option<(PathBuf, PathBuf)>,
+    pipewire_audio_mono_monitor_paths: Option<(PathBuf, PathBuf)>,
     diagnostic_wav_path: Option<PathBuf>,
     audio_content_audit_start_ms: Option<u64>,
     audio_content_audit_duration_ms: Option<u64>,
     audio_content_audit_output_dir: Option<PathBuf>,
     audio_content_audit_find_loudest_range_ms: Option<u64>,
+    audio_monitor_track: Option<u16>,
 }
 
 impl Args {
@@ -11759,11 +12160,14 @@ impl Args {
         let mut broadcast_runtime_audio_pipewire_audible_paths = None;
         let mut pipewire_audio_content_audit_original = None;
         let mut pipewire_audio_content_audit_paths = None;
+        let mut pipewire_audio_mono_monitor_original = None;
+        let mut pipewire_audio_mono_monitor_paths = None;
         let mut diagnostic_wav_path = None;
         let mut audio_content_audit_start_ms = None;
         let mut audio_content_audit_duration_ms = None;
         let mut audio_content_audit_output_dir = None;
         let mut audio_content_audit_find_loudest_range_ms = None;
+        let mut audio_monitor_track = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
@@ -11811,14 +12215,23 @@ impl Args {
         let mut next_arg_is_broadcast_runtime_audio_pipewire_audible_proxy = false;
         let mut next_arg_is_pipewire_audio_content_audit_original = false;
         let mut next_arg_is_pipewire_audio_content_audit_proxy = false;
+        let mut next_arg_is_pipewire_audio_mono_monitor_original = false;
+        let mut next_arg_is_pipewire_audio_mono_monitor_proxy = false;
         let mut next_arg_is_diagnostic_wav_path = false;
         let mut next_arg_is_audio_content_audit_start_ms = false;
         let mut next_arg_is_audio_content_audit_duration_ms = false;
         let mut next_arg_is_audio_content_audit_output_dir = false;
         let mut next_arg_is_audio_content_audit_find_loudest_range_ms = false;
+        let mut next_arg_is_audio_monitor_track = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_diagnostic_wav_path {
+            if next_arg_is_audio_monitor_track {
+                audio_monitor_track = Some(
+                    parse_monitor_track_arg(&arg)
+                        .unwrap_or_else(|err| panic!("{AUDIO_MONITOR_TRACK_ARG}: {err}")),
+                );
+                next_arg_is_audio_monitor_track = false;
+            } else if next_arg_is_diagnostic_wav_path {
                 diagnostic_wav_path = Some(PathBuf::from(arg));
                 next_arg_is_diagnostic_wav_path = false;
             } else if next_arg_is_audio_content_audit_start_ms {
@@ -11838,6 +12251,17 @@ impl Args {
                     AUDIO_AUDIT_FIND_LOUDEST_RANGE_MS_ARG,
                 ));
                 next_arg_is_audio_content_audit_find_loudest_range_ms = false;
+            } else if next_arg_is_pipewire_audio_mono_monitor_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = pipewire_audio_mono_monitor_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                pipewire_audio_mono_monitor_paths = Some((original, proxy));
+                next_arg_is_pipewire_audio_mono_monitor_proxy = false;
+            } else if next_arg_is_pipewire_audio_mono_monitor_original {
+                pipewire_audio_mono_monitor_original = Some(PathBuf::from(arg));
+                next_arg_is_pipewire_audio_mono_monitor_original = false;
+                next_arg_is_pipewire_audio_mono_monitor_proxy = true;
             } else if next_arg_is_pipewire_audio_content_audit_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = pipewire_audio_content_audit_original
@@ -12165,6 +12589,8 @@ impl Args {
                 next_arg_is_broadcast_runtime_audio_pipewire_audible_original = true;
             } else if arg == PIPEWIRE_AUDIO_CONTENT_AUDIT_ARG {
                 next_arg_is_pipewire_audio_content_audit_original = true;
+            } else if arg == PIPEWIRE_AUDIO_MONO_MONITOR_ARG {
+                next_arg_is_pipewire_audio_mono_monitor_original = true;
             } else if arg == WRITE_DIAGNOSTIC_WAV_ARG {
                 next_arg_is_diagnostic_wav_path = true;
             } else if arg == AUDIO_AUDIT_START_MS_ARG {
@@ -12175,6 +12601,8 @@ impl Args {
                 next_arg_is_audio_content_audit_output_dir = true;
             } else if arg == AUDIO_AUDIT_FIND_LOUDEST_RANGE_MS_ARG {
                 next_arg_is_audio_content_audit_find_loudest_range_ms = true;
+            } else if arg == AUDIO_MONITOR_TRACK_ARG {
+                next_arg_is_audio_monitor_track = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -12215,11 +12643,13 @@ impl Args {
             broadcast_runtime_audio_pipewire_paths,
             broadcast_runtime_audio_pipewire_audible_paths,
             pipewire_audio_content_audit_paths,
+            pipewire_audio_mono_monitor_paths,
             diagnostic_wav_path,
             audio_content_audit_start_ms,
             audio_content_audit_duration_ms,
             audio_content_audit_output_dir,
             audio_content_audit_find_loudest_range_ms,
+            audio_monitor_track,
         }
     }
 }
@@ -12231,6 +12661,21 @@ fn parse_u64_os_arg(value: &std::ffi::OsStr, flag: &str) -> u64 {
         .unwrap_or_else(|_| panic!("{flag} expects an unsigned integer"))
 }
 
+fn parse_u16_os_arg(value: &std::ffi::OsStr, flag: &str) -> u16 {
+    value
+        .to_string_lossy()
+        .parse::<u16>()
+        .unwrap_or_else(|_| panic!("{flag} expects an unsigned integer"))
+}
+
+fn parse_monitor_track_arg(value: &std::ffi::OsStr) -> Result<u16, &'static str> {
+    let track = parse_u16_os_arg(value, AUDIO_MONITOR_TRACK_ARG);
+    if track == 0 {
+        return Err("expects a 1-based original mono track number");
+    }
+    Ok(track - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -12240,9 +12685,10 @@ mod tests {
         build_pipewire_f32_interleaved_prototype_buffer,
         build_runtime_audio_payload_pipewire_buffer,
         build_sequential_original_audio_segment_for_duration, decode_s24be_i32, decode_s24le_i32,
-        decode_u24le, f32_buffer_stats, loudest_monitor_pair, mxf_file_label,
-        original_pcm_blocks_by_channel, original_segment_evidence_label,
-        parse_manual_audible_confirmation, pcm_s24le_sample_to_f32, proxy_presentation_ordinals,
+        decode_u24le, f32_buffer_stats, loudest_monitor_pair,
+        mono_monitor_diagnostic_evidence_label, mxf_file_label, original_pcm_blocks_by_channel,
+        original_segment_evidence_label, parse_manual_audible_confirmation,
+        parse_monitor_track_arg, pcm_s24le_sample_to_f32, proxy_presentation_ordinals,
         repeated_smoke_test_buffers, runtime_audio_payload_evidence_label, sanitized_source_stem,
         selected_proxy_ordinals, smoke_test_buffer_count, ManualAudibleConfirmation,
         SonyXmlSummary,
@@ -12552,6 +12998,37 @@ mod tests {
     }
 
     #[test]
+    fn mono_monitor_evidence_stays_below_audio_device_verified() {
+        assert_eq!(
+            mono_monitor_diagnostic_evidence_label(true, true, ManualAudibleConfirmation::Required),
+            "MonoTrackMonitorDrainCompleted"
+        );
+        assert_eq!(
+            mono_monitor_diagnostic_evidence_label(
+                true,
+                false,
+                ManualAudibleConfirmation::Required
+            ),
+            "MonoTrackMonitorSubmitted"
+        );
+        assert_eq!(
+            mono_monitor_diagnostic_evidence_label(true, true, ManualAudibleConfirmation::No),
+            "ManualMonoTrackMonitorNotHeard"
+        );
+        assert_eq!(
+            mono_monitor_diagnostic_evidence_label(true, true, ManualAudibleConfirmation::Yes),
+            "ManualMonoTrackMonitorHeard"
+        );
+    }
+
+    #[test]
+    fn mono_monitor_track_parser_uses_one_based_original_track_numbers() {
+        assert_eq!(parse_monitor_track_arg("4".as_ref()).unwrap(), 3);
+        assert_eq!(parse_monitor_track_arg("1".as_ref()).unwrap(), 0);
+        assert!(parse_monitor_track_arg("0".as_ref()).is_err());
+    }
+
+    #[test]
     fn runtime_audio_payload_audible_helper_repeats_bounded_payload() {
         let payload = vec![0_u8; 30_720];
         let repeats = smoke_test_buffer_count(Duration::from_millis(500), 48_000, 1_920).unwrap();
@@ -12650,6 +13127,27 @@ mod tests {
         assert!(
             build_audio_audit_f32_interleaved_range(&groups, &[0, 1, 2, 3], 48_000, 0, 4).is_ok()
         );
+    }
+
+    #[test]
+    fn mono_monitor_duplicates_one_source_track_to_stereo_output() {
+        let blocks = vec![
+            mono_block(10, 0, &[[0x00, 0x00, 0x40], [0x00, 0x00, 0x20]]),
+            mono_block(11, 1, &[[0x00, 0x00, 0x00], [0x00, 0x00, 0x00]]),
+        ];
+        let groups = original_pcm_blocks_by_channel(&blocks, 48_000).unwrap();
+        let bytes =
+            build_audio_audit_f32_interleaved_range(&groups, &[0, 0], 48_000, 0, 2).unwrap();
+        let values = bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(bytes.len(), 2 * 2 * 4);
+        assert_eq!(values[0], values[1]);
+        assert_eq!(values[2], values[3]);
+        assert_eq!(values[0], 0.5);
+        assert_eq!(values[2], 0.25);
     }
 
     #[test]

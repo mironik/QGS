@@ -724,6 +724,28 @@ mod tests {
     }
 
     #[test]
+    fn stream_format_accepts_48k_stereo_f32_boundary_format() {
+        let format = PipeWireStreamFormat {
+            sample_rate: 48_000,
+            channels: 2,
+            sample_format: PipeWireAudioSampleFormat::F32Interleaved,
+        }
+        .validate()
+        .unwrap();
+
+        assert_eq!(format.sample_rate, 48_000);
+        assert_eq!(format.channels, 2);
+    }
+
+    #[test]
+    fn channel_positions_are_stable_for_stereo_monitor_output() {
+        assert_eq!(
+            default_channel_positions(2),
+            vec![spa_sys::SPA_AUDIO_CHANNEL_FL, spa_sys::SPA_AUDIO_CHANNEL_FR]
+        );
+    }
+
+    #[test]
     fn channel_positions_are_stable_for_four_channel_prototype() {
         assert_eq!(
             default_channel_positions(4),
@@ -786,6 +808,7 @@ mod tests {
 
     #[test]
     fn f32_interleaved_buffer_size_validation_is_exact() {
+        assert!(validate_f32_interleaved_buffer(&vec![0_u8; 48_000 * 2 * 4], 48_000, 2).is_ok());
         assert!(validate_f32_interleaved_buffer(&vec![0_u8; 960 * 4 * 4], 960, 4).is_ok());
         assert!(validate_f32_interleaved_buffer(&vec![0_u8; 7], 960, 4).is_err());
     }

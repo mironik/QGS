@@ -227,10 +227,11 @@ old `FileTooLarge` failure.
 The next useful diagnostic remains:
 
 ```text
-M2 Step 21L — Monitor Routing / Stereo Diagnostic Boundary
+M2 Step 21N — PipeWire Mono Channel Monitor Diagnostic
 ```
 
-Using the corrected Mironik 2002 corpus, that follow-up should choose an audible
-range, compare 4-channel output with explicit stereo monitor output, and report
-the routing clearly while keeping original MXF audio authoritative and proxy AAC
+Using the corrected Mironik 2002 corpus, that follow-up should test individual
+original mono tracks through a desktop monitor helper and report which mono
+channels carry recognizable content. Any duplicated L/R monitor output remains
+diagnostic only; original MXF audio stays authoritative and proxy AAC remains
 unused or diagnostic-only.
