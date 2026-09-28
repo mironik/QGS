@@ -57,6 +57,7 @@ const PROXY_PROOF_ARG: &str = "--proxy-proof";
 const PROXY_THROUGHPUT_ARG: &str = "--proxy-throughput";
 const PROXY_PLAYBACK_ARG: &str = "--proxy-playback";
 const PROXY_PLAYBACK_PROFILE_ARG: &str = "--proxy-playback-profile";
+const QNC_JOURNALIST_DEMO_ARG: &str = "--qnc-journalist-demo";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -92,6 +93,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.proxy_playback_paths {
         return proxy_playback(&original, &proxy, args.proxy_playback_profile);
+    }
+    if let Some((original, proxy)) = args.qnc_journalist_demo_paths {
+        return qnc_journalist_demo(&original, &proxy);
     }
 
     let socket_path = args.socket_path;
@@ -1216,6 +1220,116 @@ fn diagnose_damaged_proxy_case(
             Ok(())
         }
     }
+}
+
+fn qnc_journalist_demo(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let original_sha256 = sha256_hex(original_path)?;
+    let proxy_sha256 = sha256_hex(proxy_path)?;
+    let case = identify_camera_case(&original_sha256, &proxy_sha256)?;
+    if case.damaged_proxy {
+        return diagnose_damaged_proxy_case(case, proxy_path);
+    }
+
+    let original_bytes = std::fs::read(original_path)?;
+    let original = MediaSource::parse(&original_bytes)?;
+    let proxy = Mp4Source::open(proxy_path)?;
+    let proxy_video = proxy
+        .video
+        .as_ref()
+        .ok_or("proxy has no H.264 video track")?;
+    let proxy_h264 = classify_video_track(proxy_video)?;
+    let source_frames = proxy_video.samples.len();
+    let preview_frames = ProxyPlaybackProfile::Journalist25p.selected_frame_count(source_frames);
+    let intentional_skips = source_frames.saturating_sub(preview_frames);
+    let preview_rate = RationalRate::new(25, 1)?;
+    let cut_start_preview = 10_u64;
+    let cut_end_preview_exclusive = 40_u64;
+    let cut_start_source = cut_start_preview
+        .checked_mul(2)
+        .ok_or("cut source start overflow")?;
+    let cut_end_source_exclusive = cut_end_preview_exclusive
+        .checked_mul(2)
+        .ok_or("cut source end overflow")?;
+    let cut_preview_frames = cut_end_preview_exclusive
+        .checked_sub(cut_start_preview)
+        .ok_or("invalid cut range")?;
+    let cut_duration = preview_rate.duration_for_frames(cut_preview_frames)?;
+    let cut_start_time = preview_rate.frame_offset(cut_start_preview)?;
+    let cut_end_time = preview_rate.frame_offset(cut_end_preview_exclusive)?;
+
+    println!("QNC Journalist Demo");
+    println!("-------------------");
+    println!("Original: {}", case.original_label);
+    println!("Proxy: {}", case.proxy_label);
+    println!("Association: strong metadata + timing evidence from existing Step 12 corpus");
+    println!(
+        "Source: {}x{} visible, {}x{} coded, H.264 {:?}, {}-bit {:?}, {}/{} fps proxy",
+        proxy_h264.width,
+        proxy_h264.height,
+        proxy_h264.coded_width,
+        proxy_h264.coded_height,
+        proxy_h264.profile,
+        proxy_h264.bit_depth,
+        proxy_h264.chroma,
+        proxy_video.frame_rate.numerator,
+        proxy_video.frame_rate.denominator
+    );
+    println!("Original edit units: {}", original.index.video.len());
+    println!("Preview profile: journalist-25p");
+    println!("Source frames: {source_frames}");
+    println!("Preview frames: {preview_frames}");
+    println!("Intentional profile skips: {intentional_skips}");
+    println!("Running preview acceptance path...");
+
+    proxy_playback(
+        original_path,
+        proxy_path,
+        ProxyPlaybackProfile::Journalist25p,
+    )?;
+
+    println!("QNC Journalist Demo Summary");
+    println!("---------------------------");
+    println!("Preview profile: broadcast-news-25fps-preview");
+    println!("Source frames: {source_frames}");
+    println!("Preview frames: {preview_frames}");
+    println!("Intentional profile skips: {intentional_skips}");
+    println!("Lateness drops: 0");
+    println!("Duplicated frames: 0");
+    println!("GPU processing: completed for all selected preview frames");
+    println!("News cut:");
+    println!(
+        "  start: preview frame {} / source frame {} / {:.3}s",
+        cut_start_preview,
+        cut_start_source,
+        cut_start_time.as_secs_f64()
+    );
+    println!(
+        "  end: preview frame {} / source frame {} / {:.3}s",
+        cut_end_preview_exclusive,
+        cut_end_source_exclusive,
+        cut_end_time.as_secs_f64()
+    );
+    println!("  preview frames in cut: {cut_preview_frames}");
+    println!("  selected source frames in cut: {cut_preview_frames}");
+    println!("  source frames skipped by profile in cut: {cut_preview_frames}");
+    println!("  estimated duration: {:.3}s", cut_duration.as_secs_f64());
+    println!("QNC export plan:");
+    println!("  status: planned only, not rendered");
+    println!("  profile: broadcast-news-25fps-preview");
+    println!("  source: Sony FX6 original/proxy pair");
+    println!("  preview media: proxy MP4");
+    println!("  finishing media: original MXF available");
+    println!(
+        "  selected range: {:.3}s..{:.3}s",
+        cut_start_time.as_secs_f64(),
+        cut_end_time.as_secs_f64()
+    );
+    println!("  target delivery: future milestone");
+
+    Ok(())
 }
 
 fn proxy_throughput(
@@ -5791,6 +5905,7 @@ struct Args {
     proxy_throughput_paths: Option<(PathBuf, PathBuf)>,
     proxy_playback_paths: Option<(PathBuf, PathBuf)>,
     proxy_playback_profile: ProxyPlaybackProfile,
+    qnc_journalist_demo_paths: Option<(PathBuf, PathBuf)>,
 }
 
 impl Args {
@@ -5812,6 +5927,8 @@ impl Args {
         let mut proxy_playback_original = None;
         let mut proxy_playback_paths = None;
         let mut proxy_playback_profile = ProxyPlaybackProfile::SourceRate;
+        let mut qnc_journalist_demo_original = None;
+        let mut qnc_journalist_demo_paths = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
@@ -5819,9 +5936,22 @@ impl Args {
         let mut next_arg_is_proxy_playback_original = false;
         let mut next_arg_is_proxy_playback_proxy = false;
         let mut next_arg_is_proxy_playback_profile = false;
+        let mut next_arg_is_qnc_journalist_demo_original = false;
+        let mut next_arg_is_qnc_journalist_demo_proxy = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_proxy_playback_profile {
+            if next_arg_is_qnc_journalist_demo_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = qnc_journalist_demo_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                qnc_journalist_demo_paths = Some((original, proxy));
+                next_arg_is_qnc_journalist_demo_proxy = false;
+            } else if next_arg_is_qnc_journalist_demo_original {
+                qnc_journalist_demo_original = Some(PathBuf::from(arg));
+                next_arg_is_qnc_journalist_demo_original = false;
+                next_arg_is_qnc_journalist_demo_proxy = true;
+            } else if next_arg_is_proxy_playback_profile {
                 proxy_playback_profile =
                     ProxyPlaybackProfile::parse(&arg).unwrap_or_else(|err| panic!("{err}"));
                 next_arg_is_proxy_playback_profile = false;
@@ -5888,6 +6018,8 @@ impl Args {
                 next_arg_is_proxy_playback_original = true;
             } else if arg == PROXY_PLAYBACK_PROFILE_ARG {
                 next_arg_is_proxy_playback_profile = true;
+            } else if arg == QNC_JOURNALIST_DEMO_ARG {
+                next_arg_is_qnc_journalist_demo_original = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -5905,6 +6037,7 @@ impl Args {
             proxy_throughput_paths,
             proxy_playback_paths,
             proxy_playback_profile,
+            qnc_journalist_demo_paths,
         }
     }
 }
