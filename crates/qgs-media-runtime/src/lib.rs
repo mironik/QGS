@@ -495,6 +495,322 @@ pub enum BroadcastVideoSourceMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsPlaybackRepresentation {
+    Original,
+    Proxy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsOriginalProxyAssociationStatus {
+    TimingCompatible,
+    TimingMismatch,
+    MissingProxy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsAudioRepresentation {
+    Original,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsPreparedSourceIdentity {
+    pub clip_id: String,
+    pub workspace_db_uri: String,
+    pub source_record_uri: String,
+}
+
+impl QgsPreparedSourceIdentity {
+    pub fn public_uris_are_valid(&self) -> bool {
+        is_qgs_public_uri(&self.workspace_db_uri) && is_qgs_public_uri(&self.source_record_uri)
+    }
+}
+
+fn is_qgs_public_uri(value: &str) -> bool {
+    value.starts_with("qnc://") && !value.contains('\\') && !value.starts_with("file:")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsPreparedMediaBinding {
+    pub original_media_uri: String,
+    pub proxy_media_uri: Option<String>,
+    pub private_original_path_bound: bool,
+    pub private_proxy_path_bound: bool,
+    pub association_status: QgsOriginalProxyAssociationStatus,
+}
+
+impl QgsPreparedMediaBinding {
+    pub fn public_uris_are_valid(&self) -> bool {
+        is_qgs_public_uri(&self.original_media_uri)
+            && self
+                .proxy_media_uri
+                .as_deref()
+                .is_none_or(is_qgs_public_uri)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsPreparedVideoTiming {
+    pub timebase: RationalRate,
+    pub duration_frames: u64,
+    pub duration: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsPreparedAudioChannel {
+    pub track_id: u32,
+    pub lane_index: u16,
+    pub channel_index: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsPreparedAudioLayout {
+    pub representation: QgsAudioRepresentation,
+    pub sample_rate: u32,
+    pub bit_depth: u8,
+    pub channels: Vec<QgsPreparedAudioChannel>,
+    pub proxy_aac_authoritative: bool,
+}
+
+impl QgsPreparedAudioLayout {
+    pub fn validate(&self) -> Result<(), PlaybackError> {
+        if self.representation != QgsAudioRepresentation::Original
+            || self.sample_rate == 0
+            || self.bit_depth == 0
+            || self.channels.is_empty()
+            || self.proxy_aac_authoritative
+        {
+            return Err(PlaybackError::InvalidAudioFormat);
+        }
+        for (expected, channel) in self.channels.iter().enumerate() {
+            if channel.lane_index as usize != expected {
+                return Err(PlaybackError::InvalidAudioFormat);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsPreparedStreamLayout {
+    pub original_video: QgsPreparedVideoTiming,
+    pub proxy_video: Option<QgsPreparedVideoTiming>,
+    pub audio_sample_rate: u32,
+}
+
+impl QgsPreparedStreamLayout {
+    pub fn selected_video(
+        self,
+        representation: QgsPlaybackRepresentation,
+    ) -> Option<QgsPreparedVideoTiming> {
+        match representation {
+            QgsPlaybackRepresentation::Original => Some(self.original_video),
+            QgsPlaybackRepresentation::Proxy => self.proxy_video,
+        }
+    }
+
+    pub fn proxy_original_timing_compatible(self) -> bool {
+        self.proxy_video.is_some_and(|proxy| {
+            proxy.timebase == self.original_video.timebase
+                && proxy.duration_frames == self.original_video.duration_frames
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsPreparedInputDescriptor {
+    pub contract_version: String,
+    pub identity: QgsPreparedSourceIdentity,
+    pub binding: QgsPreparedMediaBinding,
+    pub selected_picture: QgsPlaybackRepresentation,
+    pub authoritative_audio: QgsAudioRepresentation,
+    pub project_audio_channels: u16,
+    pub project_audio_sample_rate: u32,
+    pub layout: QgsPreparedStreamLayout,
+    pub audio_layout: QgsPreparedAudioLayout,
+}
+
+impl QgsPreparedInputDescriptor {
+    pub fn validate(&self) -> Result<(), PlaybackError> {
+        if self.contract_version.trim().is_empty()
+            || !self.identity.public_uris_are_valid()
+            || !self.binding.public_uris_are_valid()
+            || !self.binding.private_original_path_bound
+            || self.authoritative_audio != QgsAudioRepresentation::Original
+            || self.project_audio_channels == 0
+            || self.project_audio_sample_rate == 0
+            || self.project_audio_sample_rate != self.audio_layout.sample_rate
+            || usize::from(self.project_audio_channels) > self.audio_layout.channels.len()
+            || self.layout.audio_sample_rate != self.audio_layout.sample_rate
+            || self.layout.original_video.duration_frames == 0
+            || self.layout.original_video.duration.is_zero()
+        {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        self.audio_layout.validate()?;
+        match self.selected_picture {
+            QgsPlaybackRepresentation::Original => {}
+            QgsPlaybackRepresentation::Proxy => {
+                if self.binding.proxy_media_uri.is_none()
+                    || !self.binding.private_proxy_path_bound
+                    || self.binding.association_status
+                        != QgsOriginalProxyAssociationStatus::TimingCompatible
+                    || !self.layout.proxy_original_timing_compatible()
+                {
+                    return Err(PlaybackError::InvalidRuntimeTransition);
+                }
+            }
+        }
+        self.layout
+            .selected_video(self.selected_picture)
+            .ok_or(PlaybackError::InvalidRuntimeTransition)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsInputPlanSourceMode {
+    ProxyPreview,
+    OriginalMedia,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsInputPlanVideoSource {
+    pub mode: QgsInputPlanSourceMode,
+    pub representation: QgsPlaybackRepresentation,
+    pub media_uri: String,
+    pub timebase: RationalRate,
+    pub duration_frames: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsInputPlanAudioSource {
+    pub representation: QgsAudioRepresentation,
+    pub media_uri: String,
+    pub sample_rate: u32,
+    pub bit_depth: u8,
+    pub lanes: Vec<QgsPreparedAudioChannel>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsInputPlanQueueRequirements {
+    pub min_video_frames: usize,
+    pub min_audio_ranges: usize,
+    pub max_video_queue: usize,
+    pub max_audio_queue: usize,
+}
+
+impl QgsInputPlanQueueRequirements {
+    pub fn validate(self) -> Result<(), PlaybackError> {
+        if self.min_video_frames == 0
+            || self.min_audio_ranges == 0
+            || self.max_video_queue == 0
+            || self.max_audio_queue == 0
+            || self.min_video_frames > self.max_video_queue
+            || self.min_audio_ranges > self.max_audio_queue
+        {
+            return Err(PlaybackError::InvalidCapacity);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsInputPlanCapabilityRequirements {
+    pub requires_original_audio: bool,
+    pub requires_discrete_mono_lanes: bool,
+    pub requires_proxy_aac_diagnostic_only: bool,
+    pub requires_uri_identity: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsInputPlan {
+    pub source_mode: QgsInputPlanSourceMode,
+    pub video_source: QgsInputPlanVideoSource,
+    pub audio_source: QgsInputPlanAudioSource,
+    pub queue_requirements: QgsInputPlanQueueRequirements,
+    pub capability_requirements: QgsInputPlanCapabilityRequirements,
+    pub frame_sample_mapping_rate: u32,
+}
+
+impl QgsInputPlan {
+    pub fn from_descriptor(
+        descriptor: &QgsPreparedInputDescriptor,
+        queue_requirements: QgsInputPlanQueueRequirements,
+    ) -> Result<Self, PlaybackError> {
+        descriptor.validate()?;
+        queue_requirements.validate()?;
+        let selected_video = descriptor
+            .layout
+            .selected_video(descriptor.selected_picture)
+            .ok_or(PlaybackError::InvalidRuntimeTransition)?;
+        let source_mode = match descriptor.selected_picture {
+            QgsPlaybackRepresentation::Original => QgsInputPlanSourceMode::OriginalMedia,
+            QgsPlaybackRepresentation::Proxy => QgsInputPlanSourceMode::ProxyPreview,
+        };
+        let video_uri = match descriptor.selected_picture {
+            QgsPlaybackRepresentation::Original => descriptor.binding.original_media_uri.clone(),
+            QgsPlaybackRepresentation::Proxy => descriptor
+                .binding
+                .proxy_media_uri
+                .clone()
+                .ok_or(PlaybackError::InvalidRuntimeTransition)?,
+        };
+        let plan = Self {
+            source_mode,
+            video_source: QgsInputPlanVideoSource {
+                mode: source_mode,
+                representation: descriptor.selected_picture,
+                media_uri: video_uri,
+                timebase: selected_video.timebase,
+                duration_frames: selected_video.duration_frames,
+            },
+            audio_source: QgsInputPlanAudioSource {
+                representation: QgsAudioRepresentation::Original,
+                media_uri: descriptor.binding.original_media_uri.clone(),
+                sample_rate: descriptor.audio_layout.sample_rate,
+                bit_depth: descriptor.audio_layout.bit_depth,
+                lanes: descriptor.audio_layout.channels.clone(),
+            },
+            queue_requirements,
+            capability_requirements: QgsInputPlanCapabilityRequirements {
+                requires_original_audio: true,
+                requires_discrete_mono_lanes: true,
+                requires_proxy_aac_diagnostic_only: true,
+                requires_uri_identity: true,
+            },
+            frame_sample_mapping_rate: descriptor.audio_layout.sample_rate,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    pub fn validate(&self) -> Result<(), PlaybackError> {
+        self.queue_requirements.validate()?;
+        if self.audio_source.representation != QgsAudioRepresentation::Original
+            || self.audio_source.sample_rate == 0
+            || self.audio_source.bit_depth == 0
+            || self.audio_source.lanes.is_empty()
+            || !self.audio_source.media_uri.starts_with("qnc://")
+            || !self.video_source.media_uri.starts_with("qnc://")
+            || !self.capability_requirements.requires_original_audio
+            || !self.capability_requirements.requires_discrete_mono_lanes
+            || !self
+                .capability_requirements
+                .requires_proxy_aac_diagnostic_only
+            || !self.capability_requirements.requires_uri_identity
+            || self.frame_sample_mapping_rate != self.audio_source.sample_rate
+        {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        Ok(())
+    }
+
+    pub fn samples_for_duration(&self, duration: Duration) -> Result<u64, PlaybackError> {
+        audio_samples_for_duration(duration, self.frame_sample_mapping_rate)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BroadcastRuntimeState {
     Idle,
     Preparing,
@@ -3317,6 +3633,153 @@ impl std::error::Error for PlaybackError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_qgs_descriptor() -> QgsPreparedInputDescriptor {
+        let rate = RationalRate::new(50, 1).expect("rate");
+        QgsPreparedInputDescriptor {
+            contract_version: "test".into(),
+            identity: QgsPreparedSourceIdentity {
+                clip_id: "clip".into(),
+                workspace_db_uri: "qnc://local/db/project_workspace/clip".into(),
+                source_record_uri: "qnc://local/source/clip".into(),
+            },
+            binding: QgsPreparedMediaBinding {
+                original_media_uri: "qnc://local/media/original/clip".into(),
+                proxy_media_uri: Some("qnc://local/media/proxy/clip".into()),
+                private_original_path_bound: true,
+                private_proxy_path_bound: true,
+                association_status: QgsOriginalProxyAssociationStatus::TimingCompatible,
+            },
+            selected_picture: QgsPlaybackRepresentation::Proxy,
+            authoritative_audio: QgsAudioRepresentation::Original,
+            project_audio_channels: 4,
+            project_audio_sample_rate: 48_000,
+            layout: QgsPreparedStreamLayout {
+                original_video: QgsPreparedVideoTiming {
+                    timebase: rate,
+                    duration_frames: 100,
+                    duration: Duration::from_secs(2),
+                },
+                proxy_video: Some(QgsPreparedVideoTiming {
+                    timebase: rate,
+                    duration_frames: 100,
+                    duration: Duration::from_secs(2),
+                }),
+                audio_sample_rate: 48_000,
+            },
+            audio_layout: QgsPreparedAudioLayout {
+                representation: QgsAudioRepresentation::Original,
+                sample_rate: 48_000,
+                bit_depth: 24,
+                channels: (0..4)
+                    .map(|lane| QgsPreparedAudioChannel {
+                        track_id: lane + 1,
+                        lane_index: lane as u16,
+                        channel_index: 0,
+                    })
+                    .collect(),
+                proxy_aac_authoritative: false,
+            },
+        }
+    }
+
+    fn sample_qgs_queue_requirements() -> QgsInputPlanQueueRequirements {
+        QgsInputPlanQueueRequirements {
+            min_video_frames: 3,
+            min_audio_ranges: 3,
+            max_video_queue: 8,
+            max_audio_queue: 8,
+        }
+    }
+
+    #[test]
+    fn qnc_prepared_descriptor_validates_proxy_picture_original_audio() {
+        let descriptor = sample_qgs_descriptor();
+        assert!(descriptor.validate().is_ok());
+        assert_eq!(
+            descriptor.selected_picture,
+            QgsPlaybackRepresentation::Proxy
+        );
+        assert_eq!(
+            descriptor.authoritative_audio,
+            QgsAudioRepresentation::Original
+        );
+        assert!(!descriptor.audio_layout.proxy_aac_authoritative);
+        assert!(descriptor.binding.public_uris_are_valid());
+        assert!(descriptor.identity.public_uris_are_valid());
+    }
+
+    #[test]
+    fn qnc_prepared_descriptor_rejects_missing_proxy_for_proxy_picture() {
+        let mut descriptor = sample_qgs_descriptor();
+        descriptor.binding.proxy_media_uri = None;
+        assert_eq!(
+            descriptor.validate(),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+    }
+
+    #[test]
+    fn qnc_prepared_descriptor_rejects_proxy_aac_as_authoritative() {
+        let mut descriptor = sample_qgs_descriptor();
+        descriptor.audio_layout.proxy_aac_authoritative = true;
+        assert_eq!(
+            descriptor.validate(),
+            Err(PlaybackError::InvalidAudioFormat)
+        );
+    }
+
+    #[test]
+    fn qnc_prepared_descriptor_preserves_four_mono_lanes() {
+        let descriptor = sample_qgs_descriptor();
+        assert_eq!(descriptor.audio_layout.channels.len(), 4);
+        for (index, channel) in descriptor.audio_layout.channels.iter().enumerate() {
+            assert_eq!(channel.lane_index as usize, index);
+            assert_eq!(channel.channel_index, 0);
+        }
+    }
+
+    #[test]
+    fn qnc_prepared_descriptor_rejects_raw_path_public_identity() {
+        let mut descriptor = sample_qgs_descriptor();
+        descriptor.binding.original_media_uri = "/tmp/original.mxf".into();
+        assert_eq!(
+            descriptor.validate(),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+    }
+
+    #[test]
+    fn qgs_input_plan_builds_from_valid_descriptor() {
+        let descriptor = sample_qgs_descriptor();
+        let plan =
+            QgsInputPlan::from_descriptor(&descriptor, sample_qgs_queue_requirements()).unwrap();
+        assert_eq!(plan.source_mode, QgsInputPlanSourceMode::ProxyPreview);
+        assert_eq!(
+            plan.video_source.representation,
+            QgsPlaybackRepresentation::Proxy
+        );
+        assert_eq!(
+            plan.audio_source.representation,
+            QgsAudioRepresentation::Original
+        );
+        assert_eq!(plan.audio_source.lanes.len(), 4);
+        assert_eq!(
+            plan.samples_for_duration(Duration::from_millis(1_000))
+                .unwrap(),
+            48_000
+        );
+    }
+
+    #[test]
+    fn qgs_input_plan_rejects_invalid_descriptor() {
+        let mut descriptor = sample_qgs_descriptor();
+        descriptor.binding.association_status = QgsOriginalProxyAssociationStatus::TimingMismatch;
+        assert_eq!(
+            QgsInputPlan::from_descriptor(&descriptor, sample_qgs_queue_requirements()),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+    }
 
     #[test]
     fn exact_integer_rates_use_integer_timing() {

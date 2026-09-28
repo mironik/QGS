@@ -42,8 +42,11 @@ use qgs_media_runtime::{
     BroadcastVideoPayloadFormat, BroadcastVideoPayloadKind, BroadcastVideoPayloadReference,
     BroadcastVideoSourceMode, FrameIdentity as PlaybackFrameIdentity, OriginalAudioTrack,
     PcmAudioBlock, PcmAudioBlockLayout, PcmAudioPacket, PcmEndian, PcmSampleFormat, PlaybackClock,
-    PlaybackConfig, PlaybackState, PresentationDecision, RationalRate, RealTimeClock,
-    TestAudioSink, TestPresentationSink,
+    PlaybackConfig, PlaybackState, PresentationDecision, QgsAudioRepresentation, QgsInputPlan,
+    QgsInputPlanQueueRequirements, QgsOriginalProxyAssociationStatus, QgsPlaybackRepresentation,
+    QgsPreparedAudioChannel, QgsPreparedAudioLayout, QgsPreparedInputDescriptor,
+    QgsPreparedMediaBinding, QgsPreparedSourceIdentity, QgsPreparedStreamLayout,
+    QgsPreparedVideoTiming, RationalRate, RealTimeClock, TestAudioSink, TestPresentationSink,
 };
 use qgs_mp4::{
     classify_video_track, nearest_random_access_before, MediaHealth, Mp4Source, Mp4TrackKind,
@@ -125,6 +128,8 @@ const BROADCAST_RUNTIME_AUDIO_PIPEWIRE_AUDIBLE_ARG: &str =
 const PIPEWIRE_AUDIO_CONTENT_AUDIT_ARG: &str = "--pipewire-audio-content-audit";
 const PIPEWIRE_AUDIO_MONO_MONITOR_ARG: &str = "--pipewire-audio-mono-monitor";
 const PIPEWIRE_AUDIO_DISCRETE_4MONO_ARG: &str = "--pipewire-audio-discrete-4mono";
+const QNC_PREPARED_INPUT_DESCRIPTOR_ARG: &str = "--qnc-prepared-input-descriptor";
+const QGS_INPUT_PLAN_ARG: &str = "--qgs-input-plan";
 const WRITE_DIAGNOSTIC_WAV_ARG: &str = "--write-diagnostic-wav";
 const AUDIO_AUDIT_START_MS_ARG: &str = "--start-ms";
 const AUDIO_AUDIT_DURATION_MS_ARG: &str = "--duration-ms";
@@ -247,6 +252,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.broadcast_player_runtime_verification_paths {
         return broadcast_player_runtime_verification(&original, &proxy);
+    }
+    if let Some((original, proxy)) = args.qnc_prepared_input_descriptor_paths {
+        return qnc_prepared_input_descriptor_report(&original, &proxy);
+    }
+    if let Some((original, proxy)) = args.qgs_input_plan_paths {
+        return qgs_input_plan_report(&original, &proxy);
     }
     if let Some(path) = args.linux_audio_device_probe_path {
         return linux_audio_device_probe(&path);
@@ -1578,6 +1589,388 @@ fn qnc_journalist_demo(
     println!("  target delivery: future milestone");
 
     Ok(())
+}
+
+fn qnc_prepared_input_descriptor_report(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let descriptor = build_qnc_prepared_input_descriptor(original_path, proxy_path)?;
+    let validation = descriptor.validate();
+
+    println!("QNC Prepared Input Descriptor Compatibility");
+    println!("-------------------------------------------");
+    println!(
+        "Public original URI: {}",
+        descriptor.binding.original_media_uri
+    );
+    println!(
+        "Public proxy URI: {}",
+        descriptor
+            .binding
+            .proxy_media_uri
+            .as_deref()
+            .unwrap_or("<none>")
+    );
+    println!(
+        "Private original path binding present: {}",
+        yes_no(descriptor.binding.private_original_path_bound)
+    );
+    println!(
+        "Private proxy path binding present: {}",
+        yes_no(descriptor.binding.private_proxy_path_bound)
+    );
+    println!(
+        "Selected picture representation: {:?}",
+        descriptor.selected_picture
+    );
+    println!(
+        "Authoritative audio representation: {:?}",
+        descriptor.authoritative_audio
+    );
+    println!("Proxy AAC authoritative: no");
+    println!(
+        "Original/proxy association: {:?}",
+        descriptor.binding.association_status
+    );
+    println!(
+        "Audio channel count: {}",
+        descriptor.audio_layout.channels.len()
+    );
+    println!("Mono channel identities:");
+    for channel in &descriptor.audio_layout.channels {
+        println!(
+            "  lane {}: track_id={} channel_index={}",
+            channel.lane_index + 1,
+            channel.track_id,
+            channel.channel_index
+        );
+    }
+    println!(
+        "Source duration: {:.3}s",
+        descriptor.layout.original_video.duration.as_secs_f64()
+    );
+    println!(
+        "Video timebase: {}/{} fps",
+        descriptor.layout.original_video.timebase.numerator(),
+        descriptor.layout.original_video.timebase.denominator()
+    );
+    println!(
+        "Source duration frames: {}",
+        descriptor.layout.original_video.duration_frames
+    );
+    println!(
+        "Proxy duration frames: {}",
+        descriptor
+            .layout
+            .proxy_video
+            .map(|video| video.duration_frames)
+            .unwrap_or(0)
+    );
+    println!(
+        "Audio sample rate: {} Hz",
+        descriptor.audio_layout.sample_rate
+    );
+    println!("Audio bit depth: {} bit", descriptor.audio_layout.bit_depth);
+    println!(
+        "URI identity separate from private path binding: {}",
+        yes_no(
+            descriptor.identity.public_uris_are_valid()
+                && descriptor.binding.public_uris_are_valid()
+        )
+    );
+    println!("Validation result: {}", result_label(&validation));
+
+    validation?;
+    Ok(())
+}
+
+fn qgs_input_plan_report(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let descriptor = build_qnc_prepared_input_descriptor(original_path, proxy_path)?;
+    let descriptor_validation = descriptor.validate();
+    let queue_requirements = default_qgs_input_plan_queue_requirements();
+    let plan = QgsInputPlan::from_descriptor(&descriptor, queue_requirements)?;
+
+    println!("QGS InputPlan Compatibility");
+    println!("---------------------------");
+    println!(
+        "Descriptor validation result: {}",
+        result_label(&descriptor_validation)
+    );
+    println!("Source mode: {:?}", plan.source_mode);
+    println!(
+        "Video source plan: representation={:?} uri={} frames={} timebase={}/{}",
+        plan.video_source.representation,
+        plan.video_source.media_uri,
+        plan.video_source.duration_frames,
+        plan.video_source.timebase.numerator(),
+        plan.video_source.timebase.denominator()
+    );
+    println!(
+        "Audio source plan: representation={:?} uri={} sample_rate={}Hz bit_depth={} lanes={}",
+        plan.audio_source.representation,
+        plan.audio_source.media_uri,
+        plan.audio_source.sample_rate,
+        plan.audio_source.bit_depth,
+        plan.audio_source.lanes.len()
+    );
+    println!(
+        "Original/proxy timing compatible: {}",
+        yes_no(descriptor.layout.proxy_original_timing_compatible())
+    );
+    println!("Audio lane layout:");
+    for lane in &plan.audio_source.lanes {
+        println!(
+            "  lane {}: original track {} channel {}",
+            lane.lane_index + 1,
+            lane.track_id,
+            lane.channel_index
+        );
+    }
+    println!(
+        "Queue requirements: min_video_frames={} min_audio_ranges={} max_video_queue={} max_audio_queue={}",
+        plan.queue_requirements.min_video_frames,
+        plan.queue_requirements.min_audio_ranges,
+        plan.queue_requirements.max_video_queue,
+        plan.queue_requirements.max_audio_queue
+    );
+    println!(
+        "Capability requirements: original_audio={} discrete_mono_lanes={} proxy_aac_diagnostic_only={} uri_identity={}",
+        yes_no(plan.capability_requirements.requires_original_audio),
+        yes_no(plan.capability_requirements.requires_discrete_mono_lanes),
+        yes_no(plan.capability_requirements.requires_proxy_aac_diagnostic_only),
+        yes_no(plan.capability_requirements.requires_uri_identity)
+    );
+    println!(
+        "1000 ms maps to audio samples: {}",
+        plan.samples_for_duration(Duration::from_millis(1_000))?
+    );
+    println!("Not implemented in Phase 22:");
+    println!("  transport engine: no");
+    println!("  frame clock: no");
+    println!("  playout buffer: no");
+    println!("  presenter: no");
+    println!("  realtime: no");
+    println!("  A/V sync: no");
+
+    descriptor_validation?;
+    Ok(())
+}
+
+fn result_label<T>(
+    result: &std::result::Result<T, qgs_media_runtime::PlaybackError>,
+) -> &'static str {
+    if result.is_ok() {
+        "ok"
+    } else {
+        "error"
+    }
+}
+
+fn default_qgs_input_plan_queue_requirements() -> QgsInputPlanQueueRequirements {
+    QgsInputPlanQueueRequirements {
+        min_video_frames: 3,
+        min_audio_ranges: 3,
+        max_video_queue: 8,
+        max_audio_queue: 8,
+    }
+}
+
+fn build_qnc_prepared_input_descriptor(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<QgsPreparedInputDescriptor, Box<dyn std::error::Error>> {
+    let audio_index = open_pcm_audio_index(original_path)?;
+    let proxy = Mp4Source::open(proxy_path)?;
+    let proxy_video = proxy
+        .video
+        .as_ref()
+        .ok_or("proxy has no H.264 video track")?;
+    let audio_tracks = sorted_audio_tracks(&audio_index);
+    if audio_tracks.is_empty() {
+        return Err("original MXF has no audio tracks".into());
+    }
+    let sample_rate = uniform_original_audio_sample_rate(&audio_tracks)?;
+    let bit_depth = uniform_original_audio_bit_depth(&audio_tracks)?;
+    let original_duration_samples = original_audio_duration_samples(&audio_index);
+    if original_duration_samples == 0 {
+        return Err("original MXF audio duration is missing".into());
+    }
+    let source_duration = duration_from_audio_samples(original_duration_samples, sample_rate)?;
+    let original_rate =
+        original_video_timebase_from_index(&audio_index).unwrap_or(RationalRate::new(
+            u64::from(proxy_video.frame_rate.numerator),
+            u64::from(proxy_video.frame_rate.denominator),
+        )?);
+    let original_duration_frames =
+        duration_samples_to_frames(original_duration_samples, sample_rate, original_rate)?;
+    let proxy_duration = duration_from_units(
+        proxy_video.duration_units,
+        u64::from(proxy_video.timescale),
+        1,
+    )?;
+    let proxy_timing = QgsPreparedVideoTiming {
+        timebase: RationalRate::new(
+            u64::from(proxy_video.frame_rate.numerator),
+            u64::from(proxy_video.frame_rate.denominator),
+        )?,
+        duration_frames: proxy_video.samples.len() as u64,
+        duration: proxy_duration,
+    };
+    let original_timing = QgsPreparedVideoTiming {
+        timebase: original_rate,
+        duration_frames: original_duration_frames,
+        duration: source_duration,
+    };
+    let association_status = if proxy_timing.timebase == original_timing.timebase
+        && proxy_timing.duration_frames == original_timing.duration_frames
+    {
+        QgsOriginalProxyAssociationStatus::TimingCompatible
+    } else {
+        QgsOriginalProxyAssociationStatus::TimingMismatch
+    };
+    let clip_id = sanitized_source_stem(original_path);
+    let channels = audio_tracks
+        .iter()
+        .enumerate()
+        .map(|(lane, track)| {
+            let audio = track.audio.as_ref().ok_or("audio descriptor missing")?;
+            if audio.channels != Some(1) {
+                return Err("Phase 22 expects discrete mono original audio tracks".into());
+            }
+            Ok(QgsPreparedAudioChannel {
+                track_id: track.id.0,
+                lane_index: u16::try_from(lane)?,
+                channel_index: 0,
+            })
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+
+    Ok(QgsPreparedInputDescriptor {
+        contract_version: "qgs.phase22.qnc-prepared-input.v1".to_string(),
+        identity: QgsPreparedSourceIdentity {
+            clip_id: clip_id.clone(),
+            workspace_db_uri: format!("qnc://local/db/project_workspace/{clip_id}"),
+            source_record_uri: format!("qnc://local/source/{clip_id}"),
+        },
+        binding: QgsPreparedMediaBinding {
+            original_media_uri: format!("qnc://local/media/original/{clip_id}"),
+            proxy_media_uri: Some(format!("qnc://local/media/proxy/{clip_id}")),
+            private_original_path_bound: original_path.is_file(),
+            private_proxy_path_bound: proxy_path.is_file(),
+            association_status,
+        },
+        selected_picture: QgsPlaybackRepresentation::Proxy,
+        authoritative_audio: QgsAudioRepresentation::Original,
+        project_audio_channels: u16::try_from(channels.len())?,
+        project_audio_sample_rate: sample_rate,
+        layout: QgsPreparedStreamLayout {
+            original_video: original_timing,
+            proxy_video: Some(proxy_timing),
+            audio_sample_rate: sample_rate,
+        },
+        audio_layout: QgsPreparedAudioLayout {
+            representation: QgsAudioRepresentation::Original,
+            sample_rate,
+            bit_depth,
+            channels,
+            proxy_aac_authoritative: false,
+        },
+    })
+}
+
+fn sorted_audio_tracks(index: &PcmAudioIndex) -> Vec<&qgs_mxf::MxfTrack> {
+    let mut tracks = index
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Audio)
+        .collect::<Vec<_>>();
+    tracks.sort_by_key(|track| track.id.0);
+    tracks
+}
+
+fn uniform_original_audio_sample_rate(
+    tracks: &[&qgs_mxf::MxfTrack],
+) -> Result<u32, Box<dyn std::error::Error>> {
+    let rates = tracks
+        .iter()
+        .map(|track| {
+            let rate = track
+                .audio
+                .as_ref()
+                .and_then(|audio| audio.sample_rate)
+                .ok_or("audio sample rate missing")?;
+            rational_to_u32(rate)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    uniform_value(rates.as_slice()).ok_or_else(|| "original audio sample rates differ".into())
+}
+
+fn uniform_original_audio_bit_depth(
+    tracks: &[&qgs_mxf::MxfTrack],
+) -> Result<u8, Box<dyn std::error::Error>> {
+    let depths = tracks
+        .iter()
+        .map(|track| {
+            track
+                .audio
+                .as_ref()
+                .and_then(|audio| audio.bit_depth)
+                .ok_or("audio bit depth missing")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    uniform_value(depths.as_slice()).ok_or_else(|| "original audio bit depths differ".into())
+}
+
+fn original_video_timebase_from_index(index: &PcmAudioIndex) -> Option<RationalRate> {
+    index
+        .tracks
+        .iter()
+        .find(|track| track.kind == TrackKind::Video)
+        .and_then(|track| track.edit_rate)
+        .and_then(|rate| {
+            RationalRate::new(u64::from(rate.numerator), u64::from(rate.denominator)).ok()
+        })
+}
+
+fn original_audio_duration_samples(index: &PcmAudioIndex) -> u64 {
+    index
+        .audio
+        .iter()
+        .map(|entry| {
+            entry
+                .start_sample
+                .saturating_add(u64::from(entry.sample_count))
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn duration_samples_to_frames(
+    samples: u64,
+    sample_rate: u32,
+    frame_rate: RationalRate,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    if sample_rate == 0 {
+        return Err("invalid audio sample rate".into());
+    }
+    let numerator = u128::from(samples)
+        .checked_mul(u128::from(frame_rate.numerator()))
+        .ok_or("duration frame overflow")?;
+    let denominator = u128::from(sample_rate)
+        .checked_mul(u128::from(frame_rate.denominator()))
+        .ok_or("duration frame overflow")?;
+    if denominator == 0 {
+        return Err("invalid frame denominator".into());
+    }
+    let rounded = numerator
+        .checked_add(denominator / 2)
+        .ok_or("duration frame overflow")?
+        / denominator;
+    Ok(u64::try_from(rounded)?)
 }
 
 #[derive(Clone, Debug)]
@@ -12444,6 +12837,8 @@ struct Args {
     broadcast_player_runtime_simulate_paths: Option<(PathBuf, PathBuf)>,
     broadcast_player_runtime_original_video_payloads_paths: Option<(PathBuf, PathBuf)>,
     broadcast_player_runtime_verification_paths: Option<(PathBuf, PathBuf)>,
+    qnc_prepared_input_descriptor_paths: Option<(PathBuf, PathBuf)>,
+    qgs_input_plan_paths: Option<(PathBuf, PathBuf)>,
     linux_audio_device_probe_path: Option<PathBuf>,
     pipewire_audio_prototype_path: Option<PathBuf>,
     pipewire_audio_native_prototype_path: Option<PathBuf>,
@@ -12510,6 +12905,10 @@ impl Args {
         let mut broadcast_player_runtime_original_video_payloads_paths = None;
         let mut broadcast_player_runtime_verification_original = None;
         let mut broadcast_player_runtime_verification_paths = None;
+        let mut qnc_prepared_input_descriptor_original = None;
+        let mut qnc_prepared_input_descriptor_paths = None;
+        let mut qgs_input_plan_original = None;
+        let mut qgs_input_plan_paths = None;
         let mut linux_audio_device_probe_path = None;
         let mut pipewire_audio_prototype_path = None;
         let mut pipewire_audio_native_prototype_path = None;
@@ -12567,6 +12966,10 @@ impl Args {
         let mut next_arg_is_broadcast_player_runtime_original_video_payloads_proxy = false;
         let mut next_arg_is_broadcast_player_runtime_verification_original = false;
         let mut next_arg_is_broadcast_player_runtime_verification_proxy = false;
+        let mut next_arg_is_qnc_prepared_input_descriptor_original = false;
+        let mut next_arg_is_qnc_prepared_input_descriptor_proxy = false;
+        let mut next_arg_is_qgs_input_plan_original = false;
+        let mut next_arg_is_qgs_input_plan_proxy = false;
         let mut next_arg_is_linux_audio_device_probe_path = false;
         let mut next_arg_is_pipewire_audio_prototype_path = false;
         let mut next_arg_is_pipewire_audio_native_prototype_path = false;
@@ -12683,6 +13086,28 @@ impl Args {
             } else if next_arg_is_pipewire_audio_prototype_path {
                 pipewire_audio_prototype_path = Some(PathBuf::from(arg));
                 next_arg_is_pipewire_audio_prototype_path = false;
+            } else if next_arg_is_qgs_input_plan_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = qgs_input_plan_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                qgs_input_plan_paths = Some((original, proxy));
+                next_arg_is_qgs_input_plan_proxy = false;
+            } else if next_arg_is_qgs_input_plan_original {
+                qgs_input_plan_original = Some(PathBuf::from(arg));
+                next_arg_is_qgs_input_plan_original = false;
+                next_arg_is_qgs_input_plan_proxy = true;
+            } else if next_arg_is_qnc_prepared_input_descriptor_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = qnc_prepared_input_descriptor_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                qnc_prepared_input_descriptor_paths = Some((original, proxy));
+                next_arg_is_qnc_prepared_input_descriptor_proxy = false;
+            } else if next_arg_is_qnc_prepared_input_descriptor_original {
+                qnc_prepared_input_descriptor_original = Some(PathBuf::from(arg));
+                next_arg_is_qnc_prepared_input_descriptor_original = false;
+                next_arg_is_qnc_prepared_input_descriptor_proxy = true;
             } else if next_arg_is_linux_audio_device_probe_path {
                 linux_audio_device_probe_path = Some(PathBuf::from(arg));
                 next_arg_is_linux_audio_device_probe_path = false;
@@ -12949,6 +13374,10 @@ impl Args {
                 next_arg_is_broadcast_player_runtime_original_video_payloads_original = true;
             } else if arg == BROADCAST_PLAYER_RUNTIME_VERIFICATION_ARG {
                 next_arg_is_broadcast_player_runtime_verification_original = true;
+            } else if arg == QNC_PREPARED_INPUT_DESCRIPTOR_ARG {
+                next_arg_is_qnc_prepared_input_descriptor_original = true;
+            } else if arg == QGS_INPUT_PLAN_ARG {
+                next_arg_is_qgs_input_plan_original = true;
             } else if arg == LINUX_AUDIO_DEVICE_PROBE_ARG {
                 next_arg_is_linux_audio_device_probe_path = true;
             } else if arg == PIPEWIRE_AUDIO_PROTOTYPE_ARG {
@@ -13013,6 +13442,8 @@ impl Args {
             broadcast_player_runtime_simulate_paths,
             broadcast_player_runtime_original_video_payloads_paths,
             broadcast_player_runtime_verification_paths,
+            qnc_prepared_input_descriptor_paths,
+            qgs_input_plan_paths,
             linux_audio_device_probe_path,
             pipewire_audio_prototype_path,
             pipewire_audio_native_prototype_path,
@@ -13064,7 +13495,8 @@ mod tests {
         build_pipewire_f32_interleaved_prototype_buffer,
         build_runtime_audio_payload_pipewire_buffer,
         build_sequential_original_audio_segment_for_duration, decode_s24be_i32, decode_s24le_i32,
-        decode_u24le, discrete_4mono_evidence_label, f32_buffer_stats, loudest_monitor_pair,
+        decode_u24le, default_qgs_input_plan_queue_requirements, discrete_4mono_evidence_label,
+        duration_samples_to_frames, f32_buffer_stats, loudest_monitor_pair,
         mono_monitor_diagnostic_evidence_label, mxf_file_label, original_pcm_blocks_by_channel,
         original_segment_evidence_label, parse_manual_audible_confirmation,
         parse_monitor_track_arg, pcm_s24le_sample_to_f32, proxy_presentation_ordinals,
@@ -13083,6 +13515,26 @@ mod tests {
     };
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[test]
+    fn qgs_input_plan_default_queue_requirements_are_bounded() {
+        let requirements = default_qgs_input_plan_queue_requirements();
+        assert_eq!(requirements.min_video_frames, 3);
+        assert_eq!(requirements.min_audio_ranges, 3);
+        assert!(requirements.max_video_queue >= requirements.min_video_frames);
+        assert!(requirements.max_audio_queue >= requirements.min_audio_ranges);
+    }
+
+    #[test]
+    fn qnc_descriptor_duration_samples_map_to_50fps_frames() {
+        let frames = duration_samples_to_frames(
+            48_000,
+            48_000,
+            qgs_media_runtime::RationalRate::new(50, 1).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(frames, 50);
+    }
 
     #[test]
     fn sony_xml_summary_extracts_technical_fields_without_private_ids() {
