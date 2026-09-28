@@ -38,6 +38,11 @@ and what remains unimplemented.
   content from the original-audio-derived diagnostic/output path, but channel
   routing, gain, production output, realtime playback, and full audio-device
   verification remain unverified.
+- `ManualMonitorPairPreferenceObserved`: a human compared diagnostic monitor
+  WAVs and preferred one monitor pair for a bounded original-audio range. This
+  is diagnostic listening evidence only; it does not certify production
+  routing, channel mapping, full playback, realtime playback, A/V sync, or full
+  audio-device verification.
 - `VisualVerified`: visual/image correctness was verified by comparison or
   display evidence.
 - `AudioDeviceVerified`: a real audio device path was verified.
@@ -74,6 +79,7 @@ For Sony FX6 sample 002:
 | native PipeWire audible smoke test | `ManualContentAudibilityPartiallyObserved` | Bounded original-audio-derived PipeWire smoke-test buffers submitted and drained; later listening found voice-like content rather than only hum/buzz, but routing/gain and production output remain unverified. |
 | native PipeWire original-audio segment playback | `ManualContentAudibilityPartiallyObserved` | Bounded sequential original MXF audio segment submitted and drained; later listening found voice-like content in both tested versions, with the second clearer and apparently present on both channels. |
 | PipeWire audio content sanity audit | `MediaInspected` | Original MXF PCM statistics, endian/sign interpretation, f32 conversion, segment/runtime path equality, and PipeWire buffer geometry audited; manual listening partially supports content audibility, but routing and device-output correctness remain unverified. |
+| Mironik 2002 monitor diagnostic | `ManualMonitorPairPreferenceObserved` | For the 0-1000 ms bounded original-MXF audit range, the track 4 / track 1 loudest-pair stereo monitor WAV sounded best among tested diagnostics and matches the RMS statistics. Proxy AAC was not used; this is diagnostic monitor preference only. |
 | broadcast runtime audio payload to PipeWire | `RuntimeAudioPayloadDrainCompleted` | First prepared `ProxyPreview` Broadcast Player Runtime original-audio payload binding submits to native PipeWire and drains; an audible helper path exists but manual confirmation is tracked separately and does not imply full playback, realtime playback, A/V sync, channel certification, or full audio-device verification. |
 | simulated playback loop | `TestBoundaryEvidence` | Prepared slots flow through test audio/video boundaries deterministically. |
 | real speaker output | `NotImplemented` | No audible speaker output, audio-device clock, or full audio playback path exists; native PipeWire buffer submission is tracked separately. |
@@ -94,10 +100,10 @@ The matrix intentionally does not overstate these areas:
   only hum/buzz. This still does not certify channel routing, gain, production
   output, realtime/full Broadcast Player playback, A/V sync, or full
   `AudioDeviceVerified`.
-- Content-audibility and monitor-routing diagnosis should be repeated on the
-  longer Mironik 2002 corpus before any stronger listening or routing claim is
-  made. The shorter Mironik 1560 sample remains a technical boundary check, not
-  the canonical listening source.
+- Mironik 2002 monitor diagnosis identified track 4 / track 1 as the preferred
+  diagnostic monitor pair for the 0-1000 ms range. This is not channel
+  certification, production routing, full playback, realtime playback, A/V
+  sync, or full `AudioDeviceVerified`.
 - Runtime-prepared audio payload submission/drain evidence is not full playback,
   realtime playback, A/V sync, channel certification, or full
   `AudioDeviceVerified`.

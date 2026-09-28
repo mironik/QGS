@@ -64,7 +64,9 @@ overlapping the selected sample range. It does not load the full MXF into
 memory, and it preserves the 64 MiB full-file guard used by older full-parse
 paths.
 
-To select the loudest contiguous diagnostic range by RMS:
+For small files, or once a future streaming loudest-range scan exists for large
+MXF files, the command shape for selecting the loudest contiguous diagnostic
+range by RMS is:
 
 ```bash
 cargo run -q -p qgs-test -- \
@@ -159,6 +161,41 @@ target/qgs-audio-audit/mironik-2002-start0/Mironik-2002-stereo-track34-f32-start
 target/qgs-audio-audit/mironik-2002-start0/Mironik-2002-stereo-loudest-pair-f32-start000000ms-dur001000ms.wav
 ```
 
+## Manual Monitor Listening Result
+
+The first manual monitor listening pass used:
+
+```text
+target/qgs-audio-audit/mironik-2002-start0/Mironik-2002-stereo-loudest-pair-f32-start000000ms-dur001000ms.wav
+```
+
+This file is the stereo loudest-pair monitor diagnostic for Mironik 2002 at
+start 0 ms, duration 1000 ms. It is derived from original MXF audio, uses no
+proxy AAC, and is a diagnostic monitor output only. For this range, the
+diagnostic monitor pair is:
+
+- left: track 4
+- right: track 1
+
+The user reported that this first loudest-pair monitor test sounded best among
+the tested diagnostics, while the second test sounded worst. This matches the
+RMS statistics for the selected range:
+
+- track 4 RMS: -17.45 dBFS
+- track 1 RMS: -26.71 dBFS
+- track 2 RMS: -44.34 dBFS
+- track 3 RMS: -85.04 dBFS, likely silent
+
+For the Mironik 2002 start-0 range, track 4 / track 1 is therefore the
+preferred diagnostic monitor pair. Track 1/2 should not be used as the main
+listening proof for this range. Track 3 is likely silent in this range, and
+track 2 is much lower level than tracks 1 and 4.
+
+This is a monitor diagnostic observation only. It does not certify production
+routing, channel mapping, speaker calibration, full playback, realtime
+playback, A/V sync, or full `AudioDeviceVerified` status. Runtime truth is
+unchanged: original MXF audio remains authoritative, and proxy AAC is not used.
+
 ## Interpretation
 
 For content-audibility work, use Mironik 2002 first. The shorter Mironik 1560
@@ -168,7 +205,8 @@ selection.
 
 The expected diagnostic flow is:
 
-1. Run the loudest-range audit on Mironik 2002.
+1. Use explicit `--start-ms` / `--duration-ms` on Mironik 2002 until streaming
+   loudest-range scan is implemented.
 2. Listen to the 4-channel diagnostic WAV through a known-good player if
    possible.
 3. Listen to the stereo track 1/2 monitor WAV.
