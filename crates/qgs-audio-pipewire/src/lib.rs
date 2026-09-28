@@ -81,6 +81,8 @@ pub struct PipeWireBufferSubmissionReport {
     pub process_callback_reached: bool,
     pub buffer_dequeued: bool,
     pub buffer_capacity: usize,
+    pub buffers_planned: u32,
+    pub buffers_submitted: u32,
     pub samples_converted: u32,
     pub output_channels: u32,
     pub f32_samples_written: usize,
@@ -136,6 +138,7 @@ struct SubmissionObservation {
     post_submit_process_callbacks: u32,
     buffer_dequeued: bool,
     buffer_capacity: usize,
+    buffers_submitted: u32,
     bytes_copied: usize,
     buffer_submitted: bool,
     drain_requested: bool,
@@ -269,8 +272,22 @@ pub fn submit_native_pipewire_buffer(
     frame_count: u32,
     timeout: Duration,
 ) -> Result<PipeWireBufferSubmissionReport, PipeWireStreamError> {
+    submit_native_pipewire_buffers(format, vec![f32_interleaved_le], frame_count, timeout)
+}
+
+pub fn submit_native_pipewire_buffers(
+    format: PipeWireStreamFormat,
+    f32_interleaved_buffers: Vec<Vec<u8>>,
+    frames_per_buffer: u32,
+    timeout: Duration,
+) -> Result<PipeWireBufferSubmissionReport, PipeWireStreamError> {
     let format = format.validate()?;
-    validate_f32_interleaved_buffer(&f32_interleaved_le, frame_count, format.channels)?;
+    if f32_interleaved_buffers.is_empty() {
+        return Err(PipeWireStreamError::InvalidFormat("no buffers to submit"));
+    }
+    for buffer in &f32_interleaved_buffers {
+        validate_f32_interleaved_buffer(buffer, frames_per_buffer, format.channels)?;
+    }
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)
         .map_err(|err| PipeWireStreamError::Connect(err.to_string()))?;
@@ -296,8 +313,8 @@ pub fn submit_native_pipewire_buffer(
     let process_observation = Rc::clone(&observation);
     let drained_observation = Rc::clone(&observation);
     let state_observation = Rc::clone(&observation);
-    let payload = Rc::new(f32_interleaved_le);
-    let process_payload = Rc::clone(&payload);
+    let payloads = Rc::new(f32_interleaved_buffers);
+    let process_payloads = Rc::clone(&payloads);
     let listener_mainloop = mainloop.clone();
     let dequeue_failure_mainloop = mainloop.clone();
     let drained_mainloop = mainloop.clone();
@@ -333,6 +350,12 @@ pub fn submit_native_pipewire_buffer(
                     observation.post_submit_process_callbacks.saturating_add(1);
                 return;
             }
+            let payload_index =
+                usize::try_from(observation.buffers_submitted).unwrap_or(usize::MAX);
+            let Some(process_payload) = process_payloads.get(payload_index) else {
+                observation.buffer_submitted = true;
+                return;
+            };
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 dequeue_failure_mainloop.quit();
                 return;
@@ -346,7 +369,7 @@ pub fn submit_native_pipewire_buffer(
                 dequeue_failure_mainloop.quit();
                 return;
             };
-            observation.buffer_capacity = slice.len();
+            observation.buffer_capacity = observation.buffer_capacity.max(slice.len());
             if slice.len() < process_payload.len() {
                 dequeue_failure_mainloop.quit();
                 return;
@@ -356,15 +379,22 @@ pub fn submit_native_pipewire_buffer(
             *chunk.offset_mut() = 0;
             *chunk.stride_mut() = i32::try_from(stride).unwrap_or(i32::MAX);
             *chunk.size_mut() = u32::try_from(process_payload.len()).unwrap_or(u32::MAX);
-            observation.bytes_copied = process_payload.len();
-            observation.buffer_submitted = true;
+            observation.bytes_copied = observation
+                .bytes_copied
+                .saturating_add(process_payload.len());
+            observation.buffers_submitted = observation.buffers_submitted.saturating_add(1);
+            observation.buffer_submitted = usize::try_from(observation.buffers_submitted)
+                .unwrap_or(usize::MAX)
+                >= process_payloads.len();
             drop(buffer);
-            match stream.flush(true) {
-                Ok(()) => {
-                    observation.drain_requested = true;
-                }
-                Err(_) => {
-                    observation.drain_request_failed = true;
+            if observation.buffer_submitted {
+                match stream.flush(true) {
+                    Ok(()) => {
+                        observation.drain_requested = true;
+                    }
+                    Err(_) => {
+                        observation.drain_request_failed = true;
+                    }
                 }
             }
         })
@@ -455,11 +485,14 @@ pub fn submit_native_pipewire_buffer(
         process_callback_reached: observation.process_callback_reached,
         buffer_dequeued: observation.buffer_dequeued,
         buffer_capacity: observation.buffer_capacity,
-        samples_converted: frame_count,
+        buffers_planned: u32::try_from(payloads.len()).unwrap_or(u32::MAX),
+        buffers_submitted: observation.buffers_submitted,
+        samples_converted: frames_per_buffer.saturating_mul(observation.buffers_submitted),
         output_channels: format.channels,
-        f32_samples_written: usize::try_from(frame_count)
+        f32_samples_written: usize::try_from(frames_per_buffer)
             .unwrap_or(0)
-            .saturating_mul(usize::try_from(format.channels).unwrap_or(0)),
+            .saturating_mul(usize::try_from(format.channels).unwrap_or(0))
+            .saturating_mul(usize::try_from(observation.buffers_submitted).unwrap_or(0)),
         bytes_copied: observation.bytes_copied,
         buffer_submitted: observation.buffer_submitted,
         post_submit_process_callbacks: observation.post_submit_process_callbacks,

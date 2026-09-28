@@ -2,13 +2,15 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
+use std::io::{self, IsTerminal, Write};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use qgs_audio_pipewire::{
-    f32_interleaved_from_s24le_mono_tracks, submit_native_pipewire_buffer, MonoS24LeTrack,
-    PipeWireAudioSampleFormat, PipeWireStreamFormat,
+    f32_interleaved_from_s24le_mono_tracks, submit_native_pipewire_buffer,
+    submit_native_pipewire_buffers, MonoS24LeTrack, PipeWireAudioSampleFormat,
+    PipeWireStreamFormat,
 };
 use qgs_core::{BackendDecodedSurface, DecoderBackend, DeviceDiscovery, VideoCapabilityDiscovery};
 use qgs_linux::{
@@ -112,6 +114,7 @@ const BROADCAST_PLAYER_RUNTIME_VERIFICATION_ARG: &str = "--broadcast-player-runt
 const LINUX_AUDIO_DEVICE_PROBE_ARG: &str = "--linux-audio-device-probe";
 const PIPEWIRE_AUDIO_PROTOTYPE_ARG: &str = "--pipewire-audio-prototype";
 const PIPEWIRE_AUDIO_NATIVE_PROTOTYPE_ARG: &str = "--pipewire-audio-native-prototype";
+const PIPEWIRE_AUDIO_AUDIBLE_SMOKE_TEST_ARG: &str = "--pipewire-audio-audible-smoke-test";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -237,6 +240,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(path) = args.pipewire_audio_native_prototype_path {
         return pipewire_audio_native_prototype(&path);
+    }
+    if let Some(path) = args.pipewire_audio_audible_smoke_test_path {
+        return pipewire_audio_audible_smoke_test(&path);
     }
 
     let socket_path = args.socket_path;
@@ -2169,6 +2175,8 @@ fn pipewire_audio_native_prototype(path: &Path) -> Result<(), Box<dyn std::error
                 yes_no(submission_report.buffer_dequeued)
             );
             println!("Buffer capacity: {}", submission_report.buffer_capacity);
+            println!("Buffers planned: {}", submission_report.buffers_planned);
+            println!("Buffers submitted: {}", submission_report.buffers_submitted);
             println!(
                 "Samples converted per track: {}",
                 submission_report.samples_converted
@@ -2239,6 +2247,258 @@ fn pipewire_audio_native_prototype(path: &Path) -> Result<(), Box<dyn std::error
     }
 
     Ok(())
+}
+
+fn pipewire_audio_audible_smoke_test(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    let source = MediaSource::parse(&bytes)?;
+    let audio_tracks = source
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Audio)
+        .collect::<Vec<_>>();
+    if audio_tracks.is_empty() {
+        return Err("original MXF has no audio tracks".into());
+    }
+
+    let source_format = original_linux_pcm_audio_format(&audio_tracks)?;
+    let blocks = build_original_pcm_blocks(&source, &bytes)?;
+    let samples_per_buffer = 960_u32;
+    let target_duration = Duration::from_millis(500);
+    let buffers = smoke_test_buffer_count(
+        target_duration,
+        source_format.sample_rate,
+        samples_per_buffer,
+    )?;
+    let pipewire_tracks = first_pipewire_mono_tracks(&blocks, samples_per_buffer)?;
+    let segment = f32_interleaved_from_s24le_mono_tracks(&pipewire_tracks, samples_per_buffer)?;
+    let smoke_buffers = repeated_smoke_test_buffers(&segment, buffers)?;
+    let total_bytes = smoke_buffers.iter().map(Vec::len).sum::<usize>();
+    let total_samples = samples_per_buffer.saturating_mul(buffers);
+    let actual_duration =
+        duration_from_audio_samples(u64::from(total_samples), source_format.sample_rate)?;
+    let buffer = LinuxPipewirePrototypeBuffer {
+        sample_rate: source_format.sample_rate,
+        channels: u16::try_from(pipewire_tracks.len())?,
+        sample_count: samples_per_buffer,
+        sample_format: LinuxPipewirePrototypeSampleFormat::F32Interleaved,
+        bytes: segment,
+    };
+    let report = inspect_native_pipewire_stream_boundary(&buffer)?;
+
+    println!("Native PipeWire Audible Smoke Test");
+    println!("----------------------------------");
+    println!("Audio source: original MXF");
+    println!("Proxy AAC: not used");
+    println!("Full playback: no");
+    println!("Realtime Broadcast Player playback: no");
+    println!("A/V sync: no");
+    println!("Generated tone primary evidence: no");
+    println!(
+        "Input PCM: tracks={} channels_per_track={} sample_rate={}Hz bit_depth={}bit",
+        source_format.track_count,
+        source_format.channels_per_track,
+        source_format.sample_rate,
+        source_format.bits_per_sample
+    );
+    println!("Device-boundary conversion: original 24-bit mono tracks -> f32 interleaved");
+    println!("Routing: track 1 -> FL, track 2 -> FR, track 3 -> RL, track 4 -> RR");
+    println!(
+        "Smoke-test source range per buffer: {} samples/track",
+        samples_per_buffer
+    );
+    println!(
+        "Smoke-test duration: {:.3} ms",
+        actual_duration.as_secs_f64() * 1000.0
+    );
+    println!("Smoke-test buffers planned: {}", buffers);
+    println!("Smoke-test total bytes planned: {}", total_bytes);
+    println!("Manual audible confirmation required: yes");
+    println!(
+        "PipeWire runtime library available: {}",
+        yes_no(report.runtime_library_available)
+    );
+    println!(
+        "PipeWire server reachable: {}",
+        yes_no(report.pipewire_server_reachable)
+    );
+    println!(
+        "PipeWire pkg-config entry available: {}",
+        yes_no(report.pkg_config_entry_available)
+    );
+    println!(
+        "PipeWire headers available: {}",
+        yes_no(report.headers_available)
+    );
+    if !report.pkg_config_entry_available || !report.headers_available {
+        println!(
+            "Stream create attempted: {}",
+            yes_no(report.stream_create_attempted)
+        );
+        println!("Buffers submitted: 0");
+        println!("Drain requested: no");
+        println!("Drain completed: no");
+        println!("Manual confirmation status: ManualAudibleConfirmationRequired");
+        println!("Evidence level: {:?}", report.evidence_level);
+        println!("AudioDeviceVerified: no");
+        println!("Audible output claimed: no");
+        println!("Status: {}", report.status_message);
+        return Ok(());
+    }
+
+    let stream_format = PipeWireStreamFormat {
+        sample_rate: source_format.sample_rate,
+        channels: u32::from(buffer.channels),
+        sample_format: PipeWireAudioSampleFormat::F32Interleaved,
+    };
+    let submission_report = submit_native_pipewire_buffers(
+        stream_format,
+        smoke_buffers,
+        samples_per_buffer,
+        Duration::from_secs(4),
+    )?;
+    let confirmation = read_manual_audible_confirmation()?;
+    let evidence = audible_smoke_evidence_label(
+        submission_report.buffer_submitted,
+        submission_report.drain_completed,
+        confirmation,
+    );
+
+    println!(
+        "Stream configured: {}",
+        yes_no(submission_report.stream_report.stream_configured)
+    );
+    println!(
+        "Observed stream states: {:?}",
+        submission_report.stream_report.observed_states
+    );
+    println!(
+        "Final stream state: {:?}",
+        submission_report.stream_report.final_state
+    );
+    println!(
+        "Process callback reached: {}",
+        yes_no(submission_report.process_callback_reached)
+    );
+    println!("Buffer capacity: {}", submission_report.buffer_capacity);
+    println!("Buffers planned: {}", submission_report.buffers_planned);
+    println!("Buffers submitted: {}", submission_report.buffers_submitted);
+    println!(
+        "Samples submitted per track: {}",
+        submission_report.samples_converted
+    );
+    println!("Output channels: {}", submission_report.output_channels);
+    println!(
+        "F32 samples written: {}",
+        submission_report.f32_samples_written
+    );
+    println!("Bytes copied: {}", submission_report.bytes_copied);
+    println!(
+        "Drain requested: {}",
+        yes_no(submission_report.drain_requested)
+    );
+    println!(
+        "Drain completed: {}",
+        yes_no(submission_report.drain_completed)
+    );
+    println!(
+        "Post-submit callbacks observed: {}",
+        submission_report.post_submit_process_callbacks
+    );
+    println!(
+        "Post-submit timeout: {}",
+        yes_no(submission_report.post_submit_timeout)
+    );
+    println!(
+        "PipeWire evidence level: {:?}",
+        submission_report.evidence_level
+    );
+    println!("Manual confirmation status: {}", confirmation.label());
+    println!("Smoke-test evidence level: {}", evidence);
+    println!("AudioDeviceVerified: no");
+    println!("AudioDeviceVerified scope: not upgraded by smoke test");
+    println!(
+        "Audible output claimed: {}",
+        yes_no(confirmation == ManualAudibleConfirmation::Yes)
+    );
+    println!(
+        "Status: bounded original-audio-derived smoke test completed; full playback is not claimed"
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManualAudibleConfirmation {
+    Yes,
+    No,
+    Required,
+}
+
+impl ManualAudibleConfirmation {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Yes => "ManualAudibleSmokeTestConfirmed",
+            Self::No => "ManualAudibleSmokeTestNotHeard",
+            Self::Required => "ManualAudibleConfirmationRequired",
+        }
+    }
+}
+
+fn read_manual_audible_confirmation() -> io::Result<ManualAudibleConfirmation> {
+    if !io::stdin().is_terminal() {
+        return Ok(ManualAudibleConfirmation::Required);
+    }
+    print!("Did you hear audio from the default PipeWire output? yes/no: ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(parse_manual_audible_confirmation(&input))
+}
+
+fn parse_manual_audible_confirmation(input: &str) -> ManualAudibleConfirmation {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => ManualAudibleConfirmation::Yes,
+        "n" | "no" => ManualAudibleConfirmation::No,
+        _ => ManualAudibleConfirmation::Required,
+    }
+}
+
+fn audible_smoke_evidence_label(
+    submitted: bool,
+    drain_completed: bool,
+    confirmation: ManualAudibleConfirmation,
+) -> &'static str {
+    match (submitted, drain_completed, confirmation) {
+        (true, _, ManualAudibleConfirmation::Yes) => "ManualAudibleSmokeTestConfirmed",
+        (true, _, ManualAudibleConfirmation::No) => "ManualAudibleSmokeTestNotHeard",
+        (true, true, ManualAudibleConfirmation::Required) => "ManualAudibleConfirmationRequired",
+        (true, false, ManualAudibleConfirmation::Required) => "AudibleSmokeTestSubmitted",
+        _ => "AudibleSmokeTestNotSubmitted",
+    }
+}
+
+fn smoke_test_buffer_count(
+    target_duration: Duration,
+    sample_rate: u32,
+    samples_per_buffer: u32,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    if sample_rate == 0 || samples_per_buffer == 0 {
+        return Err("smoke-test sample rate and samples per buffer must be non-zero".into());
+    }
+    let target_samples = audio_samples_for_duration(target_duration, sample_rate)?;
+    let samples_per_buffer = u64::from(samples_per_buffer);
+    let buffers = target_samples.div_ceil(samples_per_buffer);
+    Ok(u32::try_from(buffers.max(1))?)
+}
+
+fn repeated_smoke_test_buffers(
+    segment: &[u8],
+    count: u32,
+) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    if segment.is_empty() || count == 0 {
+        return Err("smoke-test segment and count must be non-zero".into());
+    }
+    Ok((0..count).map(|_| segment.to_vec()).collect())
 }
 
 fn build_pipewire_f32_interleaved_prototype_buffer(
@@ -9457,6 +9717,7 @@ struct Args {
     linux_audio_device_probe_path: Option<PathBuf>,
     pipewire_audio_prototype_path: Option<PathBuf>,
     pipewire_audio_native_prototype_path: Option<PathBuf>,
+    pipewire_audio_audible_smoke_test_path: Option<PathBuf>,
 }
 
 impl Args {
@@ -9510,6 +9771,7 @@ impl Args {
         let mut linux_audio_device_probe_path = None;
         let mut pipewire_audio_prototype_path = None;
         let mut pipewire_audio_native_prototype_path = None;
+        let mut pipewire_audio_audible_smoke_test_path = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
@@ -9549,9 +9811,13 @@ impl Args {
         let mut next_arg_is_linux_audio_device_probe_path = false;
         let mut next_arg_is_pipewire_audio_prototype_path = false;
         let mut next_arg_is_pipewire_audio_native_prototype_path = false;
+        let mut next_arg_is_pipewire_audio_audible_smoke_test_path = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_pipewire_audio_native_prototype_path {
+            if next_arg_is_pipewire_audio_audible_smoke_test_path {
+                pipewire_audio_audible_smoke_test_path = Some(PathBuf::from(arg));
+                next_arg_is_pipewire_audio_audible_smoke_test_path = false;
+            } else if next_arg_is_pipewire_audio_native_prototype_path {
                 pipewire_audio_native_prototype_path = Some(PathBuf::from(arg));
                 next_arg_is_pipewire_audio_native_prototype_path = false;
             } else if next_arg_is_pipewire_audio_prototype_path {
@@ -9829,6 +10095,8 @@ impl Args {
                 next_arg_is_pipewire_audio_prototype_path = true;
             } else if arg == PIPEWIRE_AUDIO_NATIVE_PROTOTYPE_ARG {
                 next_arg_is_pipewire_audio_native_prototype_path = true;
+            } else if arg == PIPEWIRE_AUDIO_AUDIBLE_SMOKE_TEST_ARG {
+                next_arg_is_pipewire_audio_audible_smoke_test_path = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -9864,6 +10132,7 @@ impl Args {
             linux_audio_device_probe_path,
             pipewire_audio_prototype_path,
             pipewire_audio_native_prototype_path,
+            pipewire_audio_audible_smoke_test_path,
         }
     }
 }
@@ -9871,8 +10140,10 @@ impl Args {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_pipewire_f32_interleaved_prototype_buffer, mxf_file_label, pcm_s24le_sample_to_f32,
-        proxy_presentation_ordinals, selected_proxy_ordinals, SonyXmlSummary,
+        audible_smoke_evidence_label, build_pipewire_f32_interleaved_prototype_buffer,
+        mxf_file_label, parse_manual_audible_confirmation, pcm_s24le_sample_to_f32,
+        proxy_presentation_ordinals, repeated_smoke_test_buffers, selected_proxy_ordinals,
+        smoke_test_buffer_count, ManualAudibleConfirmation, SonyXmlSummary,
     };
     use qgs_media_runtime::{PcmAudioBlock, PcmAudioBlockLayout, PcmEndian, PcmSampleFormat};
     use qgs_mp4::{Mp4VideoSample, Mp4VideoTrack, Rational};
@@ -9985,6 +10256,54 @@ mod tests {
         assert_eq!(values[1], -1.0);
         assert!(values[2] > 0.999_999 && values[2] <= 1.0);
         assert_eq!(values[3], 0.5);
+    }
+
+    #[test]
+    fn audible_smoke_test_uses_bounded_repeated_original_segment() {
+        let count = smoke_test_buffer_count(Duration::from_millis(500), 48_000, 960).unwrap();
+        assert_eq!(count, 25);
+
+        let segment = vec![1_u8, 2, 3, 4];
+        let buffers = repeated_smoke_test_buffers(&segment, count).unwrap();
+        assert_eq!(buffers.len(), 25);
+        assert!(buffers.iter().all(|buffer| buffer == &segment));
+        assert_eq!(buffers.iter().map(Vec::len).sum::<usize>(), 100);
+    }
+
+    #[test]
+    fn audible_confirmation_parser_requires_explicit_yes_or_no() {
+        assert_eq!(
+            parse_manual_audible_confirmation("yes\n"),
+            ManualAudibleConfirmation::Yes
+        );
+        assert_eq!(
+            parse_manual_audible_confirmation("n"),
+            ManualAudibleConfirmation::No
+        );
+        assert_eq!(
+            parse_manual_audible_confirmation(""),
+            ManualAudibleConfirmation::Required
+        );
+        assert_eq!(
+            parse_manual_audible_confirmation("maybe"),
+            ManualAudibleConfirmation::Required
+        );
+    }
+
+    #[test]
+    fn audible_smoke_evidence_does_not_upgrade_without_manual_yes() {
+        assert_eq!(
+            audible_smoke_evidence_label(true, true, ManualAudibleConfirmation::Required),
+            "ManualAudibleConfirmationRequired"
+        );
+        assert_eq!(
+            audible_smoke_evidence_label(true, true, ManualAudibleConfirmation::No),
+            "ManualAudibleSmokeTestNotHeard"
+        );
+        assert_eq!(
+            audible_smoke_evidence_label(true, true, ManualAudibleConfirmation::Yes),
+            "ManualAudibleSmokeTestConfirmed"
+        );
     }
 
     #[test]
