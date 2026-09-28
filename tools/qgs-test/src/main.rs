@@ -13,10 +13,11 @@ use qgs_linux::{
 };
 use qgs_media_runtime::{
     audio_samples_for_duration, classify_presentation, duration_abs_delta,
-    max_video_timestamp_outside_audio_range, AudioFormat, AudioSampleFormat, AudioTimeline,
-    AudioTimingPacket, BoundedQueue, FrameIdentity as PlaybackFrameIdentity, OriginalAudioTrack,
-    PlaybackClock, PlaybackConfig, PlaybackState, PresentationDecision, RationalRate,
-    RealTimeClock, TestAudioSink, TestPresentationSink,
+    duration_from_audio_samples, max_video_timestamp_outside_audio_range, AudioFormat,
+    AudioSampleFormat, AudioTimeline, AudioTimingPacket, BoundedQueue,
+    FrameIdentity as PlaybackFrameIdentity, OriginalAudioTrack, PcmAudioPacket, PcmEndian,
+    PcmSampleFormat, PlaybackClock, PlaybackConfig, PlaybackState, PresentationDecision,
+    RationalRate, RealTimeClock, TestAudioSink, TestPresentationSink,
 };
 use qgs_mp4::{
     classify_video_track, nearest_random_access_before, MediaHealth, Mp4Source, Mp4TrackKind,
@@ -60,6 +61,7 @@ const PROXY_THROUGHPUT_ARG: &str = "--proxy-throughput";
 const PROXY_PLAYBACK_ARG: &str = "--proxy-playback";
 const PROXY_PLAYBACK_PROFILE_ARG: &str = "--proxy-playback-profile";
 const QNC_JOURNALIST_DEMO_ARG: &str = "--qnc-journalist-demo";
+const ORIGINAL_AUDIO_EXTRACT_ARG: &str = "--original-audio-extract";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -98,6 +100,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.qnc_journalist_demo_paths {
         return qnc_journalist_demo(&original, &proxy);
+    }
+    if let Some(path) = args.original_audio_extract_path {
+        return original_audio_extract(&path);
     }
 
     let socket_path = args.socket_path;
@@ -1319,7 +1324,7 @@ fn qnc_journalist_demo(
         audio_report.duration_delta.as_secs_f64() * 1000.0
     );
     println!(
-        "Audio timeline: tracks={} total_channels={} sample_rate={} bit_depth={:?} bounded_queue_peak={} payload_extraction=not implemented",
+        "Audio timeline: tracks={} total_channels={} sample_rate={} bit_depth={:?} bounded_queue_peak={} payload_extraction={} indexed_payload_packets={}",
         audio_report.timeline.tracks.len(),
         audio_report.total_channels,
         audio_report
@@ -1327,7 +1332,13 @@ fn qnc_journalist_demo(
             .map(|value| value.to_string())
             .unwrap_or_else(|| "mixed".to_string()),
         audio_report.uniform_bit_depth,
-        audio_report.audio_queue_peak
+        audio_report.audio_queue_peak,
+        if audio_report.audio_payload_packets_indexed == 0 {
+            "not available"
+        } else {
+            "available"
+        },
+        audio_report.audio_payload_packets_indexed
     );
     println!(
         "A/V clock foundation: max selected video timestamp outside audio range {:.3} ms, usable_as_future_master_clock={}",
@@ -1381,6 +1392,7 @@ struct OriginalAudioReport {
     audio_queue_peak: usize,
     audio_queue_backpressure: u64,
     audio_packets_recorded: usize,
+    audio_payload_packets_indexed: usize,
     audio_timestamps_monotonic: bool,
     max_selected_video_outside_audio: Duration,
     usable_as_master_clock: bool,
@@ -1512,6 +1524,7 @@ fn build_original_audio_report(
         audio_queue_peak: stats.peak_depth,
         audio_queue_backpressure: stats.backpressure_events,
         audio_packets_recorded: sink.packets().len(),
+        audio_payload_packets_indexed: original.index.audio.len(),
         audio_timestamps_monotonic: sink.monotonic(),
         max_selected_video_outside_audio,
         usable_as_master_clock: max_selected_video_outside_audio == Duration::ZERO,
@@ -1547,6 +1560,198 @@ fn print_original_audio_report(report: &OriginalAudioReport) {
         report.proxy_video_duration.as_secs_f64(),
         report.duration_delta.as_secs_f64() * 1000.0
     );
+}
+
+#[derive(Clone, Debug, Default)]
+struct PcmTrackPayloadStats {
+    channel_index: u16,
+    packets: u64,
+    samples: u64,
+    payload_bytes: u64,
+    first_start: Option<Duration>,
+    last_end: Option<Duration>,
+    last_start: Option<Duration>,
+    monotonic: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PcmPayloadStats {
+    queue_capacity: usize,
+    queue_peak: usize,
+    queue_backpressure: u64,
+    total_packets: u64,
+    total_payload_bytes: u64,
+    tracks: BTreeMap<u32, PcmTrackPayloadStats>,
+}
+
+fn original_audio_extract(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    let source = MediaSource::parse(&bytes)?;
+    let audio_tracks = source
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Audio)
+        .collect::<Vec<_>>();
+    if audio_tracks.is_empty() {
+        return Err("original MXF has no audio tracks".into());
+    }
+    if source.index.audio.is_empty() {
+        return Err("original MXF has no indexed PCM audio payload packets".into());
+    }
+
+    let queue_capacity = 8_usize;
+    let mut queue = BoundedQueue::new(queue_capacity)?;
+    let mut stats = PcmPayloadStats {
+        queue_capacity,
+        queue_peak: 0,
+        queue_backpressure: 0,
+        total_packets: 0,
+        total_payload_bytes: 0,
+        tracks: BTreeMap::new(),
+    };
+
+    for entry_index in 0..source.index.audio.len() {
+        let extracted = source.extract_pcm_audio_packet(&bytes, entry_index)?;
+        let track = source
+            .tracks
+            .iter()
+            .find(|track| track.id == extracted.entry.track_id)
+            .ok_or("PCM packet references missing audio track")?;
+        let audio = track
+            .audio
+            .as_ref()
+            .ok_or("PCM packet track has no audio descriptor")?;
+        let sample_rate = rational_to_u32(audio.sample_rate.ok_or("audio sample rate missing")?)?;
+        let bits_per_sample = audio.bit_depth.ok_or("audio bit depth missing")?;
+        let format = PcmSampleFormat::SignedInteger {
+            bits_per_sample,
+            endian: PcmEndian::Little,
+        };
+        let start = duration_from_audio_samples(extracted.entry.start_sample, sample_rate)?;
+        let duration =
+            duration_from_audio_samples(u64::from(extracted.entry.sample_count), sample_rate)?;
+        let packet = PcmAudioPacket::new(
+            extracted.entry.track_id.0,
+            extracted.entry.channel_index,
+            start,
+            duration,
+            extracted.entry.sample_count,
+            format,
+            extracted.payload,
+        )?;
+        if let Err(packet) = queue.try_push(packet) {
+            let drained = queue
+                .pop_front()
+                .ok_or("bounded PCM queue was full but empty")?;
+            consume_pcm_payload_packet(drained, &mut stats)?;
+            queue
+                .try_push(packet)
+                .map_err(|_| "bounded PCM queue remained full after draining")?;
+        }
+    }
+    let queue_stats = queue.stats();
+    while let Some(packet) = queue.pop_front() {
+        consume_pcm_payload_packet(packet, &mut stats)?;
+    }
+    stats.queue_peak = queue_stats.peak_depth;
+    stats.queue_backpressure = queue_stats.backpressure_events;
+
+    println!("Original MXF PCM Extraction");
+    println!("---------------------------");
+    println!("Audio source: original MXF");
+    println!("Proxy AAC: not used");
+    println!("Audio tracks: {}", audio_tracks.len());
+    for track in audio_tracks {
+        let audio = track.audio.as_ref().ok_or("audio descriptor missing")?;
+        let sample_rate = audio
+            .sample_rate
+            .map(rational_to_u32)
+            .transpose()?
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        println!(
+            "  track_id={} channels={} sample_rate={} bit_depth={:?} block_align={:?}",
+            track.id.0,
+            audio.channels.unwrap_or(0),
+            sample_rate,
+            audio.bit_depth,
+            audio.block_align
+        );
+    }
+    println!(
+        "PCM queue: capacity={} peak={} backpressure={}",
+        stats.queue_capacity, stats.queue_peak, stats.queue_backpressure
+    );
+    println!(
+        "PCM payload: packets={} bytes={}",
+        stats.total_packets, stats.total_payload_bytes
+    );
+    for (track_id, track_stats) in &stats.tracks {
+        let duration = track_stats.last_end.unwrap_or(Duration::ZERO);
+        println!(
+            "  track_id={} channel={} packets={} samples={} payload_bytes={} first={:.3}s duration={:.3}s monotonic={}",
+            track_id,
+            track_stats.channel_index,
+            track_stats.packets,
+            track_stats.samples,
+            track_stats.payload_bytes,
+            track_stats
+                .first_start
+                .unwrap_or(Duration::ZERO)
+                .as_secs_f64(),
+            duration.as_secs_f64(),
+            yes_no(track_stats.monotonic)
+        );
+    }
+
+    Ok(())
+}
+
+fn consume_pcm_payload_packet(
+    packet: PcmAudioPacket,
+    stats: &mut PcmPayloadStats,
+) -> Result<(), Box<dyn std::error::Error>> {
+    stats.total_packets = stats
+        .total_packets
+        .checked_add(1)
+        .ok_or("PCM packet count overflow")?;
+    stats.total_payload_bytes = stats
+        .total_payload_bytes
+        .checked_add(u64::try_from(packet.payload_bytes()).map_err(|_| "payload size overflow")?)
+        .ok_or("PCM payload byte count overflow")?;
+    let end = packet
+        .start
+        .checked_add(packet.duration)
+        .ok_or("PCM packet timestamp overflow")?;
+    let track = stats
+        .tracks
+        .entry(packet.track_id)
+        .or_insert_with(|| PcmTrackPayloadStats {
+            channel_index: packet.channel_index,
+            monotonic: true,
+            ..PcmTrackPayloadStats::default()
+        });
+    if let Some(last_start) = track.last_start {
+        if packet.start < last_start {
+            track.monotonic = false;
+        }
+    }
+    track.first_start.get_or_insert(packet.start);
+    track.last_start = Some(packet.start);
+    track.last_end = Some(end);
+    track.packets = track
+        .packets
+        .checked_add(1)
+        .ok_or("PCM track packet count overflow")?;
+    track.samples = track
+        .samples
+        .checked_add(u64::from(packet.sample_count))
+        .ok_or("PCM track sample count overflow")?;
+    track.payload_bytes = track
+        .payload_bytes
+        .checked_add(u64::try_from(packet.payload_bytes()).map_err(|_| "payload size overflow")?)
+        .ok_or("PCM track payload byte count overflow")?;
+    Ok(())
 }
 
 fn duration_from_units(
@@ -6158,6 +6363,7 @@ struct Args {
     proxy_playback_paths: Option<(PathBuf, PathBuf)>,
     proxy_playback_profile: ProxyPlaybackProfile,
     qnc_journalist_demo_paths: Option<(PathBuf, PathBuf)>,
+    original_audio_extract_path: Option<PathBuf>,
 }
 
 impl Args {
@@ -6181,6 +6387,7 @@ impl Args {
         let mut proxy_playback_profile = ProxyPlaybackProfile::SourceRate;
         let mut qnc_journalist_demo_original = None;
         let mut qnc_journalist_demo_paths = None;
+        let mut original_audio_extract_path = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
@@ -6190,9 +6397,13 @@ impl Args {
         let mut next_arg_is_proxy_playback_profile = false;
         let mut next_arg_is_qnc_journalist_demo_original = false;
         let mut next_arg_is_qnc_journalist_demo_proxy = false;
+        let mut next_arg_is_original_audio_extract_path = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_qnc_journalist_demo_proxy {
+            if next_arg_is_original_audio_extract_path {
+                original_audio_extract_path = Some(PathBuf::from(arg));
+                next_arg_is_original_audio_extract_path = false;
+            } else if next_arg_is_qnc_journalist_demo_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = qnc_journalist_demo_original
                     .take()
@@ -6272,6 +6483,8 @@ impl Args {
                 next_arg_is_proxy_playback_profile = true;
             } else if arg == QNC_JOURNALIST_DEMO_ARG {
                 next_arg_is_qnc_journalist_demo_original = true;
+            } else if arg == ORIGINAL_AUDIO_EXTRACT_ARG {
+                next_arg_is_original_audio_extract_path = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -6290,6 +6503,7 @@ impl Args {
             proxy_playback_paths,
             proxy_playback_profile,
             qnc_journalist_demo_paths,
+            original_audio_extract_path,
         }
     }
 }

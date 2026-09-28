@@ -231,6 +231,34 @@ pub enum AudioSampleFormat {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PcmEndian {
+    Little,
+    Big,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PcmSampleFormat {
+    SignedInteger {
+        bits_per_sample: u8,
+        endian: PcmEndian,
+    },
+}
+
+impl PcmSampleFormat {
+    pub fn bytes_per_sample(self) -> Result<usize, PlaybackError> {
+        match self {
+            Self::SignedInteger {
+                bits_per_sample, ..
+            } if bits_per_sample != 0 && bits_per_sample % 8 == 0 => {
+                Ok(usize::from(bits_per_sample / 8))
+            }
+            Self::SignedInteger { .. } => Err(PlaybackError::InvalidAudioFormat),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AudioFormat {
     pub sample_rate: u32,
     pub channels: u16,
@@ -300,6 +328,62 @@ pub struct AudioTimingPacket {
     pub duration: Duration,
     pub sample_count: u32,
     pub has_payload: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PcmAudioPacket {
+    pub track_id: u32,
+    pub channel_index: u16,
+    pub start: Duration,
+    pub duration: Duration,
+    pub sample_count: u32,
+    pub format: PcmSampleFormat,
+    pub payload: Vec<u8>,
+}
+
+impl PcmAudioPacket {
+    pub fn new(
+        track_id: u32,
+        channel_index: u16,
+        start: Duration,
+        duration: Duration,
+        sample_count: u32,
+        format: PcmSampleFormat,
+        payload: Vec<u8>,
+    ) -> Result<Self, PlaybackError> {
+        let expected = pcm_payload_byte_len(sample_count, 1, format)?;
+        if payload.len() != expected {
+            return Err(PlaybackError::InvalidAudioFormat);
+        }
+        Ok(Self {
+            track_id,
+            channel_index,
+            start,
+            duration,
+            sample_count,
+            format,
+            payload,
+        })
+    }
+
+    pub fn payload_bytes(&self) -> usize {
+        self.payload.len()
+    }
+}
+
+pub fn pcm_payload_byte_len(
+    sample_count: u32,
+    channels: u16,
+    format: PcmSampleFormat,
+) -> Result<usize, PlaybackError> {
+    if channels == 0 {
+        return Err(PlaybackError::InvalidAudioFormat);
+    }
+    usize::try_from(sample_count)
+        .ok()
+        .and_then(|samples| samples.checked_mul(usize::from(channels)))
+        .and_then(|values| values.checked_mul(format.bytes_per_sample().ok()?))
+        .ok_or(PlaybackError::TimestampOverflow)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -612,6 +696,39 @@ mod tests {
             audio_samples_for_duration(Duration::from_millis(2120), 48_000).unwrap(),
             101_760
         );
+    }
+
+    #[test]
+    fn pcm_packet_byte_size_preserves_24_bit_payloads() {
+        let format = PcmSampleFormat::SignedInteger {
+            bits_per_sample: 24,
+            endian: PcmEndian::Little,
+        };
+
+        assert_eq!(pcm_payload_byte_len(960, 1, format).unwrap(), 2880);
+        assert_eq!(pcm_payload_byte_len(960, 2, format).unwrap(), 5760);
+
+        let packet = PcmAudioPacket::new(
+            3,
+            0,
+            Duration::ZERO,
+            Duration::from_millis(20),
+            960,
+            format,
+            vec![0_u8; 2880],
+        )
+        .unwrap();
+        assert_eq!(packet.payload_bytes(), 2880);
+        assert!(PcmAudioPacket::new(
+            3,
+            0,
+            Duration::ZERO,
+            Duration::from_millis(20),
+            960,
+            format,
+            vec![0_u8; 2879],
+        )
+        .is_err());
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub const MAX_KLV_VALUE_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_KLV_COUNT: usize = 8192;
 pub const MAX_INDEX_ENTRIES: usize = 4096;
 pub const MAX_ACCESS_UNIT_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_AUDIO_PACKET_BYTES: usize = 1024 * 1024;
 pub const MAX_TRACK_COUNT: usize = 64;
 pub const MAX_METADATA_SET_COUNT: usize = 512;
 pub const MAX_METADATA_PROPERTY_COUNT: usize = 128;
@@ -40,6 +41,9 @@ const FOOTER_PARTITION_KEY: Ul = Ul([
 const H264_ESSENCE_KEY: Ul = Ul([
     0x06, 0x0e, 0x2b, 0x34, 0x01, 0x02, 0x01, 0x01, 0x0d, 0x01, 0x03, 0x01, 0x15, 0x01, 0x05, 0x00,
 ]);
+const PCM_AUDIO_ESSENCE_KEY_PREFIX: [u8; 15] = [
+    0x06, 0x0e, 0x2b, 0x34, 0x01, 0x02, 0x01, 0x01, 0x0d, 0x01, 0x03, 0x01, 0x16, 0x04, 0x03,
+];
 const PRIMER_PACK_KEY: Ul = Ul([
     0x06, 0x0e, 0x2b, 0x34, 0x02, 0x05, 0x01, 0x01, 0x0d, 0x01, 0x02, 0x01, 0x01, 0x05, 0x01, 0x00,
 ]);
@@ -362,18 +366,50 @@ pub struct VideoIndexEntry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioIndexEntry {
+    pub track_id: TrackId,
+    pub channel_index: u16,
+    pub edit_unit: u64,
+    pub start_sample: u64,
+    pub sample_count: u32,
+    pub file_offset: u64,
+    pub payload_offset: u64,
+    pub payload_len: u64,
+    pub source: IndexSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MxfPcmAudioPacket {
+    pub entry: AudioIndexEntry,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaIndex {
     pub video: Vec<VideoIndexEntry>,
+    pub audio: Vec<AudioIndexEntry>,
 }
 
 impl MediaIndex {
     pub fn new(video: Vec<VideoIndexEntry>) -> Result<Self, MxfError> {
+        Self::with_audio(video, Vec::new())
+    }
+
+    pub fn with_audio(
+        video: Vec<VideoIndexEntry>,
+        audio: Vec<AudioIndexEntry>,
+    ) -> Result<Self, MxfError> {
         validate_index_count(video.len())?;
-        Ok(Self { video })
+        validate_audio_index_count(audio.len())?;
+        Ok(Self { video, audio })
     }
 
     pub fn video_entry(&self, index: usize) -> Option<&VideoIndexEntry> {
         self.video.get(index)
+    }
+
+    pub fn audio_entry(&self, index: usize) -> Option<&AudioIndexEntry> {
+        self.audio.get(index)
     }
 
     pub fn nearest_random_access_before(&self, edit_unit: u64) -> Option<&VideoIndexEntry> {
@@ -409,6 +445,17 @@ pub fn validate_index_count(count: usize) -> Result<(), MxfError> {
             count,
             max: MAX_INDEX_ENTRIES,
         })
+    } else {
+        Ok(())
+    }
+}
+
+pub fn validate_audio_index_count(count: usize) -> Result<(), MxfError> {
+    let max = MAX_INDEX_ENTRIES
+        .checked_mul(usize::from(MAX_AUDIO_CHANNELS))
+        .ok_or(MxfError::OffsetOverflow)?;
+    if count > max {
+        Err(MxfError::ExcessiveIndexEntries { count, max })
     } else {
         Ok(())
     }
@@ -586,7 +633,8 @@ impl MediaSource {
         )?
         .or(Some(Timecode::new(0, Rational::new(25, 1)?, false)?));
         validate_batch_count(tracks.len())?;
-        let mut index = MediaIndex::new(video)?;
+        let audio = build_audio_index(&triplets, &tracks)?;
+        let mut index = MediaIndex::with_audio(video, audio)?;
         apply_mxf_index_to_derived_entries(&mut index, &index_segments);
         Ok(Self {
             duration,
@@ -624,9 +672,38 @@ impl MediaSource {
         }
         Ok(bytes[entry.payload_offset as usize..end as usize].to_vec())
     }
+
+    pub fn extract_pcm_audio_packet(
+        &self,
+        bytes: &[u8],
+        entry_index: usize,
+    ) -> Result<MxfPcmAudioPacket, MxfError> {
+        let entry = self
+            .index
+            .audio_entry(entry_index)
+            .ok_or(MxfError::InvalidEssenceOffset)?;
+        let payload = entry.payload(bytes)?;
+        Ok(MxfPcmAudioPacket {
+            entry: entry.clone(),
+            payload: payload.to_vec(),
+        })
+    }
 }
 
 impl VideoIndexEntry {
+    pub fn payload<'a>(&self, bytes: &'a [u8]) -> Result<&'a [u8], MxfError> {
+        let end = self
+            .payload_offset
+            .checked_add(self.payload_len)
+            .ok_or(MxfError::OffsetOverflow)?;
+        if end > bytes.len() as u64 {
+            return Err(MxfError::KlvValueBeyondEof);
+        }
+        Ok(&bytes[self.payload_offset as usize..end as usize])
+    }
+}
+
+impl AudioIndexEntry {
     pub fn payload<'a>(&self, bytes: &'a [u8]) -> Result<&'a [u8], MxfError> {
         let end = self
             .payload_offset
@@ -716,6 +793,8 @@ pub enum MxfError {
     ZeroRationalDenominator,
     InvalidTimecode,
     InvalidAudioDescriptor,
+    InvalidAudioEssence,
+    AudioPacketTooLarge { len: u64, max: usize },
     AccessUnitTooLarge { len: u64, max: usize },
     H264(H264Error),
 }
@@ -766,6 +845,10 @@ impl fmt::Display for MxfError {
             Self::ZeroRationalDenominator => write!(f, "zero rational denominator"),
             Self::InvalidTimecode => write!(f, "invalid timecode metadata"),
             Self::InvalidAudioDescriptor => write!(f, "invalid audio descriptor"),
+            Self::InvalidAudioEssence => write!(f, "invalid PCM audio essence"),
+            Self::AudioPacketTooLarge { len, max } => {
+                write!(f, "PCM audio packet is too large: {len} > {max}")
+            }
             Self::AccessUnitTooLarge { len, max } => {
                 write!(f, "compressed access unit is too large: {len} > {max}")
             }
@@ -821,6 +904,103 @@ fn scan_klv(bytes: &[u8]) -> Result<Vec<KlvTriplet>, MxfError> {
         offset = next;
     }
     Ok(triplets)
+}
+
+fn build_audio_index(
+    triplets: &[KlvTriplet],
+    tracks: &[MxfTrack],
+) -> Result<Vec<AudioIndexEntry>, MxfError> {
+    let mut audio_tracks = tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Audio)
+        .collect::<Vec<_>>();
+    audio_tracks.sort_by_key(|track| track.id.0);
+    if audio_tracks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut packet_counts = vec![0_u64; audio_tracks.len()];
+    let mut sample_positions = vec![0_u64; audio_tracks.len()];
+    let mut audio = Vec::new();
+
+    for triplet in triplets {
+        let Some(channel_index) = pcm_audio_channel_from_key(triplet.key) else {
+            continue;
+        };
+        let track_index = usize::from(channel_index);
+        let Some(track) = audio_tracks.get(track_index) else {
+            continue;
+        };
+        if audio.len()
+            >= MAX_INDEX_ENTRIES
+                .checked_mul(usize::from(MAX_AUDIO_CHANNELS))
+                .ok_or(MxfError::OffsetOverflow)?
+        {
+            return Err(MxfError::ExcessiveIndexEntries {
+                count: audio.len() + 1,
+                max: MAX_INDEX_ENTRIES * usize::from(MAX_AUDIO_CHANNELS),
+            });
+        }
+        if triplet.value_len > MAX_AUDIO_PACKET_BYTES as u64 {
+            return Err(MxfError::AudioPacketTooLarge {
+                len: triplet.value_len,
+                max: MAX_AUDIO_PACKET_BYTES,
+            });
+        }
+        let descriptor = track.audio.as_ref().ok_or(MxfError::InvalidAudioEssence)?;
+        let bit_depth = descriptor.bit_depth.ok_or(MxfError::InvalidAudioEssence)?;
+        let channels = descriptor.channels.ok_or(MxfError::InvalidAudioEssence)?;
+        if channels != 1 {
+            return Err(MxfError::InvalidAudioEssence);
+        }
+        let sample_count = pcm_sample_count_for_payload(triplet.value_len, bit_depth, channels)?;
+        let edit_unit = packet_counts[track_index];
+        let start_sample = sample_positions[track_index];
+        audio.push(AudioIndexEntry {
+            track_id: track.id,
+            channel_index,
+            edit_unit,
+            start_sample,
+            sample_count,
+            file_offset: triplet.offset,
+            payload_offset: triplet.value_offset,
+            payload_len: triplet.value_len,
+            source: IndexSource::QgsDerived,
+        });
+        packet_counts[track_index] = packet_counts[track_index]
+            .checked_add(1)
+            .ok_or(MxfError::OffsetOverflow)?;
+        sample_positions[track_index] = sample_positions[track_index]
+            .checked_add(u64::from(sample_count))
+            .ok_or(MxfError::OffsetOverflow)?;
+    }
+
+    Ok(audio)
+}
+
+fn pcm_audio_channel_from_key(key: Ul) -> Option<u16> {
+    if key.0[..15] == PCM_AUDIO_ESSENCE_KEY_PREFIX {
+        let channel = u16::from(key.0[15]);
+        (channel < MAX_AUDIO_CHANNELS).then_some(channel)
+    } else {
+        None
+    }
+}
+
+pub fn pcm_sample_count_for_payload(
+    payload_len: u64,
+    bit_depth: u8,
+    channels: u16,
+) -> Result<u32, MxfError> {
+    if bit_depth == 0 || bit_depth % 8 != 0 || channels == 0 {
+        return Err(MxfError::InvalidAudioEssence);
+    }
+    let bytes_per_sample = u64::from(bit_depth / 8)
+        .checked_mul(u64::from(channels))
+        .ok_or(MxfError::OffsetOverflow)?;
+    if bytes_per_sample == 0 || payload_len % bytes_per_sample != 0 {
+        return Err(MxfError::InvalidAudioEssence);
+    }
+    u32::try_from(payload_len / bytes_per_sample).map_err(|_| MxfError::InvalidAudioEssence)
 }
 
 fn decode_ber_length(bytes: &[u8], offset: usize) -> Result<(u64, usize), MxfError> {
@@ -2164,6 +2344,32 @@ mod tests {
             classify_access_unit(&bytes),
             Err(MxfError::AccessUnitTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn pcm_payload_sample_count_preserves_24_bit_mono_packets() {
+        assert_eq!(pcm_sample_count_for_payload(2880, 24, 1).unwrap(), 960);
+        assert_eq!(pcm_sample_count_for_payload(5760, 24, 2).unwrap(), 960);
+        assert!(matches!(
+            pcm_sample_count_for_payload(2879, 24, 1),
+            Err(MxfError::InvalidAudioEssence)
+        ));
+        assert!(matches!(
+            pcm_sample_count_for_payload(2880, 20, 1),
+            Err(MxfError::InvalidAudioEssence)
+        ));
+    }
+
+    #[test]
+    fn sony_pcm_audio_essence_keys_map_to_channel_indices() {
+        let mut key = Ul([
+            0x06, 0x0e, 0x2b, 0x34, 0x01, 0x02, 0x01, 0x01, 0x0d, 0x01, 0x03, 0x01, 0x16, 0x04,
+            0x03, 0x02,
+        ]);
+        assert_eq!(pcm_audio_channel_from_key(key), Some(2));
+
+        key.0[12] = 0x15;
+        assert_eq!(pcm_audio_channel_from_key(key), None);
     }
 
     #[test]
