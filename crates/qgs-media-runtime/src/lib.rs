@@ -371,6 +371,97 @@ impl PcmAudioPacket {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PcmAudioBlockLayout {
+    MonoTrack { track_id: u32, channel_index: u16 },
+    InterleavedChannels { channel_count: u16 },
+}
+
+impl PcmAudioBlockLayout {
+    pub fn channel_count(self) -> Result<u16, PlaybackError> {
+        match self {
+            Self::MonoTrack { .. } => Ok(1),
+            Self::InterleavedChannels { channel_count } if channel_count != 0 => Ok(channel_count),
+            Self::InterleavedChannels { .. } => Err(PlaybackError::InvalidAudioFormat),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PcmAudioBlock {
+    pub start_time: Duration,
+    pub duration: Duration,
+    pub sample_rate: u32,
+    pub sample_count: u32,
+    pub format: PcmSampleFormat,
+    pub layout: PcmAudioBlockLayout,
+    pub payload: Vec<u8>,
+}
+
+impl PcmAudioBlock {
+    pub fn new(
+        start_time: Duration,
+        duration: Duration,
+        sample_rate: u32,
+        sample_count: u32,
+        format: PcmSampleFormat,
+        layout: PcmAudioBlockLayout,
+        payload: Vec<u8>,
+    ) -> Result<Self, PlaybackError> {
+        if sample_rate == 0 {
+            return Err(PlaybackError::InvalidAudioFormat);
+        }
+        let expected = pcm_payload_byte_len(sample_count, layout.channel_count()?, format)?;
+        if payload.len() != expected {
+            return Err(PlaybackError::InvalidAudioFormat);
+        }
+        Ok(Self {
+            start_time,
+            duration,
+            sample_rate,
+            sample_count,
+            format,
+            layout,
+            payload,
+        })
+    }
+
+    pub fn from_mono_packet(
+        packet: PcmAudioPacket,
+        sample_rate: u32,
+    ) -> Result<Self, PlaybackError> {
+        Self::new(
+            packet.start,
+            packet.duration,
+            sample_rate,
+            packet.sample_count,
+            packet.format,
+            PcmAudioBlockLayout::MonoTrack {
+                track_id: packet.track_id,
+                channel_index: packet.channel_index,
+            },
+            packet.payload,
+        )
+    }
+
+    pub fn payload_bytes(&self) -> usize {
+        self.payload.len()
+    }
+
+    pub fn track_id(&self) -> Option<u32> {
+        match self.layout {
+            PcmAudioBlockLayout::MonoTrack { track_id, .. } => Some(track_id),
+            PcmAudioBlockLayout::InterleavedChannels { .. } => None,
+        }
+    }
+
+    pub fn end_time(&self) -> Result<Duration, PlaybackError> {
+        self.start_time
+            .checked_add(self.duration)
+            .ok_or(PlaybackError::TimestampOverflow)
+    }
+}
+
 pub fn pcm_payload_byte_len(
     sample_count: u32,
     channels: u16,
@@ -729,6 +820,146 @@ mod tests {
             vec![0_u8; 2879],
         )
         .is_err());
+    }
+
+    #[test]
+    fn pcm_packet_converts_to_mono_runtime_block_without_mutating_payload() {
+        let format = PcmSampleFormat::SignedInteger {
+            bits_per_sample: 24,
+            endian: PcmEndian::Little,
+        };
+        let payload = (0..2880)
+            .map(|value| (value % 251) as u8)
+            .collect::<Vec<_>>();
+        let packet = PcmAudioPacket::new(
+            3,
+            0,
+            Duration::from_millis(40),
+            Duration::from_millis(20),
+            960,
+            format,
+            payload.clone(),
+        )
+        .unwrap();
+
+        let block = PcmAudioBlock::from_mono_packet(packet, 48_000).unwrap();
+
+        assert_eq!(block.start_time, Duration::from_millis(40));
+        assert_eq!(block.duration, Duration::from_millis(20));
+        assert_eq!(block.sample_rate, 48_000);
+        assert_eq!(block.sample_count, 960);
+        assert_eq!(
+            block.layout,
+            PcmAudioBlockLayout::MonoTrack {
+                track_id: 3,
+                channel_index: 0
+            }
+        );
+        assert_eq!(block.payload, payload);
+        assert_eq!(block.payload_bytes(), 2880);
+        assert_eq!(block.end_time().unwrap(), Duration::from_millis(60));
+    }
+
+    #[test]
+    fn pcm_block_rejects_invalid_payload_and_layout() {
+        let format = PcmSampleFormat::SignedInteger {
+            bits_per_sample: 24,
+            endian: PcmEndian::Little,
+        };
+
+        assert!(PcmAudioBlock::new(
+            Duration::ZERO,
+            Duration::from_millis(20),
+            48_000,
+            960,
+            format,
+            PcmAudioBlockLayout::MonoTrack {
+                track_id: 3,
+                channel_index: 0
+            },
+            vec![0_u8; 2879],
+        )
+        .is_err());
+        assert!(PcmAudioBlock::new(
+            Duration::ZERO,
+            Duration::from_millis(20),
+            48_000,
+            960,
+            format,
+            PcmAudioBlockLayout::InterleavedChannels { channel_count: 0 },
+            vec![0_u8; 2880],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pcm_block_timing_detects_gap_and_overlap_cases() {
+        fn classify_pair(first: &PcmAudioBlock, second: &PcmAudioBlock) -> (bool, bool) {
+            let first_end = first.end_time().unwrap();
+            (second.start_time > first_end, second.start_time < first_end)
+        }
+
+        let format = PcmSampleFormat::SignedInteger {
+            bits_per_sample: 24,
+            endian: PcmEndian::Little,
+        };
+        let make_block = |start_ms| {
+            PcmAudioBlock::new(
+                Duration::from_millis(start_ms),
+                Duration::from_millis(20),
+                48_000,
+                960,
+                format,
+                PcmAudioBlockLayout::MonoTrack {
+                    track_id: 3,
+                    channel_index: 0,
+                },
+                vec![0_u8; 2880],
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            classify_pair(&make_block(0), &make_block(20)),
+            (false, false)
+        );
+        assert_eq!(
+            classify_pair(&make_block(0), &make_block(40)),
+            (true, false)
+        );
+        assert_eq!(
+            classify_pair(&make_block(0), &make_block(10)),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn bounded_pcm_block_queue_reports_backpressure() {
+        let format = PcmSampleFormat::SignedInteger {
+            bits_per_sample: 24,
+            endian: PcmEndian::Little,
+        };
+        let block = |position: u64| {
+            PcmAudioBlock::new(
+                Duration::from_millis(position * 20),
+                Duration::from_millis(20),
+                48_000,
+                960,
+                format,
+                PcmAudioBlockLayout::MonoTrack {
+                    track_id: 3,
+                    channel_index: 0,
+                },
+                vec![0_u8; 2880],
+            )
+            .unwrap()
+        };
+        let mut queue = BoundedQueue::new(2).unwrap();
+        queue.try_push(block(0)).unwrap();
+        queue.try_push(block(1)).unwrap();
+        assert!(queue.try_push(block(2)).is_err());
+        assert_eq!(queue.stats().peak_depth, 2);
+        assert_eq!(queue.stats().backpressure_events, 1);
     }
 
     #[test]

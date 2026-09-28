@@ -15,9 +15,9 @@ use qgs_media_runtime::{
     audio_samples_for_duration, classify_presentation, duration_abs_delta,
     duration_from_audio_samples, max_video_timestamp_outside_audio_range, AudioFormat,
     AudioSampleFormat, AudioTimeline, AudioTimingPacket, BoundedQueue,
-    FrameIdentity as PlaybackFrameIdentity, OriginalAudioTrack, PcmAudioPacket, PcmEndian,
-    PcmSampleFormat, PlaybackClock, PlaybackConfig, PlaybackState, PresentationDecision,
-    RationalRate, RealTimeClock, TestAudioSink, TestPresentationSink,
+    FrameIdentity as PlaybackFrameIdentity, OriginalAudioTrack, PcmAudioBlock, PcmAudioBlockLayout,
+    PcmAudioPacket, PcmEndian, PcmSampleFormat, PlaybackClock, PlaybackConfig, PlaybackState,
+    PresentationDecision, RationalRate, RealTimeClock, TestAudioSink, TestPresentationSink,
 };
 use qgs_mp4::{
     classify_video_track, nearest_random_access_before, MediaHealth, Mp4Source, Mp4TrackKind,
@@ -1576,12 +1576,33 @@ struct PcmTrackPayloadStats {
 
 #[derive(Clone, Debug)]
 struct PcmPayloadStats {
-    queue_capacity: usize,
-    queue_peak: usize,
-    queue_backpressure: u64,
     total_packets: u64,
     total_payload_bytes: u64,
     tracks: BTreeMap<u32, PcmTrackPayloadStats>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PcmTrackBlockStats {
+    channel_index: u16,
+    blocks: u64,
+    samples: u64,
+    payload_bytes: u64,
+    first_start: Option<Duration>,
+    last_end: Option<Duration>,
+    last_start: Option<Duration>,
+    monotonic: bool,
+    gaps: u64,
+    overlaps: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PcmBlockStats {
+    queue_capacity: usize,
+    queue_peak: usize,
+    queue_backpressure: u64,
+    total_blocks: u64,
+    total_payload_bytes: u64,
+    tracks: BTreeMap<u32, PcmTrackBlockStats>,
 }
 
 fn original_audio_extract(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -1599,13 +1620,18 @@ fn original_audio_extract(path: &Path) -> Result<(), Box<dyn std::error::Error>>
         return Err("original MXF has no indexed PCM audio payload packets".into());
     }
 
-    let queue_capacity = 8_usize;
-    let mut queue = BoundedQueue::new(queue_capacity)?;
+    let block_queue_capacity = 8_usize;
+    let mut block_queue = BoundedQueue::new(block_queue_capacity)?;
     let mut stats = PcmPayloadStats {
-        queue_capacity,
+        total_packets: 0,
+        total_payload_bytes: 0,
+        tracks: BTreeMap::new(),
+    };
+    let mut block_stats = PcmBlockStats {
+        queue_capacity: block_queue_capacity,
         queue_peak: 0,
         queue_backpressure: 0,
-        total_packets: 0,
+        total_blocks: 0,
         total_payload_bytes: 0,
         tracks: BTreeMap::new(),
     };
@@ -1639,22 +1665,24 @@ fn original_audio_extract(path: &Path) -> Result<(), Box<dyn std::error::Error>>
             format,
             extracted.payload,
         )?;
-        if let Err(packet) = queue.try_push(packet) {
-            let drained = queue
+        consume_pcm_payload_packet(&packet, &mut stats)?;
+        let block = PcmAudioBlock::from_mono_packet(packet, sample_rate)?;
+        if let Err(block) = block_queue.try_push(block) {
+            let drained = block_queue
                 .pop_front()
-                .ok_or("bounded PCM queue was full but empty")?;
-            consume_pcm_payload_packet(drained, &mut stats)?;
-            queue
-                .try_push(packet)
-                .map_err(|_| "bounded PCM queue remained full after draining")?;
+                .ok_or("bounded PCM block queue was full but empty")?;
+            consume_pcm_audio_block(drained, &mut block_stats)?;
+            block_queue
+                .try_push(block)
+                .map_err(|_| "bounded PCM block queue remained full after draining")?;
         }
     }
-    let queue_stats = queue.stats();
-    while let Some(packet) = queue.pop_front() {
-        consume_pcm_payload_packet(packet, &mut stats)?;
+    let queue_stats = block_queue.stats();
+    while let Some(block) = block_queue.pop_front() {
+        consume_pcm_audio_block(block, &mut block_stats)?;
     }
-    stats.queue_peak = queue_stats.peak_depth;
-    stats.queue_backpressure = queue_stats.backpressure_events;
+    block_stats.queue_peak = queue_stats.peak_depth;
+    block_stats.queue_backpressure = queue_stats.backpressure_events;
 
     println!("Original MXF PCM Extraction");
     println!("---------------------------");
@@ -1679,10 +1707,6 @@ fn original_audio_extract(path: &Path) -> Result<(), Box<dyn std::error::Error>>
         );
     }
     println!(
-        "PCM queue: capacity={} peak={} backpressure={}",
-        stats.queue_capacity, stats.queue_peak, stats.queue_backpressure
-    );
-    println!(
         "PCM payload: packets={} bytes={}",
         stats.total_packets, stats.total_payload_bytes
     );
@@ -1703,12 +1727,46 @@ fn original_audio_extract(path: &Path) -> Result<(), Box<dyn std::error::Error>>
             yes_no(track_stats.monotonic)
         );
     }
+    println!("Runtime block model: mono-track PCM blocks");
+    println!(
+        "Runtime block queue: capacity={} peak={} backpressure={}",
+        block_stats.queue_capacity, block_stats.queue_peak, block_stats.queue_backpressure
+    );
+    println!(
+        "Runtime blocks: blocks={} bytes={}",
+        block_stats.total_blocks, block_stats.total_payload_bytes
+    );
+    for (track_id, track_stats) in &block_stats.tracks {
+        let duration = track_stats.last_end.unwrap_or(Duration::ZERO);
+        println!(
+            "  track_id={} channel={} blocks={} samples={} payload_bytes={} first={:.3}s duration={:.3}s monotonic={} gaps={} overlaps={}",
+            track_id,
+            track_stats.channel_index,
+            track_stats.blocks,
+            track_stats.samples,
+            track_stats.payload_bytes,
+            track_stats
+                .first_start
+                .unwrap_or(Duration::ZERO)
+                .as_secs_f64(),
+            duration.as_secs_f64(),
+            yes_no(track_stats.monotonic),
+            track_stats.gaps,
+            track_stats.overlaps
+        );
+    }
+    let clock_ready = block_stats.total_blocks == stats.total_packets
+        && block_stats
+            .tracks
+            .values()
+            .all(|track| track.monotonic && track.gaps == 0 && track.overlaps == 0);
+    println!("Suitable for future audio clock: {}", yes_no(clock_ready));
 
     Ok(())
 }
 
 fn consume_pcm_payload_packet(
-    packet: PcmAudioPacket,
+    packet: &PcmAudioPacket,
     stats: &mut PcmPayloadStats,
 ) -> Result<(), Box<dyn std::error::Error>> {
     stats.total_packets = stats
@@ -1751,6 +1809,72 @@ fn consume_pcm_payload_packet(
         .payload_bytes
         .checked_add(u64::try_from(packet.payload_bytes()).map_err(|_| "payload size overflow")?)
         .ok_or("PCM track payload byte count overflow")?;
+    Ok(())
+}
+
+fn consume_pcm_audio_block(
+    block: PcmAudioBlock,
+    stats: &mut PcmBlockStats,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (track_id, channel_index) = match block.layout {
+        PcmAudioBlockLayout::MonoTrack {
+            track_id,
+            channel_index,
+        } => (track_id, channel_index),
+        PcmAudioBlockLayout::InterleavedChannels { .. } => {
+            return Err("Step 20C qgs-test expects mono-track PCM blocks".into());
+        }
+    };
+    stats.total_blocks = stats
+        .total_blocks
+        .checked_add(1)
+        .ok_or("PCM block count overflow")?;
+    stats.total_payload_bytes = stats
+        .total_payload_bytes
+        .checked_add(u64::try_from(block.payload_bytes()).map_err(|_| "payload size overflow")?)
+        .ok_or("PCM block payload byte count overflow")?;
+    let end = block.end_time()?;
+    let track = stats
+        .tracks
+        .entry(track_id)
+        .or_insert_with(|| PcmTrackBlockStats {
+            channel_index,
+            monotonic: true,
+            ..PcmTrackBlockStats::default()
+        });
+    if let Some(last_start) = track.last_start {
+        if block.start_time < last_start {
+            track.monotonic = false;
+        }
+    }
+    if let Some(last_end) = track.last_end {
+        if block.start_time > last_end {
+            track.gaps = track
+                .gaps
+                .checked_add(1)
+                .ok_or("PCM block gap count overflow")?;
+        } else if block.start_time < last_end {
+            track.overlaps = track
+                .overlaps
+                .checked_add(1)
+                .ok_or("PCM block overlap count overflow")?;
+        }
+    }
+    track.first_start.get_or_insert(block.start_time);
+    track.last_start = Some(block.start_time);
+    track.last_end = Some(end);
+    track.blocks = track
+        .blocks
+        .checked_add(1)
+        .ok_or("PCM track block count overflow")?;
+    track.samples = track
+        .samples
+        .checked_add(u64::from(block.sample_count))
+        .ok_or("PCM track block sample count overflow")?;
+    track.payload_bytes = track
+        .payload_bytes
+        .checked_add(u64::try_from(block.payload_bytes()).map_err(|_| "payload size overflow")?)
+        .ok_or("PCM track block payload byte count overflow")?;
     Ok(())
 }
 
