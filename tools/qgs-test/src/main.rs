@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use qgs_audio_pipewire::{
-    create_native_pipewire_stream, PipeWireAudioSampleFormat, PipeWireStreamFormat,
+    f32_interleaved_from_s24le_mono_tracks, submit_native_pipewire_buffer, MonoS24LeTrack,
+    PipeWireAudioSampleFormat, PipeWireStreamFormat,
 };
 use qgs_core::{BackendDecodedSurface, DecoderBackend, DeviceDiscovery, VideoCapabilityDiscovery};
 use qgs_linux::{
@@ -2054,11 +2055,16 @@ fn pipewire_audio_native_prototype(path: &Path) -> Result<(), Box<dyn std::error
     let source_format = original_linux_pcm_audio_format(&audio_tracks)?;
     let blocks = build_original_pcm_blocks(&source, &bytes)?;
     let prototype_sample_count = 960_u32;
-    let buffer = build_pipewire_f32_interleaved_prototype_buffer(
-        &blocks,
-        source_format.sample_rate,
-        prototype_sample_count,
-    )?;
+    let pipewire_tracks = first_pipewire_mono_tracks(&blocks, prototype_sample_count)?;
+    let converted =
+        f32_interleaved_from_s24le_mono_tracks(&pipewire_tracks, prototype_sample_count)?;
+    let buffer = LinuxPipewirePrototypeBuffer {
+        sample_rate: source_format.sample_rate,
+        channels: u16::try_from(pipewire_tracks.len())?,
+        sample_count: prototype_sample_count,
+        sample_format: LinuxPipewirePrototypeSampleFormat::F32Interleaved,
+        bytes: converted.clone(),
+    };
     let report = inspect_native_pipewire_stream_boundary(&buffer)?;
 
     println!("Native PipeWire Stream Prototype");
@@ -2119,8 +2125,14 @@ fn pipewire_audio_native_prototype(path: &Path) -> Result<(), Box<dyn std::error
         channels: u32::from(buffer.channels),
         sample_format: PipeWireAudioSampleFormat::F32Interleaved,
     };
-    match create_native_pipewire_stream(stream_format, Duration::from_secs(2)) {
-        Ok(stream_report) => {
+    match submit_native_pipewire_buffer(
+        stream_format,
+        converted,
+        prototype_sample_count,
+        Duration::from_secs(2),
+    ) {
+        Ok(submission_report) => {
+            let stream_report = &submission_report.stream_report;
             println!(
                 "Stream create attempted: {}",
                 yes_no(stream_report.stream_create_attempted)
@@ -2141,17 +2153,36 @@ fn pipewire_audio_native_prototype(path: &Path) -> Result<(), Box<dyn std::error
                 stream_report.observed_states
             );
             println!("Final stream state: {:?}", stream_report.final_state);
-            println!("Buffer dequeued: no");
+            println!(
+                "Process callback reached: {}",
+                yes_no(submission_report.process_callback_reached)
+            );
+            println!(
+                "Buffer dequeued: {}",
+                yes_no(submission_report.buffer_dequeued)
+            );
+            println!("Buffer capacity: {}", submission_report.buffer_capacity);
+            println!(
+                "Samples converted per track: {}",
+                submission_report.samples_converted
+            );
+            println!("Output channels: {}", submission_report.output_channels);
+            println!(
+                "F32 samples written: {}",
+                submission_report.f32_samples_written
+            );
+            println!("Bytes copied: {}", submission_report.bytes_copied);
             println!(
                 "Buffer submitted: {}",
-                yes_no(stream_report.buffer_submitted)
+                yes_no(submission_report.buffer_submitted)
             );
-            println!("Evidence level: {:?}", stream_report.evidence_level);
+            println!("Evidence level: {:?}", submission_report.evidence_level);
             println!(
                 "AudioDeviceVerified: {}",
-                yes_no(stream_report.audio_device_verified)
+                yes_no(submission_report.audio_device_verified)
             );
-            println!("Status: {}", stream_report.status_message);
+            println!("Audible output claimed: no");
+            println!("Status: {}", submission_report.status_message);
         }
         Err(err) => {
             println!("Stream create attempted: yes");
@@ -2165,6 +2196,7 @@ fn pipewire_audio_native_prototype(path: &Path) -> Result<(), Box<dyn std::error
             println!("Buffer submitted: no");
             println!("Evidence level: NativeStreamCreateFailed");
             println!("AudioDeviceVerified: no");
+            println!("Audible output claimed: no");
             println!("Status: {err}");
         }
     }
@@ -2246,6 +2278,50 @@ fn pcm_s24le_sample_to_f32(payload: &[u8], sample_index: usize) -> Result<f32, &
         value |= !0x00ff_ffff;
     }
     Ok((value as f32 / 8_388_608.0).clamp(-1.0, 1.0))
+}
+
+fn first_pipewire_mono_tracks<'a>(
+    blocks: &'a [PcmAudioBlock],
+    sample_count: u32,
+) -> Result<Vec<MonoS24LeTrack<'a>>, Box<dyn std::error::Error>> {
+    let mut tracks = blocks
+        .iter()
+        .filter_map(|block| {
+            let PcmAudioBlockLayout::MonoTrack {
+                track_id,
+                channel_index,
+            } = block.layout
+            else {
+                return None;
+            };
+            Some((track_id, channel_index, block))
+        })
+        .filter(|(_, _, block)| block.start_time == Duration::ZERO)
+        .collect::<Vec<_>>();
+    tracks.sort_by_key(|(track_id, channel_index, _)| (*channel_index, *track_id));
+    tracks.dedup_by_key(|(track_id, channel_index, _)| (*track_id, *channel_index));
+    if tracks.is_empty() {
+        return Err("no mono PCM blocks starting at zero for PipeWire prototype".into());
+    }
+    for (_, _, block) in &tracks {
+        let PcmSampleFormat::SignedInteger {
+            bits_per_sample,
+            endian,
+        } = block.format;
+        if bits_per_sample != 24 || endian != PcmEndian::Little {
+            return Err("PipeWire prototype currently expects 24-bit little-endian PCM".into());
+        }
+        if block.sample_count < sample_count {
+            return Err("PCM block is shorter than requested prototype sample count".into());
+        }
+    }
+    Ok(tracks
+        .into_iter()
+        .map(|(_, channel_index, block)| MonoS24LeTrack {
+            channel_index,
+            payload: &block.payload,
+        })
+        .collect())
 }
 
 fn original_linux_pcm_audio_format(

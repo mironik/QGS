@@ -567,6 +567,7 @@ pub enum BroadcastRuntimeVerificationLevel {
     PayloadExtracted,
     PayloadBound,
     TestBoundaryEvidence,
+    NativeBufferSubmissionVerified,
     VisualVerified,
     AudioDeviceVerified,
     RealtimeVerified,
@@ -583,6 +584,7 @@ impl BroadcastRuntimeVerificationLevel {
             Self::PayloadExtracted => "PayloadExtracted",
             Self::PayloadBound => "PayloadBound",
             Self::TestBoundaryEvidence => "TestBoundaryEvidence",
+            Self::NativeBufferSubmissionVerified => "NativeBufferSubmissionVerified",
             Self::VisualVerified => "VisualVerified",
             Self::AudioDeviceVerified => "AudioDeviceVerified",
             Self::RealtimeVerified => "RealtimeVerified",
@@ -610,6 +612,7 @@ pub enum BroadcastRuntimeVerifiedSubsystem {
     DeviceBoundaryContract,
     TestVideoPresenterEvidence,
     TestAudioSinkEvidence,
+    NativePipeWireBufferSubmission,
     SimulatedPlaybackLoop,
     RealSpeakerOutput,
     RealDisplayOutput,
@@ -637,6 +640,7 @@ impl BroadcastRuntimeVerifiedSubsystem {
             Self::DeviceBoundaryContract => "device boundary contract",
             Self::TestVideoPresenterEvidence => "test video presenter evidence",
             Self::TestAudioSinkEvidence => "test audio sink evidence",
+            Self::NativePipeWireBufferSubmission => "native PipeWire buffer submission",
             Self::SimulatedPlaybackLoop => "simulated playback loop",
             Self::RealSpeakerOutput => "real speaker output",
             Self::RealDisplayOutput => "real display output",
@@ -750,6 +754,11 @@ impl BroadcastRuntimeVerificationMatrix {
                     summary: "test audio sink evidence accepts original PCM; not real speaker output",
                 },
                 BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::NativePipeWireBufferSubmission,
+                    level: Level::NativeBufferSubmissionVerified,
+                    summary: "tiny original-audio-derived buffer queued to native PipeWire stream; not audible/full playback verification",
+                },
+                BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::SimulatedPlaybackLoop,
                     level: Level::TestBoundaryEvidence,
                     summary: "deterministic simulation consumes prepared slots through test boundaries",
@@ -757,7 +766,7 @@ impl BroadcastRuntimeVerificationMatrix {
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::RealSpeakerOutput,
                     level: Level::NotImplemented,
-                    summary: "no ALSA/Pulse/PipeWire or real audio device output exists",
+                    summary: "no audible speaker output, audio-device clock, or full audio playback path exists",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::RealDisplayOutput,
@@ -4168,6 +4177,10 @@ mod tests {
             BroadcastRuntimeVerificationLevel::TestBoundaryEvidence
                 < BroadcastRuntimeVerificationLevel::VisualVerified
         );
+        assert!(
+            BroadcastRuntimeVerificationLevel::NativeBufferSubmissionVerified
+                < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
     }
 
     #[test]
@@ -4226,6 +4239,20 @@ mod tests {
         assert_ne!(
             matrix
                 .entry(BroadcastRuntimeVerifiedSubsystem::TestAudioSinkEvidence)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
+        assert_eq!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::NativePipeWireBufferSubmission)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::NativeBufferSubmissionVerified
+        );
+        assert_ne!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::NativePipeWireBufferSubmission)
                 .unwrap()
                 .level,
             BroadcastRuntimeVerificationLevel::AudioDeviceVerified

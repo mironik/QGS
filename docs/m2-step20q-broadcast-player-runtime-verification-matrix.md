@@ -17,6 +17,8 @@ and what remains unimplemented.
 - `PayloadBound`: runtime slots bind to concrete backend payload references.
 - `TestBoundaryEvidence`: a test-only sink/presenter accepted payloads and
   returned explicit evidence.
+- `NativeBufferSubmissionVerified`: a tiny bounded payload was queued to a
+  native device boundary, without claiming audible/visible output.
 - `VisualVerified`: visual/image correctness was verified by comparison or
   display evidence.
 - `AudioDeviceVerified`: a real audio device path was verified.
@@ -49,8 +51,9 @@ For Sony FX6 sample 002:
 | device boundary contract | `UnitTested` | `PayloadReady` and `DevicePayloadReady` remain distinct. |
 | test video presenter evidence | `TestBoundaryEvidence` | Test presenter evidence gates `FramePresented`; this is not real display output. |
 | test audio sink evidence | `TestBoundaryEvidence` | Test audio sink evidence accepts original PCM; this is not real speaker output. |
+| native PipeWire buffer submission | `NativeBufferSubmissionVerified` | A 20 ms original-audio-derived f32 buffer was queued to a native PipeWire stream; audible output and full playback are not claimed. |
 | simulated playback loop | `TestBoundaryEvidence` | Prepared slots flow through test audio/video boundaries deterministically. |
-| real speaker output | `NotImplemented` | No ALSA, PulseAudio, PipeWire, or real audio device output exists. |
+| real speaker output | `NotImplemented` | No audible speaker output, audio-device clock, or full audio playback path exists; native PipeWire buffer submission is tracked separately. |
 | real display output | `NotImplemented` | No swapchain, Wayland, X11, DRM/KMS, or real display presenter exists. |
 | realtime playback | `NotImplemented` | Broadcast Player realtime scheduler has not been implemented or accepted. |
 | modern-hardware zero-copy | `NotImplemented` | VA/Vulkan zero-copy remains frozen and not verified on modern hardware. |
@@ -61,6 +64,8 @@ The matrix intentionally does not overstate these areas:
 
 - Test presenter evidence is not real display output.
 - Test audio sink evidence is not real speaker output.
+- Native PipeWire buffer submission is not audible playback or
+  `AudioDeviceVerified`.
 - Haswell CPU-bridge 1080p50 is not marked realtime verified.
 - Modern-hardware zero-copy is not marked verified.
 - `FramePresented` from the current test presenter remains test evidence, not
