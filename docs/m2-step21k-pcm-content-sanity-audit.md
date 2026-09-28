@@ -76,6 +76,24 @@ Planned focus for Step 21L:
 - keep original MXF audio authoritative
 - keep proxy AAC diagnostic-only or unused
 
+## Corpus Correction
+
+Step 21K used the shortest available Sony FX6 sample:
+
+- `Mironik 1560.MXF`
+- `Mironik 1560S03.MP4`
+
+That audit remains technically useful for validating extraction, signed 24-bit
+little-endian interpretation, f32 conversion, runtime payload equality, and
+PipeWire buffer geometry. It was not a strong practical listening source,
+because the sample is short and the audited audio ranges are low-level or
+sparse.
+
+For content-audibility and monitor-routing diagnosis, repeat the audit on the
+longer Mironik 2002 original/proxy pair. Mironik 2002 is now the preferred
+corpus for choosing an audible original-audio range and comparing 4-channel
+output against stereo monitor diagnostics.
+
 ## Source And Metadata
 
 QGS observed:

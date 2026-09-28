@@ -94,6 +94,10 @@ The matrix intentionally does not overstate these areas:
   only hum/buzz. This still does not certify channel routing, gain, production
   output, realtime/full Broadcast Player playback, A/V sync, or full
   `AudioDeviceVerified`.
+- Content-audibility and monitor-routing diagnosis should be repeated on the
+  longer Mironik 2002 corpus before any stronger listening or routing claim is
+  made. The shorter Mironik 1560 sample remains a technical boundary check, not
+  the canonical listening source.
 - Runtime-prepared audio payload submission/drain evidence is not full playback,
   realtime playback, A/V sync, channel certification, or full
   `AudioDeviceVerified`.

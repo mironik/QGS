@@ -121,6 +121,10 @@ const BROADCAST_RUNTIME_AUDIO_PIPEWIRE_AUDIBLE_ARG: &str =
     "--broadcast-runtime-audio-pipewire-audible";
 const PIPEWIRE_AUDIO_CONTENT_AUDIT_ARG: &str = "--pipewire-audio-content-audit";
 const WRITE_DIAGNOSTIC_WAV_ARG: &str = "--write-diagnostic-wav";
+const AUDIO_AUDIT_START_MS_ARG: &str = "--start-ms";
+const AUDIO_AUDIT_DURATION_MS_ARG: &str = "--duration-ms";
+const AUDIO_AUDIT_OUTPUT_DIR_ARG: &str = "--output-dir";
+const AUDIO_AUDIT_FIND_LOUDEST_RANGE_MS_ARG: &str = "--find-loudest-range-ms";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -263,7 +267,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return pipewire_audio_content_audit(
             &original,
             &proxy,
-            args.diagnostic_wav_path.as_deref(),
+            AudioContentAuditOptions {
+                start_ms: args.audio_content_audit_start_ms.unwrap_or(0),
+                duration_ms: args.audio_content_audit_duration_ms.unwrap_or(1_000),
+                output_dir: args
+                    .audio_content_audit_output_dir
+                    .unwrap_or_else(|| PathBuf::from("target/qgs-audio-audit")),
+                find_loudest_range_ms: args.audio_content_audit_find_loudest_range_ms,
+                diagnostic_wav_path: args.diagnostic_wav_path,
+            },
         );
     }
 
@@ -3284,8 +3296,10 @@ fn build_runtime_audio_payload_pipewire_buffer(
 fn pipewire_audio_content_audit(
     original_path: &Path,
     proxy_path: &Path,
-    diagnostic_wav_path: Option<&Path>,
+    options: AudioContentAuditOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let duration_ms = bounded_audio_audit_duration_ms(options.duration_ms)?;
+    let mut start_ms = options.start_ms;
     let original_bytes = std::fs::read(original_path)?;
     let original = MediaSource::parse(&original_bytes)?;
     let audio_tracks = original
@@ -3299,57 +3313,178 @@ fn pipewire_audio_content_audit(
     let source_format = original_linux_pcm_audio_format(&audio_tracks)?;
     let blocks = build_original_pcm_blocks(&original, &original_bytes)?;
     let track_groups = original_pcm_blocks_by_channel(&blocks, source_format.sample_rate)?;
-    let runtime_plan = prepare_runtime_audio_pipewire_payload(original_path, proxy_path)?;
-    let runtime_buffer = &runtime_plan.payload_buffer;
-    let segment_40ms = build_sequential_original_audio_segment_for_duration(
-        &blocks,
+    let source_total_samples = audio_audit_total_samples(&track_groups, source_format.sample_rate)?;
+    let source_duration =
+        duration_from_audio_samples(source_total_samples, source_format.sample_rate)?;
+    if let Some(loudest_duration_ms) = options.find_loudest_range_ms {
+        let loudest_duration_ms = bounded_audio_audit_duration_ms(loudest_duration_ms)?;
+        let loudest_sample_count = u32::try_from(audio_samples_for_duration(
+            Duration::from_millis(loudest_duration_ms),
+            source_format.sample_rate,
+        )?)?;
+        let loudest = find_loudest_audio_audit_range(
+            &track_groups,
+            source_format.sample_rate,
+            loudest_sample_count,
+        )?;
+        start_ms = audio_sample_to_ms(loudest.start_sample, source_format.sample_rate)?;
+        println!("Loudest-range scan:");
+        println!("  requested duration: {loudest_duration_ms} ms");
+        println!("  selected start sample: {}", loudest.start_sample);
+        println!("  selected start time: {start_ms} ms");
+        println!("  combined RMS: {:.6}", loudest.combined_rms);
+        println!("  RMS per track: {}", f64_list(&loudest.rms_per_channel));
+        println!("  peak per track: {}", f32_list(&loudest.peak_per_channel));
+    }
+    let requested_sample_count = u32::try_from(audio_samples_for_duration(
+        Duration::from_millis(duration_ms),
         source_format.sample_rate,
-        Duration::from_millis(40),
-    )?;
-    let segment_1s = build_sequential_original_audio_segment(
-        &blocks,
+    )?)?;
+    let start_sample =
+        audio_samples_for_duration(Duration::from_millis(start_ms), source_format.sample_rate)?;
+    let end_sample = start_sample
+        .checked_add(u64::from(requested_sample_count))
+        .ok_or("audio audit sample range overflow")?;
+    if end_sample > source_total_samples {
+        return Err(format!(
+            "audio audit range {}..{} exceeds source duration {} samples",
+            start_sample, end_sample, source_total_samples
+        )
+        .into());
+    }
+    let selected_duration =
+        duration_from_audio_samples(u64::from(requested_sample_count), source_format.sample_rate)?;
+    let all_channels = track_groups.keys().copied().collect::<Vec<_>>();
+    let four_channel_bytes = build_audio_audit_f32_interleaved_range(
+        &track_groups,
+        &all_channels,
         source_format.sample_rate,
-        Duration::from_secs(1),
-        Duration::from_millis(500),
+        start_sample,
+        requested_sample_count,
     )?;
-    let segment_40ms_bytes = segment_40ms
-        .buffers
-        .iter()
-        .flat_map(|buffer| buffer.iter().copied())
-        .collect::<Vec<_>>();
-    let same_range_outputs_match = segment_40ms_bytes == runtime_buffer.output_bytes;
-    let segment_stats = f32_buffer_stats(
-        &segment_40ms_bytes,
-        segment_40ms.samples_per_track,
-        u32::try_from(segment_40ms.channels)?,
+    let four_channel_stats = f32_buffer_stats(
+        &four_channel_bytes,
+        requested_sample_count,
+        u32::try_from(all_channels.len())?,
     )?;
-    let runtime_stats = f32_buffer_stats(
-        &runtime_buffer.output_bytes,
-        runtime_buffer.output_frames,
-        u32::try_from(runtime_buffer.track_count)?,
-    )?;
-    let wav_path = diagnostic_wav_path
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("target/qgs-audio-audit/qgs-original-audio-audit.wav"));
+    let source_stem = sanitized_source_stem(original_path);
+    let output_dir = options.output_dir;
+    let range_label = audio_audit_range_label(start_ms, duration_ms);
+    let four_channel_path = options.diagnostic_wav_path.unwrap_or_else(|| {
+        output_dir.join(format!(
+            "{source_stem}-original-{}ch-f32-{range_label}.wav",
+            all_channels.len()
+        ))
+    });
     write_f32_wav(
-        &wav_path,
+        &four_channel_path,
         source_format.sample_rate,
-        u16::try_from(segment_1s.channels)?,
-        &segment_1s
-            .buffers
-            .iter()
-            .flat_map(|buffer| buffer.iter().copied())
-            .collect::<Vec<_>>(),
+        u16::try_from(all_channels.len())?,
+        &four_channel_bytes,
     )?;
+    let mut diagnostic_wav_paths = vec![("original 4ch", four_channel_path.clone())];
+
+    if all_channels.len() >= 2 {
+        let track12 = all_channels.iter().take(2).copied().collect::<Vec<_>>();
+        let track12_path = output_dir.join(format!(
+            "{source_stem}-stereo-track12-f32-{range_label}.wav"
+        ));
+        let track12_bytes = build_audio_audit_f32_interleaved_range(
+            &track_groups,
+            &track12,
+            source_format.sample_rate,
+            start_sample,
+            requested_sample_count,
+        )?;
+        write_f32_wav(&track12_path, source_format.sample_rate, 2, &track12_bytes)?;
+        diagnostic_wav_paths.push(("stereo track 1/2 monitor", track12_path));
+    }
+
+    let track_summaries = audio_audit_track_summaries(
+        &track_groups,
+        source_format.sample_rate,
+        start_sample,
+        requested_sample_count,
+    )?;
+    if all_channels.len() >= 4 {
+        let track34 = all_channels
+            .iter()
+            .skip(2)
+            .take(2)
+            .copied()
+            .collect::<Vec<_>>();
+        if track34.iter().any(|channel| {
+            track_summaries
+                .iter()
+                .find(|summary| summary.channel_index == *channel)
+                .is_some_and(|summary| !summary.stats.likely_silent)
+        }) {
+            let track34_path = output_dir.join(format!(
+                "{source_stem}-stereo-track34-f32-{range_label}.wav"
+            ));
+            let track34_bytes = build_audio_audit_f32_interleaved_range(
+                &track_groups,
+                &track34,
+                source_format.sample_rate,
+                start_sample,
+                requested_sample_count,
+            )?;
+            write_f32_wav(&track34_path, source_format.sample_rate, 2, &track34_bytes)?;
+            diagnostic_wav_paths.push(("stereo track 3/4 monitor", track34_path));
+        }
+    }
+    let loudest_pair = loudest_monitor_pair(&track_summaries);
+    if loudest_pair.len() == 2 {
+        let loudest_pair_path = output_dir.join(format!(
+            "{source_stem}-stereo-loudest-pair-f32-{range_label}.wav"
+        ));
+        let loudest_pair_bytes = build_audio_audit_f32_interleaved_range(
+            &track_groups,
+            &loudest_pair,
+            source_format.sample_rate,
+            start_sample,
+            requested_sample_count,
+        )?;
+        write_f32_wav(
+            &loudest_pair_path,
+            source_format.sample_rate,
+            2,
+            &loudest_pair_bytes,
+        )?;
+        diagnostic_wav_paths.push(("stereo loudest pair monitor", loudest_pair_path));
+    }
+
+    let runtime_comparison = runtime_audio_audit_comparison(
+        original_path,
+        proxy_path,
+        &track_groups,
+        source_format.sample_rate,
+    );
 
     println!("QGS PipeWire Audio Content Path Audit");
     println!("-------------------------------------");
+    println!("Selected original path: {}", original_path.display());
+    println!("Selected proxy path: {}", proxy_path.display());
     println!("Audio source: original MXF");
     println!("Video source for runtime timing: proxy MP4");
     println!("Proxy AAC: not used");
     println!("PipeWire playback required: no");
     println!("AudioDeviceVerified: no");
-    println!("Original audio content audibility confirmed: no");
+    println!("Original audio content audibility confirmed: partial manual observation only");
+    println!("Full playback: no");
+    println!("Realtime playback: no");
+    println!("A/V sync: no");
+    println!("Selected start: {start_ms} ms");
+    println!("Selected duration: {duration_ms} ms");
+    println!(
+        "Selected duration exact: {:.3} ms",
+        selected_duration.as_secs_f64() * 1000.0
+    );
+    println!(
+        "Source duration: {:.3} ms",
+        source_duration.as_secs_f64() * 1000.0
+    );
+    println!("Analyzed sample range: {start_sample}..{end_sample}");
     println!(
         "Input PCM: tracks={} channels_per_track={} sample_rate={}Hz bit_depth={}bit",
         source_format.track_count,
@@ -3361,19 +3496,20 @@ fn pipewire_audio_content_audit(
     println!("QGS selected interpretation: signed 24-bit little-endian");
     println!("Selection reason: Step 20B/20C extraction stores Sony FX6 PCM payload as 24-bit little-endian runtime blocks");
     println!("Block count total: {}", blocks.len());
+    println!("Blocks per track:");
     for (channel_index, channel_blocks) in &track_groups {
-        let first = channel_blocks
-            .first()
-            .ok_or("channel group unexpectedly empty")?;
-        let PcmAudioBlockLayout::MonoTrack { track_id, .. } = first.layout else {
-            return Err("audit expects mono-track original PCM blocks".into());
-        };
-        let stats = audit_track_stats(channel_blocks, 48_000)?;
+        println!("  channel {channel_index}: {}", channel_blocks.len());
+    }
+    for summary in &track_summaries {
+        let stats = &summary.stats;
         println!("Track/channel audit:");
-        println!("  track_id={} channel_index={}", track_id, channel_index);
-        println!("  blocks={}", channel_blocks.len());
-        println!("  block_byte_size={}", first.payload.len());
-        println!("  samples_per_block={}", first.sample_count);
+        println!(
+            "  track_id={} channel_index={}",
+            summary.track_id, summary.channel_index
+        );
+        println!("  blocks={}", summary.block_count);
+        println!("  block_byte_size={}", summary.block_byte_size);
+        println!("  samples_per_block={}", summary.samples_per_block);
         println!("  raw first 12 bytes: {}", hex_bytes(&stats.raw_first_12));
         println!("  first samples signed24 LE: {:?}", stats.first_s24le);
         println!("  first samples signed24 BE: {:?}", stats.first_s24be);
@@ -3388,6 +3524,7 @@ fn pipewire_audio_content_audit(
             "  peak_f32={:.6} rms_f32={:.6} dc_offset={:.6}",
             stats.peak_f32, stats.rms_f32, stats.dc_offset
         );
+        println!("  relative level: {:.2} dBFS", stats.rms_dbfs);
         println!(
             "  zero_samples={:.3}% clipping={:.3}%",
             stats.zero_ratio * 100.0,
@@ -3395,61 +3532,77 @@ fn pipewire_audio_content_audit(
         );
         println!("  likely silent: {}", yes_no(stats.likely_silent));
         println!(
+            "  useful for monitoring: {}",
+            yes_no(!stats.likely_silent && stats.rms_f32 >= 0.0001)
+        );
+        println!(
             "  likely DC/buzz risk: {}",
             yes_no(stats.likely_dc_buzz_risk)
         );
     }
 
-    println!("Standalone segment path vs runtime prepared payload:");
+    println!("Suggested diagnostic monitor pairs:");
+    println!("  track 1/2: {}", monitor_pair_label(&all_channels, 0, 2));
+    println!("  track 3/4: {}", monitor_pair_label(&all_channels, 2, 2));
     println!(
-        "  segment path source blocks per track: {}",
-        segment_40ms.blocks_per_track
+        "  loudest two tracks: {}",
+        channel_pair_label(&loudest_pair)
     );
     println!(
-        "  runtime path source blocks per track: {}",
-        runtime_buffer.source_blocks_per_track
+        "Selected 4ch f32 min={:.6} max={:.6} rms={:.6} nonzero={}",
+        four_channel_stats.min,
+        four_channel_stats.max,
+        four_channel_stats.rms,
+        yes_no(four_channel_stats.nonzero)
     );
-    println!(
-        "  segment source range start_sample: {}",
-        segment_40ms.start_sample
-    );
-    println!(
-        "  runtime source range start_sample: {}",
-        runtime_plan.audio_binding.start_sample
-    );
-    println!(
-        "  segment output frames: {} bytes: {}",
-        segment_40ms.samples_per_track,
-        segment_40ms_bytes.len()
-    );
-    println!(
-        "  runtime output frames: {} bytes: {}",
-        runtime_buffer.output_frames,
-        runtime_buffer.output_bytes.len()
-    );
-    println!(
-        "  same source range f32 bytes identical: {}",
-        yes_no(same_range_outputs_match)
-    );
-    println!(
-        "  segment f32 min={:.6} max={:.6} rms={:.6} nonzero={}",
-        segment_stats.min,
-        segment_stats.max,
-        segment_stats.rms,
-        yes_no(segment_stats.nonzero)
-    );
-    println!(
-        "  runtime f32 min={:.6} max={:.6} rms={:.6} nonzero={}",
-        runtime_stats.min,
-        runtime_stats.max,
-        runtime_stats.rms,
-        yes_no(runtime_stats.nonzero)
-    );
-    println!("Interleaved first frames:");
-    println!(
-        "  runtime first 5 frames: {}",
-        interleaved_frame_list(&runtime_buffer.output_bytes, runtime_buffer.track_count, 5)?
-    );
+    match runtime_comparison {
+        Ok(comparison) => {
+            println!("Standalone segment path vs runtime prepared payload:");
+            println!(
+                "  segment source range start_sample: {}",
+                comparison.segment_start_sample
+            );
+            println!(
+                "  runtime source range start_sample: {}",
+                comparison.runtime_start_sample
+            );
+            println!(
+                "  segment output frames: {} bytes: {}",
+                comparison.segment_frames, comparison.segment_bytes
+            );
+            println!(
+                "  runtime output frames: {} bytes: {}",
+                comparison.runtime_frames, comparison.runtime_bytes
+            );
+            println!(
+                "  same source range f32 bytes identical: {}",
+                yes_no(comparison.same_range_outputs_match)
+            );
+            println!(
+                "  segment f32 min={:.6} max={:.6} rms={:.6} nonzero={}",
+                comparison.segment_stats.min,
+                comparison.segment_stats.max,
+                comparison.segment_stats.rms,
+                yes_no(comparison.segment_stats.nonzero)
+            );
+            println!(
+                "  runtime f32 min={:.6} max={:.6} rms={:.6} nonzero={}",
+                comparison.runtime_stats.min,
+                comparison.runtime_stats.max,
+                comparison.runtime_stats.rms,
+                yes_no(comparison.runtime_stats.nonzero)
+            );
+            println!("Interleaved first frames:");
+            println!(
+                "  runtime first 5 frames: {}",
+                comparison.runtime_first_frames
+            );
+        }
+        Err(err) => {
+            println!("Standalone segment path vs runtime prepared payload:");
+            println!("  skipped: {err}");
+        }
+    }
     println!("PipeWire buffer geometry review:");
     println!("  format: F32Interleaved 48000Hz 4ch");
     println!("  bytes_per_sample: 4");
@@ -3458,16 +3611,20 @@ fn pipewire_audio_content_audit(
     println!("  1920 frames expected bytes: 30720");
     println!("  48000 frames expected bytes: 768000");
     println!("  qgs-audio-pipewire writes data plane 0, chunk offset 0, chunk stride channels*4, chunk size copied bytes");
-    println!("Diagnostic WAV: {}", wav_path.display());
-    println!(
-        "Likely root cause: {}",
-        if same_range_outputs_match {
-            "not isolated between standalone segment and runtime payload conversion; PCM/content statistics and diagnostic WAV should be inspected next"
-        } else {
-            "runtime prepared payload conversion diverges from standalone segment conversion for the same source range"
-        }
-    );
+    println!("Diagnostic WAV paths:");
+    for (label, path) in diagnostic_wav_paths {
+        println!("  {label}: {}", path.display());
+    }
+    println!("Likely root cause: source range/routing/gain remains the diagnostic focus; this command does not upgrade AudioDeviceVerified");
     Ok(())
+}
+
+struct AudioContentAuditOptions {
+    start_ms: u64,
+    duration_ms: u64,
+    output_dir: PathBuf,
+    find_loudest_range_ms: Option<u64>,
+    diagnostic_wav_path: Option<PathBuf>,
 }
 
 struct TrackContentStats {
@@ -3483,11 +3640,41 @@ struct TrackContentStats {
     rms: f64,
     peak_f32: f32,
     rms_f32: f64,
+    rms_dbfs: f64,
     dc_offset: f64,
     zero_ratio: f64,
     clipping_ratio: f64,
     likely_silent: bool,
     likely_dc_buzz_risk: bool,
+}
+
+struct AudioAuditTrackSummary {
+    track_id: u32,
+    channel_index: u16,
+    block_count: usize,
+    block_byte_size: usize,
+    samples_per_block: u32,
+    stats: TrackContentStats,
+}
+
+struct AudioAuditRuntimeComparison {
+    segment_start_sample: u64,
+    runtime_start_sample: u64,
+    segment_frames: u32,
+    runtime_frames: u32,
+    segment_bytes: usize,
+    runtime_bytes: usize,
+    same_range_outputs_match: bool,
+    segment_stats: F32BufferStats,
+    runtime_stats: F32BufferStats,
+    runtime_first_frames: String,
+}
+
+struct LoudestAudioRange {
+    start_sample: u64,
+    combined_rms: f64,
+    rms_per_channel: Vec<f64>,
+    peak_per_channel: Vec<f32>,
 }
 
 struct F32BufferStats {
@@ -3517,9 +3704,290 @@ fn original_pcm_blocks_by_channel(
     Ok(by_channel)
 }
 
-fn audit_track_stats(
+fn bounded_audio_audit_duration_ms(duration_ms: u64) -> Result<u64, Box<dyn std::error::Error>> {
+    if duration_ms == 0 {
+        return Err("audio audit duration must be greater than zero".into());
+    }
+    if duration_ms > 5_000 {
+        return Err("audio audit duration is bounded to 5000 ms".into());
+    }
+    Ok(duration_ms)
+}
+
+fn audio_sample_to_ms(sample: u64, sample_rate: u32) -> Result<u64, Box<dyn std::error::Error>> {
+    sample
+        .checked_mul(1_000)
+        .map(|value| value / u64::from(sample_rate))
+        .ok_or_else(|| "audio sample to ms overflow".into())
+}
+
+fn audio_audit_total_samples(
+    track_groups: &BTreeMap<u16, Vec<&PcmAudioBlock>>,
+    sample_rate: u32,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let mut min_total = None;
+    for blocks in track_groups.values() {
+        let last = blocks.last().ok_or("empty audio track group")?;
+        let start = audio_samples_for_duration(last.start_time, sample_rate)?;
+        let total = start
+            .checked_add(u64::from(last.sample_count))
+            .ok_or("audio track sample count overflow")?;
+        min_total = Some(min_total.map_or(total, |current: u64| current.min(total)));
+    }
+    min_total.ok_or_else(|| "no audio track groups".into())
+}
+
+fn audio_audit_track_summaries(
+    track_groups: &BTreeMap<u16, Vec<&PcmAudioBlock>>,
+    sample_rate: u32,
+    start_sample: u64,
+    sample_count: u32,
+) -> Result<Vec<AudioAuditTrackSummary>, Box<dyn std::error::Error>> {
+    let mut summaries = Vec::new();
+    for (channel_index, channel_blocks) in track_groups {
+        let first = channel_blocks
+            .first()
+            .ok_or("channel group unexpectedly empty")?;
+        if first.sample_rate != sample_rate {
+            return Err("audio audit summary found mixed sample rates".into());
+        }
+        let PcmAudioBlockLayout::MonoTrack { track_id, .. } = first.layout else {
+            return Err("audit expects mono-track original PCM blocks".into());
+        };
+        summaries.push(AudioAuditTrackSummary {
+            track_id,
+            channel_index: *channel_index,
+            block_count: channel_blocks.len(),
+            block_byte_size: first.payload.len(),
+            samples_per_block: first.sample_count,
+            stats: audit_track_stats_range(channel_blocks, start_sample, sample_count)?,
+        });
+    }
+    Ok(summaries)
+}
+
+fn build_audio_audit_f32_interleaved_range(
+    track_groups: &BTreeMap<u16, Vec<&PcmAudioBlock>>,
+    channels: &[u16],
+    sample_rate: u32,
+    start_sample: u64,
+    sample_count: u32,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if channels.is_empty() {
+        return Err("audio audit output requires at least one channel".into());
+    }
+    let mut output = Vec::with_capacity(
+        usize::try_from(sample_count)?
+            .checked_mul(channels.len())
+            .and_then(|samples| samples.checked_mul(4))
+            .ok_or("audio audit f32 output size overflow")?,
+    );
+    let end_sample = start_sample
+        .checked_add(u64::from(sample_count))
+        .ok_or("audio audit output range overflow")?;
+    for absolute_sample in start_sample..end_sample {
+        for channel in channels {
+            let blocks = track_groups
+                .get(channel)
+                .ok_or("requested audio audit channel is missing")?;
+            let sample = sample_at_absolute(blocks, absolute_sample)?;
+            let value = (sample as f32 / 8_388_608.0).clamp(-1.0, 1.0);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    let expected = usize::try_from(sample_count)?
+        .checked_mul(channels.len())
+        .and_then(|samples| samples.checked_mul(4))
+        .ok_or("audio audit expected output size overflow")?;
+    if output.len() != expected {
+        return Err("audio audit f32 output size mismatch".into());
+    }
+    let _ = sample_rate;
+    Ok(output)
+}
+
+fn find_loudest_audio_audit_range(
+    track_groups: &BTreeMap<u16, Vec<&PcmAudioBlock>>,
+    sample_rate: u32,
+    sample_count: u32,
+) -> Result<LoudestAudioRange, Box<dyn std::error::Error>> {
+    let first_channel = track_groups.values().next().ok_or("no audio tracks")?;
+    let first_block = first_channel.first().ok_or("no audio blocks")?;
+    let samples_per_block = first_block.sample_count;
+    if samples_per_block == 0 {
+        return Err("audio blocks have zero samples".into());
+    }
+    let blocks_per_window = usize::try_from(sample_count.div_ceil(samples_per_block))?;
+    if blocks_per_window == 0 {
+        return Err("loudest range selected zero blocks".into());
+    }
+    let min_blocks = track_groups
+        .values()
+        .map(Vec::len)
+        .min()
+        .ok_or("no audio track groups")?;
+    if min_blocks < blocks_per_window {
+        return Err("not enough audio blocks for loudest range duration".into());
+    }
+
+    let mut combined_prefix = vec![0.0_f64; min_blocks + 1];
+    for block_index in 0..min_blocks {
+        let mut block_sum_sq = 0_f64;
+        for blocks in track_groups.values() {
+            let block = blocks[block_index];
+            for sample_index in 0..usize::try_from(block.sample_count)? {
+                let sample =
+                    f64::from(decode_s24le_i32(&block.payload, sample_index)) / 8_388_608.0;
+                block_sum_sq += sample * sample;
+            }
+        }
+        combined_prefix[block_index + 1] = combined_prefix[block_index] + block_sum_sq;
+    }
+
+    let mut best_start_block = 0_usize;
+    let mut best_sum_sq = -1.0_f64;
+    for start_block in 0..=min_blocks - blocks_per_window {
+        let end_block = start_block + blocks_per_window;
+        let sum_sq = combined_prefix[end_block] - combined_prefix[start_block];
+        if sum_sq > best_sum_sq {
+            best_sum_sq = sum_sq;
+            best_start_block = start_block;
+        }
+    }
+    let start_sample = u64::try_from(best_start_block)?
+        .checked_mul(u64::from(samples_per_block))
+        .ok_or("loudest range start sample overflow")?;
+    let mut rms_per_channel = Vec::new();
+    let mut peak_per_channel = Vec::new();
+    for blocks in track_groups.values() {
+        let stats = audit_track_stats_range(blocks, start_sample, sample_count)?;
+        rms_per_channel.push(stats.rms_f32);
+        peak_per_channel.push(stats.peak_f32);
+    }
+    let combined_rms = (best_sum_sq
+        / (blocks_per_window as f64 * f64::from(samples_per_block) * track_groups.len() as f64))
+        .sqrt();
+    let _ = sample_rate;
+    Ok(LoudestAudioRange {
+        start_sample,
+        combined_rms,
+        rms_per_channel,
+        peak_per_channel,
+    })
+}
+
+fn runtime_audio_audit_comparison(
+    original_path: &Path,
+    proxy_path: &Path,
+    track_groups: &BTreeMap<u16, Vec<&PcmAudioBlock>>,
+    sample_rate: u32,
+) -> Result<AudioAuditRuntimeComparison, Box<dyn std::error::Error>> {
+    let runtime_plan = prepare_runtime_audio_pipewire_payload(original_path, proxy_path)?;
+    let runtime_buffer = &runtime_plan.payload_buffer;
+    let channels = track_groups.keys().copied().collect::<Vec<_>>();
+    let segment_bytes = build_audio_audit_f32_interleaved_range(
+        track_groups,
+        &channels,
+        sample_rate,
+        runtime_plan.audio_binding.start_sample,
+        runtime_buffer.output_frames,
+    )?;
+    let same_range_outputs_match = segment_bytes == runtime_buffer.output_bytes;
+    let segment_stats = f32_buffer_stats(
+        &segment_bytes,
+        runtime_buffer.output_frames,
+        u32::try_from(channels.len())?,
+    )?;
+    let runtime_stats = f32_buffer_stats(
+        &runtime_buffer.output_bytes,
+        runtime_buffer.output_frames,
+        u32::try_from(runtime_buffer.track_count)?,
+    )?;
+    Ok(AudioAuditRuntimeComparison {
+        segment_start_sample: runtime_plan.audio_binding.start_sample,
+        runtime_start_sample: runtime_plan.audio_binding.start_sample,
+        segment_frames: runtime_buffer.output_frames,
+        runtime_frames: runtime_buffer.output_frames,
+        segment_bytes: segment_bytes.len(),
+        runtime_bytes: runtime_buffer.output_bytes.len(),
+        same_range_outputs_match,
+        segment_stats,
+        runtime_stats,
+        runtime_first_frames: interleaved_frame_list(
+            &runtime_buffer.output_bytes,
+            runtime_buffer.track_count,
+            5,
+        )?,
+    })
+}
+
+fn sanitized_source_stem(path: &Path) -> String {
+    let raw = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("original-audio");
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "original-audio".to_string()
+    } else {
+        out
+    }
+}
+
+fn audio_audit_range_label(start_ms: u64, duration_ms: u64) -> String {
+    format!("start{start_ms:06}ms-dur{duration_ms:06}ms")
+}
+
+fn loudest_monitor_pair(summaries: &[AudioAuditTrackSummary]) -> Vec<u16> {
+    let mut ranked = summaries
+        .iter()
+        .map(|summary| (summary.channel_index, summary.stats.rms_f32))
+        .collect::<Vec<_>>();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked
+        .into_iter()
+        .take(2)
+        .map(|(channel, _)| channel)
+        .collect()
+}
+
+fn channel_pair_label(channels: &[u16]) -> String {
+    if channels.is_empty() {
+        "unavailable".to_string()
+    } else {
+        channels
+            .iter()
+            .map(|channel| format!("track {}", u32::from(*channel) + 1))
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+}
+
+fn monitor_pair_label(channels: &[u16], start: usize, count: usize) -> String {
+    let pair = channels
+        .iter()
+        .skip(start)
+        .take(count)
+        .copied()
+        .collect::<Vec<_>>();
+    channel_pair_label(&pair)
+}
+
+fn audit_track_stats_range(
     blocks: &[&PcmAudioBlock],
-    max_samples: usize,
+    start_sample: u64,
+    sample_count: u32,
 ) -> Result<TrackContentStats, Box<dyn std::error::Error>> {
     let first = blocks.first().ok_or("no blocks for track stats")?;
     let raw_first_12 = first.payload.iter().take(12).copied().collect::<Vec<_>>();
@@ -3527,21 +3995,25 @@ fn audit_track_stats(
     let first_s24be = decode_first_samples(&first.payload, 4, decode_s24be_i32);
     let first_u24le = decode_first_samples(&first.payload, 4, decode_u24le);
     let mut values = Vec::new();
-    'outer: for block in blocks {
-        let PcmSampleFormat::SignedInteger {
-            bits_per_sample,
-            endian,
-        } = block.format;
-        if bits_per_sample != 24 || endian != PcmEndian::Little {
-            return Err("audio content audit expects 24-bit little-endian PCM blocks".into());
-        }
-        for sample_index in 0..usize::try_from(block.sample_count)? {
-            values.push(decode_s24le_i32(&block.payload, sample_index));
-            if values.len() >= max_samples {
-                break 'outer;
-            }
-        }
+    let end_sample = start_sample
+        .checked_add(u64::from(sample_count))
+        .ok_or("track stats range overflow")?;
+    for absolute_sample in start_sample..end_sample {
+        values.push(sample_at_absolute(blocks, absolute_sample)?);
     }
+    if values.is_empty() {
+        return Err("no samples available for track stats".into());
+    }
+    stats_from_i32_values(raw_first_12, first_s24le, first_s24be, first_u24le, values)
+}
+
+fn stats_from_i32_values(
+    raw_first_12: Vec<u8>,
+    first_s24le: Vec<i32>,
+    first_s24be: Vec<i32>,
+    first_u24le: Vec<u32>,
+    values: Vec<i32>,
+) -> Result<TrackContentStats, Box<dyn std::error::Error>> {
     if values.is_empty() {
         return Err("no samples available for track stats".into());
     }
@@ -3575,6 +4047,11 @@ fn audit_track_stats(
     let mean = sum / samples_analyzed as f64;
     let rms = (sum_sq / samples_analyzed as f64).sqrt();
     let rms_f32 = rms / 8_388_608.0;
+    let rms_dbfs = if rms_f32 > 0.0 {
+        20.0 * rms_f32.log10()
+    } else {
+        f64::NEG_INFINITY
+    };
     let dc_offset = mean / 8_388_608.0;
     let zero_ratio = zero_count as f64 / samples_analyzed as f64;
     let clipping_ratio = clipping_count as f64 / samples_analyzed as f64;
@@ -3591,6 +4068,7 @@ fn audit_track_stats(
         rms,
         peak_f32,
         rms_f32,
+        rms_dbfs,
         dc_offset,
         zero_ratio,
         clipping_ratio,
@@ -3598,6 +4076,42 @@ fn audit_track_stats(
         likely_dc_buzz_risk: dc_offset.abs() > 0.05
             || (rms_f32 > 0.0 && dc_offset.abs() > rms_f32 * 0.5),
     })
+}
+
+fn sample_at_absolute(
+    blocks: &[&PcmAudioBlock],
+    absolute_sample: u64,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let first = blocks.first().ok_or("no blocks for sample lookup")?;
+    let first_start = audio_samples_for_duration(first.start_time, first.sample_rate)?;
+    if absolute_sample < first_start {
+        return Err("audio sample is before first block".into());
+    }
+    let samples_per_block = first.sample_count;
+    if samples_per_block == 0 {
+        return Err("audio block has zero samples".into());
+    }
+    let relative_sample = absolute_sample - first_start;
+    let block_index = usize::try_from(relative_sample / u64::from(samples_per_block))?;
+    let local_sample = usize::try_from(relative_sample % u64::from(samples_per_block))?;
+    let block = blocks
+        .get(block_index)
+        .ok_or("audio sample range is not covered by original PCM blocks")?;
+    let PcmSampleFormat::SignedInteger {
+        bits_per_sample,
+        endian,
+    } = block.format;
+    if bits_per_sample != 24 || endian != PcmEndian::Little {
+        return Err("audio content audit expects 24-bit little-endian PCM blocks".into());
+    }
+    if block.sample_count != samples_per_block {
+        return Err("audio content audit expects stable sample counts per block".into());
+    }
+    let block_start = audio_samples_for_duration(block.start_time, block.sample_rate)?;
+    if block_start != first_start + u64::try_from(block_index)? * u64::from(samples_per_block) {
+        return Err("audio content audit sample lookup found a gap or overlap".into());
+    }
+    Ok(decode_s24le_i32(&block.payload, local_sample))
 }
 
 fn decode_first_samples<T>(payload: &[u8], count: usize, decode: fn(&[u8], usize) -> T) -> Vec<T> {
@@ -3675,6 +4189,14 @@ fn hex_bytes(bytes: &[u8]) -> String {
 }
 
 fn f32_list(values: &[f32]) -> String {
+    values
+        .iter()
+        .map(|value| format!("{value:.6}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn f64_list(values: &[f64]) -> String {
     values
         .iter()
         .map(|value| format!("{value:.6}"))
@@ -11085,6 +11607,10 @@ struct Args {
     broadcast_runtime_audio_pipewire_audible_paths: Option<(PathBuf, PathBuf)>,
     pipewire_audio_content_audit_paths: Option<(PathBuf, PathBuf)>,
     diagnostic_wav_path: Option<PathBuf>,
+    audio_content_audit_start_ms: Option<u64>,
+    audio_content_audit_duration_ms: Option<u64>,
+    audio_content_audit_output_dir: Option<PathBuf>,
+    audio_content_audit_find_loudest_range_ms: Option<u64>,
 }
 
 impl Args {
@@ -11147,6 +11673,10 @@ impl Args {
         let mut pipewire_audio_content_audit_original = None;
         let mut pipewire_audio_content_audit_paths = None;
         let mut diagnostic_wav_path = None;
+        let mut audio_content_audit_start_ms = None;
+        let mut audio_content_audit_duration_ms = None;
+        let mut audio_content_audit_output_dir = None;
+        let mut audio_content_audit_find_loudest_range_ms = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
@@ -11195,11 +11725,32 @@ impl Args {
         let mut next_arg_is_pipewire_audio_content_audit_original = false;
         let mut next_arg_is_pipewire_audio_content_audit_proxy = false;
         let mut next_arg_is_diagnostic_wav_path = false;
+        let mut next_arg_is_audio_content_audit_start_ms = false;
+        let mut next_arg_is_audio_content_audit_duration_ms = false;
+        let mut next_arg_is_audio_content_audit_output_dir = false;
+        let mut next_arg_is_audio_content_audit_find_loudest_range_ms = false;
 
         for arg in std::env::args_os().skip(1) {
             if next_arg_is_diagnostic_wav_path {
                 diagnostic_wav_path = Some(PathBuf::from(arg));
                 next_arg_is_diagnostic_wav_path = false;
+            } else if next_arg_is_audio_content_audit_start_ms {
+                audio_content_audit_start_ms =
+                    Some(parse_u64_os_arg(&arg, AUDIO_AUDIT_START_MS_ARG));
+                next_arg_is_audio_content_audit_start_ms = false;
+            } else if next_arg_is_audio_content_audit_duration_ms {
+                audio_content_audit_duration_ms =
+                    Some(parse_u64_os_arg(&arg, AUDIO_AUDIT_DURATION_MS_ARG));
+                next_arg_is_audio_content_audit_duration_ms = false;
+            } else if next_arg_is_audio_content_audit_output_dir {
+                audio_content_audit_output_dir = Some(PathBuf::from(arg));
+                next_arg_is_audio_content_audit_output_dir = false;
+            } else if next_arg_is_audio_content_audit_find_loudest_range_ms {
+                audio_content_audit_find_loudest_range_ms = Some(parse_u64_os_arg(
+                    &arg,
+                    AUDIO_AUDIT_FIND_LOUDEST_RANGE_MS_ARG,
+                ));
+                next_arg_is_audio_content_audit_find_loudest_range_ms = false;
             } else if next_arg_is_pipewire_audio_content_audit_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = pipewire_audio_content_audit_original
@@ -11529,6 +12080,14 @@ impl Args {
                 next_arg_is_pipewire_audio_content_audit_original = true;
             } else if arg == WRITE_DIAGNOSTIC_WAV_ARG {
                 next_arg_is_diagnostic_wav_path = true;
+            } else if arg == AUDIO_AUDIT_START_MS_ARG {
+                next_arg_is_audio_content_audit_start_ms = true;
+            } else if arg == AUDIO_AUDIT_DURATION_MS_ARG {
+                next_arg_is_audio_content_audit_duration_ms = true;
+            } else if arg == AUDIO_AUDIT_OUTPUT_DIR_ARG {
+                next_arg_is_audio_content_audit_output_dir = true;
+            } else if arg == AUDIO_AUDIT_FIND_LOUDEST_RANGE_MS_ARG {
+                next_arg_is_audio_content_audit_find_loudest_range_ms = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -11570,20 +12129,34 @@ impl Args {
             broadcast_runtime_audio_pipewire_audible_paths,
             pipewire_audio_content_audit_paths,
             diagnostic_wav_path,
+            audio_content_audit_start_ms,
+            audio_content_audit_duration_ms,
+            audio_content_audit_output_dir,
+            audio_content_audit_find_loudest_range_ms,
         }
     }
+}
+
+fn parse_u64_os_arg(value: &std::ffi::OsStr, flag: &str) -> u64 {
+    value
+        .to_string_lossy()
+        .parse::<u64>()
+        .unwrap_or_else(|_| panic!("{flag} expects an unsigned integer"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        audible_smoke_evidence_label, build_pipewire_f32_interleaved_prototype_buffer,
+        audible_smoke_evidence_label, audio_audit_track_summaries, bounded_audio_audit_duration_ms,
+        build_pipewire_f32_interleaved_prototype_buffer,
         build_runtime_audio_payload_pipewire_buffer,
         build_sequential_original_audio_segment_for_duration, decode_s24be_i32, decode_s24le_i32,
-        decode_u24le, f32_buffer_stats, mxf_file_label, original_segment_evidence_label,
+        decode_u24le, f32_buffer_stats, loudest_monitor_pair, mxf_file_label,
+        original_pcm_blocks_by_channel, original_segment_evidence_label,
         parse_manual_audible_confirmation, pcm_s24le_sample_to_f32, proxy_presentation_ordinals,
-        repeated_smoke_test_buffers, runtime_audio_payload_evidence_label, selected_proxy_ordinals,
-        smoke_test_buffer_count, ManualAudibleConfirmation, SonyXmlSummary,
+        repeated_smoke_test_buffers, runtime_audio_payload_evidence_label, sanitized_source_stem,
+        selected_proxy_ordinals, smoke_test_buffer_count, ManualAudibleConfirmation,
+        SonyXmlSummary,
     };
     use qgs_media_runtime::{
         av_frame_audio_range, bind_broadcast_audio_payload, BroadcastPreparedAudioSlot,
@@ -11929,6 +12502,44 @@ mod tests {
         assert_eq!(stats.max, 0.5);
         assert!(stats.nonzero);
         assert!((stats.rms - 0.375).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn audio_content_audit_bounds_duration_and_sanitizes_output_stem() {
+        assert_eq!(bounded_audio_audit_duration_ms(1).unwrap(), 1);
+        assert_eq!(bounded_audio_audit_duration_ms(5_000).unwrap(), 5_000);
+        assert!(bounded_audio_audit_duration_ms(0).is_err());
+        assert!(bounded_audio_audit_duration_ms(5_001).is_err());
+        assert_eq!(
+            sanitized_source_stem(&PathBuf::from("/tmp/Mironik 2002.MXF")),
+            "Mironik-2002"
+        );
+        assert_eq!(
+            sanitized_source_stem(&PathBuf::from("/tmp/%%%")),
+            "original-audio"
+        );
+    }
+
+    #[test]
+    fn audio_content_audit_ranks_loudest_monitor_pair() {
+        let blocks = vec![
+            mono_block(10, 0, &[[0x01, 0x00, 0x00]; 4]),
+            mono_block(11, 1, &[[0x00, 0x00, 0x40]; 4]),
+            mono_block(12, 2, &[[0x00, 0x00, 0x20]; 4]),
+            mono_block(13, 3, &[[0x00, 0x00, 0x00]; 4]),
+        ];
+        let groups = original_pcm_blocks_by_channel(&blocks, 48_000).unwrap();
+        let summaries = audio_audit_track_summaries(&groups, 48_000, 0, 4).unwrap();
+
+        assert_eq!(loudest_monitor_pair(&summaries), vec![1, 2]);
+        assert!(
+            summaries
+                .iter()
+                .find(|summary| summary.channel_index == 3)
+                .unwrap()
+                .stats
+                .likely_silent
+        );
     }
 
     #[test]
