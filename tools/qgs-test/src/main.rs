@@ -116,6 +116,7 @@ const PIPEWIRE_AUDIO_PROTOTYPE_ARG: &str = "--pipewire-audio-prototype";
 const PIPEWIRE_AUDIO_NATIVE_PROTOTYPE_ARG: &str = "--pipewire-audio-native-prototype";
 const PIPEWIRE_AUDIO_AUDIBLE_SMOKE_TEST_ARG: &str = "--pipewire-audio-audible-smoke-test";
 const PIPEWIRE_AUDIO_SEGMENT_PLAYBACK_ARG: &str = "--pipewire-audio-segment-playback";
+const BROADCAST_RUNTIME_AUDIO_PIPEWIRE_ARG: &str = "--broadcast-runtime-audio-pipewire";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -247,6 +248,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(path) = args.pipewire_audio_segment_playback_path {
         return pipewire_audio_segment_playback(&path);
+    }
+    if let Some((original, proxy)) = args.broadcast_runtime_audio_pipewire_paths {
+        return broadcast_runtime_audio_pipewire(&original, &proxy);
     }
 
     let socket_path = args.socket_path;
@@ -2454,6 +2458,14 @@ impl ManualAudibleConfirmation {
             Self::Required => "ManualOriginalSegmentConfirmationRequired",
         }
     }
+
+    const fn runtime_payload_label(self) -> &'static str {
+        match self {
+            Self::Yes => "RuntimeAudioPayloadAudibleConfirmed",
+            Self::No => "RuntimeAudioPayloadNotHeard",
+            Self::Required => "RuntimeAudioPayloadConfirmationRequired",
+        }
+    }
 }
 
 fn read_manual_audible_confirmation() -> io::Result<ManualAudibleConfirmation> {
@@ -2513,6 +2525,35 @@ fn original_segment_evidence_label(
         }
         (true, false, ManualAudibleConfirmation::Required) => "OriginalSegmentSubmitted",
         _ => "OriginalSegmentNotSubmitted",
+    }
+}
+
+fn read_manual_runtime_payload_confirmation() -> io::Result<ManualAudibleConfirmation> {
+    if !io::stdin().is_terminal() {
+        return Ok(ManualAudibleConfirmation::Required);
+    }
+    print!(
+        "Did you hear the runtime-prepared original-audio payload from the default PipeWire output? yes/no: "
+    );
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(parse_manual_audible_confirmation(&input))
+}
+
+fn runtime_audio_payload_evidence_label(
+    submitted: bool,
+    drain_completed: bool,
+    confirmation: ManualAudibleConfirmation,
+) -> &'static str {
+    match (submitted, drain_completed, confirmation) {
+        (true, _, ManualAudibleConfirmation::Yes) => "RuntimeAudioPayloadAudibleConfirmed",
+        (true, _, ManualAudibleConfirmation::No) => "RuntimeAudioPayloadNotHeard",
+        (true, true, ManualAudibleConfirmation::Required) => "RuntimeAudioPayloadDrainCompleted",
+        (true, false, ManualAudibleConfirmation::Required) => {
+            "RuntimeAudioPayloadSubmittedToPipeWire"
+        }
+        _ => "RuntimeAudioPayloadNotSubmitted",
     }
 }
 
@@ -2715,6 +2756,353 @@ fn pipewire_audio_segment_playback(path: &Path) -> Result<(), Box<dyn std::error
         "Status: bounded sequential original-audio segment completed; full playback is not claimed"
     );
     Ok(())
+}
+
+fn broadcast_runtime_audio_pipewire(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let original_bytes = std::fs::read(original_path)?;
+    let original = MediaSource::parse(&original_bytes)?;
+    let audio_tracks = original
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Audio)
+        .collect::<Vec<_>>();
+    if audio_tracks.is_empty() {
+        return Err("original MXF has no audio tracks".into());
+    }
+    let source_format = original_linux_pcm_audio_format(&audio_tracks)?;
+    let blocks = build_original_pcm_blocks(&original, &original_bytes)?;
+
+    let proxy = Mp4Source::open(proxy_path)?;
+    let proxy_video = proxy
+        .video
+        .as_ref()
+        .ok_or("proxy has no H.264 video track")?;
+    let selected = selected_journalist_preview_frames(proxy_video)?;
+    let first_selected = selected
+        .first()
+        .ok_or("journalist-50i-preview selected no proxy frames")?;
+    let presentation_rate =
+        ProxyPlaybackProfile::Journalist50iPreview.presentation_rate(RationalRate::new(
+            u64::from(proxy_video.frame_rate.numerator),
+            u64::from(proxy_video.frame_rate.denominator),
+        )?)?;
+    let frame_duration = presentation_rate.frame_duration()?;
+    let range = av_frame_audio_range(
+        first_selected.preview_index,
+        first_selected.start_time,
+        frame_duration,
+        source_format.sample_rate,
+        &blocks,
+        audio_tracks.len(),
+    )?;
+    let audio_slot = BroadcastPreparedAudioSlot::from_audio_range(
+        0,
+        BroadcastVideoSourceMode::ProxyPreview,
+        &range,
+    );
+    let audio_binding = bind_broadcast_audio_payload(&audio_slot, &blocks)?;
+    let payload_buffer = build_runtime_audio_payload_pipewire_buffer(&audio_binding, &blocks)?;
+    let report_buffer = LinuxPipewirePrototypeBuffer {
+        sample_rate: payload_buffer.sample_rate,
+        channels: u16::try_from(payload_buffer.track_count)?,
+        sample_count: payload_buffer.output_frames,
+        sample_format: LinuxPipewirePrototypeSampleFormat::F32Interleaved,
+        bytes: payload_buffer.output_bytes.clone(),
+    };
+    let report = inspect_native_pipewire_stream_boundary(&report_buffer)?;
+
+    println!("QGS Broadcast Player Runtime Audio Payload to PipeWire");
+    println!("------------------------------------------------------");
+    println!("Source mode: ProxyPreview");
+    println!("Audio source: original MXF");
+    println!("Video source: proxy MP4");
+    println!("Original MXF audio authoritative: yes");
+    println!("Proxy AAC: not used");
+    println!("Full playback: no");
+    println!("Realtime Broadcast Player playback: no");
+    println!("A/V sync: no");
+    println!("QNC UI integration: no");
+    println!("Runtime source mode: {:?}", audio_binding.source_mode);
+    println!(
+        "Prepared audio slot index: {}",
+        audio_binding.audio_slot_index
+    );
+    println!(
+        "Presentation range duration: {:.3} ms",
+        audio_slot.duration.as_secs_f64() * 1000.0
+    );
+    println!(
+        "Presentation start sample: {} sample_count={}",
+        audio_binding.start_sample, audio_binding.sample_count
+    );
+    println!(
+        "Source blocks per track: {}",
+        payload_buffer.source_blocks_per_track
+    );
+    println!(
+        "Source blocks total: {}",
+        payload_buffer.source_blocks_total
+    );
+    println!("Source bytes: {}", payload_buffer.source_bytes);
+    println!("Samples per track: {}", payload_buffer.output_frames);
+    println!("Device-boundary conversion: runtime original 24-bit mono tracks -> f32 interleaved");
+    println!("Routing: track 1 -> FL, track 2 -> FR, track 3 -> RL, track 4 -> RR");
+    println!(
+        "Output format: F32Interleaved {}Hz channels={}",
+        payload_buffer.sample_rate, payload_buffer.track_count
+    );
+    println!("Output frames: {}", payload_buffer.output_frames);
+    println!("F32 samples planned: {}", payload_buffer.f32_sample_count());
+    println!(
+        "Output bytes planned: {}",
+        payload_buffer.output_bytes.len()
+    );
+    println!("Manual audible confirmation required: yes");
+    println!(
+        "PipeWire runtime library available: {}",
+        yes_no(report.runtime_library_available)
+    );
+    println!(
+        "PipeWire server reachable: {}",
+        yes_no(report.pipewire_server_reachable)
+    );
+    println!(
+        "PipeWire pkg-config entry available: {}",
+        yes_no(report.pkg_config_entry_available)
+    );
+    println!(
+        "PipeWire headers available: {}",
+        yes_no(report.headers_available)
+    );
+    if !report.pkg_config_entry_available || !report.headers_available {
+        println!(
+            "Stream create attempted: {}",
+            yes_no(report.stream_create_attempted)
+        );
+        println!("Buffers submitted: 0");
+        println!("Drain requested: no");
+        println!("Drain completed: no");
+        println!("Manual confirmation status: RuntimeAudioPayloadConfirmationRequired");
+        println!("Evidence level: {:?}", report.evidence_level);
+        println!("AudioDeviceVerified: no");
+        println!("AudioDeviceVerified scope: not upgraded by runtime payload boundary");
+        println!("Audible output claimed: no");
+        println!("Status: {}", report.status_message);
+        return Ok(());
+    }
+
+    let stream_format = PipeWireStreamFormat {
+        sample_rate: payload_buffer.sample_rate,
+        channels: u32::try_from(payload_buffer.track_count)?,
+        sample_format: PipeWireAudioSampleFormat::F32Interleaved,
+    };
+    let submission_report = submit_native_pipewire_buffer(
+        stream_format,
+        payload_buffer.output_bytes,
+        payload_buffer.output_frames,
+        Duration::from_secs(3),
+    )?;
+    let confirmation = read_manual_runtime_payload_confirmation()?;
+    let evidence = runtime_audio_payload_evidence_label(
+        submission_report.buffer_submitted,
+        submission_report.drain_completed,
+        confirmation,
+    );
+
+    println!(
+        "Stream configured: {}",
+        yes_no(submission_report.stream_report.stream_configured)
+    );
+    println!(
+        "Observed stream states: {:?}",
+        submission_report.stream_report.observed_states
+    );
+    println!(
+        "Final stream state: {:?}",
+        submission_report.stream_report.final_state
+    );
+    println!(
+        "Process callback reached: {}",
+        yes_no(submission_report.process_callback_reached)
+    );
+    println!(
+        "Buffer dequeued: {}",
+        yes_no(submission_report.buffer_dequeued)
+    );
+    println!("Buffer capacity: {}", submission_report.buffer_capacity);
+    println!("Buffers planned: {}", submission_report.buffers_planned);
+    println!("Buffers submitted: {}", submission_report.buffers_submitted);
+    println!(
+        "Samples submitted per track: {}",
+        submission_report.samples_converted
+    );
+    println!("Output channels: {}", submission_report.output_channels);
+    println!(
+        "F32 samples written: {}",
+        submission_report.f32_samples_written
+    );
+    println!("Bytes copied: {}", submission_report.bytes_copied);
+    println!(
+        "Drain requested: {}",
+        yes_no(submission_report.drain_requested)
+    );
+    println!(
+        "Drain completed: {}",
+        yes_no(submission_report.drain_completed)
+    );
+    println!(
+        "Post-submit callbacks observed: {}",
+        submission_report.post_submit_process_callbacks
+    );
+    println!(
+        "Post-submit timeout: {}",
+        yes_no(submission_report.post_submit_timeout)
+    );
+    println!(
+        "PipeWire evidence level: {:?}",
+        submission_report.evidence_level
+    );
+    println!(
+        "Manual confirmation status: {}",
+        confirmation.runtime_payload_label()
+    );
+    println!("Runtime payload evidence level: {}", evidence);
+    println!("AudioDeviceVerified: no");
+    println!("AudioDeviceVerified scope: not upgraded by runtime payload boundary");
+    println!(
+        "Audible output claimed: {}",
+        yes_no(confirmation == ManualAudibleConfirmation::Yes)
+    );
+    println!(
+        "Status: runtime-prepared original-audio payload submitted to PipeWire; full playback is not claimed"
+    );
+    Ok(())
+}
+
+struct RuntimeAudioPayloadPipeWireBuffer {
+    output_bytes: Vec<u8>,
+    output_frames: u32,
+    sample_rate: u32,
+    track_count: usize,
+    source_blocks_per_track: usize,
+    source_blocks_total: usize,
+    source_bytes: usize,
+}
+
+impl RuntimeAudioPayloadPipeWireBuffer {
+    fn f32_sample_count(&self) -> usize {
+        usize::try_from(self.output_frames).unwrap_or(0) * self.track_count
+    }
+}
+
+fn build_runtime_audio_payload_pipewire_buffer(
+    binding: &qgs_media_runtime::BroadcastAudioPayloadBinding,
+    blocks: &[PcmAudioBlock],
+) -> Result<RuntimeAudioPayloadPipeWireBuffer, Box<dyn std::error::Error>> {
+    if binding.source_mode != BroadcastVideoSourceMode::ProxyPreview || !binding.complete {
+        return Err(
+            "runtime PipeWire payload requires a complete ProxyPreview audio binding".into(),
+        );
+    }
+    let output_frames = u32::try_from(binding.sample_count)?;
+    let mut coverage_by_channel: BTreeMap<
+        u16,
+        Vec<&qgs_media_runtime::BroadcastAudioBlockCoverage>,
+    > = BTreeMap::new();
+    for coverage in &binding.block_coverage {
+        coverage_by_channel
+            .entry(coverage.channel_index)
+            .or_default()
+            .push(coverage);
+    }
+    if coverage_by_channel.len() != binding.track_count {
+        return Err("runtime audio payload binding does not cover every track".into());
+    }
+
+    let mut track_payloads = Vec::with_capacity(coverage_by_channel.len());
+    let mut source_bytes = 0_usize;
+    let mut source_blocks_per_track = None;
+    for (channel_index, coverages) in coverage_by_channel {
+        let mut coverages = coverages;
+        coverages.sort_by_key(|coverage| coverage.block_start_sample);
+        if let Some(expected) = source_blocks_per_track {
+            if expected != coverages.len() {
+                return Err("runtime audio payload has uneven block coverage per track".into());
+            }
+        } else {
+            source_blocks_per_track = Some(coverages.len());
+        }
+        let mut payload = Vec::new();
+        for coverage in coverages {
+            let block = blocks
+                .get(coverage.block_index)
+                .ok_or("runtime audio payload coverage references missing block")?;
+            let PcmAudioBlockLayout::MonoTrack {
+                track_id,
+                channel_index: block_channel_index,
+            } = block.layout
+            else {
+                return Err("runtime audio payload requires mono-track PCM blocks".into());
+            };
+            if track_id != coverage.track_id || block_channel_index != coverage.channel_index {
+                return Err("runtime audio payload coverage does not match block identity".into());
+            }
+            let PcmSampleFormat::SignedInteger {
+                bits_per_sample,
+                endian,
+            } = block.format;
+            if bits_per_sample != 24 || endian != PcmEndian::Little {
+                return Err(
+                    "runtime PipeWire boundary requires original 24-bit little-endian PCM".into(),
+                );
+            }
+            if block.sample_rate != binding.sample_rate {
+                return Err("runtime audio payload contains mixed sample rates".into());
+            }
+            let end = coverage
+                .byte_offset_within_block
+                .checked_add(coverage.byte_count)
+                .ok_or("runtime audio payload byte range overflow")?;
+            let slice = block
+                .payload
+                .get(coverage.byte_offset_within_block..end)
+                .ok_or("runtime audio payload byte range is outside block payload")?;
+            payload.extend_from_slice(slice);
+            source_bytes = source_bytes
+                .checked_add(slice.len())
+                .ok_or("runtime audio payload source byte count overflow")?;
+        }
+        let expected_bytes = usize::try_from(binding.sample_count)?
+            .checked_mul(3)
+            .ok_or("runtime audio payload expected byte count overflow")?;
+        if payload.len() != expected_bytes {
+            return Err(
+                "runtime audio payload track byte count does not match sample range".into(),
+            );
+        }
+        track_payloads.push((channel_index, payload));
+    }
+
+    let mono_tracks = track_payloads
+        .iter()
+        .map(|(channel_index, payload)| MonoS24LeTrack {
+            channel_index: *channel_index,
+            payload,
+        })
+        .collect::<Vec<_>>();
+    let output_bytes = f32_interleaved_from_s24le_mono_tracks(&mono_tracks, output_frames)?;
+    Ok(RuntimeAudioPayloadPipeWireBuffer {
+        output_bytes,
+        output_frames,
+        sample_rate: binding.sample_rate,
+        track_count: binding.track_count,
+        source_blocks_per_track: source_blocks_per_track.unwrap_or(0),
+        source_blocks_total: binding.block_coverage.len(),
+        source_bytes,
+    })
 }
 
 struct OriginalAudioSegmentPlan {
@@ -10050,6 +10438,7 @@ struct Args {
     pipewire_audio_native_prototype_path: Option<PathBuf>,
     pipewire_audio_audible_smoke_test_path: Option<PathBuf>,
     pipewire_audio_segment_playback_path: Option<PathBuf>,
+    broadcast_runtime_audio_pipewire_paths: Option<(PathBuf, PathBuf)>,
 }
 
 impl Args {
@@ -10105,6 +10494,8 @@ impl Args {
         let mut pipewire_audio_native_prototype_path = None;
         let mut pipewire_audio_audible_smoke_test_path = None;
         let mut pipewire_audio_segment_playback_path = None;
+        let mut broadcast_runtime_audio_pipewire_original = None;
+        let mut broadcast_runtime_audio_pipewire_paths = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
@@ -10146,9 +10537,22 @@ impl Args {
         let mut next_arg_is_pipewire_audio_native_prototype_path = false;
         let mut next_arg_is_pipewire_audio_audible_smoke_test_path = false;
         let mut next_arg_is_pipewire_audio_segment_playback_path = false;
+        let mut next_arg_is_broadcast_runtime_audio_pipewire_original = false;
+        let mut next_arg_is_broadcast_runtime_audio_pipewire_proxy = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_pipewire_audio_segment_playback_path {
+            if next_arg_is_broadcast_runtime_audio_pipewire_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = broadcast_runtime_audio_pipewire_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                broadcast_runtime_audio_pipewire_paths = Some((original, proxy));
+                next_arg_is_broadcast_runtime_audio_pipewire_proxy = false;
+            } else if next_arg_is_broadcast_runtime_audio_pipewire_original {
+                broadcast_runtime_audio_pipewire_original = Some(PathBuf::from(arg));
+                next_arg_is_broadcast_runtime_audio_pipewire_original = false;
+                next_arg_is_broadcast_runtime_audio_pipewire_proxy = true;
+            } else if next_arg_is_pipewire_audio_segment_playback_path {
                 pipewire_audio_segment_playback_path = Some(PathBuf::from(arg));
                 next_arg_is_pipewire_audio_segment_playback_path = false;
             } else if next_arg_is_pipewire_audio_audible_smoke_test_path {
@@ -10436,6 +10840,8 @@ impl Args {
                 next_arg_is_pipewire_audio_audible_smoke_test_path = true;
             } else if arg == PIPEWIRE_AUDIO_SEGMENT_PLAYBACK_ARG {
                 next_arg_is_pipewire_audio_segment_playback_path = true;
+            } else if arg == BROADCAST_RUNTIME_AUDIO_PIPEWIRE_ARG {
+                next_arg_is_broadcast_runtime_audio_pipewire_original = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -10473,6 +10879,7 @@ impl Args {
             pipewire_audio_native_prototype_path,
             pipewire_audio_audible_smoke_test_path,
             pipewire_audio_segment_playback_path,
+            broadcast_runtime_audio_pipewire_paths,
         }
     }
 }
@@ -10481,13 +10888,17 @@ impl Args {
 mod tests {
     use super::{
         audible_smoke_evidence_label, build_pipewire_f32_interleaved_prototype_buffer,
+        build_runtime_audio_payload_pipewire_buffer,
         build_sequential_original_audio_segment_for_duration, mxf_file_label,
         original_segment_evidence_label, parse_manual_audible_confirmation,
         pcm_s24le_sample_to_f32, proxy_presentation_ordinals, repeated_smoke_test_buffers,
-        selected_proxy_ordinals, smoke_test_buffer_count, ManualAudibleConfirmation,
-        SonyXmlSummary,
+        runtime_audio_payload_evidence_label, selected_proxy_ordinals, smoke_test_buffer_count,
+        ManualAudibleConfirmation, SonyXmlSummary,
     };
-    use qgs_media_runtime::{PcmAudioBlock, PcmAudioBlockLayout, PcmEndian, PcmSampleFormat};
+    use qgs_media_runtime::{
+        av_frame_audio_range, bind_broadcast_audio_payload, BroadcastPreparedAudioSlot,
+        BroadcastVideoSourceMode, PcmAudioBlock, PcmAudioBlockLayout, PcmEndian, PcmSampleFormat,
+    };
     use qgs_mp4::{Mp4VideoSample, Mp4VideoTrack, Rational};
     use std::path::PathBuf;
     use std::time::Duration;
@@ -10716,6 +11127,71 @@ mod tests {
         assert_eq!(
             original_segment_evidence_label(true, true, ManualAudibleConfirmation::Yes),
             "ManualOriginalSegmentAudibleConfirmed"
+        );
+    }
+
+    #[test]
+    fn runtime_audio_payload_pipewire_buffer_uses_prepared_binding_geometry() {
+        let mut blocks = Vec::new();
+        for block_index in 0..2 {
+            for channel in 0..4 {
+                let byte = u8::try_from(1 + block_index * 4 + channel).unwrap();
+                let samples = [[byte, 0x00, 0x00]; 960];
+                blocks.push(mono_block_at(
+                    10 + u32::from(channel),
+                    channel,
+                    u64::from(block_index) * 960,
+                    &samples,
+                ));
+            }
+        }
+        let range = av_frame_audio_range(
+            0,
+            Duration::ZERO,
+            Duration::from_millis(40),
+            48_000,
+            &blocks,
+            4,
+        )
+        .unwrap();
+        let slot = BroadcastPreparedAudioSlot::from_audio_range(
+            0,
+            BroadcastVideoSourceMode::ProxyPreview,
+            &range,
+        );
+        let binding = bind_broadcast_audio_payload(&slot, &blocks).unwrap();
+
+        let buffer = build_runtime_audio_payload_pipewire_buffer(&binding, &blocks).unwrap();
+
+        assert_eq!(binding.sample_count, 1_920);
+        assert_eq!(binding.block_coverage.len(), 8);
+        assert_eq!(binding.total_referenced_payload_bytes, 23_040);
+        assert_eq!(buffer.source_blocks_per_track, 2);
+        assert_eq!(buffer.source_blocks_total, 8);
+        assert_eq!(buffer.source_bytes, 23_040);
+        assert_eq!(buffer.output_frames, 1_920);
+        assert_eq!(buffer.track_count, 4);
+        assert_eq!(buffer.output_bytes.len(), 30_720);
+        assert!(buffer.output_bytes.iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn runtime_audio_payload_evidence_stays_scoped() {
+        assert_eq!(
+            runtime_audio_payload_evidence_label(true, true, ManualAudibleConfirmation::Required),
+            "RuntimeAudioPayloadDrainCompleted"
+        );
+        assert_eq!(
+            runtime_audio_payload_evidence_label(true, false, ManualAudibleConfirmation::Required),
+            "RuntimeAudioPayloadSubmittedToPipeWire"
+        );
+        assert_eq!(
+            runtime_audio_payload_evidence_label(true, true, ManualAudibleConfirmation::No),
+            "RuntimeAudioPayloadNotHeard"
+        );
+        assert_eq!(
+            runtime_audio_payload_evidence_label(true, true, ManualAudibleConfirmation::Yes),
+            "RuntimeAudioPayloadAudibleConfirmed"
         );
     }
 

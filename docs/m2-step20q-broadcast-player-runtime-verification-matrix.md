@@ -22,6 +22,14 @@ and what remains unimplemented.
 - `NativePostSubmitEvidence`: a native device boundary accepted a tiny bounded
   payload and provided bounded post-submit evidence such as a drain callback,
   without claiming audible/visible output.
+- `RuntimeAudioPayloadDrainCompleted`: a prepared Broadcast Player Runtime
+  original-audio payload binding was submitted to native PipeWire and drained;
+  this is below full audio-device verification.
+- `RuntimeAudioPayloadAudibleConfirmed`: a human confirmed hearing a prepared
+  Broadcast Player Runtime original-audio payload through the native PipeWire
+  boundary; this is still narrower than full Broadcast Player playback,
+  realtime playback, A/V sync, channel certification, or full audio-device
+  verification.
 - `ManualAudibleSmokeTestConfirmed`: a human confirmed hearing a bounded
   original-audio-derived native audio smoke test; this is narrower than full
   audio-device verification.
@@ -63,6 +71,7 @@ For Sony FX6 sample 002:
 | native PipeWire buffer submission | `NativePostSubmitEvidence` | A 20 ms original-audio-derived f32 buffer was queued to a native PipeWire stream and a drain callback was observed; audible output and full playback are not claimed. |
 | native PipeWire audible smoke test | `ManualAudibleSmokeTestConfirmed` | Human-confirmed bounded original-audio-derived PipeWire smoke test; not full playback, realtime playback, A/V sync, channel certification, or full audio-device verification. |
 | native PipeWire original-audio segment playback | `ManualOriginalSegmentAudibleConfirmed` | Human-confirmed bounded sequential original MXF audio segment; not full playback, realtime playback, A/V sync, channel certification, or full audio-device verification. |
+| broadcast runtime audio payload to PipeWire | `RuntimeAudioPayloadDrainCompleted` | First prepared `ProxyPreview` Broadcast Player Runtime original-audio payload binding submits to native PipeWire and drains; not full playback, realtime playback, A/V sync, channel certification, or full audio-device verification. |
 | simulated playback loop | `TestBoundaryEvidence` | Prepared slots flow through test audio/video boundaries deterministically. |
 | real speaker output | `NotImplemented` | No audible speaker output, audio-device clock, or full audio playback path exists; native PipeWire buffer submission is tracked separately. |
 | real display output | `NotImplemented` | No swapchain, Wayland, X11, DRM/KMS, or real display presenter exists. |
@@ -81,6 +90,9 @@ The matrix intentionally does not overstate these areas:
   is not realtime/full Broadcast Player playback, A/V sync, channel
   certification, or full `AudioDeviceVerified`.
 - Bounded original-audio segment playback confirmation is not full playback,
+  realtime playback, A/V sync, channel certification, or full
+  `AudioDeviceVerified`.
+- Runtime-prepared audio payload submission/drain evidence is not full playback,
   realtime playback, A/V sync, channel certification, or full
   `AudioDeviceVerified`.
 - Haswell CPU-bridge 1080p50 is not marked realtime verified.

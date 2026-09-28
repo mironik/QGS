@@ -569,6 +569,8 @@ pub enum BroadcastRuntimeVerificationLevel {
     TestBoundaryEvidence,
     NativeBufferSubmissionVerified,
     NativePostSubmitEvidence,
+    RuntimeAudioPayloadDrainCompleted,
+    RuntimeAudioPayloadAudibleConfirmed,
     VisualVerified,
     AudioDeviceVerified,
     RealtimeVerified,
@@ -587,6 +589,8 @@ impl BroadcastRuntimeVerificationLevel {
             Self::TestBoundaryEvidence => "TestBoundaryEvidence",
             Self::NativeBufferSubmissionVerified => "NativeBufferSubmissionVerified",
             Self::NativePostSubmitEvidence => "NativePostSubmitEvidence",
+            Self::RuntimeAudioPayloadDrainCompleted => "RuntimeAudioPayloadDrainCompleted",
+            Self::RuntimeAudioPayloadAudibleConfirmed => "RuntimeAudioPayloadAudibleConfirmed",
             Self::VisualVerified => "VisualVerified",
             Self::AudioDeviceVerified => "AudioDeviceVerified",
             Self::RealtimeVerified => "RealtimeVerified",
@@ -617,6 +621,7 @@ pub enum BroadcastRuntimeVerifiedSubsystem {
     NativePipeWireBufferSubmission,
     NativePipeWireAudibleSmokeTest,
     NativePipeWireOriginalAudioSegmentPlayback,
+    BroadcastRuntimeAudioPayloadPipeWire,
     SimulatedPlaybackLoop,
     RealSpeakerOutput,
     RealDisplayOutput,
@@ -648,6 +653,9 @@ impl BroadcastRuntimeVerifiedSubsystem {
             Self::NativePipeWireAudibleSmokeTest => "native PipeWire audible smoke test",
             Self::NativePipeWireOriginalAudioSegmentPlayback => {
                 "native PipeWire original-audio segment playback"
+            }
+            Self::BroadcastRuntimeAudioPayloadPipeWire => {
+                "broadcast runtime audio payload to PipeWire"
             }
             Self::SimulatedPlaybackLoop => "simulated playback loop",
             Self::RealSpeakerOutput => "real speaker output",
@@ -775,6 +783,11 @@ impl BroadcastRuntimeVerificationMatrix {
                     subsystem: Subsystem::NativePipeWireOriginalAudioSegmentPlayback,
                     level: Level::NativePostSubmitEvidence,
                     summary: "bounded sequential original-audio segment submits/drains; manual original-segment confirmation remains separate",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::BroadcastRuntimeAudioPayloadPipeWire,
+                    level: Level::RuntimeAudioPayloadDrainCompleted,
+                    summary: "first prepared ProxyPreview Broadcast Player Runtime audio payload binding submits to native PipeWire and drains; not full playback, realtime, A/V sync, or full audio-device verification",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::SimulatedPlaybackLoop,
@@ -4203,6 +4216,14 @@ mod tests {
             BroadcastRuntimeVerificationLevel::NativePostSubmitEvidence
                 < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
         );
+        assert!(
+            BroadcastRuntimeVerificationLevel::RuntimeAudioPayloadDrainCompleted
+                < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::RuntimeAudioPayloadAudibleConfirmed
+                < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
     }
 
     #[test]
@@ -4291,6 +4312,13 @@ mod tests {
                 .entry(
                     BroadcastRuntimeVerifiedSubsystem::NativePipeWireOriginalAudioSegmentPlayback
                 )
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
+        assert_ne!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::BroadcastRuntimeAudioPayloadPipeWire)
                 .unwrap()
                 .level,
             BroadcastRuntimeVerificationLevel::AudioDeviceVerified
