@@ -102,11 +102,21 @@ Observed local command:
 cargo run -q -p qgs-test -- --pipewire-audio-audible-smoke-test "/home/miro/QGS-media-tests/sony-fx6/sample-002/Mironik 1560.MXF"
 ```
 
-Observed local noninteractive result:
+Observed local manual result:
 
 - audio source: original MXF
 - proxy AAC: not used
+- generated tone primary evidence: no
+- full playback: no
+- realtime Broadcast Player playback: no
+- A/V sync: no
+- routing: track 1 -> FL, track 2 -> FR, track 3 -> RL, track 4 -> RR
 - stream configured: yes
+- observed stream states: `Connecting`, `Paused`, `Streaming`
+- final stream state: `Streaming`
+- process callback reached: yes
+- smoke-test source range per buffer: 960 samples per track
+- smoke-test duration: 500.000 ms
 - buffers planned: 25
 - buffers submitted: 25
 - samples submitted per track: 24,000
@@ -116,19 +126,22 @@ Observed local noninteractive result:
 - drain requested: yes
 - drain completed: yes
 - PipeWire evidence level: `DrainCompleted`
-- manual confirmation status: `ManualAudibleConfirmationRequired`
-- smoke-test evidence level: `ManualAudibleConfirmationRequired`
+- manual confirmation answer: yes
+- manual confirmation status: `ManualAudibleSmokeTestConfirmed`
+- smoke-test evidence level: `ManualAudibleSmokeTestConfirmed`
 - `AudioDeviceVerified`: no
-- audible output claimed: no
+- `AudioDeviceVerified` scope: not upgraded by smoke test
+- audible output claimed: yes
 
 ## Verification Matrix
 
 Step 20Q now includes a separate `native PipeWire audible smoke test` row. Its
-current evidence remains `NativePostSubmitEvidence` because the noninteractive
-run submitted and drained buffers but did not receive manual audible
-confirmation.
+current evidence is `ManualAudibleSmokeTestConfirmed`: a human confirmed hearing
+the bounded original-audio-derived PipeWire smoke test.
 
-Real speaker output and full `AudioDeviceVerified` remain separate.
+This remains separate from full Broadcast Player playback, realtime playback,
+A/V sync, full `AudioDeviceVerified`, channel certification, and speaker
+calibration.
 
 ## Not Implemented
 
