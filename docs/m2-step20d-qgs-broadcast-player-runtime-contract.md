@@ -109,7 +109,7 @@ Audio source: original MXF
 Video source: proxy MP4
 Proxy AAC: not used
 Preview profile: journalist-50i-preview
-Clock policy: future QGS Broadcast Player Runtime/device backend policy; QNC apps observe/control through session and transport commands.
+Clock policy: future QGS Broadcast Player Runtime/device backend policy; QNC applications observe and control it through session and transport commands.
 Contract owner: QGS backend-neutral Broadcast Player Runtime
 Proxy video: 1920x1080 H.264 High 8-bit Cs420 source_frames=106 selected_preview_frames=53
 Original audio: tracks=4 sample_rate=48000Hz blocks=424 duration=2.120s
