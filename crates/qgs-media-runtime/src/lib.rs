@@ -558,6 +558,265 @@ pub enum BroadcastPlayerRuntimeFailureReason {
     CapabilityMissing,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum BroadcastRuntimeVerificationLevel {
+    NotImplemented,
+    CompileChecked,
+    UnitTested,
+    MediaInspected,
+    PayloadExtracted,
+    PayloadBound,
+    TestBoundaryEvidence,
+    VisualVerified,
+    AudioDeviceVerified,
+    RealtimeVerified,
+    HardwareValidated,
+}
+
+impl BroadcastRuntimeVerificationLevel {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NotImplemented => "NotImplemented",
+            Self::CompileChecked => "CompileChecked",
+            Self::UnitTested => "UnitTested",
+            Self::MediaInspected => "MediaInspected",
+            Self::PayloadExtracted => "PayloadExtracted",
+            Self::PayloadBound => "PayloadBound",
+            Self::TestBoundaryEvidence => "TestBoundaryEvidence",
+            Self::VisualVerified => "VisualVerified",
+            Self::AudioDeviceVerified => "AudioDeviceVerified",
+            Self::RealtimeVerified => "RealtimeVerified",
+            Self::HardwareValidated => "HardwareValidated",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastRuntimeVerifiedSubsystem {
+    OriginalProxyAssociation,
+    ProxyMp4Inspection,
+    OriginalMxfInspection,
+    ProxyH264HardwareDecode,
+    OriginalH264SoftwareDecode,
+    OriginalMxfPcmMetadata,
+    OriginalMxfPcmExtraction,
+    PcmRuntimeBlocks,
+    ProxyVideoPayloadBinding,
+    OriginalVideoPayloadBinding,
+    StateMachine,
+    PrerollPlan,
+    PreparedSlots,
+    EventSurface,
+    DeviceBoundaryContract,
+    TestVideoPresenterEvidence,
+    TestAudioSinkEvidence,
+    SimulatedPlaybackLoop,
+    RealSpeakerOutput,
+    RealDisplayOutput,
+    RealtimePlayback,
+    ModernHardwareZeroCopy,
+}
+
+impl BroadcastRuntimeVerifiedSubsystem {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::OriginalProxyAssociation => "original/proxy association",
+            Self::ProxyMp4Inspection => "proxy MP4 inspection",
+            Self::OriginalMxfInspection => "original MXF inspection",
+            Self::ProxyH264HardwareDecode => "proxy H.264 hardware decode",
+            Self::OriginalH264SoftwareDecode => "original H.264 10-bit 4:2:2 software decode",
+            Self::OriginalMxfPcmMetadata => "original MXF PCM metadata",
+            Self::OriginalMxfPcmExtraction => "original MXF PCM extraction",
+            Self::PcmRuntimeBlocks => "PCM runtime blocks",
+            Self::ProxyVideoPayloadBinding => "proxy video payload binding",
+            Self::OriginalVideoPayloadBinding => "original video payload binding",
+            Self::StateMachine => "Broadcast Player Runtime state machine",
+            Self::PrerollPlan => "preroll plan",
+            Self::PreparedSlots => "prepared slots",
+            Self::EventSurface => "event surface",
+            Self::DeviceBoundaryContract => "device boundary contract",
+            Self::TestVideoPresenterEvidence => "test video presenter evidence",
+            Self::TestAudioSinkEvidence => "test audio sink evidence",
+            Self::SimulatedPlaybackLoop => "simulated playback loop",
+            Self::RealSpeakerOutput => "real speaker output",
+            Self::RealDisplayOutput => "real display output",
+            Self::RealtimePlayback => "realtime playback",
+            Self::ModernHardwareZeroCopy => "modern-hardware zero-copy",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BroadcastRuntimeVerificationEntry {
+    pub subsystem: BroadcastRuntimeVerifiedSubsystem,
+    pub level: BroadcastRuntimeVerificationLevel,
+    pub summary: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastRuntimeVerificationMatrix {
+    pub entries: Vec<BroadcastRuntimeVerificationEntry>,
+}
+
+impl BroadcastRuntimeVerificationMatrix {
+    pub fn sony_fx6_sample_002_current() -> Self {
+        use BroadcastRuntimeVerificationLevel as Level;
+        use BroadcastRuntimeVerifiedSubsystem as Subsystem;
+        Self {
+            entries: vec![
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::OriginalProxyAssociation,
+                    level: Level::MediaInspected,
+                    summary: "original/proxy timing and metadata association proven for sample 002",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::ProxyMp4Inspection,
+                    level: Level::MediaInspected,
+                    summary: "proxy MP4 container, H.264 video, timing, and tracks inspected",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::OriginalMxfInspection,
+                    level: Level::MediaInspected,
+                    summary: "original MXF structure, essence descriptors, video, audio, and timing inspected",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::ProxyH264HardwareDecode,
+                    level: Level::HardwareValidated,
+                    summary: "proxy H.264 VA decode proved for 106/106 frames after Step 15",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::OriginalH264SoftwareDecode,
+                    level: Level::PayloadExtracted,
+                    summary: "original 10-bit 4:2:2 H.264 access units decode to QGS software surfaces",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::OriginalMxfPcmMetadata,
+                    level: Level::MediaInspected,
+                    summary: "original MXF authoritative LPCM metadata modeled",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::OriginalMxfPcmExtraction,
+                    level: Level::PayloadExtracted,
+                    summary: "original MXF LPCM payload packets extracted without synthesis",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::PcmRuntimeBlocks,
+                    level: Level::PayloadBound,
+                    summary: "PCM packets converted to runtime mono-track blocks with timing",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::ProxyVideoPayloadBinding,
+                    level: Level::TestBoundaryEvidence,
+                    summary: "proxy processed GPU frame payloads bind and pass test presenter evidence",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::OriginalVideoPayloadBinding,
+                    level: Level::PayloadBound,
+                    summary: "bounded original MXF processed GPU frame payloads bind; realtime not claimed",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::StateMachine,
+                    level: Level::UnitTested,
+                    summary: "state transitions and invalid transitions covered by unit tests",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::PrerollPlan,
+                    level: Level::UnitTested,
+                    summary: "bounded preroll readiness and not-ready cases covered",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::PreparedSlots,
+                    level: Level::UnitTested,
+                    summary: "finite prepared audio/video/presentation slots modeled",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::EventSurface,
+                    level: Level::UnitTested,
+                    summary: "deterministic backend-neutral event accounting covered",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::DeviceBoundaryContract,
+                    level: Level::UnitTested,
+                    summary: "PayloadReady and DevicePayloadReady distinction covered",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::TestVideoPresenterEvidence,
+                    level: Level::TestBoundaryEvidence,
+                    summary: "test presenter evidence gates FramePresented; not real display output",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::TestAudioSinkEvidence,
+                    level: Level::TestBoundaryEvidence,
+                    summary: "test audio sink evidence accepts original PCM; not real speaker output",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::SimulatedPlaybackLoop,
+                    level: Level::TestBoundaryEvidence,
+                    summary: "deterministic simulation consumes prepared slots through test boundaries",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::RealSpeakerOutput,
+                    level: Level::NotImplemented,
+                    summary: "no ALSA/Pulse/PipeWire or real audio device output exists",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::RealDisplayOutput,
+                    level: Level::NotImplemented,
+                    summary: "no swapchain/Wayland/X11/DRM/KMS display presenter exists",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::RealtimePlayback,
+                    level: Level::NotImplemented,
+                    summary: "Broadcast Player realtime scheduler has not been implemented or accepted",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::ModernHardwareZeroCopy,
+                    level: Level::NotImplemented,
+                    summary: "VA/Vulkan zero-copy remains frozen and not verified on modern hardware",
+                },
+            ],
+        }
+    }
+
+    pub fn entry(
+        &self,
+        subsystem: BroadcastRuntimeVerifiedSubsystem,
+    ) -> Option<&BroadcastRuntimeVerificationEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.subsystem == subsystem)
+    }
+
+    pub fn validate_truth_rules(&self) -> Result<(), PlaybackError> {
+        use BroadcastRuntimeVerificationLevel as Level;
+        use BroadcastRuntimeVerifiedSubsystem as Subsystem;
+        let level = |subsystem| {
+            self.entry(subsystem)
+                .map(|entry| entry.level)
+                .ok_or(PlaybackError::InvalidRuntimeTransition)
+        };
+        if level(Subsystem::RealDisplayOutput)? != Level::NotImplemented {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        if level(Subsystem::RealSpeakerOutput)? != Level::NotImplemented {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        if level(Subsystem::RealtimePlayback)? == Level::RealtimeVerified {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        if level(Subsystem::ModernHardwareZeroCopy)? != Level::NotImplemented {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        if level(Subsystem::TestVideoPresenterEvidence)? > Level::TestBoundaryEvidence {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        if level(Subsystem::TestAudioSinkEvidence)? > Level::TestBoundaryEvidence {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BroadcastPlayerRuntimeEvent {
     SessionCreated {
@@ -3896,6 +4155,80 @@ mod tests {
         assert_eq!(
             bind_broadcast_video_payload_ready(original_video, payload),
             Err(PlaybackError::InvalidRuntimeTransition)
+        );
+    }
+
+    #[test]
+    fn verification_matrix_orders_evidence_levels() {
+        assert!(
+            BroadcastRuntimeVerificationLevel::PayloadBound
+                > BroadcastRuntimeVerificationLevel::PayloadExtracted
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::TestBoundaryEvidence
+                < BroadcastRuntimeVerificationLevel::VisualVerified
+        );
+    }
+
+    #[test]
+    fn verification_matrix_keeps_real_outputs_not_implemented() {
+        let matrix = BroadcastRuntimeVerificationMatrix::sony_fx6_sample_002_current();
+        matrix.validate_truth_rules().unwrap();
+
+        assert_eq!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::RealDisplayOutput)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::NotImplemented
+        );
+        assert_eq!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::RealSpeakerOutput)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::NotImplemented
+        );
+        assert_eq!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::RealtimePlayback)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::NotImplemented
+        );
+    }
+
+    #[test]
+    fn verification_matrix_does_not_treat_test_evidence_as_real_output() {
+        let matrix = BroadcastRuntimeVerificationMatrix::sony_fx6_sample_002_current();
+
+        assert_eq!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::TestVideoPresenterEvidence)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::TestBoundaryEvidence
+        );
+        assert_eq!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::TestAudioSinkEvidence)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::TestBoundaryEvidence
+        );
+        assert_ne!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::TestVideoPresenterEvidence)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::VisualVerified
+        );
+        assert_ne!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::TestAudioSinkEvidence)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::AudioDeviceVerified
         );
     }
 

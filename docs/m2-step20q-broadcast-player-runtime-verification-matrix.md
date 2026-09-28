@@ -1,0 +1,92 @@
+# M2 Step 20Q — QGS Broadcast Player Runtime Acceptance Verification Matrix
+
+Step 20Q adds an explicit verification matrix for the QGS Broadcast Player
+Runtime work completed through Step 20O.
+
+This is not a new media feature. It is a truthfulness milestone: the matrix
+states what is actually proven, what is only modeled or test-boundary verified,
+and what remains unimplemented.
+
+## Evidence Levels
+
+- `NotImplemented`: no runtime implementation exists.
+- `CompileChecked`: code builds, but no stronger evidence is claimed.
+- `UnitTested`: behavior is covered by hardware-independent tests.
+- `MediaInspected`: real media was parsed or inspected.
+- `PayloadExtracted`: real media payload bytes/access units were extracted.
+- `PayloadBound`: runtime slots bind to concrete backend payload references.
+- `TestBoundaryEvidence`: a test-only sink/presenter accepted payloads and
+  returned explicit evidence.
+- `VisualVerified`: visual/image correctness was verified by comparison or
+  display evidence.
+- `AudioDeviceVerified`: a real audio device path was verified.
+- `RealtimeVerified`: timed realtime acceptance with margin was verified.
+- `HardwareValidated`: hardware path was validated for the stated subsystem.
+
+Test-boundary evidence is deliberately below real visual/audio-device
+verification.
+
+## Current Matrix
+
+For Sony FX6 sample 002:
+
+| Subsystem | Evidence Level | Current Evidence |
+| --- | --- | --- |
+| original/proxy association | `MediaInspected` | Original/proxy timing and metadata association proved for sample 002. |
+| proxy MP4 inspection | `MediaInspected` | Proxy MP4 container, H.264 video, timing, and tracks inspected. |
+| original MXF inspection | `MediaInspected` | Original MXF structure, essence descriptors, video, audio, and timing inspected. |
+| proxy H.264 hardware decode | `HardwareValidated` | Proxy H.264 VA decode proved for 106/106 frames after Step 15. |
+| original H.264 10-bit 4:2:2 software decode | `PayloadExtracted` | Original access units decode to QGS software video surfaces. |
+| original MXF PCM metadata | `MediaInspected` | Authoritative original MXF LPCM metadata modeled. |
+| original MXF PCM extraction | `PayloadExtracted` | Original MXF LPCM packets extracted without synthesis. |
+| PCM runtime blocks | `PayloadBound` | PCM packets converted to runtime mono-track blocks with timing. |
+| proxy video payload binding | `TestBoundaryEvidence` | Processed proxy GPU frame payloads bind and pass test presenter evidence. |
+| original video payload binding | `PayloadBound` | Bounded original MXF processed GPU frame payloads bind; realtime is not claimed. |
+| Broadcast Player Runtime state machine | `UnitTested` | State transitions and invalid transitions are covered by tests. |
+| preroll plan | `UnitTested` | Bounded ready/not-ready behavior is covered. |
+| prepared slots | `UnitTested` | Finite prepared audio/video/presentation slot behavior is covered. |
+| event surface | `UnitTested` | Deterministic backend-neutral runtime event accounting is covered. |
+| device boundary contract | `UnitTested` | `PayloadReady` and `DevicePayloadReady` remain distinct. |
+| test video presenter evidence | `TestBoundaryEvidence` | Test presenter evidence gates `FramePresented`; this is not real display output. |
+| test audio sink evidence | `TestBoundaryEvidence` | Test audio sink evidence accepts original PCM; this is not real speaker output. |
+| simulated playback loop | `TestBoundaryEvidence` | Prepared slots flow through test audio/video boundaries deterministically. |
+| real speaker output | `NotImplemented` | No ALSA, PulseAudio, PipeWire, or real audio device output exists. |
+| real display output | `NotImplemented` | No swapchain, Wayland, X11, DRM/KMS, or real display presenter exists. |
+| realtime playback | `NotImplemented` | Broadcast Player realtime scheduler has not been implemented or accepted. |
+| modern-hardware zero-copy | `NotImplemented` | VA/Vulkan zero-copy remains frozen and not verified on modern hardware. |
+
+## Truth Rules
+
+The matrix intentionally does not overstate these areas:
+
+- Test presenter evidence is not real display output.
+- Test audio sink evidence is not real speaker output.
+- Haswell CPU-bridge 1080p50 is not marked realtime verified.
+- Modern-hardware zero-copy is not marked verified.
+- `FramePresented` from the current test presenter remains test evidence, not
+  user-visible display presentation.
+
+## QGS-Test Command
+
+The verification matrix can be printed with:
+
+```bash
+cargo run -q -p qgs-test -- --broadcast-player-runtime-verification <original-mxf> <proxy-mp4>
+```
+
+The command parses the supplied media enough to report the media-backed context,
+then prints the canonical current evidence matrix and validates the truth rules.
+
+## Remaining Unverified Work
+
+The major remaining runtime upgrades are:
+
+- real audio device output and device-clock evidence
+- real display/presenter output and presentation evidence
+- realtime Broadcast Player scheduler
+- realtime acceptance with margin
+- modern-hardware VA/Vulkan zero-copy validation
+- production policy for choosing `ProxyPreview` vs `OriginalMedia`
+
+Future milestones should upgrade evidence levels only when they produce the
+corresponding proof.

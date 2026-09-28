@@ -28,13 +28,14 @@ use qgs_media_runtime::{
     BroadcastPreparedVideoSlotStatus, BroadcastPrerollConfig, BroadcastPrerollPlan,
     BroadcastPreviewProfile, BroadcastRuntimeCapabilities, BroadcastRuntimePrepareFacts,
     BroadcastRuntimeQueueLimits, BroadcastRuntimeSessionDescription, BroadcastRuntimeStateMachine,
-    BroadcastTestAudioSink, BroadcastTestAudioSinkConfig, BroadcastTestVideoPresenter,
-    BroadcastTestVideoPresenterConfig, BroadcastVideoPayloadBackendPath,
-    BroadcastVideoPayloadBindingStatus, BroadcastVideoPayloadFormat, BroadcastVideoPayloadKind,
-    BroadcastVideoPayloadReference, BroadcastVideoSourceMode,
-    FrameIdentity as PlaybackFrameIdentity, OriginalAudioTrack, PcmAudioBlock, PcmAudioBlockLayout,
-    PcmAudioPacket, PcmEndian, PcmSampleFormat, PlaybackClock, PlaybackConfig, PlaybackState,
-    PresentationDecision, RationalRate, RealTimeClock, TestAudioSink, TestPresentationSink,
+    BroadcastRuntimeVerificationMatrix, BroadcastTestAudioSink, BroadcastTestAudioSinkConfig,
+    BroadcastTestVideoPresenter, BroadcastTestVideoPresenterConfig,
+    BroadcastVideoPayloadBackendPath, BroadcastVideoPayloadBindingStatus,
+    BroadcastVideoPayloadFormat, BroadcastVideoPayloadKind, BroadcastVideoPayloadReference,
+    BroadcastVideoSourceMode, FrameIdentity as PlaybackFrameIdentity, OriginalAudioTrack,
+    PcmAudioBlock, PcmAudioBlockLayout, PcmAudioPacket, PcmEndian, PcmSampleFormat, PlaybackClock,
+    PlaybackConfig, PlaybackState, PresentationDecision, RationalRate, RealTimeClock,
+    TestAudioSink, TestPresentationSink,
 };
 use qgs_mp4::{
     classify_video_track, nearest_random_access_before, MediaHealth, Mp4Source, Mp4TrackKind,
@@ -96,6 +97,7 @@ const BROADCAST_PLAYER_RUNTIME_TEST_AUDIO_SINK_ARG: &str =
 const BROADCAST_PLAYER_RUNTIME_SIMULATE_ARG: &str = "--broadcast-player-runtime-simulate";
 const BROADCAST_PLAYER_RUNTIME_ORIGINAL_VIDEO_PAYLOADS_ARG: &str =
     "--broadcast-player-runtime-original-video-payloads";
+const BROADCAST_PLAYER_RUNTIME_VERIFICATION_ARG: &str = "--broadcast-player-runtime-verification";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -209,6 +211,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &proxy,
             BroadcastRuntimeReportFocus::OriginalVideoPayloads,
         );
+    }
+    if let Some((original, proxy)) = args.broadcast_player_runtime_verification_paths {
+        return broadcast_player_runtime_verification(&original, &proxy);
     }
 
     let socket_path = args.socket_path;
@@ -2504,6 +2509,65 @@ fn broadcast_runtime_preroll(
         "Play from Ready succeeds: {}",
         yes_no(play_from_ready_succeeds)
     );
+
+    Ok(())
+}
+
+fn broadcast_player_runtime_verification(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let original_bytes = std::fs::read(original_path)?;
+    let original = MediaSource::parse(&original_bytes)?;
+    let proxy = Mp4Source::open(proxy_path)?;
+    let proxy_video = proxy
+        .video
+        .as_ref()
+        .ok_or("proxy has no H.264 video track")?;
+    let proxy_h264 = classify_video_track(proxy_video)?;
+    let audio_tracks = original
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Audio)
+        .count();
+    let matrix = BroadcastRuntimeVerificationMatrix::sony_fx6_sample_002_current();
+    matrix.validate_truth_rules()?;
+
+    println!("QGS Broadcast Player Runtime Acceptance Verification Matrix");
+    println!("-----------------------------------------------------------");
+    println!("This is a truthfulness/validation report, not a new media feature.");
+    println!("Audio source rule: original MXF is authoritative");
+    println!("Proxy AAC: not authoritative / not used as primary audio");
+    println!("Proxy video role: responsive ProxyPreview source");
+    println!("Original video role: OriginalMedia source; realtime support not claimed");
+    println!(
+        "Media inspected: proxy_video_frames={} proxy={}x{} coded={}x{} original_audio_tracks={} original_video_index_entries={}",
+        proxy_video.samples.len(),
+        proxy_h264.width,
+        proxy_h264.height,
+        proxy_h264.coded_width,
+        proxy_h264.coded_height,
+        audio_tracks,
+        original.index.video.len()
+    );
+    println!();
+    println!("{:<48} | {:<24} | Evidence", "Subsystem", "Level");
+    println!("{:-<48}-+-{:-<24}-+-{:-<1}", "", "", "");
+    for entry in &matrix.entries {
+        println!(
+            "{:<48} | {:<24} | {}",
+            entry.subsystem.label(),
+            entry.level.label(),
+            entry.summary
+        );
+    }
+    println!();
+    println!("Truth rules:");
+    println!("  Test video presenter evidence is not real display output");
+    println!("  Test audio sink evidence is not real speaker output");
+    println!("  Haswell CPU-bridge 50p is not marked realtime verified");
+    println!("  Modern-hardware zero-copy remains frozen/not verified");
+    println!("  Matrix truth-rule validation: passed");
 
     Ok(())
 }
@@ -8846,6 +8910,7 @@ struct Args {
     broadcast_player_runtime_test_audio_sink_paths: Option<(PathBuf, PathBuf)>,
     broadcast_player_runtime_simulate_paths: Option<(PathBuf, PathBuf)>,
     broadcast_player_runtime_original_video_payloads_paths: Option<(PathBuf, PathBuf)>,
+    broadcast_player_runtime_verification_paths: Option<(PathBuf, PathBuf)>,
 }
 
 impl Args {
@@ -8894,6 +8959,8 @@ impl Args {
         let mut broadcast_player_runtime_simulate_paths = None;
         let mut broadcast_player_runtime_original_video_payloads_original = None;
         let mut broadcast_player_runtime_original_video_payloads_paths = None;
+        let mut broadcast_player_runtime_verification_original = None;
+        let mut broadcast_player_runtime_verification_paths = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
@@ -8928,9 +8995,22 @@ impl Args {
         let mut next_arg_is_broadcast_player_runtime_simulate_proxy = false;
         let mut next_arg_is_broadcast_player_runtime_original_video_payloads_original = false;
         let mut next_arg_is_broadcast_player_runtime_original_video_payloads_proxy = false;
+        let mut next_arg_is_broadcast_player_runtime_verification_original = false;
+        let mut next_arg_is_broadcast_player_runtime_verification_proxy = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_broadcast_player_runtime_original_video_payloads_proxy {
+            if next_arg_is_broadcast_player_runtime_verification_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = broadcast_player_runtime_verification_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                broadcast_player_runtime_verification_paths = Some((original, proxy));
+                next_arg_is_broadcast_player_runtime_verification_proxy = false;
+            } else if next_arg_is_broadcast_player_runtime_verification_original {
+                broadcast_player_runtime_verification_original = Some(PathBuf::from(arg));
+                next_arg_is_broadcast_player_runtime_verification_original = false;
+                next_arg_is_broadcast_player_runtime_verification_proxy = true;
+            } else if next_arg_is_broadcast_player_runtime_original_video_payloads_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = broadcast_player_runtime_original_video_payloads_original
                     .take()
@@ -9172,6 +9252,8 @@ impl Args {
                 next_arg_is_broadcast_player_runtime_simulate_original = true;
             } else if arg == BROADCAST_PLAYER_RUNTIME_ORIGINAL_VIDEO_PAYLOADS_ARG {
                 next_arg_is_broadcast_player_runtime_original_video_payloads_original = true;
+            } else if arg == BROADCAST_PLAYER_RUNTIME_VERIFICATION_ARG {
+                next_arg_is_broadcast_player_runtime_verification_original = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -9203,6 +9285,7 @@ impl Args {
             broadcast_player_runtime_test_audio_sink_paths,
             broadcast_player_runtime_simulate_paths,
             broadcast_player_runtime_original_video_payloads_paths,
+            broadcast_player_runtime_verification_paths,
         }
     }
 }
