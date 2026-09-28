@@ -19,12 +19,12 @@ use qgs_media_runtime::{
     build_broadcast_player_event_surface, build_broadcast_video_presenter_submission,
     classify_presentation, duration_abs_delta, duration_from_audio_samples,
     evaluate_broadcast_preroll, max_video_timestamp_outside_audio_range,
-    summarize_broadcast_device_boundary, summarize_broadcast_payload_bindings,
-    summarize_broadcast_player_runtime_events, summarize_broadcast_prepared_slots,
-    summarize_broadcast_runtime_contract, AudioFormat, AudioSampleFormat, AudioTimeline,
-    AudioTimingPacket, AvFrameAudioRange, BoundedQueue, BroadcastDevicePayloadStatus,
-    BroadcastDeviceStatus, BroadcastMediaSourceRole, BroadcastPreparedAudioSlot,
-    BroadcastPreparedPresentationSlot, BroadcastPreparedVideoSlot,
+    simulate_broadcast_player_runtime_loop, summarize_broadcast_device_boundary,
+    summarize_broadcast_payload_bindings, summarize_broadcast_player_runtime_events,
+    summarize_broadcast_prepared_slots, summarize_broadcast_runtime_contract, AudioFormat,
+    AudioSampleFormat, AudioTimeline, AudioTimingPacket, AvFrameAudioRange, BoundedQueue,
+    BroadcastDevicePayloadStatus, BroadcastDeviceStatus, BroadcastMediaSourceRole,
+    BroadcastPreparedAudioSlot, BroadcastPreparedPresentationSlot, BroadcastPreparedVideoSlot,
     BroadcastPreparedVideoSlotStatus, BroadcastPrerollConfig, BroadcastPrerollPlan,
     BroadcastPreviewProfile, BroadcastRuntimeCapabilities, BroadcastRuntimePrepareFacts,
     BroadcastRuntimeQueueLimits, BroadcastRuntimeSessionDescription, BroadcastRuntimeStateMachine,
@@ -93,6 +93,7 @@ const BROADCAST_PLAYER_RUNTIME_TEST_PRESENTER_ARG: &str =
     "--broadcast-player-runtime-test-presenter";
 const BROADCAST_PLAYER_RUNTIME_TEST_AUDIO_SINK_ARG: &str =
     "--broadcast-player-runtime-test-audio-sink";
+const BROADCAST_PLAYER_RUNTIME_SIMULATE_ARG: &str = "--broadcast-player-runtime-simulate";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -191,6 +192,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &original,
             &proxy,
             BroadcastRuntimeReportFocus::TestAudioSink,
+        );
+    }
+    if let Some((original, proxy)) = args.broadcast_player_runtime_simulate_paths {
+        return broadcast_runtime_prepared_slots(
+            &original,
+            &proxy,
+            BroadcastRuntimeReportFocus::SimulatedPlayback,
         );
     }
 
@@ -2903,6 +2911,7 @@ fn broadcast_runtime_prepared_slots(
             | BroadcastRuntimeReportFocus::DeviceBoundary
             | BroadcastRuntimeReportFocus::TestPresenter
             | BroadcastRuntimeReportFocus::TestAudioSink
+            | BroadcastRuntimeReportFocus::SimulatedPlayback
     ) {
         Some(bind_proxy_preview_video_payloads(
             proxy_video,
@@ -3134,6 +3143,10 @@ fn broadcast_runtime_prepared_slots(
             println!("QGS Broadcast Player Runtime Test Audio Sink Evidence");
             println!("-----------------------------------------------------");
         }
+        BroadcastRuntimeReportFocus::SimulatedPlayback => {
+            println!("QGS Broadcast Player Runtime Simulated Playback Loop");
+            println!("----------------------------------------------------");
+        }
     }
     println!(
         "Not real playback: no speaker output, no display output, no real-time Broadcast Player loop"
@@ -3142,6 +3155,9 @@ fn broadcast_runtime_prepared_slots(
         println!("Test presenter only: no real display output");
     } else if report_focus == BroadcastRuntimeReportFocus::TestAudioSink {
         println!("Test audio sink only: no real speaker output");
+    } else if report_focus == BroadcastRuntimeReportFocus::SimulatedPlayback {
+        println!("Test boundaries only: no real speaker output or display output");
+        println!("No realtime scheduler");
     } else {
         println!("No FramePresented event");
     }
@@ -3223,6 +3239,7 @@ fn broadcast_runtime_prepared_slots(
             | BroadcastRuntimeReportFocus::DeviceBoundary
             | BroadcastRuntimeReportFocus::TestPresenter
             | BroadcastRuntimeReportFocus::TestAudioSink
+            | BroadcastRuntimeReportFocus::SimulatedPlayback
     ) {
         let blocks_per_presentation = proxy_audio_payload_bindings
             .first()
@@ -3529,6 +3546,66 @@ fn broadcast_runtime_prepared_slots(
             );
             println!("  Evidence source: test audio sink, not real speaker output");
         }
+        if report_focus == BroadcastRuntimeReportFocus::SimulatedPlayback {
+            let audio_format = blocks
+                .first()
+                .map(|block| block.format)
+                .ok_or("no PCM blocks available for simulated playback report")?;
+            let PcmSampleFormat::SignedInteger {
+                bits_per_sample, ..
+            } = audio_format;
+            let track_count = proxy_audio_payload_bindings
+                .first()
+                .map(|binding| binding.track_count)
+                .unwrap_or(0);
+            let mut sink = BroadcastTestAudioSink::new(BroadcastTestAudioSinkConfig {
+                sample_rate,
+                bits_per_sample,
+                track_count,
+            })?;
+            let mut presenter =
+                BroadcastTestVideoPresenter::new(BroadcastTestVideoPresenterConfig {
+                    accepted_kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+                    accepted_format: BroadcastVideoPayloadFormat::RgbaU16,
+                    visible_width: proxy_h264.width,
+                    visible_height: proxy_h264.height,
+                    coded_width: proxy_h264.coded_width,
+                    coded_height: proxy_h264.coded_height,
+                })?;
+            let simulation = simulate_broadcast_player_runtime_loop(
+                BroadcastVideoSourceMode::ProxyPreview,
+                &proxy_presentation_payload_bindings,
+                &proxy_audio_payload_bindings,
+                &proxy_video_payload_bindings,
+                audio_format,
+                &mut sink,
+                &mut presenter,
+            );
+            println!(
+                "  Simulated playback: slots={} audio_submitted={} audio_accepted={} video_submitted={} video_accepted={}",
+                simulation.summary.presentation_slots_attempted,
+                simulation.summary.audio_submissions,
+                simulation.summary.audio_accepted,
+                simulation.summary.video_submissions,
+                simulation.summary.video_accepted
+            );
+            println!(
+                "  Test evidence: audio={} video={} total={}",
+                simulation.summary.audio_evidence_count,
+                simulation.summary.video_evidence_count,
+                simulation.summary.test_evidence_count
+            );
+            println!(
+                "  FramePresented count: {} (test presenter evidence only)",
+                simulation.summary.frame_presented_count
+            );
+            println!("  Lateness drops: {}", simulation.summary.lateness_drops);
+            println!("  Failed slots: {}", simulation.summary.failed_slots);
+            println!("  Final state: {:?}", simulation.summary.final_state);
+            println!("  Completed: {}", yes_no(simulation.summary.completed));
+            println!("  Audio evidence source: test audio sink, not real speaker output");
+            println!("  Video evidence source: test video presenter, not real display output");
+        }
     }
     println!("OriginalMedia:");
     println!("  video source: original MXF");
@@ -3574,6 +3651,7 @@ fn broadcast_runtime_prepared_slots(
             | BroadcastRuntimeReportFocus::DeviceBoundary
             | BroadcastRuntimeReportFocus::TestPresenter
             | BroadcastRuntimeReportFocus::TestAudioSink
+            | BroadcastRuntimeReportFocus::SimulatedPlayback
     ) {
         let video_binding_status = original_video_payload_bindings
             .first()
@@ -3655,6 +3733,54 @@ fn broadcast_runtime_prepared_slots(
             println!("  Original video payload: CapabilityMissing");
             println!("  Full OriginalMedia presentation ready: no");
         }
+        if report_focus == BroadcastRuntimeReportFocus::SimulatedPlayback {
+            let audio_format = blocks
+                .first()
+                .map(|block| block.format)
+                .ok_or("no PCM blocks available for OriginalMedia simulated playback report")?;
+            let PcmSampleFormat::SignedInteger {
+                bits_per_sample, ..
+            } = audio_format;
+            let track_count = original_audio_payload_bindings
+                .first()
+                .map(|binding| binding.track_count)
+                .unwrap_or(0);
+            let mut sink = BroadcastTestAudioSink::new(BroadcastTestAudioSinkConfig {
+                sample_rate,
+                bits_per_sample,
+                track_count,
+            })?;
+            let mut presenter =
+                BroadcastTestVideoPresenter::new(BroadcastTestVideoPresenterConfig {
+                    accepted_kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+                    accepted_format: BroadcastVideoPayloadFormat::RgbaU16,
+                    visible_width: proxy_h264.width,
+                    visible_height: proxy_h264.height,
+                    coded_width: proxy_h264.coded_width,
+                    coded_height: proxy_h264.coded_height,
+                })?;
+            let simulation = simulate_broadcast_player_runtime_loop(
+                BroadcastVideoSourceMode::OriginalMedia,
+                &original_presentation_payload_bindings,
+                &original_audio_payload_bindings,
+                &original_video_payload_bindings,
+                audio_format,
+                &mut sink,
+                &mut presenter,
+            );
+            println!(
+                "  Simulated playback: completed={} final_state={:?} failed_slots={}",
+                yes_no(simulation.summary.completed),
+                simulation.summary.final_state,
+                simulation.summary.failed_slots
+            );
+            println!(
+                "  FramePresented count: {}",
+                simulation.summary.frame_presented_count
+            );
+            println!("  Original video payload: CapabilityMissing");
+            println!("  Simulation result: not ready / capability missing");
+        }
     }
     println!("  Original video runtime backend: capability missing in this milestone");
 
@@ -3670,6 +3796,7 @@ enum BroadcastRuntimeReportFocus {
     DeviceBoundary,
     TestPresenter,
     TestAudioSink,
+    SimulatedPlayback,
 }
 
 #[derive(Clone, Debug)]
@@ -8433,6 +8560,7 @@ struct Args {
     broadcast_player_runtime_device_boundary_paths: Option<(PathBuf, PathBuf)>,
     broadcast_player_runtime_test_presenter_paths: Option<(PathBuf, PathBuf)>,
     broadcast_player_runtime_test_audio_sink_paths: Option<(PathBuf, PathBuf)>,
+    broadcast_player_runtime_simulate_paths: Option<(PathBuf, PathBuf)>,
 }
 
 impl Args {
@@ -8477,6 +8605,8 @@ impl Args {
         let mut broadcast_player_runtime_test_presenter_paths = None;
         let mut broadcast_player_runtime_test_audio_sink_original = None;
         let mut broadcast_player_runtime_test_audio_sink_paths = None;
+        let mut broadcast_player_runtime_simulate_original = None;
+        let mut broadcast_player_runtime_simulate_paths = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
@@ -8507,9 +8637,22 @@ impl Args {
         let mut next_arg_is_broadcast_player_runtime_test_presenter_proxy = false;
         let mut next_arg_is_broadcast_player_runtime_test_audio_sink_original = false;
         let mut next_arg_is_broadcast_player_runtime_test_audio_sink_proxy = false;
+        let mut next_arg_is_broadcast_player_runtime_simulate_original = false;
+        let mut next_arg_is_broadcast_player_runtime_simulate_proxy = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_broadcast_player_runtime_test_audio_sink_proxy {
+            if next_arg_is_broadcast_player_runtime_simulate_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = broadcast_player_runtime_simulate_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                broadcast_player_runtime_simulate_paths = Some((original, proxy));
+                next_arg_is_broadcast_player_runtime_simulate_proxy = false;
+            } else if next_arg_is_broadcast_player_runtime_simulate_original {
+                broadcast_player_runtime_simulate_original = Some(PathBuf::from(arg));
+                next_arg_is_broadcast_player_runtime_simulate_original = false;
+                next_arg_is_broadcast_player_runtime_simulate_proxy = true;
+            } else if next_arg_is_broadcast_player_runtime_test_audio_sink_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = broadcast_player_runtime_test_audio_sink_original
                     .take()
@@ -8724,6 +8867,8 @@ impl Args {
                 next_arg_is_broadcast_player_runtime_test_presenter_original = true;
             } else if arg == BROADCAST_PLAYER_RUNTIME_TEST_AUDIO_SINK_ARG {
                 next_arg_is_broadcast_player_runtime_test_audio_sink_original = true;
+            } else if arg == BROADCAST_PLAYER_RUNTIME_SIMULATE_ARG {
+                next_arg_is_broadcast_player_runtime_simulate_original = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -8753,6 +8898,7 @@ impl Args {
             broadcast_player_runtime_device_boundary_paths,
             broadcast_player_runtime_test_presenter_paths,
             broadcast_player_runtime_test_audio_sink_paths,
+            broadcast_player_runtime_simulate_paths,
         }
     }
 }
