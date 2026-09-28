@@ -109,7 +109,7 @@ Intentional skips are preview profile behavior and are not lateness drops.
 Command:
 
 ```sh
-cargo run -q -p qgs-test -- --broadcast-runtime-state-machine <original-mxf> <proxy-mp4>
+cargo run -q -p qgs-test -- --broadcast-player-runtime-state-machine <original-mxf> <proxy-mp4>
 ```
 
 Observed privacy-safe result:

@@ -80,10 +80,15 @@ const PROXY_PLAYBACK_ARG: &str = "--proxy-playback";
 const PROXY_PLAYBACK_PROFILE_ARG: &str = "--proxy-playback-profile";
 const QNC_JOURNALIST_DEMO_ARG: &str = "--qnc-journalist-demo";
 const ORIGINAL_AUDIO_EXTRACT_ARG: &str = "--original-audio-extract";
-const BROADCAST_RUNTIME_CONTRACT_ARG: &str = "--broadcast-runtime-contract";
-const BROADCAST_RUNTIME_STATE_MACHINE_ARG: &str = "--broadcast-runtime-state-machine";
-const BROADCAST_RUNTIME_PREROLL_ARG: &str = "--broadcast-runtime-preroll";
-const BROADCAST_RUNTIME_PREPARED_SLOTS_ARG: &str = "--broadcast-runtime-prepared-slots";
+const BROADCAST_PLAYER_RUNTIME_CONTRACT_ARG: &str = "--broadcast-player-runtime-contract";
+const BROADCAST_PLAYER_RUNTIME_STATE_MACHINE_ARG: &str = "--broadcast-player-runtime-state-machine";
+const BROADCAST_PLAYER_RUNTIME_PREROLL_ARG: &str = "--broadcast-player-runtime-preroll";
+const BROADCAST_PLAYER_RUNTIME_PREPARED_SLOTS_ARG: &str =
+    "--broadcast-player-runtime-prepared-slots";
+const LEGACY_BROADCAST_RUNTIME_CONTRACT_ARG: &str = "--broadcast-runtime-contract";
+const LEGACY_BROADCAST_RUNTIME_STATE_MACHINE_ARG: &str = "--broadcast-runtime-state-machine";
+const LEGACY_BROADCAST_RUNTIME_PREROLL_ARG: &str = "--broadcast-runtime-preroll";
+const LEGACY_BROADCAST_RUNTIME_PREPARED_SLOTS_ARG: &str = "--broadcast-runtime-prepared-slots";
 const BROADCAST_PLAYER_RUNTIME_EVENTS_ARG: &str = "--broadcast-player-runtime-events";
 const BROADCAST_PLAYER_RUNTIME_PAYLOADS_ARG: &str = "--broadcast-player-runtime-payloads";
 const BROADCAST_PLAYER_RUNTIME_VIDEO_PAYLOADS_ARG: &str =
@@ -9228,13 +9233,21 @@ impl Args {
                 next_arg_is_qnc_journalist_demo_original = true;
             } else if arg == ORIGINAL_AUDIO_EXTRACT_ARG {
                 next_arg_is_original_audio_extract_path = true;
-            } else if arg == BROADCAST_RUNTIME_CONTRACT_ARG {
+            } else if arg == BROADCAST_PLAYER_RUNTIME_CONTRACT_ARG
+                || arg == LEGACY_BROADCAST_RUNTIME_CONTRACT_ARG
+            {
                 next_arg_is_broadcast_runtime_contract_original = true;
-            } else if arg == BROADCAST_RUNTIME_STATE_MACHINE_ARG {
+            } else if arg == BROADCAST_PLAYER_RUNTIME_STATE_MACHINE_ARG
+                || arg == LEGACY_BROADCAST_RUNTIME_STATE_MACHINE_ARG
+            {
                 next_arg_is_broadcast_runtime_state_machine_original = true;
-            } else if arg == BROADCAST_RUNTIME_PREROLL_ARG {
+            } else if arg == BROADCAST_PLAYER_RUNTIME_PREROLL_ARG
+                || arg == LEGACY_BROADCAST_RUNTIME_PREROLL_ARG
+            {
                 next_arg_is_broadcast_runtime_preroll_original = true;
-            } else if arg == BROADCAST_RUNTIME_PREPARED_SLOTS_ARG {
+            } else if arg == BROADCAST_PLAYER_RUNTIME_PREPARED_SLOTS_ARG
+                || arg == LEGACY_BROADCAST_RUNTIME_PREPARED_SLOTS_ARG
+            {
                 next_arg_is_broadcast_runtime_prepared_slots_original = true;
             } else if arg == BROADCAST_PLAYER_RUNTIME_EVENTS_ARG {
                 next_arg_is_broadcast_player_runtime_events_original = true;

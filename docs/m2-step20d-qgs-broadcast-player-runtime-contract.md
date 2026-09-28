@@ -99,7 +99,7 @@ For Sony FX6 sample 002:
 Command:
 
 ```sh
-cargo run -q -p qgs-test -- --broadcast-runtime-contract <original-mxf> <proxy-mp4>
+cargo run -q -p qgs-test -- --broadcast-player-runtime-contract <original-mxf> <proxy-mp4>
 ```
 
 Observed privacy-safe result for Sony FX6 sample 002:
