@@ -28,7 +28,7 @@ use qgs_protocol::{
     FlushDecoderRequest, H264Profile, HelloRequest, ImageDesc, ImageUsageFlags, MemoryPreference,
     PixelFormat, ProtocolErrorCode, QueryDeviceCapabilitiesRequest, QueryVideoCapabilitiesRequest,
     ResourceId, ScanMode, SelectedMemoryProperties, SubmitAccessUnitRequest, SyncExportHandleType,
-    SyncId, SyncKind, VideoCapabilities, VideoCodec, VideoProfile, WireMessage,
+    SyncId, SyncKind, VideoCapabilities, VideoCodec, VideoProfile, VisibleRegion, WireMessage,
     CURRENT_PROTOCOL_VERSION,
 };
 use qgs_software_video::{
@@ -39,7 +39,8 @@ use qgs_vulkan::{
     diagnose_haswell_video_import, yuv422p10_reference_rgba_u16, yuv422p10_rgba_u16_checksum,
     DiagnosticDrmLayer, DiagnosticDrmObject, DiagnosticDrmPlane, FrameIdentity,
     FrameProcessorError, GpuFrameProcessor, GpuFrameProcessorConfig, HaswellVideoDiagnosticInput,
-    VulkanDeviceDiscovery, YcbcrConversion, Yuv422P10Plane, Yuv422P10Upload,
+    Nv12FrameProcessor, Nv12FrameProcessorConfig, Nv12FrameProcessorDiagnostics, Nv12Plane,
+    Nv12Upload, VulkanDeviceDiscovery, YcbcrConversion, Yuv422P10Plane, Yuv422P10Upload,
 };
 use sha2::{Digest, Sha256};
 
@@ -1521,10 +1522,36 @@ fn proxy_playback(
 
     let decoder_create_start = Instant::now();
     let mut decoder = vaapi.create_decoder(&CreateDecoderRequest {
-        config: proxy_config,
+        config: proxy_config.clone(),
     })?;
     let decoder_create_elapsed = decoder_create_start.elapsed();
     let decoder_id = DecoderId::new(1)?;
+    let visible_region = VisibleRegion {
+        x: 0,
+        y: 0,
+        width: proxy_h264.width,
+        height: proxy_h264.height,
+    };
+    let cpu_pool_capacity = 6_usize;
+    let mut cpu_pool = qgs_vaapi::CpuNv12FramePool::new(
+        proxy_h264.coded_width,
+        proxy_h264.coded_height,
+        visible_region,
+        cpu_pool_capacity,
+    )?;
+    let mut gpu_processor = Nv12FrameProcessor::new(
+        &discovery,
+        Nv12FrameProcessorConfig {
+            device_id: device.id,
+            coded_width: proxy_h264.coded_width,
+            coded_height: proxy_h264.coded_height,
+            visible_width: proxy_h264.width,
+            visible_height: proxy_h264.height,
+            slot_count: config.gpu_capacity.max(1),
+            conversion: YcbcrConversion::Rec709Limited,
+            validation_readback: false,
+        },
+    )?;
 
     let playback_start = Instant::now();
     let mut clock = RealTimeClock::start_now();
@@ -1542,10 +1569,27 @@ fn proxy_playback(
     let mut gpu_submissions = 0_usize;
     let mut gpu_completions = 0_usize;
     let mut decode_submit_elapsed = Duration::ZERO;
-    let mut gpu_stage_elapsed = Duration::ZERO;
+    let mut va_cpu_sync_copy_elapsed = Duration::ZERO;
+    let mut gpu_submit_elapsed = Duration::ZERO;
+    let mut gpu_completion_elapsed = Duration::ZERO;
     let mut presentation_wait_elapsed = Duration::ZERO;
     let mut max_lateness = Duration::ZERO;
     let mut lateness_values = Vec::new();
+    let mut transfer_totals = Vec::new();
+    let mut transfer_sync_times = Vec::new();
+    let mut transfer_image_times = Vec::new();
+    let mut transfer_copy_y_times = Vec::new();
+    let mut transfer_copy_uv_times = Vec::new();
+    let mut transfer_release_times = Vec::new();
+    let mut transfer_bytes_copied = 0_usize;
+    let mut first_va_image_layout = None;
+    let mut pool_acquire_elapsed = Duration::ZERO;
+    let mut upload_view_elapsed = Duration::ZERO;
+    let mut pool_release_elapsed = Duration::ZERO;
+    let mut gpu_submit_times = Vec::new();
+    let mut gpu_completion_times = Vec::new();
+    let progress_trace = std::env::var_os("QGS_STEP17_PROGRESS").is_some();
+    let step17_diag = std::env::var_os("QGS_STEP17_DIAG").is_some();
 
     loop {
         while next_input < access_units.len() && !compressed_queue.is_full() {
@@ -1608,26 +1652,113 @@ fn proxy_playback(
             let decoded = decoded_queue
                 .pop_front()
                 .ok_or("decoded queue unexpectedly empty")?;
+            let pool_started = Instant::now();
+            let cpu_frame = cpu_pool.acquire()?;
+            pool_acquire_elapsed += pool_started.elapsed();
+            let transfer_started = Instant::now();
+            if progress_trace {
+                eprintln!(
+                    "step17 progress: transfer start presentation={}",
+                    decoded.identity.presentation_position
+                );
+            }
+            let (cpu_frame, transfer_timing) = qgs_vaapi::transfer_nv12_surface_timed(
+                decoded.surface.resource.as_ref(),
+                cpu_frame,
+            )?;
+            let transfer_elapsed = transfer_started.elapsed();
+            va_cpu_sync_copy_elapsed += transfer_elapsed;
+            transfer_totals.push(transfer_elapsed);
+            transfer_sync_times.push(duration_from_ns(transfer_timing.sync_ns));
+            transfer_image_times.push(duration_from_ns(transfer_timing.image_create_ns));
+            transfer_copy_y_times.push(duration_from_ns(transfer_timing.copy_y_ns));
+            transfer_copy_uv_times.push(duration_from_ns(transfer_timing.copy_uv_ns));
+            transfer_release_times.push(duration_from_ns(transfer_timing.image_release_ns));
+            transfer_bytes_copied =
+                transfer_bytes_copied.saturating_add(transfer_timing.bytes_copied);
+            if first_va_image_layout.is_none() {
+                first_va_image_layout = transfer_timing.image_layout.clone();
+            }
+            if progress_trace {
+                eprintln!(
+                    "step17 progress: transfer done presentation={}",
+                    decoded.identity.presentation_position
+                );
+            }
+            let upload_started = Instant::now();
+            let upload = nv12_upload_for_cpu_surface(device.id, &cpu_frame)?;
+            upload_view_elapsed += upload_started.elapsed();
+            let token = match gpu_processor.submit_frame(
+                &upload,
+                FrameIdentity {
+                    presentation_position: decoded.identity.presentation_position,
+                },
+            ) {
+                Ok(token) => token,
+                Err(FrameProcessorError::NoFrameSlotAvailable) => {
+                    break;
+                }
+                Err(err) => return Err(Box::new(err)),
+            };
+            let release_started = Instant::now();
+            cpu_pool.release(cpu_frame)?;
+            pool_release_elapsed += release_started.elapsed();
+            if progress_trace {
+                eprintln!(
+                    "step17 progress: gpu submit presentation={} token={}",
+                    decoded.identity.presentation_position,
+                    token.get()
+                );
+            }
             gpu_queue
-                .try_push(decoded)
+                .try_push(GpuPendingPlaybackFrame {
+                    token,
+                    identity: decoded.identity,
+                })
                 .map_err(|_| "GPU queue unexpectedly full")?;
             gpu_submissions += 1;
-            gpu_stage_elapsed += started.elapsed();
+            let submit_elapsed = started.elapsed();
+            gpu_submit_elapsed += submit_elapsed;
+            gpu_submit_times.push(submit_elapsed);
         }
 
         while !gpu_queue.is_empty() && !presentation_queue.is_full() {
             let started = Instant::now();
+            let Some(front) = gpu_queue.front() else {
+                break;
+            };
+            let completed = gpu_processor.poll_completed()?;
+            if !completed.contains(&front.token) {
+                let input_drained = flushed
+                    && next_input == access_units.len()
+                    && compressed_queue.is_empty()
+                    && decoded_queue.is_empty();
+                if gpu_queue.is_full() || input_drained {
+                    gpu_processor.wait_for_completion(front.token)?;
+                } else {
+                    break;
+                }
+            }
             let processed = gpu_queue
                 .pop_front()
                 .ok_or("GPU queue unexpectedly empty")?;
+            gpu_processor.retire_completed_token(processed.token)?;
             presentation_queue
                 .try_push(ReadyPlaybackFrame {
                     identity: processed.identity,
-                    surface: processed.surface,
                 })
                 .map_err(|_| "presentation queue unexpectedly full")?;
+            if progress_trace {
+                eprintln!(
+                    "step17 progress: gpu complete presentation={} token={}",
+                    processed.identity.presentation_position,
+                    processed.token.get()
+                );
+            }
             gpu_completions += 1;
-            gpu_stage_elapsed += started.elapsed();
+            let completion_elapsed = started.elapsed();
+            gpu_completion_elapsed += completion_elapsed;
+            gpu_completion_times.push(completion_elapsed);
         }
 
         if state == PlaybackState::Prerolling && presentation_queue.len() >= config.preroll_frames {
@@ -1660,7 +1791,6 @@ fn proxy_playback(
                     lateness,
                     status,
                 });
-                drop(frame.surface);
             }
         }
 
@@ -1743,8 +1873,26 @@ fn proxy_playback(
         gpu_queue.stats().backpressure_events,
         presentation_queue.stats().backpressure_events
     );
-    println!("  VA surfaces: held through decoded/GPU/presentation queues; detailed pool stats measured by clean VA observation");
-    println!("  GPU processing: bounded scheduling queue only in realtime path; VA->Vulkan zero-copy remains frozen");
+    let cpu_pool_stats = cpu_pool.stats();
+    let gpu_counters = gpu_processor.counters();
+    let gpu_diagnostics = gpu_processor.diagnostics();
+    println!("  VA surfaces: transferred to bounded CPU NV12 pool before GPU upload; VA->Vulkan zero-copy remains frozen");
+    println!(
+        "  CPU NV12 pool: capacity={} bytes_per_frame={} peak_checked_out={} reused={}",
+        cpu_pool_capacity,
+        cpu_pool_stats.bytes_per_frame,
+        cpu_pool_stats.peak_checked_out,
+        cpu_pool_stats.frames_reused
+    );
+    println!(
+        "  GPU processing: submissions={} completions={} slot_reuses={} staging_allocations={} gpu_plane_allocations={} output_allocations={}",
+        gpu_submissions,
+        gpu_completions,
+        gpu_counters.slot_reuses,
+        gpu_counters.staging_allocations,
+        gpu_counters.gpu_plane_allocations,
+        gpu_counters.output_allocations
+    );
     println!("Stage timing observations:");
     println!(
         "  MP4 open/sample extraction: {:.3} ms",
@@ -1759,13 +1907,102 @@ fn proxy_playback(
         duration_ms(decode_submit_elapsed)
     );
     println!(
-        "  GPU scheduling aggregate: {:.3} ms",
-        duration_ms(gpu_stage_elapsed)
+        "  VA sync + CPU transfer aggregate: {:.3} ms",
+        duration_ms(va_cpu_sync_copy_elapsed)
     );
+    print_duration_distribution("  VA transfer total/frame", &mut transfer_totals);
+    print_duration_distribution("  VA transfer sync/frame", &mut transfer_sync_times);
+    print_duration_distribution("  VA image derive/get/frame", &mut transfer_image_times);
+    print_duration_distribution("  VA copy Y/frame", &mut transfer_copy_y_times);
+    print_duration_distribution("  VA copy UV/frame", &mut transfer_copy_uv_times);
+    print_duration_distribution("  VA image release/frame", &mut transfer_release_times);
+    if let Some(layout) = &first_va_image_layout {
+        print_va_nv12_image_layout("  VA NV12 image", layout);
+    }
+    println!(
+        "  VA transfer bytes copied: total={} per_frame={}",
+        transfer_bytes_copied,
+        transfer_bytes_copied / frame_count.max(1)
+    );
+    println!(
+        "  CPU pool acquire/release/upload-view aggregate: acquire={:.3} ms upload_view={:.3} ms release={:.3} ms",
+        duration_ms(pool_acquire_elapsed),
+        duration_ms(upload_view_elapsed),
+        duration_ms(pool_release_elapsed)
+    );
+    println!(
+        "  decoded->GPU submit loop aggregate, including transfer: {:.3} ms",
+        duration_ms(gpu_submit_elapsed)
+    );
+    print_duration_distribution(
+        "  decoded->GPU submit loop/frame, including transfer",
+        &mut gpu_submit_times,
+    );
+    println!(
+        "  Vulkan completion handling aggregate: {:.3} ms",
+        duration_ms(gpu_completion_elapsed)
+    );
+    print_duration_distribution("  Vulkan completion path/frame", &mut gpu_completion_times);
+    print_nv12_gpu_diagnostics(&gpu_diagnostics);
     println!(
         "  presentation wait aggregate: {:.3} ms",
         duration_ms(presentation_wait_elapsed)
     );
+
+    if step17_diag {
+        run_step17_isolated_va_transfer_observation(
+            &devices,
+            device,
+            proxy_config.clone(),
+            &access_units,
+            visible_region,
+            source_duration,
+        )?;
+        run_step17_va_transfer_variant_observations(
+            &devices,
+            device,
+            proxy_config.clone(),
+            &access_units,
+            visible_region,
+            source_duration,
+        )?;
+        run_step17_as_fast_full_pixel_observation(
+            &devices,
+            &discovery,
+            device,
+            proxy_config,
+            &access_units,
+            visible_region,
+            config,
+            source_duration,
+        )?;
+        run_step17_synthetic_nv12_gpu_observation(
+            &discovery,
+            device,
+            proxy_h264.coded_width,
+            proxy_h264.coded_height,
+            proxy_h264.width,
+            proxy_h264.height,
+            frame_count,
+            source_duration,
+        )?;
+        if let Some(discrete_device) = devices
+            .iter()
+            .find(|candidate| matches!(candidate.class, DeviceClass::DiscreteGpu))
+        {
+            run_step17_synthetic_nv12_gpu_observation(
+                &discovery,
+                discrete_device,
+                proxy_h264.coded_width,
+                proxy_h264.coded_height,
+                proxy_h264.width,
+                proxy_h264.height,
+                frame_count,
+                source_duration,
+            )?;
+        }
+        return Ok(());
+    }
 
     if counts.dropped != 0 || counts.duplicated != 0 {
         return Err("real-time playback produced drops or duplicates".into());
@@ -1846,11 +2083,677 @@ struct DecodedPlaybackFrame {
 
 struct ReadyPlaybackFrame {
     identity: PlaybackFrameIdentity,
-    surface: BackendDecodedSurface,
+}
+
+struct GpuPendingPlaybackFrame {
+    token: qgs_vulkan::FrameToken,
+    identity: PlaybackFrameIdentity,
+}
+
+fn nv12_upload_for_cpu_surface<'a>(
+    device_id: qgs_protocol::DeviceId,
+    surface: &'a qgs_vaapi::CpuNv12Surface,
+) -> Result<Nv12Upload<'a>, Box<dyn std::error::Error>> {
+    Ok(Nv12Upload {
+        device_id,
+        coded_width: surface.desc.coded_width,
+        coded_height: surface.desc.coded_height,
+        visible_width: surface.desc.visible_region.width,
+        visible_height: surface.desc.visible_region.height,
+        y: Nv12Plane {
+            width_bytes: u32::try_from(surface.y.width_bytes)?,
+            height: u32::try_from(surface.y.height)?,
+            stride_bytes: surface.y.stride_bytes,
+            data: &surface.y.data,
+        },
+        uv: Nv12Plane {
+            width_bytes: u32::try_from(surface.uv.width_bytes)?,
+            height: u32::try_from(surface.uv.height)?,
+            stride_bytes: surface.uv.stride_bytes,
+            data: &surface.uv.data,
+        },
+        conversion: YcbcrConversion::Rec709Limited,
+    })
+}
+
+fn run_step17_isolated_va_transfer_observation(
+    devices: &[DeviceDesc],
+    device: &DeviceDesc,
+    proxy_config: DecoderConfig,
+    access_units: &[Vec<u8>],
+    visible_region: VisibleRegion,
+    source_duration: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vaapi = qgs_vaapi::VaapiVideoDiscovery::new(devices);
+    let mut decoder = vaapi.create_decoder(&CreateDecoderRequest {
+        config: proxy_config.clone(),
+    })?;
+    let decoder_id = DecoderId::new(17)?;
+    let mut cpu_pool = qgs_vaapi::CpuNv12FramePool::new(
+        proxy_config.coded_width,
+        proxy_config.coded_height,
+        visible_region,
+        6,
+    )?;
+    let mut decode_elapsed = Duration::ZERO;
+    let mut transfer_elapsed = Duration::ZERO;
+    let mut frames = 0_usize;
+    let mut transfer_totals = Vec::new();
+    let started = Instant::now();
+    for access_unit in access_units {
+        let decode_started = Instant::now();
+        let outputs = decoder.submit_access_unit(&SubmitAccessUnitRequest {
+            decoder_id,
+            data: access_unit.clone(),
+        })?;
+        decode_elapsed += decode_started.elapsed();
+        for output in outputs {
+            let frame = cpu_pool.acquire()?;
+            let transfer_started = Instant::now();
+            let (frame, _timing) =
+                qgs_vaapi::transfer_nv12_surface_timed(output.resource.as_ref(), frame)?;
+            let elapsed = transfer_started.elapsed();
+            transfer_elapsed += elapsed;
+            transfer_totals.push(elapsed);
+            cpu_pool.release(frame)?;
+            frames += 1;
+        }
+    }
+    let decode_started = Instant::now();
+    let outputs = decoder.flush(&FlushDecoderRequest { decoder_id })?;
+    decode_elapsed += decode_started.elapsed();
+    for output in outputs {
+        let frame = cpu_pool.acquire()?;
+        let transfer_started = Instant::now();
+        let (frame, _timing) =
+            qgs_vaapi::transfer_nv12_surface_timed(output.resource.as_ref(), frame)?;
+        let elapsed = transfer_started.elapsed();
+        transfer_elapsed += elapsed;
+        transfer_totals.push(elapsed);
+        cpu_pool.release(frame)?;
+        frames += 1;
+    }
+    let elapsed = started.elapsed();
+    println!("Step 17 isolated VA decode + CPU NV12 transfer:");
+    println!(
+        "  device: {} frames={} wall={:.3} ms source={:.3}s throughput={:.2} fps realtime={:.2}x",
+        device.name,
+        frames,
+        duration_ms(elapsed),
+        source_duration.as_secs_f64(),
+        frames as f64 / elapsed.as_secs_f64().max(0.000_001),
+        source_duration.as_secs_f64() / elapsed.as_secs_f64().max(0.000_001)
+    );
+    println!(
+        "  decode aggregate={:.3} ms transfer aggregate={:.3} ms pool_reuses={}",
+        duration_ms(decode_elapsed),
+        duration_ms(transfer_elapsed),
+        cpu_pool.stats().frames_reused
+    );
+    print_duration_distribution("  isolated VA transfer/frame", &mut transfer_totals);
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Step17TransferVariant {
+    TightCoded,
+    TightVisible,
+    SourcePitchCoded,
+    FullSourceRows,
+}
+
+impl Step17TransferVariant {
+    const ALL: [Self; 4] = [
+        Self::TightCoded,
+        Self::TightVisible,
+        Self::SourcePitchCoded,
+        Self::FullSourceRows,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::TightCoded => "tight-coded",
+            Self::TightVisible => "tight-visible",
+            Self::SourcePitchCoded => "source-pitch-coded",
+            Self::FullSourceRows => "full-source-rows",
+        }
+    }
+
+    fn layout(
+        self,
+        proxy_config: &DecoderConfig,
+        visible_region: VisibleRegion,
+        image_layout: &qgs_vaapi::VaNv12ImageLayout,
+    ) -> Result<qgs_vaapi::CpuNv12FrameLayout, Box<dyn std::error::Error>> {
+        Ok(match self {
+            Self::TightCoded => qgs_vaapi::CpuNv12FrameLayout::tight_coded(
+                proxy_config.coded_width,
+                proxy_config.coded_height,
+            )?,
+            Self::TightVisible => qgs_vaapi::CpuNv12FrameLayout::tight_visible(visible_region)?,
+            Self::SourcePitchCoded => qgs_vaapi::CpuNv12FrameLayout::coded_with_destination_pitch(
+                proxy_config.coded_width,
+                proxy_config.coded_height,
+                image_layout.pitches[0],
+                image_layout.pitches[1],
+            )?,
+            Self::FullSourceRows => qgs_vaapi::CpuNv12FrameLayout::full_source_rows(
+                usize::try_from(image_layout.height)?,
+                image_layout.pitches[0],
+                usize::try_from(image_layout.height)? / 2,
+                image_layout.pitches[1],
+            )?,
+        })
+    }
+}
+
+fn run_step17_va_transfer_variant_observations(
+    devices: &[DeviceDesc],
+    device: &DeviceDesc,
+    proxy_config: DecoderConfig,
+    access_units: &[Vec<u8>],
+    visible_region: VisibleRegion,
+    source_duration: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let image_layout =
+        probe_step17_first_va_nv12_layout(devices, proxy_config.clone(), access_units)?;
+    println!("Step 17C VA NV12 image layout:");
+    print_va_nv12_image_layout("  probed VA NV12 image", &image_layout);
+
+    for variant in Step17TransferVariant::ALL {
+        let layout = variant.layout(&proxy_config, visible_region, &image_layout)?;
+        run_step17_va_transfer_variant(
+            devices,
+            device,
+            proxy_config.clone(),
+            access_units,
+            visible_region,
+            source_duration,
+            variant,
+            layout,
+        )?;
+    }
+    Ok(())
+}
+
+fn probe_step17_first_va_nv12_layout(
+    devices: &[DeviceDesc],
+    proxy_config: DecoderConfig,
+    access_units: &[Vec<u8>],
+) -> Result<qgs_vaapi::VaNv12ImageLayout, Box<dyn std::error::Error>> {
+    let vaapi = qgs_vaapi::VaapiVideoDiscovery::new(devices);
+    let mut decoder = vaapi.create_decoder(&CreateDecoderRequest {
+        config: proxy_config,
+    })?;
+    let decoder_id = DecoderId::new(17)?;
+    for access_unit in access_units {
+        let outputs = decoder.submit_access_unit(&SubmitAccessUnitRequest {
+            decoder_id,
+            data: access_unit.clone(),
+        })?;
+        if let Some(output) = outputs.first() {
+            return Ok(qgs_vaapi::describe_nv12_surface_image(
+                output.resource.as_ref(),
+            )?);
+        }
+    }
+    let outputs = decoder.flush(&FlushDecoderRequest { decoder_id })?;
+    let output = outputs
+        .first()
+        .ok_or("proxy decode did not produce a surface to inspect")?;
+    Ok(qgs_vaapi::describe_nv12_surface_image(
+        output.resource.as_ref(),
+    )?)
+}
+
+fn run_step17_va_transfer_variant(
+    devices: &[DeviceDesc],
+    device: &DeviceDesc,
+    proxy_config: DecoderConfig,
+    access_units: &[Vec<u8>],
+    visible_region: VisibleRegion,
+    source_duration: Duration,
+    variant: Step17TransferVariant,
+    layout: qgs_vaapi::CpuNv12FrameLayout,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vaapi = qgs_vaapi::VaapiVideoDiscovery::new(devices);
+    let mut decoder = vaapi.create_decoder(&CreateDecoderRequest {
+        config: proxy_config.clone(),
+    })?;
+    let decoder_id = DecoderId::new(17)?;
+    let mut cpu_pool = qgs_vaapi::CpuNv12FramePool::new_with_layout(
+        proxy_config.coded_width,
+        proxy_config.coded_height,
+        visible_region,
+        6,
+        layout,
+    )?;
+    let mut decode_elapsed = Duration::ZERO;
+    let mut transfer_elapsed = Duration::ZERO;
+    let mut frames = 0_usize;
+    let mut bytes_copied = 0_usize;
+    let mut transfer_totals = Vec::new();
+    let mut sync_times = Vec::new();
+    let mut image_times = Vec::new();
+    let mut copy_y_times = Vec::new();
+    let mut copy_uv_times = Vec::new();
+    let mut release_times = Vec::new();
+    let started = Instant::now();
+    for access_unit in access_units {
+        let decode_started = Instant::now();
+        let outputs = decoder.submit_access_unit(&SubmitAccessUnitRequest {
+            decoder_id,
+            data: access_unit.clone(),
+        })?;
+        decode_elapsed += decode_started.elapsed();
+        for output in outputs {
+            let frame = cpu_pool.acquire()?;
+            let transfer_started = Instant::now();
+            let (frame, timing) =
+                qgs_vaapi::transfer_nv12_surface_timed(output.resource.as_ref(), frame)?;
+            let elapsed = transfer_started.elapsed();
+            transfer_elapsed += elapsed;
+            transfer_totals.push(elapsed);
+            sync_times.push(duration_from_ns(timing.sync_ns));
+            image_times.push(duration_from_ns(timing.image_create_ns));
+            copy_y_times.push(duration_from_ns(timing.copy_y_ns));
+            copy_uv_times.push(duration_from_ns(timing.copy_uv_ns));
+            release_times.push(duration_from_ns(timing.image_release_ns));
+            bytes_copied = bytes_copied.saturating_add(timing.bytes_copied);
+            cpu_pool.release(frame)?;
+            frames += 1;
+        }
+    }
+    let decode_started = Instant::now();
+    let outputs = decoder.flush(&FlushDecoderRequest { decoder_id })?;
+    decode_elapsed += decode_started.elapsed();
+    for output in outputs {
+        let frame = cpu_pool.acquire()?;
+        let transfer_started = Instant::now();
+        let (frame, timing) =
+            qgs_vaapi::transfer_nv12_surface_timed(output.resource.as_ref(), frame)?;
+        let elapsed = transfer_started.elapsed();
+        transfer_elapsed += elapsed;
+        transfer_totals.push(elapsed);
+        sync_times.push(duration_from_ns(timing.sync_ns));
+        image_times.push(duration_from_ns(timing.image_create_ns));
+        copy_y_times.push(duration_from_ns(timing.copy_y_ns));
+        copy_uv_times.push(duration_from_ns(timing.copy_uv_ns));
+        release_times.push(duration_from_ns(timing.image_release_ns));
+        bytes_copied = bytes_copied.saturating_add(timing.bytes_copied);
+        cpu_pool.release(frame)?;
+        frames += 1;
+    }
+    let elapsed = started.elapsed();
+    println!("Step 17C VA transfer variant: {}", variant.label());
+    println!(
+        "  layout: y width={} height={} stride={} uv width={} height={} stride={} bytes/frame={}",
+        layout.y_width_bytes,
+        layout.y_height,
+        layout.y_stride_bytes,
+        layout.uv_width_bytes,
+        layout.uv_height,
+        layout.uv_stride_bytes,
+        cpu_pool.stats().bytes_per_frame
+    );
+    println!(
+        "  device: {} frames={} wall={:.3} ms source={:.3}s throughput={:.2} fps realtime={:.2}x",
+        device.name,
+        frames,
+        duration_ms(elapsed),
+        source_duration.as_secs_f64(),
+        frames as f64 / elapsed.as_secs_f64().max(0.000_001),
+        source_duration.as_secs_f64() / elapsed.as_secs_f64().max(0.000_001)
+    );
+    println!(
+        "  decode aggregate={:.3} ms transfer aggregate={:.3} ms bytes_copied/frame={} pool_reuses={}",
+        duration_ms(decode_elapsed),
+        duration_ms(transfer_elapsed),
+        bytes_copied / frames.max(1),
+        cpu_pool.stats().frames_reused
+    );
+    print_duration_distribution("  variant VA transfer/frame", &mut transfer_totals);
+    print_duration_distribution("  variant VA sync/frame", &mut sync_times);
+    print_duration_distribution("  variant VA image derive/get/frame", &mut image_times);
+    print_duration_distribution("  variant VA copy Y/frame", &mut copy_y_times);
+    print_duration_distribution("  variant VA copy UV/frame", &mut copy_uv_times);
+    print_duration_distribution("  variant VA image release/frame", &mut release_times);
+    Ok(())
+}
+
+fn print_va_nv12_image_layout(label: &str, layout: &qgs_vaapi::VaNv12ImageLayout) {
+    println!(
+        "{label}: fourcc={} width={} height={} planes={} data_size={} derived={}",
+        layout.fourcc_string(),
+        layout.width,
+        layout.height,
+        layout.num_planes,
+        layout.data_size,
+        yes_no(layout.derived)
+    );
+    println!(
+        "    offsets={:?} pitches={:?} y_uv_contiguous={}",
+        layout.offsets,
+        layout.pitches,
+        yes_no(layout.y_uv_contiguous())
+    );
+}
+
+fn run_step17_as_fast_full_pixel_observation(
+    devices: &[DeviceDesc],
+    discovery: &VulkanDeviceDiscovery,
+    device: &DeviceDesc,
+    proxy_config: DecoderConfig,
+    access_units: &[Vec<u8>],
+    visible_region: VisibleRegion,
+    config: PlaybackConfig,
+    source_duration: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vaapi = qgs_vaapi::VaapiVideoDiscovery::new(devices);
+    let mut decoder = vaapi.create_decoder(&CreateDecoderRequest {
+        config: proxy_config.clone(),
+    })?;
+    let decoder_id = DecoderId::new(17)?;
+    let mut cpu_pool = qgs_vaapi::CpuNv12FramePool::new(
+        proxy_config.coded_width,
+        proxy_config.coded_height,
+        visible_region,
+        6,
+    )?;
+    let mut gpu_processor = Nv12FrameProcessor::new(
+        discovery,
+        Nv12FrameProcessorConfig {
+            device_id: device.id,
+            coded_width: proxy_config.coded_width,
+            coded_height: proxy_config.coded_height,
+            visible_width: visible_region.width,
+            visible_height: visible_region.height,
+            slot_count: config.gpu_capacity.max(1),
+            conversion: YcbcrConversion::Rec709Limited,
+            validation_readback: false,
+        },
+    )?;
+    let mut compressed_queue = BoundedQueue::new(config.compressed_capacity)?;
+    let mut decoded_queue = BoundedQueue::new(config.decoded_capacity)?;
+    let mut gpu_queue = BoundedQueue::new(config.gpu_capacity)?;
+    let mut next_input = 0_usize;
+    let mut next_output = 0_usize;
+    let mut flushed = false;
+    let mut access_units_submitted = 0_usize;
+    let mut decoder_outputs = 0_usize;
+    let mut gpu_submissions = 0_usize;
+    let mut gpu_completions = 0_usize;
+    let mut decode_elapsed = Duration::ZERO;
+    let mut transfer_elapsed = Duration::ZERO;
+    let mut gpu_submit_elapsed = Duration::ZERO;
+    let mut gpu_completion_elapsed = Duration::ZERO;
+    let mut transfer_bytes = 0_usize;
+    let started = Instant::now();
+
+    loop {
+        while next_input < access_units.len() && !compressed_queue.is_full() {
+            compressed_queue
+                .try_push(ScheduledAccessUnit {
+                    access_unit: access_units[next_input].clone(),
+                })
+                .map_err(|_| "compressed queue unexpectedly full")?;
+            next_input += 1;
+        }
+
+        while !compressed_queue.is_empty() && !decoded_queue.is_full() {
+            let scheduled = compressed_queue
+                .pop_front()
+                .ok_or("compressed queue unexpectedly empty")?;
+            let decode_started = Instant::now();
+            let outputs = decoder.submit_access_unit(&SubmitAccessUnitRequest {
+                decoder_id,
+                data: scheduled.access_unit,
+            })?;
+            decode_elapsed += decode_started.elapsed();
+            access_units_submitted += 1;
+            for output in outputs {
+                let identity = PlaybackFrameIdentity::from_position(u64::try_from(next_output)?);
+                next_output += 1;
+                decoded_queue
+                    .try_push(DecodedPlaybackFrame {
+                        identity,
+                        surface: output,
+                    })
+                    .map_err(|_| "decoded queue unexpectedly full")?;
+                decoder_outputs += 1;
+            }
+        }
+
+        if next_input == access_units.len()
+            && compressed_queue.is_empty()
+            && !flushed
+            && decoded_queue.len() < decoded_queue.capacity()
+        {
+            let decode_started = Instant::now();
+            let outputs = decoder.flush(&FlushDecoderRequest { decoder_id })?;
+            decode_elapsed += decode_started.elapsed();
+            flushed = true;
+            for output in outputs {
+                let identity = PlaybackFrameIdentity::from_position(u64::try_from(next_output)?);
+                next_output += 1;
+                decoded_queue
+                    .try_push(DecodedPlaybackFrame {
+                        identity,
+                        surface: output,
+                    })
+                    .map_err(|_| "decoded queue unexpectedly full during flush")?;
+                decoder_outputs += 1;
+            }
+        }
+
+        while !decoded_queue.is_empty() && !gpu_queue.is_full() {
+            let submit_started = Instant::now();
+            let decoded = decoded_queue
+                .pop_front()
+                .ok_or("decoded queue unexpectedly empty")?;
+            let cpu_frame = cpu_pool.acquire()?;
+            let transfer_started = Instant::now();
+            let (cpu_frame, transfer_timing) = qgs_vaapi::transfer_nv12_surface_timed(
+                decoded.surface.resource.as_ref(),
+                cpu_frame,
+            )?;
+            transfer_elapsed += transfer_started.elapsed();
+            transfer_bytes = transfer_bytes.saturating_add(transfer_timing.bytes_copied);
+            let upload = nv12_upload_for_cpu_surface(device.id, &cpu_frame)?;
+            let token = gpu_processor.submit_frame(
+                &upload,
+                FrameIdentity {
+                    presentation_position: decoded.identity.presentation_position,
+                },
+            )?;
+            cpu_pool.release(cpu_frame)?;
+            gpu_queue
+                .try_push(GpuPendingPlaybackFrame {
+                    token,
+                    identity: decoded.identity,
+                })
+                .map_err(|_| "GPU queue unexpectedly full")?;
+            gpu_submissions += 1;
+            gpu_submit_elapsed += submit_started.elapsed();
+        }
+
+        while !gpu_queue.is_empty() {
+            let completion_started = Instant::now();
+            let Some(front) = gpu_queue.front() else {
+                break;
+            };
+            let completed = gpu_processor.poll_completed()?;
+            if !completed.contains(&front.token) {
+                if gpu_queue.is_full()
+                    || (flushed && compressed_queue.is_empty() && decoded_queue.is_empty())
+                {
+                    gpu_processor.wait_for_completion(front.token)?;
+                } else {
+                    break;
+                }
+            }
+            let processed = gpu_queue
+                .pop_front()
+                .ok_or("GPU queue unexpectedly empty")?;
+            gpu_processor.retire_completed_token(processed.token)?;
+            gpu_completions += 1;
+            gpu_completion_elapsed += completion_started.elapsed();
+        }
+
+        if flushed
+            && next_input == access_units.len()
+            && compressed_queue.is_empty()
+            && decoded_queue.is_empty()
+            && gpu_queue.is_empty()
+        {
+            break;
+        }
+    }
+
+    let elapsed = started.elapsed();
+    println!("Step 17C as-fast full pixel path:");
+    println!(
+        "  device: {} frames={} wall={:.3} ms source={:.3}s throughput={:.2} fps realtime={:.2}x",
+        device.name,
+        gpu_completions,
+        duration_ms(elapsed),
+        source_duration.as_secs_f64(),
+        gpu_completions as f64 / elapsed.as_secs_f64().max(0.000_001),
+        source_duration.as_secs_f64() / elapsed.as_secs_f64().max(0.000_001)
+    );
+    println!(
+        "  access_units={} decoder_outputs={} gpu_submissions={} gpu_completions={}",
+        access_units_submitted, decoder_outputs, gpu_submissions, gpu_completions
+    );
+    println!(
+        "  stage totals: decode={:.3} ms transfer={:.3} ms gpu_submit_loop={:.3} ms gpu_completion={:.3} ms bytes_copied/frame={}",
+        duration_ms(decode_elapsed),
+        duration_ms(transfer_elapsed),
+        duration_ms(gpu_submit_elapsed),
+        duration_ms(gpu_completion_elapsed),
+        transfer_bytes / gpu_completions.max(1)
+    );
+    println!(
+        "  queue peaks: compressed={} decoded={} gpu={}",
+        compressed_queue.stats().peak_depth,
+        decoded_queue.stats().peak_depth,
+        gpu_queue.stats().peak_depth
+    );
+    print_nv12_gpu_diagnostics(&gpu_processor.diagnostics());
+    Ok(())
+}
+
+fn run_step17_synthetic_nv12_gpu_observation(
+    discovery: &VulkanDeviceDiscovery,
+    device: &DeviceDesc,
+    coded_width: u32,
+    coded_height: u32,
+    visible_width: u32,
+    visible_height: u32,
+    frame_count: usize,
+    source_duration: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let y_len = usize::try_from(coded_width)?
+        .checked_mul(usize::try_from(coded_height)?)
+        .ok_or("synthetic NV12 Y size overflow")?;
+    let uv_len = usize::try_from(coded_width)?
+        .checked_mul(usize::try_from(coded_height / 2)?)
+        .ok_or("synthetic NV12 UV size overflow")?;
+    let y = vec![96_u8; y_len];
+    let uv = vec![128_u8; uv_len];
+    let upload = Nv12Upload {
+        device_id: device.id,
+        coded_width,
+        coded_height,
+        visible_width,
+        visible_height,
+        y: Nv12Plane {
+            width_bytes: coded_width,
+            height: coded_height,
+            stride_bytes: usize::try_from(coded_width)?,
+            data: &y,
+        },
+        uv: Nv12Plane {
+            width_bytes: coded_width,
+            height: coded_height / 2,
+            stride_bytes: usize::try_from(coded_width)?,
+            data: &uv,
+        },
+        conversion: YcbcrConversion::Rec709Limited,
+    };
+    let mut processor = Nv12FrameProcessor::new(
+        discovery,
+        Nv12FrameProcessorConfig {
+            device_id: device.id,
+            coded_width,
+            coded_height,
+            visible_width,
+            visible_height,
+            slot_count: 3,
+            conversion: YcbcrConversion::Rec709Limited,
+            validation_readback: false,
+        },
+    )?;
+    let mut pending = VecDeque::new();
+    let mut submit_times = Vec::new();
+    let mut wait_times = Vec::new();
+    let started = Instant::now();
+    for index in 0..frame_count {
+        loop {
+            let submit_started = Instant::now();
+            match processor.submit_frame(
+                &upload,
+                FrameIdentity {
+                    presentation_position: u64::try_from(index)?,
+                },
+            ) {
+                Ok(token) => {
+                    submit_times.push(submit_started.elapsed());
+                    pending.push_back(token);
+                    break;
+                }
+                Err(FrameProcessorError::NoFrameSlotAvailable) => {
+                    let token = pending
+                        .pop_front()
+                        .ok_or("synthetic GPU pending queue empty")?;
+                    let wait_started = Instant::now();
+                    processor.wait_for_completion(token)?;
+                    processor.retire_completed_token(token)?;
+                    wait_times.push(wait_started.elapsed());
+                }
+                Err(err) => return Err(Box::new(err)),
+            }
+        }
+    }
+    while let Some(token) = pending.pop_front() {
+        let wait_started = Instant::now();
+        processor.wait_for_completion(token)?;
+        processor.retire_completed_token(token)?;
+        wait_times.push(wait_started.elapsed());
+    }
+    let elapsed = started.elapsed();
+    println!("Step 17 isolated synthetic CPU NV12 -> Vulkan processing:");
+    println!(
+        "  device: {} frames={} wall={:.3} ms source={:.3}s throughput={:.2} fps realtime={:.2}x",
+        device.name,
+        frame_count,
+        duration_ms(elapsed),
+        source_duration.as_secs_f64(),
+        frame_count as f64 / elapsed.as_secs_f64().max(0.000_001),
+        source_duration.as_secs_f64() / elapsed.as_secs_f64().max(0.000_001)
+    );
+    print_duration_distribution("  isolated Vulkan submit/frame", &mut submit_times);
+    print_duration_distribution("  isolated Vulkan wait/retire", &mut wait_times);
+    print_nv12_gpu_diagnostics(&processor.diagnostics());
+    Ok(())
 }
 
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
+}
+
+fn duration_from_ns(ns: u128) -> Duration {
+    Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
 }
 
 fn mean_duration(values: &[Duration]) -> Duration {
@@ -1871,6 +2774,72 @@ fn median_duration(values: &mut [Duration]) -> Duration {
     }
     values.sort_unstable();
     values[values.len() / 2]
+}
+
+fn print_duration_distribution(label: &str, values: &mut [Duration]) {
+    if values.is_empty() {
+        println!("{label}: no samples");
+        return;
+    }
+    let total = values
+        .iter()
+        .copied()
+        .fold(Duration::ZERO, |acc, value| acc.saturating_add(value));
+    let avg = Duration::from_nanos(
+        u64::try_from(total.as_nanos() / values.len() as u128).unwrap_or(u64::MAX),
+    );
+    values.sort_unstable();
+    let median = values[values.len() / 2];
+    let p90 = values[((values.len() * 9) / 10).min(values.len() - 1)];
+    let max = *values.last().expect("nonempty");
+    println!(
+        "{label}: total={:.3} ms avg={:.3} ms median={:.3} ms p90={:.3} ms max={:.3} ms samples={}",
+        duration_ms(total),
+        duration_ms(avg),
+        duration_ms(median),
+        duration_ms(p90),
+        duration_ms(max),
+        values.len()
+    );
+}
+
+fn print_nv12_gpu_diagnostics(diagnostics: &Nv12FrameProcessorDiagnostics) {
+    println!("  NV12 Vulkan processor diagnostics:");
+    println!(
+        "    calls: submit={} poll={} fence_wait={} retire={} readback_enabled={}",
+        diagnostics.submit_calls,
+        diagnostics.poll_calls,
+        diagnostics.fence_wait_calls,
+        diagnostics.retire_calls,
+        yes_no(diagnostics.output_readback_enabled)
+    );
+    println!(
+        "    CPU prep: slot_acquire={:.3} ms compact_y_copy={:.3} ms compact_uv_copy={:.3} ms staging_write_y={:.3} ms staging_write_uv={:.3} ms",
+        ns_ms(diagnostics.slot_acquire_ns),
+        ns_ms(diagnostics.compact_y_copy_ns),
+        ns_ms(diagnostics.compact_uv_copy_ns),
+        ns_ms(diagnostics.staging_write_y_ns),
+        ns_ms(diagnostics.staging_write_uv_ns)
+    );
+    println!(
+        "    command/submit: pool_reset={:.3} ms fence_reset={:.3} ms begin={:.3} ms record={:.3} ms end={:.3} ms queue_submit={:.3} ms",
+        ns_ms(diagnostics.command_pool_reset_ns),
+        ns_ms(diagnostics.fence_reset_ns),
+        ns_ms(diagnostics.command_begin_ns),
+        ns_ms(diagnostics.command_record_ns),
+        ns_ms(diagnostics.command_end_ns),
+        ns_ms(diagnostics.queue_submit_ns)
+    );
+    println!(
+        "    completion: poll={:.3} ms fence_wait={:.3} ms retire={:.3} ms",
+        ns_ms(diagnostics.poll_ns),
+        ns_ms(diagnostics.fence_wait_ns),
+        ns_ms(diagnostics.retire_ns)
+    );
+}
+
+fn ns_ms(ns: u128) -> f64 {
+    ns as f64 / 1_000_000.0
 }
 
 struct FrontendOnlyObservation {

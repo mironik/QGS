@@ -28,7 +28,7 @@ use qgs_protocol::{
     BitDepth, ChromaSubsampling, CreateDecoderRequest, DecoderConfig, DecoderId, DeviceDesc,
     DeviceId, FlushDecoderRequest, H264Profile, Mpeg2Profile, SubmitAccessUnitRequest,
     VideoCapabilities, VideoCodec, VideoDecodeCapability, VideoProfile, VideoSurfaceDesc,
-    VideoSurfaceFormat, MAX_VIDEO_SURFACE_HEIGHT, MAX_VIDEO_SURFACE_WIDTH,
+    VideoSurfaceFormat, VisibleRegion, MAX_VIDEO_SURFACE_HEIGHT, MAX_VIDEO_SURFACE_WIDTH,
 };
 
 const DEFAULT_MAX_WIDTH: u32 = MAX_VIDEO_SURFACE_WIDTH;
@@ -255,6 +255,312 @@ pub struct VaapiDecodeObservation {
     pub max_client_held_outputs: usize,
     pub diagnostic_frames: usize,
     pub diagnostic_export_probes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CpuNv12Plane {
+    pub width_bytes: usize,
+    pub height: usize,
+    pub stride_bytes: usize,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CpuNv12Surface {
+    pub desc: VideoSurfaceDesc,
+    pub y: CpuNv12Plane,
+    pub uv: CpuNv12Plane,
+}
+
+impl CpuNv12Surface {
+    pub fn owned_bytes(&self) -> usize {
+        self.y.data.len().saturating_add(self.uv.data.len())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CpuNv12FrameLayout {
+    pub y_width_bytes: usize,
+    pub y_height: usize,
+    pub y_stride_bytes: usize,
+    pub uv_width_bytes: usize,
+    pub uv_height: usize,
+    pub uv_stride_bytes: usize,
+}
+
+impl CpuNv12FrameLayout {
+    pub fn tight_coded(coded_width: u32, coded_height: u32) -> Result<Self, DecoderError> {
+        let width = usize::try_from(coded_width).map_err(|_| DecoderError::DecodeFailed)?;
+        let height = usize::try_from(coded_height).map_err(|_| DecoderError::DecodeFailed)?;
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(DecoderError::DecodeFailed);
+        }
+        Ok(Self {
+            y_width_bytes: width,
+            y_height: height,
+            y_stride_bytes: width,
+            uv_width_bytes: width,
+            uv_height: height / 2,
+            uv_stride_bytes: width,
+        })
+    }
+
+    pub fn tight_visible(visible_region: VisibleRegion) -> Result<Self, DecoderError> {
+        let width =
+            usize::try_from(visible_region.width).map_err(|_| DecoderError::DecodeFailed)?;
+        let height =
+            usize::try_from(visible_region.height).map_err(|_| DecoderError::DecodeFailed)?;
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(DecoderError::DecodeFailed);
+        }
+        Ok(Self {
+            y_width_bytes: width,
+            y_height: height,
+            y_stride_bytes: width,
+            uv_width_bytes: width,
+            uv_height: height / 2,
+            uv_stride_bytes: width,
+        })
+    }
+
+    pub fn coded_with_destination_pitch(
+        coded_width: u32,
+        coded_height: u32,
+        y_stride_bytes: usize,
+        uv_stride_bytes: usize,
+    ) -> Result<Self, DecoderError> {
+        let tight = Self::tight_coded(coded_width, coded_height)?;
+        if y_stride_bytes < tight.y_width_bytes || uv_stride_bytes < tight.uv_width_bytes {
+            return Err(DecoderError::DecodeFailed);
+        }
+        Ok(Self {
+            y_stride_bytes,
+            uv_stride_bytes,
+            ..tight
+        })
+    }
+
+    pub fn full_source_rows(
+        y_height: usize,
+        y_stride_bytes: usize,
+        uv_height: usize,
+        uv_stride_bytes: usize,
+    ) -> Result<Self, DecoderError> {
+        if y_height == 0
+            || uv_height == 0
+            || y_stride_bytes == 0
+            || uv_stride_bytes == 0
+            || !y_stride_bytes.is_multiple_of(2)
+            || !uv_stride_bytes.is_multiple_of(2)
+        {
+            return Err(DecoderError::DecodeFailed);
+        }
+        Ok(Self {
+            y_width_bytes: y_stride_bytes,
+            y_height,
+            y_stride_bytes,
+            uv_width_bytes: uv_stride_bytes,
+            uv_height,
+            uv_stride_bytes,
+        })
+    }
+
+    fn bytes_per_frame(&self) -> Result<usize, DecoderError> {
+        let y_len = self
+            .y_stride_bytes
+            .checked_mul(self.y_height)
+            .ok_or(DecoderError::DecodeFailed)?;
+        let uv_len = self
+            .uv_stride_bytes
+            .checked_mul(self.uv_height)
+            .ok_or(DecoderError::DecodeFailed)?;
+        y_len.checked_add(uv_len).ok_or(DecoderError::DecodeFailed)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CpuNv12PoolStats {
+    pub frames_created: usize,
+    pub frames_reused: usize,
+    pub peak_checked_out: usize,
+    pub bytes_per_frame: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CpuNv12TransferTiming {
+    pub sync_ns: u128,
+    pub image_create_ns: u128,
+    pub copy_y_ns: u128,
+    pub copy_uv_ns: u128,
+    pub image_release_ns: u128,
+    pub bytes_copied: usize,
+    pub image_layout: Option<VaNv12ImageLayout>,
+    pub total_ns: u128,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VaNv12ImageLayout {
+    pub fourcc: u32,
+    pub width: u32,
+    pub height: u32,
+    pub num_planes: u32,
+    pub offsets: [usize; 3],
+    pub pitches: [usize; 3],
+    pub data_size: usize,
+    pub derived: bool,
+}
+
+impl VaNv12ImageLayout {
+    pub fn fourcc_string(&self) -> String {
+        let bytes = self.fourcc.to_le_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    pub fn y_uv_contiguous(&self) -> bool {
+        self.offsets[0].checked_add(self.pitches[0].saturating_mul(self.height as usize))
+            == Some(self.offsets[1])
+    }
+}
+
+pub struct CpuNv12FramePool {
+    coded_width: u32,
+    coded_height: u32,
+    visible_region: VisibleRegion,
+    capacity: usize,
+    available: Vec<CpuNv12Surface>,
+    checked_out: usize,
+    total_acquires: usize,
+    stats: CpuNv12PoolStats,
+}
+
+impl CpuNv12FramePool {
+    pub fn new(
+        coded_width: u32,
+        coded_height: u32,
+        visible_region: VisibleRegion,
+        capacity: usize,
+    ) -> Result<Self, DecoderError> {
+        Self::new_with_layout(
+            coded_width,
+            coded_height,
+            visible_region,
+            capacity,
+            CpuNv12FrameLayout::tight_coded(coded_width, coded_height)?,
+        )
+    }
+
+    pub fn new_with_layout(
+        coded_width: u32,
+        coded_height: u32,
+        visible_region: VisibleRegion,
+        capacity: usize,
+        layout: CpuNv12FrameLayout,
+    ) -> Result<Self, DecoderError> {
+        if capacity == 0 || !coded_width.is_multiple_of(2) || !coded_height.is_multiple_of(2) {
+            return Err(DecoderError::DecodeFailed);
+        }
+        let desc = nv12_surface_desc(coded_width, coded_height, visible_region)?;
+        let y_len = layout
+            .y_stride_bytes
+            .checked_mul(layout.y_height)
+            .ok_or(DecoderError::DecodeFailed)?;
+        let uv_len = layout
+            .uv_stride_bytes
+            .checked_mul(layout.uv_height)
+            .ok_or(DecoderError::DecodeFailed)?;
+        let bytes_per_frame = layout.bytes_per_frame()?;
+        let mut available = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            available.push(CpuNv12Surface {
+                desc: desc.clone(),
+                y: CpuNv12Plane {
+                    width_bytes: layout.y_width_bytes,
+                    height: layout.y_height,
+                    stride_bytes: layout.y_stride_bytes,
+                    data: vec![0; y_len],
+                },
+                uv: CpuNv12Plane {
+                    width_bytes: layout.uv_width_bytes,
+                    height: layout.uv_height,
+                    stride_bytes: layout.uv_stride_bytes,
+                    data: vec![0; uv_len],
+                },
+            });
+        }
+        Ok(Self {
+            coded_width,
+            coded_height,
+            visible_region,
+            capacity,
+            available,
+            checked_out: 0,
+            total_acquires: 0,
+            stats: CpuNv12PoolStats {
+                frames_created: capacity,
+                bytes_per_frame,
+                ..CpuNv12PoolStats::default()
+            },
+        })
+    }
+
+    pub fn acquire(&mut self) -> Result<CpuNv12Surface, DecoderError> {
+        let frame = self.available.pop().ok_or(DecoderError::DecodeFailed)?;
+        if self.total_acquires >= self.capacity {
+            self.stats.frames_reused = self.stats.frames_reused.saturating_add(1);
+        }
+        self.total_acquires = self.total_acquires.saturating_add(1);
+        self.checked_out = self.checked_out.saturating_add(1);
+        self.stats.peak_checked_out = self.stats.peak_checked_out.max(self.checked_out);
+        Ok(frame)
+    }
+
+    pub fn release(&mut self, mut frame: CpuNv12Surface) -> Result<(), DecoderError> {
+        if frame.desc.coded_width != self.coded_width
+            || frame.desc.coded_height != self.coded_height
+            || frame.desc.visible_region != self.visible_region
+            || self.available.len() >= self.capacity
+            || self.checked_out == 0
+        {
+            return Err(DecoderError::DecodeFailed);
+        }
+        frame.y.data.fill(0);
+        frame.uv.data.fill(0);
+        self.checked_out -= 1;
+        self.available.push(frame);
+        Ok(())
+    }
+
+    pub fn stats(&self) -> CpuNv12PoolStats {
+        self.stats.clone()
+    }
+}
+
+pub fn transfer_nv12_surface(
+    resource: &dyn BackendResource,
+    destination: CpuNv12Surface,
+) -> Result<CpuNv12Surface, DecoderError> {
+    transfer_nv12_surface_timed(resource, destination).map(|(surface, _timing)| surface)
+}
+
+pub fn transfer_nv12_surface_timed(
+    resource: &dyn BackendResource,
+    destination: CpuNv12Surface,
+) -> Result<(CpuNv12Surface, CpuNv12TransferTiming), DecoderError> {
+    let surface = resource
+        .as_any()
+        .downcast_ref::<VaapiVideoSurface>()
+        .ok_or(DecoderError::UnsupportedDecodeConfiguration)?;
+    surface.state.transfer_nv12(destination)
+}
+
+pub fn describe_nv12_surface_image(
+    resource: &dyn BackendResource,
+) -> Result<VaNv12ImageLayout, DecoderError> {
+    let surface = resource
+        .as_any()
+        .downcast_ref::<VaapiVideoSurface>()
+        .ok_or(DecoderError::UnsupportedDecodeConfiguration)?;
+    surface.state.describe_nv12_image()
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -748,6 +1054,40 @@ impl DecodedSurfaceState {
             .is_some_and(DecodedVaSurface::is_submitted)
     }
 
+    fn transfer_nv12(
+        &self,
+        mut destination: CpuNv12Surface,
+    ) -> Result<(CpuNv12Surface, CpuNv12TransferTiming), DecoderError> {
+        let transfer_started = Instant::now();
+        let mut timing = CpuNv12TransferTiming::default();
+        if destination.desc.coded_width != self.desc.coded_width
+            || destination.desc.coded_height != self.desc.coded_height
+            || destination.desc.visible_region != self.desc.visible_region
+            || destination.desc.format != VideoSurfaceFormat::Nv12
+        {
+            return Err(DecoderError::DecodeFailed);
+        }
+        let mut stored = self.surface.borrow_mut();
+        let decoded = stored.take().ok_or(DecoderError::DecodeFailed)?;
+        let sync_started = Instant::now();
+        let ready = decoded.into_ready_for_cpu()?;
+        timing.sync_ns = sync_started.elapsed().as_nanos();
+        copy_nv12_surface_to_cpu(&ready, &mut destination, &mut timing)?;
+        *stored = Some(DecodedVaSurface::Ready(ready));
+        timing.total_ns = transfer_started.elapsed().as_nanos();
+        Ok((destination, timing))
+    }
+
+    fn describe_nv12_image(&self) -> Result<VaNv12ImageLayout, DecoderError> {
+        let mut stored = self.surface.borrow_mut();
+        let decoded = stored.take().ok_or(DecoderError::DecodeFailed)?;
+        let ready = decoded.into_ready_for_cpu()?;
+        let layout =
+            describe_nv12_surface_layout(&ready, self.desc.coded_width, self.desc.coded_height)?;
+        *stored = Some(DecodedVaSurface::Ready(ready));
+        Ok(layout)
+    }
+
     fn recycle_if_released(&self) {
         if !self.codec_released.get() {
             return;
@@ -756,6 +1096,184 @@ impl DecodedSurfaceState {
             self.pool.borrow_mut().defer_recycle(surface);
         }
     }
+}
+
+fn nv12_surface_desc(
+    coded_width: u32,
+    coded_height: u32,
+    visible_region: VisibleRegion,
+) -> Result<VideoSurfaceDesc, DecoderError> {
+    let desc = VideoSurfaceDesc {
+        coded_width,
+        coded_height,
+        visible_region,
+        format: VideoSurfaceFormat::Nv12,
+        bit_depth: BitDepth::new(8).map_err(DecoderError::from)?,
+        chroma: ChromaSubsampling::Cs420,
+        scan_mode: qgs_protocol::ScanMode::Progressive,
+        field_order: qgs_protocol::FieldOrder::Unknown,
+    };
+    desc.validate().map_err(DecoderError::from)?;
+    Ok(desc)
+}
+
+fn copy_nv12_surface_to_cpu(
+    surface: &Surface<()>,
+    destination: &mut CpuNv12Surface,
+    timing: &mut CpuNv12TransferTiming,
+) -> Result<(), DecoderError> {
+    let coded_width = destination.desc.coded_width;
+    let coded_height = destination.desc.coded_height;
+    let image_started = Instant::now();
+    let image = Image::derive_from(surface, (coded_width, coded_height))
+        .or_else(|_| {
+            Image::create_from(
+                surface,
+                nv12_image_format(),
+                (coded_width, coded_height),
+                (coded_width, coded_height),
+            )
+        })
+        .map_err(|_| DecoderError::DecodeFailed)?;
+    timing.image_create_ns = image_started.elapsed().as_nanos();
+    let va_image = image.image();
+    if va_image.num_planes < 2 {
+        return Err(DecoderError::DecodeFailed);
+    }
+    timing.image_layout = Some(va_image_layout(&image));
+    let copy_y_started = Instant::now();
+    timing.bytes_copied = timing.bytes_copied.saturating_add(copy_nv12_plane(
+        image.as_ref(),
+        va_image.offsets[0] as usize,
+        va_image.pitches[0] as usize,
+        &mut destination.y,
+    )?);
+    timing.copy_y_ns = copy_y_started.elapsed().as_nanos();
+    let copy_uv_started = Instant::now();
+    timing.bytes_copied = timing.bytes_copied.saturating_add(copy_nv12_plane(
+        image.as_ref(),
+        va_image.offsets[1] as usize,
+        va_image.pitches[1] as usize,
+        &mut destination.uv,
+    )?);
+    timing.copy_uv_ns = copy_uv_started.elapsed().as_nanos();
+    let release_started = Instant::now();
+    drop(image);
+    timing.image_release_ns = release_started.elapsed().as_nanos();
+    Ok(())
+}
+
+fn describe_nv12_surface_layout(
+    surface: &Surface<()>,
+    coded_width: u32,
+    coded_height: u32,
+) -> Result<VaNv12ImageLayout, DecoderError> {
+    let image = Image::derive_from(surface, (coded_width, coded_height))
+        .or_else(|_| {
+            Image::create_from(
+                surface,
+                nv12_image_format(),
+                (coded_width, coded_height),
+                (coded_width, coded_height),
+            )
+        })
+        .map_err(|_| DecoderError::DecodeFailed)?;
+    let layout = va_image_layout(&image);
+    if layout.num_planes < 2 {
+        return Err(DecoderError::DecodeFailed);
+    }
+    Ok(layout)
+}
+
+fn va_image_layout(image: &Image<'_>) -> VaNv12ImageLayout {
+    let va_image = image.image();
+    VaNv12ImageLayout {
+        fourcc: va_image.format.fourcc,
+        width: u32::from(va_image.width),
+        height: u32::from(va_image.height),
+        num_planes: u32::from(va_image.num_planes),
+        offsets: [
+            va_image.offsets[0] as usize,
+            va_image.offsets[1] as usize,
+            va_image.offsets[2] as usize,
+        ],
+        pitches: [
+            va_image.pitches[0] as usize,
+            va_image.pitches[1] as usize,
+            va_image.pitches[2] as usize,
+        ],
+        data_size: va_image.data_size as usize,
+        derived: image.is_derived(),
+    }
+}
+
+fn copy_nv12_plane(
+    source: &[u8],
+    source_offset: usize,
+    source_pitch: usize,
+    destination: &mut CpuNv12Plane,
+) -> Result<usize, DecoderError> {
+    if source_pitch < destination.width_bytes
+        || destination.stride_bytes < destination.width_bytes
+        || destination.height == 0
+    {
+        return Err(DecoderError::DecodeFailed);
+    }
+    let required_destination = destination
+        .stride_bytes
+        .checked_mul(destination.height)
+        .ok_or(DecoderError::DecodeFailed)?;
+    if destination.data.len() < required_destination {
+        return Err(DecoderError::DecodeFailed);
+    }
+    if source_pitch == destination.stride_bytes
+        && destination.width_bytes == destination.stride_bytes
+    {
+        let byte_count = destination
+            .stride_bytes
+            .checked_mul(destination.height)
+            .ok_or(DecoderError::DecodeFailed)?;
+        let source_end = source_offset
+            .checked_add(byte_count)
+            .ok_or(DecoderError::DecodeFailed)?;
+        let source_slice = source
+            .get(source_offset..source_end)
+            .ok_or(DecoderError::DecodeFailed)?;
+        let destination_slice = destination
+            .data
+            .get_mut(0..byte_count)
+            .ok_or(DecoderError::DecodeFailed)?;
+        destination_slice.copy_from_slice(source_slice);
+        return Ok(byte_count);
+    }
+    let mut copied = 0_usize;
+    for row in 0..destination.height {
+        let source_start = source_offset
+            .checked_add(
+                row.checked_mul(source_pitch)
+                    .ok_or(DecoderError::DecodeFailed)?,
+            )
+            .ok_or(DecoderError::DecodeFailed)?;
+        let source_end = source_start
+            .checked_add(destination.width_bytes)
+            .ok_or(DecoderError::DecodeFailed)?;
+        let destination_start = row
+            .checked_mul(destination.stride_bytes)
+            .ok_or(DecoderError::DecodeFailed)?;
+        let destination_end = destination_start
+            .checked_add(destination.width_bytes)
+            .ok_or(DecoderError::DecodeFailed)?;
+        let source_row = source
+            .get(source_start..source_end)
+            .ok_or(DecoderError::DecodeFailed)?;
+        let destination_row = destination
+            .data
+            .get_mut(destination_start..destination_end)
+            .ok_or(DecoderError::DecodeFailed)?;
+        destination_row.copy_from_slice(source_row);
+        copied = copied.saturating_add(destination.width_bytes);
+    }
+    Ok(copied)
 }
 
 impl Drop for DecodedSurfaceState {
@@ -863,6 +1381,20 @@ impl DecodedVaSurface {
 
     fn is_submitted(&self) -> bool {
         matches!(self, Self::Submitted(_))
+    }
+
+    fn into_ready_for_cpu(self) -> Result<Surface<()>, DecoderError> {
+        match self {
+            Self::Submitted(picture) => picture
+                .sync()
+                .map_err(|_| DecoderError::DecodeFailed)?
+                .take_surface()
+                .map_err(|_| DecoderError::DecodeFailed),
+            Self::Ready(surface) => {
+                surface.sync().map_err(|_| DecoderError::DecodeFailed)?;
+                Ok(surface)
+            }
+        }
     }
 
     fn reclaim_for_reuse(self, timing: Option<&mut VaapiDecodeTiming>) -> Option<Surface<()>> {
@@ -1593,6 +2125,51 @@ mod tests {
         push_unique_capability(&mut capabilities, capability);
 
         assert_eq!(capabilities.len(), 1);
+    }
+
+    #[test]
+    fn cpu_nv12_pool_is_bounded_and_reuses_owned_frames() {
+        let visible = VisibleRegion {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 2,
+        };
+        let mut pool = CpuNv12FramePool::new(4, 4, visible, 2).expect("pool");
+
+        let first = pool.acquire().expect("first");
+        let second = pool.acquire().expect("second");
+        assert!(matches!(pool.acquire(), Err(DecoderError::DecodeFailed)));
+        assert_eq!(pool.stats().peak_checked_out, 2);
+
+        pool.release(first).expect("release");
+        let reused = pool.acquire().expect("reused");
+        assert_eq!(reused.desc.visible_region, visible);
+        assert_eq!(reused.y.width_bytes, 4);
+        assert_eq!(reused.y.height, 4);
+        assert_eq!(reused.uv.width_bytes, 4);
+        assert_eq!(reused.uv.height, 2);
+        assert_eq!(reused.owned_bytes(), 24);
+        assert_eq!(pool.stats().bytes_per_frame, 24);
+        assert_eq!(pool.stats().frames_reused, 1);
+        pool.release(second).expect("release second");
+        pool.release(reused).expect("release reused");
+    }
+
+    #[test]
+    fn copy_nv12_plane_skips_source_padding() {
+        let source = [1_u8, 2, 3, 4, 0xaa, 0xbb, 5, 6, 7, 8, 0xcc, 0xdd];
+        let mut plane = CpuNv12Plane {
+            width_bytes: 4,
+            height: 2,
+            stride_bytes: 4,
+            data: vec![0; 8],
+        };
+
+        let copied = copy_nv12_plane(&source, 0, 6, &mut plane).expect("copy");
+
+        assert_eq!(copied, 8);
+        assert_eq!(plane.data, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]

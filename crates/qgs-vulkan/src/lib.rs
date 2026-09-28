@@ -4,6 +4,7 @@ use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use ash::vk;
 use qgs_core::{
@@ -101,6 +102,89 @@ const YUV422P10_TO_RGBA_U16_SHADER: [u32; 740] = [
     174, 175, 393281, 177, 178, 160, 38, 155, 196670, 178, 176, 131321, 181, 131320, 181, 65789,
     65592,
 ];
+const NV12_TO_RGBA_U16_SHADER: [u32; 1342] = [
+    119734787, 66304, 851979, 218, 0, 131089, 1, 393227, 1, 1280527431, 1685353262, 808793134, 0,
+    196622, 0, 1, 393231, 5, 4, 1852399981, 0, 84, 393232, 4, 17, 8, 8, 1, 196611, 2, 450, 655364,
+    1197427783, 1279741775, 1885560645, 1953718128, 1600482425, 1701734764, 1919509599, 1769235301,
+    25974, 524292, 1197427783, 1279741775, 1852399429, 1685417059, 1768185701, 1952671090, 6649449,
+    262149, 4, 1852399981, 0, 393221, 10, 1684107116, 1954112095, 679042917, 3879285, 327685, 9,
+    1702132066, 1684957535, 30821, 458757, 13, 1684107116, 1954112095, 1987403621, 993097000, 0,
+    327685, 12, 1702132066, 1684957535, 30821, 327685, 19, 1835101283, 674312304, 3879270, 196613,
+    18, 118, 327685, 23, 1969188724, 1713911345, 15153, 196613, 22, 118, 262149, 25, 1685221239, 0,
+    262149, 27, 1634488409, 25966, 327686, 27, 0, 1870094201, 7562354, 262149, 29, 1819303801,
+    6647393, 262149, 49, 1685221239, 0, 262149, 51, 1817204309, 6647393, 393222, 51, 0, 2002744949,
+    1935962735, 0, 327685, 53, 1885304437, 1701732716, 0, 262149, 72, 1634886000, 109, 196613, 81,
+    120, 524293, 84, 1197436007, 1633841004, 1986939244, 1952539503, 1231974249, 68, 196613, 89,
+    7827314, 262149, 95, 1634885968, 29549, 327686, 95, 0, 1952737655, 104, 327686, 95, 1,
+    1734960488, 29800, 458758, 95, 2, 1953718137, 1701079410, 1954112095, 29541, 458758, 95, 3,
+    1935636085, 1684632180, 2036490085, 7562612, 196613, 97, 25456, 196613, 114, 30329, 262149,
+    122, 1634886000, 109, 327685, 124, 1767863925, 2019910766, 0, 196613, 135, 7758435, 262149,
+    136, 1634886000, 109, 196613, 139, 7762531, 262149, 142, 1634886000, 109, 196613, 144, 31097,
+    196613, 152, 25187, 196613, 159, 29283, 196613, 164, 114, 262149, 170, 1634886000, 109, 196613,
+    172, 103, 262149, 182, 1634886000, 109, 196613, 184, 98, 262149, 190, 1634886000, 109, 196613,
+    192, 7890025, 196613, 201, 7632207, 327686, 201, 0, 1633838962, 0, 327685, 203, 1601467759,
+    1633838962, 0, 262215, 26, 6, 4, 196679, 27, 2, 262216, 27, 0, 24, 327752, 27, 0, 35, 0,
+    196679, 29, 24, 262215, 29, 33, 0, 262215, 29, 34, 0, 262215, 50, 6, 4, 196679, 51, 2, 262216,
+    51, 0, 24, 327752, 51, 0, 35, 0, 196679, 53, 24, 262215, 53, 33, 1, 262215, 53, 34, 0, 262215,
+    84, 11, 28, 196679, 95, 2, 327752, 95, 0, 35, 0, 327752, 95, 1, 35, 4, 327752, 95, 2, 35, 8,
+    327752, 95, 3, 35, 12, 262215, 200, 6, 4, 196679, 201, 2, 262216, 201, 0, 25, 327752, 201, 0,
+    35, 0, 196679, 203, 25, 262215, 203, 33, 2, 262215, 203, 34, 0, 262215, 217, 11, 25, 131091, 2,
+    196641, 3, 2, 262165, 6, 32, 0, 262176, 7, 7, 6, 262177, 8, 6, 7, 196630, 15, 32, 262176, 16,
+    7, 15, 262177, 17, 15, 16, 262177, 21, 6, 16, 196637, 26, 6, 196638, 27, 26, 262176, 28, 12,
+    27, 262203, 28, 29, 12, 262165, 30, 32, 1, 262187, 30, 31, 0, 262187, 6, 33, 2, 262176, 35, 12,
+    6, 262187, 6, 40, 3, 262187, 6, 42, 8, 262187, 6, 45, 255, 196637, 50, 6, 196638, 51, 50,
+    262176, 52, 12, 51, 262203, 52, 53, 12, 262187, 15, 67, 0, 262187, 15, 68, 1065353216, 262187,
+    15, 75, 1199570688, 262167, 82, 6, 3, 262176, 83, 1, 82, 262203, 83, 84, 1, 262187, 6, 85, 0,
+    262176, 86, 1, 6, 262187, 6, 90, 1, 131092, 93, 393246, 95, 6, 6, 6, 6, 262176, 96, 9, 95,
+    262203, 96, 97, 9, 262176, 98, 9, 6, 262187, 30, 106, 1, 262187, 30, 116, 2, 262187, 30, 127,
+    3, 262187, 6, 132, 4294967294, 262187, 15, 147, 1098907648, 262187, 15, 150, 1130037248,
+    262187, 15, 155, 1124073472, 262187, 15, 157, 1130364928, 262187, 15, 166, 1070174988, 262187,
+    15, 174, 1044369885, 262187, 15, 178, 1055895027, 262187, 15, 186, 1072530509, 196637, 200, 6,
+    196638, 201, 200, 262176, 202, 12, 201, 262203, 202, 203, 12, 262187, 6, 207, 16, 262187, 6,
+    214, 4294901760, 393260, 82, 217, 42, 42, 90, 327734, 2, 4, 0, 3, 131320, 5, 262203, 7, 81, 7,
+    262203, 7, 89, 7, 262203, 7, 114, 7, 262203, 7, 122, 7, 262203, 7, 124, 7, 262203, 7, 135, 7,
+    262203, 7, 136, 7, 262203, 7, 139, 7, 262203, 7, 142, 7, 262203, 16, 144, 7, 262203, 16, 152,
+    7, 262203, 16, 159, 7, 262203, 7, 164, 7, 262203, 16, 170, 7, 262203, 7, 172, 7, 262203, 16,
+    182, 7, 262203, 7, 184, 7, 262203, 16, 190, 7, 262203, 7, 192, 7, 327745, 86, 87, 84, 85,
+    262205, 6, 88, 87, 196670, 81, 88, 327745, 86, 91, 84, 90, 262205, 6, 92, 91, 196670, 89, 92,
+    262205, 6, 94, 81, 327745, 98, 99, 97, 31, 262205, 6, 100, 99, 327854, 93, 101, 94, 100,
+    262312, 93, 102, 101, 196855, 104, 0, 262394, 102, 103, 104, 131320, 103, 262205, 6, 105, 89,
+    327745, 98, 107, 97, 106, 262205, 6, 108, 107, 327854, 93, 109, 105, 108, 131321, 104, 131320,
+    104, 458997, 93, 110, 101, 5, 109, 103, 196855, 112, 0, 262394, 110, 111, 112, 131320, 111,
+    65789, 131320, 112, 262205, 6, 115, 89, 327745, 98, 117, 97, 116, 262205, 6, 118, 117, 327812,
+    6, 119, 115, 118, 262205, 6, 120, 81, 327808, 6, 121, 119, 120, 196670, 122, 121, 327737, 6,
+    123, 10, 122, 196670, 114, 123, 262205, 6, 125, 89, 327814, 6, 126, 125, 33, 327745, 98, 128,
+    97, 127, 262205, 6, 129, 128, 327812, 6, 130, 126, 129, 262205, 6, 131, 81, 327879, 6, 133,
+    131, 132, 327808, 6, 134, 130, 133, 196670, 124, 134, 262205, 6, 137, 124, 196670, 136, 137,
+    327737, 6, 138, 13, 136, 196670, 135, 138, 262205, 6, 140, 124, 327808, 6, 141, 140, 90,
+    196670, 142, 141, 327737, 6, 143, 13, 142, 196670, 139, 143, 262205, 6, 145, 114, 262256, 15,
+    146, 145, 327811, 15, 148, 146, 147, 458764, 15, 149, 1, 40, 148, 67, 327816, 15, 151, 149,
+    150, 196670, 144, 151, 262205, 6, 153, 135, 262256, 15, 154, 153, 327811, 15, 156, 154, 155,
+    327816, 15, 158, 156, 157, 196670, 152, 158, 262205, 6, 160, 139, 262256, 15, 161, 160, 327811,
+    15, 162, 161, 155, 327816, 15, 163, 162, 157, 196670, 159, 163, 262205, 15, 165, 144, 262205,
+    15, 167, 159, 327813, 15, 168, 166, 167, 327809, 15, 169, 165, 168, 196670, 170, 169, 327737,
+    6, 171, 23, 170, 196670, 164, 171, 262205, 15, 173, 144, 262205, 15, 175, 152, 327813, 15, 176,
+    174, 175, 327811, 15, 177, 173, 176, 262205, 15, 179, 159, 327813, 15, 180, 178, 179, 327811,
+    15, 181, 177, 180, 196670, 182, 181, 327737, 6, 183, 23, 182, 196670, 172, 183, 262205, 15,
+    185, 144, 262205, 15, 187, 152, 327813, 15, 188, 186, 187, 327809, 15, 189, 185, 188, 196670,
+    190, 189, 327737, 6, 191, 23, 190, 196670, 184, 191, 262205, 6, 193, 89, 327745, 98, 194, 97,
+    31, 262205, 6, 195, 194, 327812, 6, 196, 193, 195, 262205, 6, 197, 81, 327808, 6, 198, 196,
+    197, 327812, 6, 199, 198, 33, 196670, 192, 199, 262205, 6, 204, 192, 262205, 6, 205, 164,
+    262205, 6, 206, 172, 327876, 6, 208, 206, 207, 327877, 6, 209, 205, 208, 393281, 35, 210, 203,
+    31, 204, 196670, 210, 209, 262205, 6, 211, 192, 327808, 6, 212, 211, 90, 262205, 6, 213, 184,
+    327877, 6, 215, 213, 214, 393281, 35, 216, 203, 31, 212, 196670, 216, 215, 65789, 65592,
+    327734, 6, 10, 0, 8, 196663, 7, 9, 131320, 11, 262203, 7, 25, 7, 262205, 6, 32, 9, 327874, 6,
+    34, 32, 33, 393281, 35, 36, 29, 31, 34, 262205, 6, 37, 36, 196670, 25, 37, 262205, 6, 38, 25,
+    262205, 6, 39, 9, 327879, 6, 41, 39, 40, 327812, 6, 43, 41, 42, 327874, 6, 44, 38, 43, 327879,
+    6, 46, 44, 45, 131326, 46, 65592, 327734, 6, 13, 0, 8, 196663, 7, 12, 131320, 14, 262203, 7,
+    49, 7, 262205, 6, 54, 12, 327874, 6, 55, 54, 33, 393281, 35, 56, 53, 31, 55, 262205, 6, 57, 56,
+    196670, 49, 57, 262205, 6, 58, 49, 262205, 6, 59, 12, 327879, 6, 60, 59, 40, 327812, 6, 61, 60,
+    42, 327874, 6, 62, 58, 61, 327879, 6, 63, 62, 45, 131326, 63, 65592, 327734, 15, 19, 0, 17,
+    196663, 16, 18, 131320, 20, 262205, 15, 66, 18, 524300, 15, 69, 1, 43, 66, 67, 68, 131326, 69,
+    65592, 327734, 6, 23, 0, 21, 196663, 16, 22, 131320, 24, 262203, 16, 72, 7, 262205, 15, 73, 22,
+    196670, 72, 73, 327737, 15, 74, 19, 72, 327813, 15, 76, 74, 75, 393228, 15, 77, 1, 1, 76,
+    262253, 6, 78, 77, 131326, 78, 65592,
+];
 
 type BackendResult<T> = Result<T, BackendError>;
 
@@ -151,8 +235,40 @@ pub struct Yuv422P10Upload<'a> {
     pub conversion: YcbcrConversion,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct Nv12Plane<'a> {
+    pub width_bytes: u32,
+    pub height: u32,
+    pub stride_bytes: usize,
+    pub data: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Nv12Upload<'a> {
+    pub device_id: DeviceId,
+    pub coded_width: u32,
+    pub coded_height: u32,
+    pub visible_width: u32,
+    pub visible_height: u32,
+    pub y: Nv12Plane<'a>,
+    pub uv: Nv12Plane<'a>,
+    pub conversion: YcbcrConversion,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Yuv422P10GpuOutput {
+    pub width: u32,
+    pub height: u32,
+    pub rgba_u16: Vec<u16>,
+    pub checksum: u64,
+    pub cpu_surface_bytes: usize,
+    pub staging_bytes: usize,
+    pub gpu_plane_bytes: usize,
+    pub output_bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Nv12GpuOutput {
     pub width: u32,
     pub height: u32,
     pub rgba_u16: Vec<u16>,
@@ -186,6 +302,18 @@ pub struct GpuFrameProcessorConfig {
     pub conversion: YcbcrConversion,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Nv12FrameProcessorConfig {
+    pub device_id: DeviceId,
+    pub coded_width: u32,
+    pub coded_height: u32,
+    pub visible_width: u32,
+    pub visible_height: u32,
+    pub slot_count: usize,
+    pub conversion: YcbcrConversion,
+    pub validation_readback: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GpuFrameProcessorCounters {
     pub pipeline_creations: u64,
@@ -197,6 +325,29 @@ pub struct GpuFrameProcessorCounters {
     pub command_buffer_count: u64,
     pub frame_submissions: u64,
     pub slot_reuses: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Nv12FrameProcessorDiagnostics {
+    pub slot_acquire_ns: u128,
+    pub compact_y_copy_ns: u128,
+    pub compact_uv_copy_ns: u128,
+    pub staging_write_y_ns: u128,
+    pub staging_write_uv_ns: u128,
+    pub command_pool_reset_ns: u128,
+    pub fence_reset_ns: u128,
+    pub command_begin_ns: u128,
+    pub command_record_ns: u128,
+    pub command_end_ns: u128,
+    pub queue_submit_ns: u128,
+    pub poll_ns: u128,
+    pub fence_wait_ns: u128,
+    pub retire_ns: u128,
+    pub submit_calls: u64,
+    pub poll_calls: u64,
+    pub fence_wait_calls: u64,
+    pub retire_calls: u64,
+    pub output_readback_enabled: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -248,6 +399,19 @@ impl std::error::Error for FrameProcessorError {}
 struct Yuv422P10Layout {
     y_samples: usize,
     chroma_samples: usize,
+    output_samples: usize,
+    cpu_surface_bytes: usize,
+    staging_bytes: usize,
+    gpu_plane_bytes: usize,
+    output_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Nv12Layout {
+    y_bytes: usize,
+    uv_bytes: usize,
+    y_stride_bytes: usize,
+    uv_stride_bytes: usize,
     output_samples: usize,
     cpu_surface_bytes: usize,
     staging_bytes: usize,
@@ -373,6 +537,47 @@ impl VulkanDeviceDiscovery {
             .wait_for_frame(token)
             .map_err(frame_processor_resource_error)?;
         Ok(Yuv422P10GpuOutput {
+            width: output.width,
+            height: output.height,
+            rgba_u16: output.rgba_u16,
+            checksum: output.checksum,
+            cpu_surface_bytes: output.cpu_surface_bytes,
+            staging_bytes: output.staging_bytes,
+            gpu_plane_bytes: output.gpu_plane_bytes,
+            output_bytes: output.output_bytes,
+        })
+    }
+
+    pub fn process_nv12_surface(
+        &self,
+        upload: &Nv12Upload<'_>,
+    ) -> Result<Nv12GpuOutput, ResourceError> {
+        let mut processor = Nv12FrameProcessor::new(
+            self,
+            Nv12FrameProcessorConfig {
+                device_id: upload.device_id,
+                coded_width: upload.coded_width,
+                coded_height: upload.coded_height,
+                visible_width: upload.visible_width,
+                visible_height: upload.visible_height,
+                slot_count: 1,
+                conversion: upload.conversion,
+                validation_readback: true,
+            },
+        )
+        .map_err(frame_processor_resource_error)?;
+        let token = processor
+            .submit_frame(
+                upload,
+                FrameIdentity {
+                    presentation_position: 0,
+                },
+            )
+            .map_err(frame_processor_resource_error)?;
+        let output = processor
+            .wait_for_frame(token)
+            .map_err(frame_processor_resource_error)?;
+        Ok(Nv12GpuOutput {
             width: output.width,
             height: output.height,
             rgba_u16: output.rgba_u16,
@@ -1580,6 +1785,71 @@ impl GpuBuffer {
         })
     }
 
+    fn write_pitched_rows(
+        &self,
+        offset: u64,
+        source: &[u8],
+        source_stride: usize,
+        row_bytes: usize,
+        row_count: usize,
+        destination_stride: usize,
+    ) -> Result<(), ResourceError> {
+        if row_bytes == 0
+            || row_count == 0
+            || source_stride < row_bytes
+            || destination_stride < row_bytes
+        {
+            return Err(ResourceError::InvalidBufferSize);
+        }
+        let source_required = source_stride
+            .checked_mul(row_count)
+            .ok_or(ResourceError::InvalidBufferSize)?;
+        if source.len() < source_required {
+            return Err(ResourceError::InvalidBufferSize);
+        }
+        let destination_bytes = destination_stride
+            .checked_mul(row_count)
+            .ok_or(ResourceError::InvalidBufferSize)?;
+        let destination_size =
+            u64::try_from(destination_bytes).map_err(|_| ResourceError::InvalidBufferSize)?;
+        if offset
+            .checked_add(destination_size)
+            .is_none_or(|end| end > self.size)
+        {
+            return Err(ResourceError::InvalidBufferSize);
+        }
+        let ptr = self.memory.map().map_err(|err| {
+            eprintln!("vulkan buffer map for pitched write failed: {err:?}");
+            ResourceError::UnsupportedMemoryRequirements
+        })?;
+        // SAFETY: destination range was bounds-checked against this buffer;
+        // source rows were bounds-checked above; rows do not overlap in the
+        // destination because destination_stride >= row_bytes.
+        unsafe {
+            let base = ptr.cast::<u8>().add(offset as usize);
+            for row in 0..row_count {
+                let src_offset = row * source_stride;
+                let dst_offset = row * destination_stride;
+                std::ptr::copy_nonoverlapping(
+                    source.as_ptr().add(src_offset),
+                    base.add(dst_offset),
+                    row_bytes,
+                );
+                if destination_stride > row_bytes {
+                    std::ptr::write_bytes(
+                        base.add(dst_offset + row_bytes),
+                        0,
+                        destination_stride - row_bytes,
+                    );
+                }
+            }
+        }
+        self.memory.flush(offset, destination_size).map_err(|err| {
+            eprintln!("vulkan buffer pitched flush failed: {err:?}");
+            ResourceError::ExportFailed
+        })
+    }
+
     fn read_bytes(&self, offset: u64, len: usize) -> Result<Vec<u8>, ResourceError> {
         let size = u64::try_from(len).map_err(|_| ResourceError::InvalidBufferSize)?;
         if offset.checked_add(size).is_none_or(|end| end > self.size) {
@@ -2121,6 +2391,16 @@ fn checked_sample_count(width: u32, height: u32) -> Result<usize, ResourceError>
         .ok_or(ResourceError::InvalidImageDimensions)
 }
 
+fn align_usize(value: usize, alignment: usize) -> Result<usize, ResourceError> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return Err(ResourceError::InvalidBufferSize);
+    }
+    value
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
+        .ok_or(ResourceError::InvalidBufferSize)
+}
+
 fn expand_yuv422p10_plane(plane: Yuv422P10Plane<'_>) -> Result<Vec<u32>, ResourceError> {
     validate_yuv422p10_plane(plane, plane.width_samples, plane.height)?;
     let width =
@@ -2155,6 +2435,198 @@ fn expand_yuv422p10_plane(plane: Yuv422P10Plane<'_>) -> Result<Vec<u32>, Resourc
     Ok(values)
 }
 
+fn validate_nv12_upload(upload: &Nv12Upload<'_>) -> Result<Nv12Layout, ResourceError> {
+    if upload.coded_width == 0
+        || upload.coded_height == 0
+        || upload.visible_width == 0
+        || upload.visible_height == 0
+        || upload.coded_width > MAX_VIDEO_SURFACE_WIDTH
+        || upload.coded_height > MAX_VIDEO_SURFACE_HEIGHT
+        || upload.visible_width > upload.coded_width
+        || upload.visible_height > upload.coded_height
+        || !upload.coded_width.is_multiple_of(2)
+        || !upload.coded_height.is_multiple_of(2)
+        || !upload.visible_width.is_multiple_of(2)
+    {
+        return Err(ResourceError::InvalidImageDimensions);
+    }
+    validate_nv12_plane(upload.y, upload.coded_width, upload.coded_height)?;
+    validate_nv12_plane(upload.uv, upload.coded_width, upload.coded_height / 2)?;
+    let cpu_surface_bytes = upload
+        .y
+        .data
+        .len()
+        .checked_add(upload.uv.data.len())
+        .ok_or(ResourceError::InvalidImageDimensions)?;
+    nv12_layout_for_dimensions(
+        upload.coded_width,
+        upload.coded_height,
+        upload.visible_width,
+        upload.visible_height,
+        cpu_surface_bytes,
+    )
+}
+
+fn validate_nv12_plane(
+    plane: Nv12Plane<'_>,
+    expected_width_bytes: u32,
+    expected_height: u32,
+) -> Result<(), ResourceError> {
+    if plane.width_bytes != expected_width_bytes || plane.height != expected_height {
+        return Err(ResourceError::InvalidImageDimensions);
+    }
+    let row_bytes =
+        usize::try_from(plane.width_bytes).map_err(|_| ResourceError::InvalidImageDimensions)?;
+    if plane.stride_bytes < row_bytes || plane.stride_bytes == 0 {
+        return Err(ResourceError::InvalidImageDimensions);
+    }
+    let required_len = plane
+        .stride_bytes
+        .checked_mul(
+            usize::try_from(plane.height).map_err(|_| ResourceError::InvalidImageDimensions)?,
+        )
+        .ok_or(ResourceError::InvalidImageDimensions)?;
+    if plane.data.len() < required_len {
+        return Err(ResourceError::InvalidImageDimensions);
+    }
+    Ok(())
+}
+
+fn expand_nv12_y_plane(plane: Nv12Plane<'_>) -> Result<Vec<u32>, ResourceError> {
+    let width =
+        usize::try_from(plane.width_bytes).map_err(|_| ResourceError::InvalidImageDimensions)?;
+    let height =
+        usize::try_from(plane.height).map_err(|_| ResourceError::InvalidImageDimensions)?;
+    let mut values = Vec::with_capacity(
+        width
+            .checked_mul(height)
+            .ok_or(ResourceError::InvalidImageDimensions)?,
+    );
+    for row in 0..height {
+        let start = row
+            .checked_mul(plane.stride_bytes)
+            .ok_or(ResourceError::InvalidImageDimensions)?;
+        let end = start
+            .checked_add(width)
+            .ok_or(ResourceError::InvalidImageDimensions)?;
+        let row_data = plane
+            .data
+            .get(start..end)
+            .ok_or(ResourceError::InvalidImageDimensions)?;
+        values.extend(row_data.iter().map(|value| u32::from(*value)));
+    }
+    Ok(values)
+}
+
+fn expand_nv12_uv_plane(plane: Nv12Plane<'_>) -> Result<Vec<u32>, ResourceError> {
+    let width =
+        usize::try_from(plane.width_bytes).map_err(|_| ResourceError::InvalidImageDimensions)?;
+    if !width.is_multiple_of(2) {
+        return Err(ResourceError::InvalidImageDimensions);
+    }
+    let height =
+        usize::try_from(plane.height).map_err(|_| ResourceError::InvalidImageDimensions)?;
+    let mut values = Vec::with_capacity(
+        (width / 2)
+            .checked_mul(height)
+            .ok_or(ResourceError::InvalidImageDimensions)?,
+    );
+    for row in 0..height {
+        let start = row
+            .checked_mul(plane.stride_bytes)
+            .ok_or(ResourceError::InvalidImageDimensions)?;
+        let end = start
+            .checked_add(width)
+            .ok_or(ResourceError::InvalidImageDimensions)?;
+        let row_data = plane
+            .data
+            .get(start..end)
+            .ok_or(ResourceError::InvalidImageDimensions)?;
+        for pair in row_data.chunks_exact(2) {
+            values.push(u32::from(pair[0]) | (u32::from(pair[1]) << 8));
+        }
+    }
+    Ok(values)
+}
+
+fn nv12_layout_for_dimensions(
+    coded_width: u32,
+    coded_height: u32,
+    visible_width: u32,
+    visible_height: u32,
+    cpu_surface_bytes: usize,
+) -> Result<Nv12Layout, ResourceError> {
+    if coded_width == 0
+        || coded_height == 0
+        || visible_width == 0
+        || visible_height == 0
+        || visible_width > coded_width
+        || visible_height > coded_height
+        || !coded_width.is_multiple_of(2)
+        || !coded_height.is_multiple_of(2)
+        || !visible_width.is_multiple_of(2)
+    {
+        return Err(ResourceError::InvalidImageDimensions);
+    }
+    let coded_width =
+        usize::try_from(coded_width).map_err(|_| ResourceError::InvalidImageDimensions)?;
+    let coded_height =
+        usize::try_from(coded_height).map_err(|_| ResourceError::InvalidImageDimensions)?;
+    let y_stride_bytes = align_usize(coded_width, 4)?;
+    let uv_stride_bytes = align_usize(coded_width, 4)?;
+    let y_bytes = y_stride_bytes
+        .checked_mul(coded_height)
+        .ok_or(ResourceError::InvalidImageDimensions)?;
+    let uv_bytes = uv_stride_bytes
+        .checked_mul(coded_height / 2)
+        .ok_or(ResourceError::InvalidImageDimensions)?;
+    let output_pixels = checked_sample_count(visible_width, visible_height)?;
+    let output_samples = output_pixels
+        .checked_mul(YUV422P10_OUTPUT_COMPONENTS)
+        .ok_or(ResourceError::InvalidImageDimensions)?;
+    let staging_bytes = y_bytes
+        .checked_add(uv_bytes)
+        .ok_or(ResourceError::InvalidImageDimensions)?;
+    let output_bytes = output_samples
+        .checked_mul(YUV422P10_OUTPUT_BYTES_PER_COMPONENT)
+        .ok_or(ResourceError::InvalidImageDimensions)?;
+    Ok(Nv12Layout {
+        y_bytes,
+        uv_bytes,
+        y_stride_bytes,
+        uv_stride_bytes,
+        output_samples,
+        cpu_surface_bytes,
+        staging_bytes,
+        gpu_plane_bytes: staging_bytes,
+        output_bytes,
+    })
+}
+
+pub fn nv12_reference_rgba_u16(upload: &Nv12Upload<'_>) -> Result<Vec<u16>, ResourceError> {
+    let layout = validate_nv12_upload(upload)?;
+    let y_values = expand_nv12_y_plane(upload.y)?;
+    let uv_values = expand_nv12_uv_plane(upload.uv)?;
+    let coded_width =
+        usize::try_from(upload.coded_width).map_err(|_| ResourceError::InvalidImageDimensions)?;
+    let uv_width = coded_width / 2;
+    let visible_width =
+        usize::try_from(upload.visible_width).map_err(|_| ResourceError::InvalidImageDimensions)?;
+    let visible_height = usize::try_from(upload.visible_height)
+        .map_err(|_| ResourceError::InvalidImageDimensions)?;
+    let mut out = Vec::with_capacity(layout.output_samples);
+    for row in 0..visible_height {
+        for x in 0..visible_width {
+            let y = y_values[row * coded_width + x];
+            let uv = uv_values[(row / 2) * uv_width + (x / 2)];
+            let cb = uv & 0xff;
+            let cr = (uv >> 8) & 0xff;
+            out.extend_from_slice(&convert_rec709_limited8_to_rgba_u16(y, cb, cr));
+        }
+    }
+    Ok(out)
+}
+
 pub fn yuv422p10_reference_rgba_u16(
     upload: &Yuv422P10Upload<'_>,
 ) -> Result<Vec<u16>, ResourceError> {
@@ -2183,6 +2655,21 @@ fn convert_rec709_limited_to_rgba_u16(y: u32, cb: u32, cr: u32) -> [u16; 4] {
     let y_limited = ((y as f32 - 64.0).max(0.0)) / 876.0;
     let cb_centered = (cb as f32 - 512.0) / 896.0;
     let cr_centered = (cr as f32 - 512.0) / 896.0;
+    let r = (y_limited + 1.5748 * cr_centered).clamp(0.0, 1.0);
+    let g = (y_limited - 0.187324 * cb_centered - 0.468124 * cr_centered).clamp(0.0, 1.0);
+    let b = (y_limited + 1.8556 * cb_centered).clamp(0.0, 1.0);
+    [
+        (r * 65535.0).round() as u16,
+        (g * 65535.0).round() as u16,
+        (b * 65535.0).round() as u16,
+        u16::MAX,
+    ]
+}
+
+fn convert_rec709_limited8_to_rgba_u16(y: u32, cb: u32, cr: u32) -> [u16; 4] {
+    let y_limited = ((y as f32 - 16.0).max(0.0)) / 219.0;
+    let cb_centered = (cb as f32 - 128.0) / 224.0;
+    let cr_centered = (cr as f32 - 128.0) / 224.0;
     let r = (y_limited + 1.5748 * cr_centered).clamp(0.0, 1.0);
     let g = (y_limited - 0.187324 * cb_centered - 0.468124 * cr_centered).clamp(0.0, 1.0);
     let b = (y_limited + 1.8556 * cb_centered).clamp(0.0, 1.0);
@@ -3052,6 +3539,21 @@ impl GpuFrameProcessor {
         Ok(retired)
     }
 
+    pub fn retire_completed_token(&mut self, token: FrameToken) -> Result<(), FrameProcessorError> {
+        self.poll_completed()?;
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.submitted.is_some_and(|info| info.token == token))
+            .ok_or(FrameProcessorError::UnknownFrameToken)?;
+        if !slot.state.can_retire() {
+            return Err(FrameProcessorError::FrameNotComplete);
+        }
+        slot.submitted = None;
+        slot.state = FrameSlotState::Available;
+        Ok(())
+    }
+
     pub fn wait_for_frame(
         &mut self,
         token: FrameToken,
@@ -3088,6 +3590,271 @@ impl GpuFrameProcessor {
 }
 
 impl Drop for GpuFrameProcessor {
+    fn drop(&mut self) {
+        for slot in &mut self.slots {
+            if slot.state == FrameSlotState::Submitted {
+                let _ = slot.fence.wait();
+                slot.state = FrameSlotState::Completed;
+            }
+        }
+    }
+}
+
+pub struct Nv12FrameProcessor {
+    device: Arc<GpuDevice>,
+    config: Nv12FrameProcessorConfig,
+    pipeline: Nv12PipelineState,
+    slots: Vec<Nv12FrameSlot>,
+    next_token: u64,
+    next_sequence: u64,
+    counters: GpuFrameProcessorCounters,
+    diagnostics: Nv12FrameProcessorDiagnostics,
+}
+
+impl Nv12FrameProcessor {
+    pub fn new(
+        discovery: &VulkanDeviceDiscovery,
+        config: Nv12FrameProcessorConfig,
+    ) -> Result<Self, FrameProcessorError> {
+        validate_nv12_frame_processor_config(config)?;
+        let device = discovery
+            .devices
+            .iter()
+            .find(|device| device.desc.id == config.device_id)
+            .ok_or(FrameProcessorError::Resource(
+                ResourceError::UnknownDeviceId,
+            ))?
+            .device
+            .clone();
+        if !device.queue_supports_compute() {
+            return Err(FrameProcessorError::Resource(
+                ResourceError::UnsupportedMemoryRequirements,
+            ));
+        }
+        let layout = nv12_layout_for_dimensions(
+            config.coded_width,
+            config.coded_height,
+            config.visible_width,
+            config.visible_height,
+            0,
+        )?;
+        let pipeline = Nv12PipelineState::new(
+            device.clone(),
+            u32::try_from(config.slot_count).map_err(|_| ResourceError::InvalidBufferSize)?,
+        )?;
+        let mut slots = Vec::with_capacity(config.slot_count);
+        for index in 0..config.slot_count {
+            slots.push(Nv12FrameSlot::new(
+                index,
+                device.clone(),
+                &pipeline,
+                layout,
+            )?);
+        }
+        let slot_count = config.slot_count as u64;
+        Ok(Self {
+            device,
+            config,
+            pipeline,
+            slots,
+            next_token: 1,
+            next_sequence: 1,
+            counters: GpuFrameProcessorCounters {
+                pipeline_creations: 1,
+                shader_module_creations: 1,
+                staging_allocations: slot_count * 2,
+                gpu_plane_allocations: slot_count * 2,
+                output_allocations: slot_count,
+                readback_allocations: slot_count,
+                command_buffer_count: slot_count,
+                ..Default::default()
+            },
+            diagnostics: Nv12FrameProcessorDiagnostics {
+                output_readback_enabled: config.validation_readback,
+                ..Default::default()
+            },
+        })
+    }
+
+    pub fn submit_frame(
+        &mut self,
+        upload: &Nv12Upload<'_>,
+        identity: FrameIdentity,
+    ) -> Result<FrameToken, FrameProcessorError> {
+        if upload.device_id != self.config.device_id
+            || upload.coded_width != self.config.coded_width
+            || upload.coded_height != self.config.coded_height
+            || upload.visible_width != self.config.visible_width
+            || upload.visible_height != self.config.visible_height
+            || upload.conversion != self.config.conversion
+        {
+            return Err(FrameProcessorError::Resource(
+                ResourceError::InvalidImageDimensions,
+            ));
+        }
+        let layout = validate_nv12_upload(upload)?;
+        let slot_started = Instant::now();
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.state.can_submit())
+            .ok_or(FrameProcessorError::NoFrameSlotAvailable)?;
+        self.diagnostics.slot_acquire_ns = self
+            .diagnostics
+            .slot_acquire_ns
+            .saturating_add(slot_started.elapsed().as_nanos());
+        let token = FrameToken(self.next_token);
+        self.next_token = self
+            .next_token
+            .checked_add(1)
+            .ok_or(FrameProcessorError::InvalidFrameState)?;
+        let sequence = self.next_sequence;
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or(FrameProcessorError::InvalidFrameState)?;
+        if slot.had_submission {
+            self.counters.slot_reuses = self.counters.slot_reuses.saturating_add(1);
+        }
+        slot.submit(
+            &self.device,
+            &self.pipeline,
+            Nv12FrameSubmission {
+                upload,
+                layout,
+                token,
+                identity,
+                sequence,
+                validation_readback: self.config.validation_readback,
+            },
+            &mut self.diagnostics,
+        )?;
+        self.diagnostics.submit_calls = self.diagnostics.submit_calls.saturating_add(1);
+        self.counters.frame_submissions = self.counters.frame_submissions.saturating_add(1);
+        Ok(token)
+    }
+
+    pub fn poll_completed(&mut self) -> Result<Vec<FrameToken>, FrameProcessorError> {
+        let started = Instant::now();
+        self.diagnostics.poll_calls = self.diagnostics.poll_calls.saturating_add(1);
+        let mut completed = Vec::new();
+        for slot in &mut self.slots {
+            if slot.state == FrameSlotState::Submitted
+                && slot.fence.is_signaled().map_err(|err| {
+                    eprintln!("vulkan NV12 frame fence status query failed: {err:?}");
+                    FrameProcessorError::Resource(ResourceError::ExportFailed)
+                })?
+            {
+                slot.state = FrameSlotState::Completed;
+                if let Some(info) = slot.submitted {
+                    completed.push(info.token);
+                }
+            }
+        }
+        self.diagnostics.poll_ns = self
+            .diagnostics
+            .poll_ns
+            .saturating_add(started.elapsed().as_nanos());
+        Ok(completed)
+    }
+
+    pub fn retire_completed(&mut self) -> Result<usize, FrameProcessorError> {
+        self.poll_completed()?;
+        let mut retired = 0;
+        for slot in &mut self.slots {
+            if slot.state.can_retire() {
+                slot.submitted = None;
+                slot.state = FrameSlotState::Available;
+                retired += 1;
+            }
+        }
+        Ok(retired)
+    }
+
+    pub fn retire_completed_token(&mut self, token: FrameToken) -> Result<(), FrameProcessorError> {
+        let started = Instant::now();
+        self.poll_completed()?;
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.submitted.is_some_and(|info| info.token == token))
+            .ok_or(FrameProcessorError::UnknownFrameToken)?;
+        if !slot.state.can_retire() {
+            return Err(FrameProcessorError::FrameNotComplete);
+        }
+        slot.submitted = None;
+        slot.state = FrameSlotState::Available;
+        self.diagnostics.retire_calls = self.diagnostics.retire_calls.saturating_add(1);
+        self.diagnostics.retire_ns = self
+            .diagnostics
+            .retire_ns
+            .saturating_add(started.elapsed().as_nanos());
+        Ok(())
+    }
+
+    pub fn wait_for_frame(
+        &mut self,
+        token: FrameToken,
+    ) -> Result<ProcessedFrameOutput, FrameProcessorError> {
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.submitted.is_some_and(|info| info.token == token))
+            .ok_or(FrameProcessorError::UnknownFrameToken)?;
+        match slot.state {
+            FrameSlotState::Submitted => {
+                slot.fence.wait().map_err(|err| {
+                    eprintln!("vulkan NV12 frame fence wait failed: {err:?}");
+                    FrameProcessorError::Resource(ResourceError::ExportFailed)
+                })?;
+                slot.state = FrameSlotState::Completed;
+            }
+            FrameSlotState::Completed => {}
+            _ => return Err(FrameProcessorError::InvalidFrameState),
+        }
+        let output = slot.read_completed_output()?;
+        slot.submitted = None;
+        slot.state = FrameSlotState::Available;
+        Ok(output)
+    }
+
+    pub fn wait_for_completion(&mut self, token: FrameToken) -> Result<(), FrameProcessorError> {
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.submitted.is_some_and(|info| info.token == token))
+            .ok_or(FrameProcessorError::UnknownFrameToken)?;
+        match slot.state {
+            FrameSlotState::Submitted => {
+                let started = Instant::now();
+                slot.fence.wait().map_err(|err| {
+                    eprintln!("vulkan NV12 frame fence wait failed: {err:?}");
+                    FrameProcessorError::Resource(ResourceError::ExportFailed)
+                })?;
+                self.diagnostics.fence_wait_calls =
+                    self.diagnostics.fence_wait_calls.saturating_add(1);
+                self.diagnostics.fence_wait_ns = self
+                    .diagnostics
+                    .fence_wait_ns
+                    .saturating_add(started.elapsed().as_nanos());
+                slot.state = FrameSlotState::Completed;
+            }
+            FrameSlotState::Completed => {}
+            _ => return Err(FrameProcessorError::InvalidFrameState),
+        }
+        Ok(())
+    }
+
+    pub fn counters(&self) -> GpuFrameProcessorCounters {
+        self.counters
+    }
+
+    pub fn diagnostics(&self) -> Nv12FrameProcessorDiagnostics {
+        self.diagnostics.clone()
+    }
+}
+
+impl Drop for Nv12FrameProcessor {
     fn drop(&mut self) {
         for slot in &mut self.slots {
             if slot.state == FrameSlotState::Submitted {
@@ -3152,6 +3919,287 @@ struct FrameSlot {
     command_buffer: vk::CommandBuffer,
     fence: GpuFence,
     descriptor: DescriptorSet,
+}
+
+#[derive(Clone, Copy)]
+struct Nv12SubmittedFrameInfo {
+    token: FrameToken,
+    identity: FrameIdentity,
+    sequence: u64,
+    width: u32,
+    height: u32,
+    layout: Nv12Layout,
+}
+
+#[derive(Clone, Copy)]
+struct Nv12FrameSubmission<'a> {
+    upload: &'a Nv12Upload<'a>,
+    layout: Nv12Layout,
+    token: FrameToken,
+    identity: FrameIdentity,
+    sequence: u64,
+    validation_readback: bool,
+}
+
+struct Nv12FrameSlot {
+    index: usize,
+    state: FrameSlotState,
+    submitted: Option<Nv12SubmittedFrameInfo>,
+    had_submission: bool,
+    staging_y: GpuBuffer,
+    staging_uv: GpuBuffer,
+    gpu_y: GpuBuffer,
+    gpu_uv: GpuBuffer,
+    output: GpuBuffer,
+    readback: GpuBuffer,
+    command_pool: GpuCommandPool,
+    command_buffer: vk::CommandBuffer,
+    fence: GpuFence,
+    descriptor: DescriptorSet,
+}
+
+impl Nv12FrameSlot {
+    fn new(
+        index: usize,
+        device: Arc<GpuDevice>,
+        pipeline: &Nv12PipelineState,
+        layout: Nv12Layout,
+    ) -> Result<Self, FrameProcessorError> {
+        let y_bytes =
+            u64::try_from(layout.y_bytes).map_err(|_| ResourceError::InvalidBufferSize)?;
+        let uv_bytes =
+            u64::try_from(layout.uv_bytes).map_err(|_| ResourceError::InvalidBufferSize)?;
+        let output_u32_bytes = checked_byte_len(layout.output_samples, std::mem::size_of::<u32>())?;
+        let staging_y = frame_staging_buffer(&device, y_bytes)?;
+        let staging_uv = frame_staging_buffer(&device, uv_bytes)?;
+        let gpu_y = frame_gpu_plane_buffer(&device, y_bytes)?;
+        let gpu_uv = frame_gpu_plane_buffer(&device, uv_bytes)?;
+        let output = frame_output_buffer(&device, output_u32_bytes)?;
+        let readback = frame_readback_buffer(&device, output_u32_bytes)?;
+        let command_pool = GpuCommandPool::new(device.clone()).map_err(|err| {
+            eprintln!("vulkan NV12 frame command pool creation failed: {err:?}");
+            FrameProcessorError::Resource(ResourceError::ExportFailed)
+        })?;
+        let command_buffer = command_pool.allocate_primary().map_err(|err| {
+            eprintln!("vulkan NV12 frame command buffer allocation failed: {err:?}");
+            FrameProcessorError::Resource(ResourceError::ExportFailed)
+        })?;
+        let fence = GpuFence::new(device).map_err(|err| {
+            eprintln!("vulkan NV12 frame fence creation failed: {err:?}");
+            FrameProcessorError::Resource(ResourceError::ExportFailed)
+        })?;
+        let descriptor = pipeline.write_buffers(&gpu_y, &gpu_uv, &output)?;
+        Ok(Self {
+            index,
+            state: FrameSlotState::Available,
+            submitted: None,
+            had_submission: false,
+            staging_y,
+            staging_uv,
+            gpu_y,
+            gpu_uv,
+            output,
+            readback,
+            command_pool,
+            command_buffer,
+            fence,
+            descriptor,
+        })
+    }
+
+    fn submit(
+        &mut self,
+        device: &Arc<GpuDevice>,
+        pipeline: &Nv12PipelineState,
+        submission: Nv12FrameSubmission<'_>,
+        diagnostics: &mut Nv12FrameProcessorDiagnostics,
+    ) -> Result<(), FrameProcessorError> {
+        if self.state != FrameSlotState::Available {
+            return Err(FrameProcessorError::InvalidFrameState);
+        }
+        self.state = FrameSlotState::Preparing;
+        let submit_result = self.submit_inner(device, pipeline, submission, diagnostics);
+        if submit_result.is_err() {
+            self.state = FrameSlotState::Available;
+            self.submitted = None;
+        }
+        submit_result
+    }
+
+    fn submit_inner(
+        &mut self,
+        device: &Arc<GpuDevice>,
+        pipeline: &Nv12PipelineState,
+        submission: Nv12FrameSubmission<'_>,
+        diagnostics: &mut Nv12FrameProcessorDiagnostics,
+    ) -> Result<(), FrameProcessorError> {
+        let upload = submission.upload;
+        let compact_y_copy_started = Instant::now();
+        let y_row_bytes = usize::try_from(upload.y.width_bytes)
+            .map_err(|_| FrameProcessorError::Resource(ResourceError::InvalidImageDimensions))?;
+        let y_rows = usize::try_from(upload.y.height)
+            .map_err(|_| FrameProcessorError::Resource(ResourceError::InvalidImageDimensions))?;
+        self.staging_y.write_pitched_rows(
+            0,
+            upload.y.data,
+            upload.y.stride_bytes,
+            y_row_bytes,
+            y_rows,
+            submission.layout.y_stride_bytes,
+        )?;
+        diagnostics.compact_y_copy_ns = diagnostics
+            .compact_y_copy_ns
+            .saturating_add(compact_y_copy_started.elapsed().as_nanos());
+        let compact_uv_copy_started = Instant::now();
+        let uv_row_bytes = usize::try_from(upload.uv.width_bytes)
+            .map_err(|_| FrameProcessorError::Resource(ResourceError::InvalidImageDimensions))?;
+        let uv_rows = usize::try_from(upload.uv.height)
+            .map_err(|_| FrameProcessorError::Resource(ResourceError::InvalidImageDimensions))?;
+        self.staging_uv.write_pitched_rows(
+            0,
+            upload.uv.data,
+            upload.uv.stride_bytes,
+            uv_row_bytes,
+            uv_rows,
+            submission.layout.uv_stride_bytes,
+        )?;
+        diagnostics.compact_uv_copy_ns = diagnostics
+            .compact_uv_copy_ns
+            .saturating_add(compact_uv_copy_started.elapsed().as_nanos());
+        let y_bytes = u64::try_from(submission.layout.y_bytes)
+            .map_err(|_| FrameProcessorError::Resource(ResourceError::InvalidBufferSize))?;
+        let uv_bytes = u64::try_from(submission.layout.uv_bytes)
+            .map_err(|_| FrameProcessorError::Resource(ResourceError::InvalidBufferSize))?;
+        let output_copy_bytes = u64::try_from(submission.layout.output_bytes)
+            .map_err(|_| FrameProcessorError::Resource(ResourceError::InvalidBufferSize))?;
+        let reset_pool_started = Instant::now();
+        self.command_pool.reset().map_err(|err| {
+            eprintln!("vulkan NV12 frame command pool reset failed: {err:?}");
+            FrameProcessorError::Resource(ResourceError::ExportFailed)
+        })?;
+        diagnostics.command_pool_reset_ns = diagnostics
+            .command_pool_reset_ns
+            .saturating_add(reset_pool_started.elapsed().as_nanos());
+        let reset_fence_started = Instant::now();
+        self.fence.reset().map_err(|err| {
+            eprintln!("vulkan NV12 frame fence reset failed: {err:?}");
+            FrameProcessorError::Resource(ResourceError::ExportFailed)
+        })?;
+        diagnostics.fence_reset_ns = diagnostics
+            .fence_reset_ns
+            .saturating_add(reset_fence_started.elapsed().as_nanos());
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        let begin_started = Instant::now();
+        // SAFETY: command buffer belongs to a reset command pool and is not in
+        // use because this slot is Available.
+        unsafe {
+            device
+                .device
+                .begin_command_buffer(self.command_buffer, &begin)
+        }
+        .map_err(|err| {
+            eprintln!("vulkan NV12 command buffer begin failed: {err:?}");
+            FrameProcessorError::Resource(ResourceError::ExportFailed)
+        })?;
+        diagnostics.command_begin_ns = diagnostics
+            .command_begin_ns
+            .saturating_add(begin_started.elapsed().as_nanos());
+        let record_started = Instant::now();
+        record_nv12_processing_commands(
+            device,
+            self.command_buffer,
+            &self.staging_y,
+            &self.staging_uv,
+            &self.gpu_y,
+            &self.gpu_uv,
+            &self.output,
+            &self.readback,
+            pipeline,
+            self.descriptor,
+            upload.visible_width,
+            upload.visible_height,
+            u32::try_from(submission.layout.y_stride_bytes)
+                .map_err(|_| FrameProcessorError::Resource(ResourceError::InvalidBufferSize))?,
+            u32::try_from(submission.layout.uv_stride_bytes)
+                .map_err(|_| FrameProcessorError::Resource(ResourceError::InvalidBufferSize))?,
+            y_bytes,
+            uv_bytes,
+            output_copy_bytes,
+            submission.validation_readback,
+        );
+        diagnostics.command_record_ns = diagnostics
+            .command_record_ns
+            .saturating_add(record_started.elapsed().as_nanos());
+        let end_started = Instant::now();
+        // SAFETY: command buffer is currently recording.
+        unsafe { device.device.end_command_buffer(self.command_buffer) }.map_err(|err| {
+            eprintln!("vulkan NV12 command buffer end failed: {err:?}");
+            FrameProcessorError::Resource(ResourceError::ExportFailed)
+        })?;
+        diagnostics.command_end_ns = diagnostics
+            .command_end_ns
+            .saturating_add(end_started.elapsed().as_nanos());
+        let command_buffers = [self.command_buffer];
+        let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
+        let submit_started = Instant::now();
+        // SAFETY: queue belongs to device, command buffer is executable, and the
+        // per-slot fence/resources remain live until completion.
+        unsafe {
+            device
+                .device
+                .queue_submit(device.queue, &[submit], self.fence.fence)
+        }
+        .map_err(|err| {
+            eprintln!("vulkan NV12 queue submit failed: {err:?}");
+            FrameProcessorError::Resource(ResourceError::ExportFailed)
+        })?;
+        diagnostics.queue_submit_ns = diagnostics
+            .queue_submit_ns
+            .saturating_add(submit_started.elapsed().as_nanos());
+        self.submitted = Some(Nv12SubmittedFrameInfo {
+            token: submission.token,
+            identity: submission.identity,
+            sequence: submission.sequence,
+            width: upload.visible_width,
+            height: upload.visible_height,
+            layout: submission.layout,
+        });
+        self.state = FrameSlotState::Submitted;
+        self.had_submission = true;
+        Ok(())
+    }
+
+    fn read_completed_output(&self) -> Result<ProcessedFrameOutput, FrameProcessorError> {
+        if self.state != FrameSlotState::Completed {
+            return Err(FrameProcessorError::FrameNotComplete);
+        }
+        let info = self
+            .submitted
+            .ok_or(FrameProcessorError::UnknownFrameToken)?;
+        let output_u16_bytes =
+            checked_byte_len(info.layout.output_samples, std::mem::size_of::<u16>())?;
+        let bytes = self.readback.read_bytes(0, output_u16_bytes as usize)?;
+        let rgba_u16 = read_rgba_u16_from_le_bytes(&bytes, info.layout.output_samples)?;
+        if output_u16_bytes != info.layout.output_bytes as u64 {
+            return Err(FrameProcessorError::Resource(ResourceError::ExportFailed));
+        }
+        let checksum = yuv422p10_rgba_u16_checksum(&rgba_u16);
+        Ok(ProcessedFrameOutput {
+            token: info.token,
+            presentation_position: info.identity.presentation_position,
+            slot_index: self.index,
+            submission_sequence: info.sequence,
+            width: info.width,
+            height: info.height,
+            rgba_u16,
+            checksum,
+            cpu_surface_bytes: info.layout.cpu_surface_bytes,
+            staging_bytes: info.layout.staging_bytes,
+            gpu_plane_bytes: info.layout.gpu_plane_bytes,
+            output_bytes: info.layout.output_bytes,
+        })
+    }
 }
 
 impl FrameSlot {
@@ -3367,6 +4415,24 @@ fn validate_frame_processor_config(
     Ok(())
 }
 
+fn validate_nv12_frame_processor_config(
+    config: Nv12FrameProcessorConfig,
+) -> Result<(), FrameProcessorError> {
+    if config.slot_count == 0 || config.slot_count > 8 {
+        return Err(FrameProcessorError::Resource(
+            ResourceError::InvalidBufferSize,
+        ));
+    }
+    nv12_layout_for_dimensions(
+        config.coded_width,
+        config.coded_height,
+        config.visible_width,
+        config.visible_height,
+        0,
+    )?;
+    Ok(())
+}
+
 fn yuv422p10_layout_for_dimensions(
     width: u32,
     height: u32,
@@ -3571,6 +4637,127 @@ fn record_yuv422p10_processing_commands(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn record_nv12_processing_commands(
+    device: &GpuDevice,
+    command_buffer: vk::CommandBuffer,
+    staging_y: &GpuBuffer,
+    staging_uv: &GpuBuffer,
+    gpu_y: &GpuBuffer,
+    gpu_uv: &GpuBuffer,
+    output: &GpuBuffer,
+    readback: &GpuBuffer,
+    pipeline: &Nv12PipelineState,
+    descriptor: DescriptorSet,
+    visible_width: u32,
+    visible_height: u32,
+    y_stride_bytes: u32,
+    uv_stride_bytes: u32,
+    y_bytes: u64,
+    uv_bytes: u64,
+    output_copy_bytes: u64,
+    validation_readback: bool,
+) {
+    buffer_barrier(
+        device,
+        command_buffer,
+        &[gpu_y, gpu_uv],
+        vk::AccessFlags::SHADER_READ,
+        vk::AccessFlags::TRANSFER_WRITE,
+        vk::PipelineStageFlags::COMPUTE_SHADER,
+        vk::PipelineStageFlags::TRANSFER,
+    );
+    buffer_barrier(
+        device,
+        command_buffer,
+        &[output],
+        vk::AccessFlags::TRANSFER_READ,
+        vk::AccessFlags::SHADER_WRITE,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::PipelineStageFlags::COMPUTE_SHADER,
+    );
+    if validation_readback {
+        buffer_barrier(
+            device,
+            command_buffer,
+            &[readback],
+            vk::AccessFlags::HOST_READ,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::PipelineStageFlags::HOST,
+            vk::PipelineStageFlags::TRANSFER,
+        );
+    }
+    copy_buffer(command_buffer, staging_y, gpu_y, y_bytes);
+    copy_buffer(command_buffer, staging_uv, gpu_uv, uv_bytes);
+    buffer_barrier(
+        device,
+        command_buffer,
+        &[gpu_y, gpu_uv],
+        vk::AccessFlags::TRANSFER_WRITE,
+        vk::AccessFlags::SHADER_READ,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::PipelineStageFlags::COMPUTE_SHADER,
+    );
+    let params = Nv12ShaderParams {
+        width: visible_width,
+        height: visible_height,
+        y_stride_bytes,
+        uv_stride_bytes,
+    };
+    // SAFETY: command buffer is recording; pipeline, descriptor set and buffers
+    // are live for the submission. Push constants match the fixed shader's
+    // 16-byte parameter block.
+    unsafe {
+        device.device.cmd_bind_pipeline(
+            command_buffer,
+            vk::PipelineBindPoint::COMPUTE,
+            pipeline.pipeline,
+        );
+        device.device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::COMPUTE,
+            pipeline.layout,
+            0,
+            &[descriptor.set],
+            &[],
+        );
+        device.device.cmd_push_constants(
+            command_buffer,
+            pipeline.layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            params.as_bytes(),
+        );
+        device.device.cmd_dispatch(
+            command_buffer,
+            visible_width.div_ceil(YUV422P10_LOCAL_SIZE_X),
+            visible_height.div_ceil(YUV422P10_LOCAL_SIZE_Y),
+            1,
+        );
+    }
+    if validation_readback {
+        buffer_barrier(
+            device,
+            command_buffer,
+            &[output],
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::TRANSFER_READ,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::TRANSFER,
+        );
+        copy_buffer(command_buffer, output, readback, output_copy_bytes);
+        buffer_barrier(
+            device,
+            command_buffer,
+            &[readback],
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::HOST_READ,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::HOST,
+        );
+    }
+}
+
 fn read_rgba_u16_from_u32_bytes(
     bytes: &[u8],
     expected_samples: usize,
@@ -3591,6 +4778,22 @@ fn read_rgba_u16_from_u32_bytes(
         return Err(FrameProcessorError::Resource(ResourceError::ExportFailed));
     }
     Ok(rgba_u16)
+}
+
+fn read_rgba_u16_from_le_bytes(
+    bytes: &[u8],
+    expected_samples: usize,
+) -> Result<Vec<u16>, FrameProcessorError> {
+    let expected_bytes = expected_samples
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or(FrameProcessorError::Resource(ResourceError::ExportFailed))?;
+    if bytes.len() != expected_bytes {
+        return Err(FrameProcessorError::Resource(ResourceError::ExportFailed));
+    }
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect())
 }
 
 fn checked_byte_len(count: usize, bytes_per_item: usize) -> Result<u64, ResourceError> {
@@ -3945,6 +5148,29 @@ impl Yuv422P10ShaderParams {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct Nv12ShaderParams {
+    width: u32,
+    height: u32,
+    y_stride_bytes: u32,
+    uv_stride_bytes: u32,
+}
+
+impl Nv12ShaderParams {
+    fn as_bytes(&self) -> &[u8] {
+        // SAFETY: Nv12ShaderParams is repr(C), contains only u32 fields, and
+        // has no padding-dependent validity. The returned slice is tied to self
+        // and exactly covers the push-constant struct.
+        unsafe {
+            std::slice::from_raw_parts(
+                (self as *const Self).cast::<u8>(),
+                std::mem::size_of::<Self>(),
+            )
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Yuv422P10PipelineState {
     device: Arc<GpuDevice>,
@@ -4142,6 +5368,212 @@ impl Drop for Yuv422P10PipelineState {
     fn drop(&mut self) {
         // SAFETY: Yuv422P10PipelineState owns these objects and they are
         // destroyed in dependency order after submissions complete.
+        unsafe {
+            self.device
+                .device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device.device.destroy_pipeline(self.pipeline, None);
+            self.device
+                .device
+                .destroy_pipeline_layout(self.layout, None);
+            self.device
+                .device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            self.device.device.destroy_shader_module(self.shader, None);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Nv12PipelineState {
+    device: Arc<GpuDevice>,
+    shader: vk::ShaderModule,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    descriptor_pool: vk::DescriptorPool,
+}
+
+impl Nv12PipelineState {
+    fn new(device: Arc<GpuDevice>, max_sets: u32) -> Result<Self, ResourceError> {
+        if max_sets == 0 {
+            return Err(ResourceError::InvalidBufferSize);
+        }
+        let shader_info = vk::ShaderModuleCreateInfo::default().code(&NV12_TO_RGBA_U16_SHADER);
+        // SAFETY: shader code is fixed QGS-controlled SPIR-V compiled for the
+        // descriptor/push-constant contract below.
+        let shader =
+            unsafe { device.device.create_shader_module(&shader_info, None) }.map_err(|err| {
+                eprintln!("vulkan NV12 shader module creation failed: {err:?}");
+                ResourceError::ExportFailed
+            })?;
+        let bindings = [
+            storage_buffer_binding(0),
+            storage_buffer_binding(1),
+            storage_buffer_binding(2),
+        ];
+        let descriptor_set_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        // SAFETY: descriptor set layout info references the local bindings for
+        // the duration of this call.
+        let descriptor_set_layout = unsafe {
+            device
+                .device
+                .create_descriptor_set_layout(&descriptor_set_layout_info, None)
+        }
+        .map_err(|err| {
+            eprintln!("vulkan NV12 descriptor set layout creation failed: {err:?}");
+            // SAFETY: shader was created above and is still owned here.
+            unsafe {
+                device.device.destroy_shader_module(shader, None);
+            }
+            ResourceError::ExportFailed
+        })?;
+        let push_ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(std::mem::size_of::<Nv12ShaderParams>() as u32)];
+        let set_layouts = [descriptor_set_layout];
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&push_ranges);
+        // SAFETY: pipeline layout info references live descriptor set layout and
+        // fixed push-constant range.
+        let layout = unsafe {
+            device
+                .device
+                .create_pipeline_layout(&pipeline_layout_info, None)
+        }
+        .map_err(|err| {
+            eprintln!("vulkan NV12 pipeline layout creation failed: {err:?}");
+            // SAFETY: objects are live and owned by this constructor.
+            unsafe {
+                device
+                    .device
+                    .destroy_descriptor_set_layout(descriptor_set_layout, None);
+                device.device.destroy_shader_module(shader, None);
+            }
+            ResourceError::ExportFailed
+        })?;
+        let entry_point = c"main";
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(shader)
+            .name(entry_point);
+        let pipeline_info = vk::ComputePipelineCreateInfo::default()
+            .stage(stage)
+            .layout(layout);
+        // SAFETY: shader module and pipeline layout are live and match the
+        // fixed QGS NV12 descriptor contract.
+        let pipeline = unsafe {
+            device.device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[pipeline_info],
+                None,
+            )
+        }
+        .map_err(|(_, err)| {
+            eprintln!("vulkan NV12 compute pipeline creation failed: {err:?}");
+            // SAFETY: objects are live and owned by this constructor.
+            unsafe {
+                device.device.destroy_pipeline_layout(layout, None);
+                device
+                    .device
+                    .destroy_descriptor_set_layout(descriptor_set_layout, None);
+                device.device.destroy_shader_module(shader, None);
+            }
+            ResourceError::ExportFailed
+        })?[0];
+        let pool_size = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(
+                max_sets
+                    .checked_mul(3)
+                    .ok_or(ResourceError::InvalidBufferSize)?,
+            )];
+        let descriptor_pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(max_sets)
+            .pool_sizes(&pool_size);
+        // SAFETY: descriptor pool info is valid for max_sets fixed three-binding sets.
+        let descriptor_pool = unsafe {
+            device
+                .device
+                .create_descriptor_pool(&descriptor_pool_info, None)
+        }
+        .map_err(|err| {
+            eprintln!("vulkan NV12 descriptor pool creation failed: {err:?}");
+            // SAFETY: objects are live and owned by this constructor.
+            unsafe {
+                device.device.destroy_pipeline(pipeline, None);
+                device.device.destroy_pipeline_layout(layout, None);
+                device
+                    .device
+                    .destroy_descriptor_set_layout(descriptor_set_layout, None);
+                device.device.destroy_shader_module(shader, None);
+            }
+            ResourceError::ExportFailed
+        })?;
+
+        Ok(Self {
+            device,
+            shader,
+            descriptor_set_layout,
+            layout,
+            pipeline,
+            descriptor_pool,
+        })
+    }
+
+    fn write_buffers(
+        &self,
+        y: &GpuBuffer,
+        uv: &GpuBuffer,
+        output: &GpuBuffer,
+    ) -> Result<DescriptorSet, ResourceError> {
+        let set_layouts = [self.descriptor_set_layout];
+        let allocate_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&set_layouts);
+        // SAFETY: descriptor pool and set layout are live.
+        let sets = unsafe { self.device.device.allocate_descriptor_sets(&allocate_info) }.map_err(
+            |err| {
+                eprintln!("vulkan NV12 descriptor set allocation failed: {err:?}");
+                ResourceError::ExportFailed
+            },
+        )?;
+        let set = sets[0];
+        let buffer_infos = [
+            vk::DescriptorBufferInfo::default()
+                .buffer(y.buffer)
+                .offset(0)
+                .range(y.size),
+            vk::DescriptorBufferInfo::default()
+                .buffer(uv.buffer)
+                .offset(0)
+                .range(uv.size),
+            vk::DescriptorBufferInfo::default()
+                .buffer(output.buffer)
+                .offset(0)
+                .range(output.size),
+        ];
+        let writes = [
+            storage_buffer_write(set, 0, &buffer_infos[0..1]),
+            storage_buffer_write(set, 1, &buffer_infos[1..2]),
+            storage_buffer_write(set, 2, &buffer_infos[2..3]),
+        ];
+        // SAFETY: descriptor set is allocated from this pool, and buffer infos
+        // reference live buffers for the call and subsequent submission.
+        unsafe {
+            self.device.device.update_descriptor_sets(&writes, &[]);
+        }
+        Ok(DescriptorSet { set })
+    }
+}
+
+impl Drop for Nv12PipelineState {
+    fn drop(&mut self) {
+        // SAFETY: Nv12PipelineState owns these objects and they are destroyed in
+        // dependency order after submissions complete.
         unsafe {
             self.device
                 .device
@@ -4368,6 +5800,104 @@ mod tests {
             validate_yuv422p10_upload(&upload),
             Err(ResourceError::InvalidImageDimensions)
         ));
+    }
+
+    fn tiny_nv12_upload<'a>(
+        y: &'a [u8],
+        uv: &'a [u8],
+        y_stride: usize,
+        uv_stride: usize,
+    ) -> Nv12Upload<'a> {
+        Nv12Upload {
+            device_id: DeviceId::new(1).expect("device"),
+            coded_width: 4,
+            coded_height: 4,
+            visible_width: 4,
+            visible_height: 2,
+            y: Nv12Plane {
+                width_bytes: 4,
+                height: 4,
+                stride_bytes: y_stride,
+                data: y,
+            },
+            uv: Nv12Plane {
+                width_bytes: 4,
+                height: 2,
+                stride_bytes: uv_stride,
+                data: uv,
+            },
+            conversion: YcbcrConversion::Rec709Limited,
+        }
+    }
+
+    #[test]
+    fn validates_nv12_geometry_visible_region_and_padding() {
+        let y = [
+            [16, 64, 128, 235, 0xee, 0xee],
+            [32, 80, 144, 220, 0xee, 0xee],
+            [48, 96, 160, 210, 0xee, 0xee],
+            [64, 112, 176, 200, 0xee, 0xee],
+        ]
+        .concat();
+        let uv = [
+            [90, 240, 54, 200, 0xdd, 0xdd],
+            [100, 230, 64, 190, 0xdd, 0xdd],
+        ]
+        .concat();
+        let upload = tiny_nv12_upload(&y, &uv, 6, 6);
+
+        let layout = validate_nv12_upload(&upload).expect("valid NV12");
+
+        assert_eq!(layout.y_bytes, 16);
+        assert_eq!(layout.uv_bytes, 8);
+        assert_eq!(layout.output_samples, 32);
+        assert_eq!(layout.cpu_surface_bytes, 36);
+        assert_eq!(
+            expand_nv12_y_plane(upload.y).expect("Y"),
+            vec![16, 64, 128, 235, 32, 80, 144, 220, 48, 96, 160, 210, 64, 112, 176, 200]
+        );
+        assert_eq!(
+            expand_nv12_uv_plane(upload.uv).expect("UV"),
+            vec![
+                90 | (240 << 8),
+                54 | (200 << 8),
+                100 | (230 << 8),
+                64 | (190 << 8)
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_nv12_uploads() {
+        let y = [0_u8; 16];
+        let uv = [0_u8; 8];
+        let mut upload = tiny_nv12_upload(&y, &uv, 4, 4);
+
+        upload.coded_width = 3;
+        assert!(matches!(
+            validate_nv12_upload(&upload),
+            Err(ResourceError::InvalidImageDimensions)
+        ));
+
+        upload.coded_width = 4;
+        upload.y.stride_bytes = 3;
+        assert!(matches!(
+            validate_nv12_upload(&upload),
+            Err(ResourceError::InvalidImageDimensions)
+        ));
+    }
+
+    #[test]
+    fn nv12_reference_uses_420_chroma_addressing() {
+        let y = vec![16, 235, 16, 235, 16, 235, 16, 235, 0, 0, 0, 0, 0, 0, 0, 0];
+        let uv = vec![128, 128, 128, 128, 200, 16, 16, 200];
+        let upload = tiny_nv12_upload(&y, &uv, 4, 4);
+
+        let rgba = nv12_reference_rgba_u16(&upload).expect("reference");
+
+        assert_eq!(&rgba[0..4], &[0, 0, 0, u16::MAX]);
+        assert_eq!(&rgba[4..8], &[u16::MAX, u16::MAX, u16::MAX, u16::MAX]);
+        assert_eq!(rgba.len(), 4 * 2 * 4);
     }
 
     #[test]
