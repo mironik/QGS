@@ -1568,6 +1568,236 @@ pub fn summarize_broadcast_payload_bindings(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastDeviceKind {
+    AudioSink,
+    VideoPresenter,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastDeviceStatus {
+    NotConfigured,
+    CapabilityMissing,
+    Ready,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastDeviceCapability {
+    AcceptsOriginalPcm,
+    AcceptsF32Pcm,
+    AcceptsProcessedGpuFrame,
+    AcceptsCpuImage,
+    ProvidesPresentationEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastDevicePayloadStatus {
+    PayloadReady,
+    DevicePayloadReady,
+    DeviceNotConfigured,
+    DeviceCapabilityMissing,
+    SubmittedToDevice,
+    PresentationEvidenceReceived,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastAudioDeviceSubmission {
+    pub audio_binding_index: usize,
+    pub start_sample: u64,
+    pub sample_count: u64,
+    pub sample_rate: u32,
+    pub track_count: usize,
+    pub format: PcmSampleFormat,
+    pub status: BroadcastDevicePayloadStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastVideoPresenterSubmission {
+    pub video_binding_index: usize,
+    pub payload_kind: Option<BroadcastVideoPayloadKind>,
+    pub coded_width: Option<u32>,
+    pub coded_height: Option<u32>,
+    pub visible_width: Option<u32>,
+    pub visible_height: Option<u32>,
+    pub format: Option<BroadcastVideoPayloadFormat>,
+    pub status: BroadcastDevicePayloadStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastPresentationEvidenceKind {
+    AudioAudible,
+    VideoFramePresented,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastPresentationEvidence {
+    pub presentation_slot_index: usize,
+    pub media_time: Duration,
+    pub evidence_kind: BroadcastPresentationEvidenceKind,
+    pub source_device_kind: BroadcastDeviceKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastDeviceBoundarySummary {
+    pub audio_payload_ready: bool,
+    pub video_payload_ready: bool,
+    pub audio_device_status: BroadcastDeviceStatus,
+    pub video_presenter_status: BroadcastDeviceStatus,
+    pub audio_submission_status: BroadcastDevicePayloadStatus,
+    pub video_submission_status: BroadcastDevicePayloadStatus,
+    pub device_payload_ready: bool,
+    pub frame_presented_count: usize,
+    pub reason: Option<&'static str>,
+}
+
+pub fn build_broadcast_audio_device_submission(
+    binding_index: usize,
+    binding: &BroadcastAudioPayloadBinding,
+    format: PcmSampleFormat,
+    device_status: BroadcastDeviceStatus,
+    capabilities: &[BroadcastDeviceCapability],
+) -> BroadcastAudioDeviceSubmission {
+    let status = device_payload_status_for_audio(binding.complete, device_status, capabilities);
+    BroadcastAudioDeviceSubmission {
+        audio_binding_index: binding_index,
+        start_sample: binding.start_sample,
+        sample_count: binding.sample_count,
+        sample_rate: binding.sample_rate,
+        track_count: binding.track_count,
+        format,
+        status,
+    }
+}
+
+pub fn build_broadcast_video_presenter_submission(
+    binding_index: usize,
+    binding: &BroadcastVideoPayloadBinding,
+    device_status: BroadcastDeviceStatus,
+    capabilities: &[BroadcastDeviceCapability],
+) -> BroadcastVideoPresenterSubmission {
+    let payload = binding.payload.as_ref();
+    let status = device_payload_status_for_video(binding.status, device_status, capabilities);
+    BroadcastVideoPresenterSubmission {
+        video_binding_index: binding_index,
+        payload_kind: payload.map(|payload| payload.kind),
+        coded_width: payload.map(|payload| payload.coded_width),
+        coded_height: payload.map(|payload| payload.coded_height),
+        visible_width: payload.map(|payload| payload.visible_width),
+        visible_height: payload.map(|payload| payload.visible_height),
+        format: payload.map(|payload| payload.format),
+        status,
+    }
+}
+
+pub fn summarize_broadcast_device_boundary(
+    audio_submission: &BroadcastAudioDeviceSubmission,
+    video_submission: &BroadcastVideoPresenterSubmission,
+    evidence: &[BroadcastPresentationEvidence],
+    audio_device_status: BroadcastDeviceStatus,
+    video_presenter_status: BroadcastDeviceStatus,
+) -> BroadcastDeviceBoundarySummary {
+    let audio_payload_ready = audio_submission.status != BroadcastDevicePayloadStatus::Failed
+        && !matches!(
+            audio_submission.status,
+            BroadcastDevicePayloadStatus::DeviceCapabilityMissing
+        );
+    let video_payload_ready = video_submission.payload_kind.is_some()
+        && !matches!(
+            video_submission.status,
+            BroadcastDevicePayloadStatus::DeviceCapabilityMissing
+                | BroadcastDevicePayloadStatus::Failed
+        );
+    let device_payload_ready = audio_submission.status
+        == BroadcastDevicePayloadStatus::DevicePayloadReady
+        && video_submission.status == BroadcastDevicePayloadStatus::DevicePayloadReady;
+    let frame_presented_count = evidence
+        .iter()
+        .filter(|event| {
+            event.evidence_kind == BroadcastPresentationEvidenceKind::VideoFramePresented
+                && event.source_device_kind == BroadcastDeviceKind::VideoPresenter
+        })
+        .count();
+    let reason = if audio_device_status == BroadcastDeviceStatus::NotConfigured
+        || video_presenter_status == BroadcastDeviceStatus::NotConfigured
+    {
+        Some("device boundary not configured")
+    } else if audio_submission.status == BroadcastDevicePayloadStatus::DeviceCapabilityMissing
+        || video_submission.status == BroadcastDevicePayloadStatus::DeviceCapabilityMissing
+    {
+        Some("device capability missing")
+    } else if !device_payload_ready {
+        Some("payload not accepted by device boundary")
+    } else {
+        None
+    };
+    BroadcastDeviceBoundarySummary {
+        audio_payload_ready,
+        video_payload_ready,
+        audio_device_status,
+        video_presenter_status,
+        audio_submission_status: audio_submission.status,
+        video_submission_status: video_submission.status,
+        device_payload_ready,
+        frame_presented_count,
+        reason,
+    }
+}
+
+fn device_payload_status_for_audio(
+    payload_ready: bool,
+    device_status: BroadcastDeviceStatus,
+    capabilities: &[BroadcastDeviceCapability],
+) -> BroadcastDevicePayloadStatus {
+    if !payload_ready {
+        return BroadcastDevicePayloadStatus::Failed;
+    }
+    match device_status {
+        BroadcastDeviceStatus::NotConfigured => BroadcastDevicePayloadStatus::DeviceNotConfigured,
+        BroadcastDeviceStatus::CapabilityMissing => {
+            BroadcastDevicePayloadStatus::DeviceCapabilityMissing
+        }
+        BroadcastDeviceStatus::Failed => BroadcastDevicePayloadStatus::Failed,
+        BroadcastDeviceStatus::Ready => {
+            if capabilities.contains(&BroadcastDeviceCapability::AcceptsOriginalPcm) {
+                BroadcastDevicePayloadStatus::DevicePayloadReady
+            } else {
+                BroadcastDevicePayloadStatus::DeviceCapabilityMissing
+            }
+        }
+    }
+}
+
+fn device_payload_status_for_video(
+    payload_status: BroadcastVideoPayloadBindingStatus,
+    device_status: BroadcastDeviceStatus,
+    capabilities: &[BroadcastDeviceCapability],
+) -> BroadcastDevicePayloadStatus {
+    if payload_status != BroadcastVideoPayloadBindingStatus::PayloadReady {
+        return match payload_status {
+            BroadcastVideoPayloadBindingStatus::CapabilityMissing => {
+                BroadcastDevicePayloadStatus::DeviceCapabilityMissing
+            }
+            _ => BroadcastDevicePayloadStatus::Failed,
+        };
+    }
+    match device_status {
+        BroadcastDeviceStatus::NotConfigured => BroadcastDevicePayloadStatus::DeviceNotConfigured,
+        BroadcastDeviceStatus::CapabilityMissing => {
+            BroadcastDevicePayloadStatus::DeviceCapabilityMissing
+        }
+        BroadcastDeviceStatus::Failed => BroadcastDevicePayloadStatus::Failed,
+        BroadcastDeviceStatus::Ready => {
+            if capabilities.contains(&BroadcastDeviceCapability::AcceptsProcessedGpuFrame) {
+                BroadcastDevicePayloadStatus::DevicePayloadReady
+            } else {
+                BroadcastDevicePayloadStatus::DeviceCapabilityMissing
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BroadcastRuntimeAccounting {
     pub selected_frames_accounted: usize,
     pub audio_ranges_accounted: usize,
@@ -3141,6 +3371,169 @@ mod tests {
             original_binding.readiness,
             BroadcastPresentationPayloadReadiness::CapabilityMissing
         );
+    }
+
+    #[test]
+    fn device_boundary_keeps_payload_ready_distinct_from_device_ready() {
+        let video_slot = &test_prepared_video_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
+        let video_binding = bind_broadcast_video_payload_ready(
+            video_slot,
+            BroadcastVideoPayloadReference {
+                payload_id: 11,
+                kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+                format: BroadcastVideoPayloadFormat::RgbaU16,
+                backend_path: BroadcastVideoPayloadBackendPath::VaapiCpuNv12Vulkan,
+                source_frame_index: video_slot.source_frame_index.unwrap(),
+                selected_preview_frame_index: video_slot.selected_preview_frame_index,
+                presentation_time: video_slot.presentation_time,
+                duration: video_slot.duration,
+                coded_width: 1920,
+                coded_height: 1088,
+                visible_width: 1920,
+                visible_height: 1080,
+                bounded_slot_index: video_slot.slot_index,
+                session_index: 0,
+            },
+        )
+        .unwrap();
+        let audio_slot = &test_prepared_audio_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
+        let audio_binding =
+            bind_broadcast_audio_payload(audio_slot, &clock_ready_blocks_120ms()).unwrap();
+        let format = PcmSampleFormat::SignedInteger {
+            bits_per_sample: 24,
+            endian: PcmEndian::Little,
+        };
+        let audio_submission = build_broadcast_audio_device_submission(
+            0,
+            &audio_binding,
+            format,
+            BroadcastDeviceStatus::NotConfigured,
+            &[],
+        );
+        let video_submission = build_broadcast_video_presenter_submission(
+            0,
+            &video_binding,
+            BroadcastDeviceStatus::NotConfigured,
+            &[],
+        );
+        let summary = summarize_broadcast_device_boundary(
+            &audio_submission,
+            &video_submission,
+            &[],
+            BroadcastDeviceStatus::NotConfigured,
+            BroadcastDeviceStatus::NotConfigured,
+        );
+
+        assert!(summary.audio_payload_ready);
+        assert!(summary.video_payload_ready);
+        assert!(!summary.device_payload_ready);
+        assert_eq!(summary.frame_presented_count, 0);
+        assert_eq!(
+            summary.audio_submission_status,
+            BroadcastDevicePayloadStatus::DeviceNotConfigured
+        );
+        assert_eq!(
+            summary.video_submission_status,
+            BroadcastDevicePayloadStatus::DeviceNotConfigured
+        );
+        assert_eq!(summary.reason, Some("device boundary not configured"));
+    }
+
+    #[test]
+    fn device_boundary_requires_matching_capabilities() {
+        let video_slot = &test_prepared_video_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
+        let video_binding = bind_broadcast_video_payload_ready(
+            video_slot,
+            BroadcastVideoPayloadReference {
+                payload_id: 12,
+                kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+                format: BroadcastVideoPayloadFormat::RgbaU16,
+                backend_path: BroadcastVideoPayloadBackendPath::VaapiCpuNv12Vulkan,
+                source_frame_index: video_slot.source_frame_index.unwrap(),
+                selected_preview_frame_index: video_slot.selected_preview_frame_index,
+                presentation_time: video_slot.presentation_time,
+                duration: video_slot.duration,
+                coded_width: 1920,
+                coded_height: 1088,
+                visible_width: 1920,
+                visible_height: 1080,
+                bounded_slot_index: video_slot.slot_index,
+                session_index: 0,
+            },
+        )
+        .unwrap();
+        let video_submission = build_broadcast_video_presenter_submission(
+            0,
+            &video_binding,
+            BroadcastDeviceStatus::Ready,
+            &[BroadcastDeviceCapability::AcceptsCpuImage],
+        );
+
+        assert_eq!(
+            video_submission.status,
+            BroadcastDevicePayloadStatus::DeviceCapabilityMissing
+        );
+
+        let ready_submission = build_broadcast_video_presenter_submission(
+            0,
+            &video_binding,
+            BroadcastDeviceStatus::Ready,
+            &[BroadcastDeviceCapability::AcceptsProcessedGpuFrame],
+        );
+        assert_eq!(
+            ready_submission.status,
+            BroadcastDevicePayloadStatus::DevicePayloadReady
+        );
+    }
+
+    #[test]
+    fn frame_presented_requires_presentation_evidence() {
+        let audio_submission = BroadcastAudioDeviceSubmission {
+            audio_binding_index: 0,
+            start_sample: 0,
+            sample_count: 1920,
+            sample_rate: 48_000,
+            track_count: 4,
+            format: PcmSampleFormat::SignedInteger {
+                bits_per_sample: 24,
+                endian: PcmEndian::Little,
+            },
+            status: BroadcastDevicePayloadStatus::DevicePayloadReady,
+        };
+        let video_submission = BroadcastVideoPresenterSubmission {
+            video_binding_index: 0,
+            payload_kind: Some(BroadcastVideoPayloadKind::ProcessedGpuFrame),
+            coded_width: Some(1920),
+            coded_height: Some(1088),
+            visible_width: Some(1920),
+            visible_height: Some(1080),
+            format: Some(BroadcastVideoPayloadFormat::RgbaU16),
+            status: BroadcastDevicePayloadStatus::DevicePayloadReady,
+        };
+
+        let no_evidence = summarize_broadcast_device_boundary(
+            &audio_submission,
+            &video_submission,
+            &[],
+            BroadcastDeviceStatus::Ready,
+            BroadcastDeviceStatus::Ready,
+        );
+        assert!(no_evidence.device_payload_ready);
+        assert_eq!(no_evidence.frame_presented_count, 0);
+
+        let with_evidence = summarize_broadcast_device_boundary(
+            &audio_submission,
+            &video_submission,
+            &[BroadcastPresentationEvidence {
+                presentation_slot_index: 0,
+                media_time: Duration::ZERO,
+                evidence_kind: BroadcastPresentationEvidenceKind::VideoFramePresented,
+                source_device_kind: BroadcastDeviceKind::VideoPresenter,
+            }],
+            BroadcastDeviceStatus::Ready,
+            BroadcastDeviceStatus::Ready,
+        );
+        assert_eq!(with_evidence.frame_presented_count, 1);
     }
 
     #[test]

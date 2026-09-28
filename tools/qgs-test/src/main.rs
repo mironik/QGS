@@ -14,12 +14,14 @@ use qgs_linux::{
 use qgs_media_runtime::{
     audio_samples_for_duration, av_frame_audio_range, bind_broadcast_audio_payload,
     bind_broadcast_presentation_payload, bind_broadcast_video_payload_accounting,
-    bind_broadcast_video_payload_ready, build_broadcast_player_event_surface,
+    bind_broadcast_video_payload_ready, build_broadcast_audio_device_submission,
+    build_broadcast_player_event_surface, build_broadcast_video_presenter_submission,
     classify_presentation, duration_abs_delta, duration_from_audio_samples,
     evaluate_broadcast_preroll, max_video_timestamp_outside_audio_range,
-    summarize_broadcast_payload_bindings, summarize_broadcast_player_runtime_events,
-    summarize_broadcast_prepared_slots, summarize_broadcast_runtime_contract, AudioFormat,
-    AudioSampleFormat, AudioTimeline, AudioTimingPacket, AvFrameAudioRange, BoundedQueue,
+    summarize_broadcast_device_boundary, summarize_broadcast_payload_bindings,
+    summarize_broadcast_player_runtime_events, summarize_broadcast_prepared_slots,
+    summarize_broadcast_runtime_contract, AudioFormat, AudioSampleFormat, AudioTimeline,
+    AudioTimingPacket, AvFrameAudioRange, BoundedQueue, BroadcastDeviceStatus,
     BroadcastMediaSourceRole, BroadcastPreparedAudioSlot, BroadcastPreparedPresentationSlot,
     BroadcastPreparedVideoSlot, BroadcastPreparedVideoSlotStatus, BroadcastPrerollConfig,
     BroadcastPrerollPlan, BroadcastPreviewProfile, BroadcastRuntimeCapabilities,
@@ -82,6 +84,8 @@ const BROADCAST_PLAYER_RUNTIME_EVENTS_ARG: &str = "--broadcast-player-runtime-ev
 const BROADCAST_PLAYER_RUNTIME_PAYLOADS_ARG: &str = "--broadcast-player-runtime-payloads";
 const BROADCAST_PLAYER_RUNTIME_VIDEO_PAYLOADS_ARG: &str =
     "--broadcast-player-runtime-video-payloads";
+const BROADCAST_PLAYER_RUNTIME_DEVICE_BOUNDARY_ARG: &str =
+    "--broadcast-player-runtime-device-boundary";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -159,6 +163,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &original,
             &proxy,
             BroadcastRuntimeReportFocus::VideoPayloads,
+        );
+    }
+    if let Some((original, proxy)) = args.broadcast_player_runtime_device_boundary_paths {
+        return broadcast_runtime_prepared_slots(
+            &original,
+            &proxy,
+            BroadcastRuntimeReportFocus::DeviceBoundary,
         );
     }
 
@@ -2865,7 +2876,10 @@ fn broadcast_runtime_prepared_slots(
         .iter()
         .map(|slot| bind_broadcast_audio_payload(slot, &blocks))
         .collect::<Result<Vec<_>, _>>()?;
-    let proxy_video_payload_proof = if report_focus == BroadcastRuntimeReportFocus::VideoPayloads {
+    let proxy_video_payload_proof = if matches!(
+        report_focus,
+        BroadcastRuntimeReportFocus::VideoPayloads | BroadcastRuntimeReportFocus::DeviceBoundary
+    ) {
         Some(bind_proxy_preview_video_payloads(
             proxy_video,
             &proxy_h264,
@@ -3084,6 +3098,10 @@ fn broadcast_runtime_prepared_slots(
             println!("QGS Broadcast Player Runtime Proxy Video Payload Binding");
             println!("-------------------------------------------------------");
         }
+        BroadcastRuntimeReportFocus::DeviceBoundary => {
+            println!("QGS Broadcast Player Runtime Device Boundary Contract");
+            println!("-----------------------------------------------------");
+        }
     }
     println!(
         "Not real playback: no speaker output, no display output, no real-time Broadcast Player loop"
@@ -3162,7 +3180,9 @@ fn broadcast_runtime_prepared_slots(
     }
     if matches!(
         report_focus,
-        BroadcastRuntimeReportFocus::Payloads | BroadcastRuntimeReportFocus::VideoPayloads
+        BroadcastRuntimeReportFocus::Payloads
+            | BroadcastRuntimeReportFocus::VideoPayloads
+            | BroadcastRuntimeReportFocus::DeviceBoundary
     ) {
         let blocks_per_presentation = proxy_audio_payload_bindings
             .first()
@@ -3253,6 +3273,57 @@ fn broadcast_runtime_prepared_slots(
                 );
             }
         }
+        if report_focus == BroadcastRuntimeReportFocus::DeviceBoundary {
+            let audio_format = blocks
+                .first()
+                .map(|block| block.format)
+                .ok_or("no PCM blocks available for device boundary report")?;
+            let audio_binding = proxy_audio_payload_bindings
+                .first()
+                .ok_or("missing proxy audio payload binding")?;
+            let video_binding = proxy_video_payload_bindings
+                .first()
+                .ok_or("missing proxy video payload binding")?;
+            let audio_submission = build_broadcast_audio_device_submission(
+                0,
+                audio_binding,
+                audio_format,
+                BroadcastDeviceStatus::NotConfigured,
+                &[],
+            );
+            let video_submission = build_broadcast_video_presenter_submission(
+                0,
+                video_binding,
+                BroadcastDeviceStatus::NotConfigured,
+                &[],
+            );
+            let boundary = summarize_broadcast_device_boundary(
+                &audio_submission,
+                &video_submission,
+                &[],
+                BroadcastDeviceStatus::NotConfigured,
+                BroadcastDeviceStatus::NotConfigured,
+            );
+            println!(
+                "  Device boundary: audio_payload_ready={} video_payload_ready={} device_payload_ready={} frame_presented={}",
+                yes_no(boundary.audio_payload_ready),
+                yes_no(boundary.video_payload_ready),
+                yes_no(boundary.device_payload_ready),
+                boundary.frame_presented_count
+            );
+            println!(
+                "  Audio sink status: {:?} submission={:?}",
+                boundary.audio_device_status, boundary.audio_submission_status
+            );
+            println!(
+                "  Video presenter status: {:?} submission={:?}",
+                boundary.video_presenter_status, boundary.video_submission_status
+            );
+            println!(
+                "  Device-ready reason: {}",
+                boundary.reason.unwrap_or("ready")
+            );
+        }
     }
     println!("OriginalMedia:");
     println!("  video source: original MXF");
@@ -3293,7 +3364,9 @@ fn broadcast_runtime_prepared_slots(
     }
     if matches!(
         report_focus,
-        BroadcastRuntimeReportFocus::Payloads | BroadcastRuntimeReportFocus::VideoPayloads
+        BroadcastRuntimeReportFocus::Payloads
+            | BroadcastRuntimeReportFocus::VideoPayloads
+            | BroadcastRuntimeReportFocus::DeviceBoundary
     ) {
         let video_binding_status = original_video_payload_bindings
             .first()
@@ -3327,6 +3400,11 @@ fn broadcast_runtime_prepared_slots(
             "  Capability-missing presentations: {}",
             original_payload_summary.capability_missing_presentations
         );
+        if report_focus == BroadcastRuntimeReportFocus::DeviceBoundary {
+            println!("  Device boundary: not attempted for OriginalMedia");
+            println!("  DevicePayloadReady: no");
+            println!("  FramePresented: 0");
+        }
     }
     println!("  Original video runtime backend: capability missing in this milestone");
 
@@ -3339,6 +3417,7 @@ enum BroadcastRuntimeReportFocus {
     Events,
     Payloads,
     VideoPayloads,
+    DeviceBoundary,
 }
 
 #[derive(Clone, Debug)]
@@ -8099,6 +8178,7 @@ struct Args {
     broadcast_player_runtime_events_paths: Option<(PathBuf, PathBuf)>,
     broadcast_player_runtime_payloads_paths: Option<(PathBuf, PathBuf)>,
     broadcast_player_runtime_video_payloads_paths: Option<(PathBuf, PathBuf)>,
+    broadcast_player_runtime_device_boundary_paths: Option<(PathBuf, PathBuf)>,
 }
 
 impl Args {
@@ -8137,6 +8217,8 @@ impl Args {
         let mut broadcast_player_runtime_payloads_paths = None;
         let mut broadcast_player_runtime_video_payloads_original = None;
         let mut broadcast_player_runtime_video_payloads_paths = None;
+        let mut broadcast_player_runtime_device_boundary_original = None;
+        let mut broadcast_player_runtime_device_boundary_paths = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
@@ -8161,9 +8243,22 @@ impl Args {
         let mut next_arg_is_broadcast_player_runtime_payloads_proxy = false;
         let mut next_arg_is_broadcast_player_runtime_video_payloads_original = false;
         let mut next_arg_is_broadcast_player_runtime_video_payloads_proxy = false;
+        let mut next_arg_is_broadcast_player_runtime_device_boundary_original = false;
+        let mut next_arg_is_broadcast_player_runtime_device_boundary_proxy = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_broadcast_player_runtime_video_payloads_proxy {
+            if next_arg_is_broadcast_player_runtime_device_boundary_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = broadcast_player_runtime_device_boundary_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                broadcast_player_runtime_device_boundary_paths = Some((original, proxy));
+                next_arg_is_broadcast_player_runtime_device_boundary_proxy = false;
+            } else if next_arg_is_broadcast_player_runtime_device_boundary_original {
+                broadcast_player_runtime_device_boundary_original = Some(PathBuf::from(arg));
+                next_arg_is_broadcast_player_runtime_device_boundary_original = false;
+                next_arg_is_broadcast_player_runtime_device_boundary_proxy = true;
+            } else if next_arg_is_broadcast_player_runtime_video_payloads_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = broadcast_player_runtime_video_payloads_original
                     .take()
@@ -8339,6 +8434,8 @@ impl Args {
                 next_arg_is_broadcast_player_runtime_payloads_original = true;
             } else if arg == BROADCAST_PLAYER_RUNTIME_VIDEO_PAYLOADS_ARG {
                 next_arg_is_broadcast_player_runtime_video_payloads_original = true;
+            } else if arg == BROADCAST_PLAYER_RUNTIME_DEVICE_BOUNDARY_ARG {
+                next_arg_is_broadcast_player_runtime_device_boundary_original = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -8365,6 +8462,7 @@ impl Args {
             broadcast_player_runtime_events_paths,
             broadcast_player_runtime_payloads_paths,
             broadcast_player_runtime_video_payloads_paths,
+            broadcast_player_runtime_device_boundary_paths,
         }
     }
 }
