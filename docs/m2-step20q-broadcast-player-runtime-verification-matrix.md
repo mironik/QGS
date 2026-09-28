@@ -69,6 +69,7 @@ For Sony FX6 sample 002:
 | native PipeWire buffer submission | `NativePostSubmitEvidence` | A 20 ms original-audio-derived f32 buffer was queued to a native PipeWire stream and a drain callback was observed; audible output and full playback are not claimed. |
 | native PipeWire audible smoke test | `ManualAudibleSignalDetectedContentUnverified` | Bounded original-audio-derived PipeWire smoke-test buffers submitted and drained; user later clarified the heard output was slight hum/buzz only, not recognizable original audio content. |
 | native PipeWire original-audio segment playback | `ManualAudibleSignalDetectedContentUnverified` | Bounded sequential original MXF audio segment submitted and drained; user later clarified the heard output was slight hum/buzz only, not recognizable original audio content. |
+| PipeWire audio content sanity audit | `MediaInspected` | Original MXF PCM statistics, endian/sign interpretation, f32 conversion, segment/runtime path equality, and PipeWire buffer geometry audited; recognizable content audibility remains unconfirmed. |
 | broadcast runtime audio payload to PipeWire | `RuntimeAudioPayloadDrainCompleted` | First prepared `ProxyPreview` Broadcast Player Runtime original-audio payload binding submits to native PipeWire and drains; an audible helper path exists but manual confirmation is tracked separately and does not imply full playback, realtime playback, A/V sync, channel certification, or full audio-device verification. |
 | simulated playback loop | `TestBoundaryEvidence` | Prepared slots flow through test audio/video boundaries deterministically. |
 | real speaker output | `NotImplemented` | No audible speaker output, audio-device clock, or full audio playback path exists; native PipeWire buffer submission is tracked separately. |
@@ -95,6 +96,8 @@ The matrix intentionally does not overstate these areas:
 - Runtime-prepared audio payload submission/drain evidence is not full playback,
   realtime playback, A/V sync, channel certification, or full
   `AudioDeviceVerified`.
+- The audio content sanity audit is inspection evidence, not audible content
+  verification.
 - Haswell CPU-bridge 1080p50 is not marked realtime verified.
 - Modern-hardware zero-copy is not marked verified.
 - `FramePresented` from the current test presenter remains test evidence, not

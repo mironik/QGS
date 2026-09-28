@@ -119,6 +119,8 @@ const PIPEWIRE_AUDIO_SEGMENT_PLAYBACK_ARG: &str = "--pipewire-audio-segment-play
 const BROADCAST_RUNTIME_AUDIO_PIPEWIRE_ARG: &str = "--broadcast-runtime-audio-pipewire";
 const BROADCAST_RUNTIME_AUDIO_PIPEWIRE_AUDIBLE_ARG: &str =
     "--broadcast-runtime-audio-pipewire-audible";
+const PIPEWIRE_AUDIO_CONTENT_AUDIT_ARG: &str = "--pipewire-audio-content-audit";
+const WRITE_DIAGNOSTIC_WAV_ARG: &str = "--write-diagnostic-wav";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -256,6 +258,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.broadcast_runtime_audio_pipewire_audible_paths {
         return broadcast_runtime_audio_pipewire_audible(&original, &proxy);
+    }
+    if let Some((original, proxy)) = args.pipewire_audio_content_audit_paths {
+        return pipewire_audio_content_audit(
+            &original,
+            &proxy,
+            args.diagnostic_wav_path.as_deref(),
+        );
     }
 
     let socket_path = args.socket_path;
@@ -3270,6 +3279,473 @@ fn build_runtime_audio_payload_pipewire_buffer(
         source_blocks_total: binding.block_coverage.len(),
         source_bytes,
     })
+}
+
+fn pipewire_audio_content_audit(
+    original_path: &Path,
+    proxy_path: &Path,
+    diagnostic_wav_path: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let original_bytes = std::fs::read(original_path)?;
+    let original = MediaSource::parse(&original_bytes)?;
+    let audio_tracks = original
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Audio)
+        .collect::<Vec<_>>();
+    if audio_tracks.is_empty() {
+        return Err("original MXF has no audio tracks".into());
+    }
+    let source_format = original_linux_pcm_audio_format(&audio_tracks)?;
+    let blocks = build_original_pcm_blocks(&original, &original_bytes)?;
+    let track_groups = original_pcm_blocks_by_channel(&blocks, source_format.sample_rate)?;
+    let runtime_plan = prepare_runtime_audio_pipewire_payload(original_path, proxy_path)?;
+    let runtime_buffer = &runtime_plan.payload_buffer;
+    let segment_40ms = build_sequential_original_audio_segment_for_duration(
+        &blocks,
+        source_format.sample_rate,
+        Duration::from_millis(40),
+    )?;
+    let segment_1s = build_sequential_original_audio_segment(
+        &blocks,
+        source_format.sample_rate,
+        Duration::from_secs(1),
+        Duration::from_millis(500),
+    )?;
+    let segment_40ms_bytes = segment_40ms
+        .buffers
+        .iter()
+        .flat_map(|buffer| buffer.iter().copied())
+        .collect::<Vec<_>>();
+    let same_range_outputs_match = segment_40ms_bytes == runtime_buffer.output_bytes;
+    let segment_stats = f32_buffer_stats(
+        &segment_40ms_bytes,
+        segment_40ms.samples_per_track,
+        u32::try_from(segment_40ms.channels)?,
+    )?;
+    let runtime_stats = f32_buffer_stats(
+        &runtime_buffer.output_bytes,
+        runtime_buffer.output_frames,
+        u32::try_from(runtime_buffer.track_count)?,
+    )?;
+    let wav_path = diagnostic_wav_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("target/qgs-audio-audit/qgs-original-audio-audit.wav"));
+    write_f32_wav(
+        &wav_path,
+        source_format.sample_rate,
+        u16::try_from(segment_1s.channels)?,
+        &segment_1s
+            .buffers
+            .iter()
+            .flat_map(|buffer| buffer.iter().copied())
+            .collect::<Vec<_>>(),
+    )?;
+
+    println!("QGS PipeWire Audio Content Path Audit");
+    println!("-------------------------------------");
+    println!("Audio source: original MXF");
+    println!("Video source for runtime timing: proxy MP4");
+    println!("Proxy AAC: not used");
+    println!("PipeWire playback required: no");
+    println!("AudioDeviceVerified: no");
+    println!("Original audio content audibility confirmed: no");
+    println!(
+        "Input PCM: tracks={} channels_per_track={} sample_rate={}Hz bit_depth={}bit",
+        source_format.track_count,
+        source_format.channels_per_track,
+        source_format.sample_rate,
+        source_format.bits_per_sample
+    );
+    println!("MXF declared byte order: not explicitly modeled by qgs-mxf descriptor");
+    println!("QGS selected interpretation: signed 24-bit little-endian");
+    println!("Selection reason: Step 20B/20C extraction stores Sony FX6 PCM payload as 24-bit little-endian runtime blocks");
+    println!("Block count total: {}", blocks.len());
+    for (channel_index, channel_blocks) in &track_groups {
+        let first = channel_blocks
+            .first()
+            .ok_or("channel group unexpectedly empty")?;
+        let PcmAudioBlockLayout::MonoTrack { track_id, .. } = first.layout else {
+            return Err("audit expects mono-track original PCM blocks".into());
+        };
+        let stats = audit_track_stats(channel_blocks, 48_000)?;
+        println!("Track/channel audit:");
+        println!("  track_id={} channel_index={}", track_id, channel_index);
+        println!("  blocks={}", channel_blocks.len());
+        println!("  block_byte_size={}", first.payload.len());
+        println!("  samples_per_block={}", first.sample_count);
+        println!("  raw first 12 bytes: {}", hex_bytes(&stats.raw_first_12));
+        println!("  first samples signed24 LE: {:?}", stats.first_s24le);
+        println!("  first samples signed24 BE: {:?}", stats.first_s24be);
+        println!("  first samples unsigned24 LE: {:?}", stats.first_u24le);
+        println!("  first 20 f32 samples: {}", f32_list(&stats.first_f32));
+        println!("  samples analyzed: {}", stats.samples_analyzed);
+        println!(
+            "  min={} max={} mean={:.3} rms={:.3}",
+            stats.min_sample, stats.max_sample, stats.mean, stats.rms
+        );
+        println!(
+            "  peak_f32={:.6} rms_f32={:.6} dc_offset={:.6}",
+            stats.peak_f32, stats.rms_f32, stats.dc_offset
+        );
+        println!(
+            "  zero_samples={:.3}% clipping={:.3}%",
+            stats.zero_ratio * 100.0,
+            stats.clipping_ratio * 100.0
+        );
+        println!("  likely silent: {}", yes_no(stats.likely_silent));
+        println!(
+            "  likely DC/buzz risk: {}",
+            yes_no(stats.likely_dc_buzz_risk)
+        );
+    }
+
+    println!("Standalone segment path vs runtime prepared payload:");
+    println!(
+        "  segment path source blocks per track: {}",
+        segment_40ms.blocks_per_track
+    );
+    println!(
+        "  runtime path source blocks per track: {}",
+        runtime_buffer.source_blocks_per_track
+    );
+    println!(
+        "  segment source range start_sample: {}",
+        segment_40ms.start_sample
+    );
+    println!(
+        "  runtime source range start_sample: {}",
+        runtime_plan.audio_binding.start_sample
+    );
+    println!(
+        "  segment output frames: {} bytes: {}",
+        segment_40ms.samples_per_track,
+        segment_40ms_bytes.len()
+    );
+    println!(
+        "  runtime output frames: {} bytes: {}",
+        runtime_buffer.output_frames,
+        runtime_buffer.output_bytes.len()
+    );
+    println!(
+        "  same source range f32 bytes identical: {}",
+        yes_no(same_range_outputs_match)
+    );
+    println!(
+        "  segment f32 min={:.6} max={:.6} rms={:.6} nonzero={}",
+        segment_stats.min,
+        segment_stats.max,
+        segment_stats.rms,
+        yes_no(segment_stats.nonzero)
+    );
+    println!(
+        "  runtime f32 min={:.6} max={:.6} rms={:.6} nonzero={}",
+        runtime_stats.min,
+        runtime_stats.max,
+        runtime_stats.rms,
+        yes_no(runtime_stats.nonzero)
+    );
+    println!("Interleaved first frames:");
+    println!(
+        "  runtime first 5 frames: {}",
+        interleaved_frame_list(&runtime_buffer.output_bytes, runtime_buffer.track_count, 5)?
+    );
+    println!("PipeWire buffer geometry review:");
+    println!("  format: F32Interleaved 48000Hz 4ch");
+    println!("  bytes_per_sample: 4");
+    println!("  bytes_per_frame: 16");
+    println!("  960 frames expected bytes: 15360");
+    println!("  1920 frames expected bytes: 30720");
+    println!("  48000 frames expected bytes: 768000");
+    println!("  qgs-audio-pipewire writes data plane 0, chunk offset 0, chunk stride channels*4, chunk size copied bytes");
+    println!("Diagnostic WAV: {}", wav_path.display());
+    println!(
+        "Likely root cause: {}",
+        if same_range_outputs_match {
+            "not isolated between standalone segment and runtime payload conversion; PCM/content statistics and diagnostic WAV should be inspected next"
+        } else {
+            "runtime prepared payload conversion diverges from standalone segment conversion for the same source range"
+        }
+    );
+    Ok(())
+}
+
+struct TrackContentStats {
+    raw_first_12: Vec<u8>,
+    first_s24le: Vec<i32>,
+    first_s24be: Vec<i32>,
+    first_u24le: Vec<u32>,
+    first_f32: Vec<f32>,
+    samples_analyzed: usize,
+    min_sample: i32,
+    max_sample: i32,
+    mean: f64,
+    rms: f64,
+    peak_f32: f32,
+    rms_f32: f64,
+    dc_offset: f64,
+    zero_ratio: f64,
+    clipping_ratio: f64,
+    likely_silent: bool,
+    likely_dc_buzz_risk: bool,
+}
+
+struct F32BufferStats {
+    min: f32,
+    max: f32,
+    rms: f64,
+    nonzero: bool,
+}
+
+fn original_pcm_blocks_by_channel(
+    blocks: &[PcmAudioBlock],
+    sample_rate: u32,
+) -> Result<BTreeMap<u16, Vec<&PcmAudioBlock>>, Box<dyn std::error::Error>> {
+    let mut by_channel: BTreeMap<u16, Vec<&PcmAudioBlock>> = BTreeMap::new();
+    for block in blocks {
+        if block.sample_rate != sample_rate {
+            return Err("audio content audit found mixed sample rates".into());
+        }
+        let PcmAudioBlockLayout::MonoTrack { channel_index, .. } = block.layout else {
+            return Err("audio content audit expects mono-track PCM blocks".into());
+        };
+        by_channel.entry(channel_index).or_default().push(block);
+    }
+    for channel_blocks in by_channel.values_mut() {
+        channel_blocks.sort_by_key(|block| block.start_time);
+    }
+    Ok(by_channel)
+}
+
+fn audit_track_stats(
+    blocks: &[&PcmAudioBlock],
+    max_samples: usize,
+) -> Result<TrackContentStats, Box<dyn std::error::Error>> {
+    let first = blocks.first().ok_or("no blocks for track stats")?;
+    let raw_first_12 = first.payload.iter().take(12).copied().collect::<Vec<_>>();
+    let first_s24le = decode_first_samples(&first.payload, 4, decode_s24le_i32);
+    let first_s24be = decode_first_samples(&first.payload, 4, decode_s24be_i32);
+    let first_u24le = decode_first_samples(&first.payload, 4, decode_u24le);
+    let mut values = Vec::new();
+    'outer: for block in blocks {
+        let PcmSampleFormat::SignedInteger {
+            bits_per_sample,
+            endian,
+        } = block.format;
+        if bits_per_sample != 24 || endian != PcmEndian::Little {
+            return Err("audio content audit expects 24-bit little-endian PCM blocks".into());
+        }
+        for sample_index in 0..usize::try_from(block.sample_count)? {
+            values.push(decode_s24le_i32(&block.payload, sample_index));
+            if values.len() >= max_samples {
+                break 'outer;
+            }
+        }
+    }
+    if values.is_empty() {
+        return Err("no samples available for track stats".into());
+    }
+    let mut min_sample = i32::MAX;
+    let mut max_sample = i32::MIN;
+    let mut sum = 0_f64;
+    let mut sum_sq = 0_f64;
+    let mut zero_count = 0_usize;
+    let mut clipping_count = 0_usize;
+    let mut peak_f32 = 0_f32;
+    let mut first_f32 = Vec::new();
+    for (index, sample) in values.iter().copied().enumerate() {
+        min_sample = min_sample.min(sample);
+        max_sample = max_sample.max(sample);
+        let sample_f64 = f64::from(sample);
+        sum += sample_f64;
+        sum_sq += sample_f64 * sample_f64;
+        if sample == 0 {
+            zero_count += 1;
+        }
+        if sample == -8_388_608 || sample == 8_388_607 {
+            clipping_count += 1;
+        }
+        let f32_value = (sample as f32 / 8_388_608.0).clamp(-1.0, 1.0);
+        peak_f32 = peak_f32.max(f32_value.abs());
+        if index < 20 {
+            first_f32.push(f32_value);
+        }
+    }
+    let samples_analyzed = values.len();
+    let mean = sum / samples_analyzed as f64;
+    let rms = (sum_sq / samples_analyzed as f64).sqrt();
+    let rms_f32 = rms / 8_388_608.0;
+    let dc_offset = mean / 8_388_608.0;
+    let zero_ratio = zero_count as f64 / samples_analyzed as f64;
+    let clipping_ratio = clipping_count as f64 / samples_analyzed as f64;
+    Ok(TrackContentStats {
+        raw_first_12,
+        first_s24le,
+        first_s24be,
+        first_u24le,
+        first_f32,
+        samples_analyzed,
+        min_sample,
+        max_sample,
+        mean,
+        rms,
+        peak_f32,
+        rms_f32,
+        dc_offset,
+        zero_ratio,
+        clipping_ratio,
+        likely_silent: rms_f32 < 0.0001,
+        likely_dc_buzz_risk: dc_offset.abs() > 0.05
+            || (rms_f32 > 0.0 && dc_offset.abs() > rms_f32 * 0.5),
+    })
+}
+
+fn decode_first_samples<T>(payload: &[u8], count: usize, decode: fn(&[u8], usize) -> T) -> Vec<T> {
+    let available = payload.len() / 3;
+    (0..count.min(available))
+        .map(|index| decode(payload, index))
+        .collect()
+}
+
+fn decode_s24le_i32(payload: &[u8], sample_index: usize) -> i32 {
+    let offset = sample_index * 3;
+    let bytes = &payload[offset..offset + 3];
+    let mut value = i32::from(bytes[0]) | (i32::from(bytes[1]) << 8) | (i32::from(bytes[2]) << 16);
+    if value & 0x0080_0000 != 0 {
+        value |= !0x00ff_ffff;
+    }
+    value
+}
+
+fn decode_s24be_i32(payload: &[u8], sample_index: usize) -> i32 {
+    let offset = sample_index * 3;
+    let bytes = &payload[offset..offset + 3];
+    let mut value = (i32::from(bytes[0]) << 16) | (i32::from(bytes[1]) << 8) | i32::from(bytes[2]);
+    if value & 0x0080_0000 != 0 {
+        value |= !0x00ff_ffff;
+    }
+    value
+}
+
+fn decode_u24le(payload: &[u8], sample_index: usize) -> u32 {
+    let offset = sample_index * 3;
+    let bytes = &payload[offset..offset + 3];
+    u32::from(bytes[0]) | (u32::from(bytes[1]) << 8) | (u32::from(bytes[2]) << 16)
+}
+
+fn f32_buffer_stats(
+    bytes: &[u8],
+    frame_count: u32,
+    channels: u32,
+) -> Result<F32BufferStats, Box<dyn std::error::Error>> {
+    let expected = usize::try_from(frame_count)?
+        .checked_mul(usize::try_from(channels)?)
+        .and_then(|samples| samples.checked_mul(4))
+        .ok_or("f32 audit buffer size overflow")?;
+    if bytes.len() != expected {
+        return Err("f32 audit buffer size mismatch".into());
+    }
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut sum_sq = 0_f64;
+    let mut nonzero = false;
+    let mut count = 0_usize;
+    for chunk in bytes.chunks_exact(4) {
+        let value = f32::from_le_bytes(chunk.try_into()?);
+        min = min.min(value);
+        max = max.max(value);
+        sum_sq += f64::from(value) * f64::from(value);
+        nonzero |= value != 0.0;
+        count += 1;
+    }
+    Ok(F32BufferStats {
+        min,
+        max,
+        rms: (sum_sq / count as f64).sqrt(),
+        nonzero,
+    })
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn f32_list(values: &[f32]) -> String {
+    values
+        .iter()
+        .map(|value| format!("{value:.6}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn interleaved_frame_list(
+    bytes: &[u8],
+    channels: usize,
+    frames: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let samples = bytes
+        .chunks_exact(4)
+        .map(|chunk| Ok(f32::from_le_bytes(chunk.try_into()?)))
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    let mut rows = Vec::new();
+    for frame in 0..frames {
+        let start = frame
+            .checked_mul(channels)
+            .ok_or("interleaved frame offset overflow")?;
+        let end = start
+            .checked_add(channels)
+            .ok_or("interleaved frame end overflow")?;
+        if end > samples.len() {
+            break;
+        }
+        rows.push(format!("[{}]", f32_list(&samples[start..end])));
+    }
+    Ok(rows.join(" "))
+}
+
+fn write_f32_wav(
+    path: &Path,
+    sample_rate: u32,
+    channels: u16,
+    f32_interleaved_le: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let data_len = u32::try_from(f32_interleaved_le.len())?;
+    let fmt_len = 16_u32;
+    let audio_format = 3_u16; // IEEE float
+    let bits_per_sample = 32_u16;
+    let block_align = channels
+        .checked_mul(bits_per_sample / 8)
+        .ok_or("WAV block align overflow")?;
+    let byte_rate = sample_rate
+        .checked_mul(u32::from(block_align))
+        .ok_or("WAV byte rate overflow")?;
+    let riff_size = 4_u32
+        .checked_add(8 + fmt_len)
+        .and_then(|value| value.checked_add(8 + data_len))
+        .ok_or("WAV RIFF size overflow")?;
+    let mut file = File::create(path)?;
+    file.write_all(b"RIFF")?;
+    file.write_all(&riff_size.to_le_bytes())?;
+    file.write_all(b"WAVE")?;
+    file.write_all(b"fmt ")?;
+    file.write_all(&fmt_len.to_le_bytes())?;
+    file.write_all(&audio_format.to_le_bytes())?;
+    file.write_all(&channels.to_le_bytes())?;
+    file.write_all(&sample_rate.to_le_bytes())?;
+    file.write_all(&byte_rate.to_le_bytes())?;
+    file.write_all(&block_align.to_le_bytes())?;
+    file.write_all(&bits_per_sample.to_le_bytes())?;
+    file.write_all(b"data")?;
+    file.write_all(&data_len.to_le_bytes())?;
+    file.write_all(f32_interleaved_le)?;
+    Ok(())
 }
 
 struct OriginalAudioSegmentPlan {
@@ -10607,6 +11083,8 @@ struct Args {
     pipewire_audio_segment_playback_path: Option<PathBuf>,
     broadcast_runtime_audio_pipewire_paths: Option<(PathBuf, PathBuf)>,
     broadcast_runtime_audio_pipewire_audible_paths: Option<(PathBuf, PathBuf)>,
+    pipewire_audio_content_audit_paths: Option<(PathBuf, PathBuf)>,
+    diagnostic_wav_path: Option<PathBuf>,
 }
 
 impl Args {
@@ -10666,6 +11144,9 @@ impl Args {
         let mut broadcast_runtime_audio_pipewire_paths = None;
         let mut broadcast_runtime_audio_pipewire_audible_original = None;
         let mut broadcast_runtime_audio_pipewire_audible_paths = None;
+        let mut pipewire_audio_content_audit_original = None;
+        let mut pipewire_audio_content_audit_paths = None;
+        let mut diagnostic_wav_path = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
@@ -10711,9 +11192,26 @@ impl Args {
         let mut next_arg_is_broadcast_runtime_audio_pipewire_proxy = false;
         let mut next_arg_is_broadcast_runtime_audio_pipewire_audible_original = false;
         let mut next_arg_is_broadcast_runtime_audio_pipewire_audible_proxy = false;
+        let mut next_arg_is_pipewire_audio_content_audit_original = false;
+        let mut next_arg_is_pipewire_audio_content_audit_proxy = false;
+        let mut next_arg_is_diagnostic_wav_path = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_broadcast_runtime_audio_pipewire_audible_proxy {
+            if next_arg_is_diagnostic_wav_path {
+                diagnostic_wav_path = Some(PathBuf::from(arg));
+                next_arg_is_diagnostic_wav_path = false;
+            } else if next_arg_is_pipewire_audio_content_audit_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = pipewire_audio_content_audit_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                pipewire_audio_content_audit_paths = Some((original, proxy));
+                next_arg_is_pipewire_audio_content_audit_proxy = false;
+            } else if next_arg_is_pipewire_audio_content_audit_original {
+                pipewire_audio_content_audit_original = Some(PathBuf::from(arg));
+                next_arg_is_pipewire_audio_content_audit_original = false;
+                next_arg_is_pipewire_audio_content_audit_proxy = true;
+            } else if next_arg_is_broadcast_runtime_audio_pipewire_audible_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = broadcast_runtime_audio_pipewire_audible_original
                     .take()
@@ -11027,6 +11525,10 @@ impl Args {
                 next_arg_is_broadcast_runtime_audio_pipewire_original = true;
             } else if arg == BROADCAST_RUNTIME_AUDIO_PIPEWIRE_AUDIBLE_ARG {
                 next_arg_is_broadcast_runtime_audio_pipewire_audible_original = true;
+            } else if arg == PIPEWIRE_AUDIO_CONTENT_AUDIT_ARG {
+                next_arg_is_pipewire_audio_content_audit_original = true;
+            } else if arg == WRITE_DIAGNOSTIC_WAV_ARG {
+                next_arg_is_diagnostic_wav_path = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -11066,6 +11568,8 @@ impl Args {
             pipewire_audio_segment_playback_path,
             broadcast_runtime_audio_pipewire_paths,
             broadcast_runtime_audio_pipewire_audible_paths,
+            pipewire_audio_content_audit_paths,
+            diagnostic_wav_path,
         }
     }
 }
@@ -11075,11 +11579,11 @@ mod tests {
     use super::{
         audible_smoke_evidence_label, build_pipewire_f32_interleaved_prototype_buffer,
         build_runtime_audio_payload_pipewire_buffer,
-        build_sequential_original_audio_segment_for_duration, mxf_file_label,
-        original_segment_evidence_label, parse_manual_audible_confirmation,
-        pcm_s24le_sample_to_f32, proxy_presentation_ordinals, repeated_smoke_test_buffers,
-        runtime_audio_payload_evidence_label, selected_proxy_ordinals, smoke_test_buffer_count,
-        ManualAudibleConfirmation, SonyXmlSummary,
+        build_sequential_original_audio_segment_for_duration, decode_s24be_i32, decode_s24le_i32,
+        decode_u24le, f32_buffer_stats, mxf_file_label, original_segment_evidence_label,
+        parse_manual_audible_confirmation, pcm_s24le_sample_to_f32, proxy_presentation_ordinals,
+        repeated_smoke_test_buffers, runtime_audio_payload_evidence_label, selected_proxy_ordinals,
+        smoke_test_buffer_count, ManualAudibleConfirmation, SonyXmlSummary,
     };
     use qgs_media_runtime::{
         av_frame_audio_range, bind_broadcast_audio_payload, BroadcastPreparedAudioSlot,
@@ -11393,6 +11897,38 @@ mod tests {
         assert_eq!(buffers.len(), 13);
         assert_eq!(buffers.iter().map(Vec::len).sum::<usize>(), 399_360);
         assert!(buffers.iter().all(|buffer| buffer == &payload));
+    }
+
+    #[test]
+    fn audio_content_audit_decodes_endian_and_unsigned_variants() {
+        let payload = [
+            0x00, 0x00, 0x00, // zero
+            0xff, 0xff, 0x7f, // max positive little-endian
+            0x00, 0x00, 0x80, // min negative little-endian
+            0x34, 0x12, 0x00, // small positive little-endian
+        ];
+
+        assert_eq!(decode_s24le_i32(&payload, 0), 0);
+        assert_eq!(decode_s24le_i32(&payload, 1), 8_388_607);
+        assert_eq!(decode_s24le_i32(&payload, 2), -8_388_608);
+        assert_eq!(decode_s24le_i32(&payload, 3), 0x1234);
+        assert_eq!(decode_s24be_i32(&payload, 1), -129);
+        assert_eq!(decode_u24le(&payload, 2), 0x80_0000);
+    }
+
+    #[test]
+    fn audio_content_audit_computes_f32_buffer_stats() {
+        let mut bytes = Vec::new();
+        for value in [-0.5_f32, 0.0, 0.25, 0.5] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let stats = f32_buffer_stats(&bytes, 2, 2).unwrap();
+
+        assert_eq!(stats.min, -0.5);
+        assert_eq!(stats.max, 0.5);
+        assert!(stats.nonzero);
+        assert!((stats.rms - 0.375).abs() < 0.000_001);
     }
 
     #[test]

@@ -625,6 +625,7 @@ pub enum BroadcastRuntimeVerifiedSubsystem {
     NativePipeWireBufferSubmission,
     NativePipeWireAudibleSmokeTest,
     NativePipeWireOriginalAudioSegmentPlayback,
+    PipeWireAudioContentSanityAudit,
     BroadcastRuntimeAudioPayloadPipeWire,
     SimulatedPlaybackLoop,
     RealSpeakerOutput,
@@ -658,6 +659,7 @@ impl BroadcastRuntimeVerifiedSubsystem {
             Self::NativePipeWireOriginalAudioSegmentPlayback => {
                 "native PipeWire original-audio segment playback"
             }
+            Self::PipeWireAudioContentSanityAudit => "PipeWire audio content sanity audit",
             Self::BroadcastRuntimeAudioPayloadPipeWire => {
                 "broadcast runtime audio payload to PipeWire"
             }
@@ -787,6 +789,11 @@ impl BroadcastRuntimeVerificationMatrix {
                     subsystem: Subsystem::NativePipeWireOriginalAudioSegmentPlayback,
                     level: Level::ManualAudibleSignalDetectedContentUnverified,
                     summary: "bounded sequential original-audio segment submits/drains; user later clarified the heard output was slight hum/buzz only, not recognizable original audio content",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::PipeWireAudioContentSanityAudit,
+                    level: Level::MediaInspected,
+                    summary: "original MXF PCM statistics, endian/sign interpretation, f32 conversion, segment/runtime path equality, and PipeWire buffer geometry audited; recognizable content audibility remains unconfirmed",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::BroadcastRuntimeAudioPayloadPipeWire,
@@ -4339,6 +4346,13 @@ mod tests {
                 .unwrap()
                 .level,
             BroadcastRuntimeVerificationLevel::ManualAudibleSignalDetectedContentUnverified
+        );
+        assert_eq!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::PipeWireAudioContentSanityAudit)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::MediaInspected
         );
         assert_ne!(
             matrix
