@@ -1,12 +1,12 @@
-# M2 Step 20E - QGS Broadcast Runtime State Machine Skeleton
+# M2 Step 20E - QGS Broadcast Player Runtime State Machine Skeleton
 
-Step 20E adds the first backend-neutral QGS Broadcast Runtime state machine skeleton. It builds on the Step 20D QGS Broadcast Runtime contract and remains independent of any existing QNC Broadcast Player implementation.
+Step 20E adds the first backend-neutral QGS Broadcast Player Runtime state machine skeleton. It builds on the Step 20D QGS Broadcast Player Runtime contract and remains independent of any existing QNC Broadcast Player implementation.
 
 This is not a UI player, not a real playback loop, and not audio/video device output. It models runtime state, commands, event sequencing, and accounting that future QNC applications can drive through a backend contract.
 
 ## Relationship To Step 20D
 
-Step 20D defined the backend-neutral contract facts:
+Step 20D defined the backend-neutral Broadcast Player Runtime contract facts:
 
 - original MXF audio is authoritative
 - proxy MP4 video is the preview/edit-performance source

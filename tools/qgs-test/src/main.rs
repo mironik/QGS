@@ -1980,15 +1980,15 @@ fn broadcast_runtime_contract(
         .collect::<Result<Vec<_>, _>>()?;
     let summary = summarize_broadcast_runtime_contract(&ranges, audio_duration);
 
-    println!("QGS Broadcast Runtime Contract Draft");
-    println!("------------------------------------");
+    println!("QGS Broadcast Player Runtime Contract Draft");
+    println!("-------------------------------------------");
     println!("Audio source: original MXF");
     println!("Video source mode: proxy-preview");
     println!("Video source: proxy MP4");
     println!("Proxy AAC: not used");
     println!("Preview profile: journalist-50i-preview");
     println!("Clock owner: future QNC application/runtime policy, not QGS UI");
-    println!("Contract owner: QGS backend-neutral Broadcast Runtime");
+    println!("Contract owner: QGS backend-neutral Broadcast Player Runtime");
     println!(
         "Session: audio_role={:?} video_role={:?} sample_clock_aware={} ui_dependent={}",
         session.audio_source,
@@ -2028,7 +2028,7 @@ fn broadcast_runtime_contract(
         summary.max_audio_video_delta.as_secs_f64() * 1000.0
     );
     println!(
-        "Suitable for Broadcast Runtime contract: {}",
+        "Suitable for Broadcast Player Runtime contract: {}",
         yes_no(summary.suitable_for_broadcast_runtime_contract)
     );
     println!("Representative frame-to-sample ranges:");
@@ -2163,8 +2163,8 @@ fn broadcast_runtime_state_machine(
         })
         .count();
 
-    println!("QGS Broadcast Runtime State Machine Skeleton");
-    println!("--------------------------------------------");
+    println!("QGS Broadcast Player Runtime State Machine Skeleton");
+    println!("---------------------------------------------------");
     println!("Not real playback: no speaker output, no display output, no real-time Broadcast Player loop");
     println!("Audio source: original MXF");
     println!("Video source mode: proxy-preview");
@@ -2367,8 +2367,8 @@ fn broadcast_runtime_preroll(
     let ready_reached = runtime.state() == qgs_media_runtime::BroadcastRuntimeState::Ready;
     let play_from_ready_succeeds = runtime.play().is_ok();
 
-    println!("QGS Broadcast Runtime Preroll Plan");
-    println!("-----------------------------------");
+    println!("QGS Broadcast Player Runtime Preroll Plan");
+    println!("------------------------------------------");
     println!("Not real playback: no speaker output, no display output, no real-time Broadcast Player loop");
     println!("Audio source: original MXF");
     println!("Video source mode: proxy-preview");
@@ -2690,8 +2690,8 @@ fn broadcast_runtime_prepared_slots(
         &original_presentation_slots,
     );
 
-    println!("QGS Broadcast Runtime Prepared Payload Slots");
-    println!("--------------------------------------------");
+    println!("QGS Broadcast Player Runtime Prepared Payload Slots");
+    println!("---------------------------------------------------");
     println!("Not real playback: no speaker output, no display output, no real-time Broadcast Player loop");
     println!("Audio source: original MXF");
     println!("Proxy AAC: not used");

@@ -1,4 +1,4 @@
-# M2 Step 20G — QGS Broadcast Runtime Prepared Payload Slots
+# M2 Step 20G — QGS Broadcast Player Runtime Prepared Payload Slots
 
 Step 20G turns the Step 20F preroll plan into a finite prepared working-set model.
 
@@ -75,7 +75,7 @@ Intentional source-frame skips are profile behavior. They are not presentation s
 
 ## OriginalMedia Result
 
-The QGS Broadcast Runtime contract also represents `OriginalMedia`:
+The QGS Broadcast Player Runtime contract also represents `OriginalMedia`:
 
 - video source: original MXF
 - audio source: original MXF

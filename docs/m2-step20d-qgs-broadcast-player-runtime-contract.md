@@ -1,10 +1,12 @@
-# M2 Step 20D - QGS Broadcast Runtime Contract
+# M2 Step 20D - QGS Broadcast Player Runtime Contract
 
-Step 20D defines the first backend-neutral QGS Broadcast Runtime contract for future QNC OS applications. This is a QGS-owned contract, not a port, preservation effort, or adaptation of an existing QNC Broadcast Player.
+Step 20D defines the first backend-neutral QGS Broadcast Player Runtime contract for future QGS/QNC OS applications. The QGS Broadcast Player runtime is the backend foundation for the future QGS/QNC OS Broadcast Player. It is not a QNC UI component, and it is not merely a final-air playout engine.
 
-Existing QNC Broadcast Player concepts may be treated as reference material only. QGS is free to define the best runtime contract for QGS/QNC OS without matching older player boundaries when those boundaries would compromise the media model.
+Existing QNC Broadcast Player concepts may be treated as reference material only. QGS is free to define the best Broadcast Player runtime contract for QGS/QNC OS without matching older player boundaries when those boundaries would compromise the media model.
 
-QGS provides backend facts, bounded runtime contract types, and deterministic media-range mapping. Future QNC applications may consume this through media snapshots, resolver/media identity, session/transport contracts, and runtime events. QNC applications remain responsible for final transport commands, clock policy, presentation policy, UI, Broadcast Player readiness, and user-facing sessions.
+QGS owns backend media readiness, source mode validation, original/proxy media mapping, original-audio/proxy-video timing facts, bounded prepared runtime state, and lower-level timing/accounting facts needed by future playback policy.
+
+Future QNC applications may issue transport/session commands, observe runtime events, present UI state, and store or read media snapshots. QNC UI policy remains in QNC. Media/backend timing facts and backend readiness remain in QGS.
 
 ## Scope
 
@@ -21,7 +23,6 @@ Implemented in this milestone:
 
 Not implemented:
 
-- QNC Broadcast Player
 - QNC UI integration
 - real playback loop
 - QGS-owned final playback clock
@@ -51,7 +52,7 @@ For the QNC Journalist workflow, original MXF audio is authoritative and proxy M
 
 `journalist-50i-preview` is a preview profile. It is not full interlaced rendering, does not implement field cadence, and does not produce interlaced output.
 
-## Broadcast Runtime Types
+## Broadcast Player Runtime Types
 
 `qgs-media-runtime` now includes small backend-neutral contract types:
 
@@ -67,7 +68,7 @@ For the QNC Journalist workflow, original MXF audio is authoritative and proxy M
 - `AvFrameAudioRange`
 - `BroadcastRuntimeContractSummary`
 
-The session description validates that the contract is sample-clock aware, preserves original PCM format, preserves track/channel identity, uses proxy video for preview, does not treat proxy audio as primary, and is not UI-dependent.
+The session description validates that the contract is sample-clock aware, preserves original PCM format, preserves track/channel identity, supports explicit source roles, does not treat proxy audio as primary, and is not UI-dependent.
 
 ## Frame To Sample Mapping
 
@@ -109,11 +110,11 @@ Video source: proxy MP4
 Proxy AAC: not used
 Preview profile: journalist-50i-preview
 Clock owner: future QNC application/runtime policy, not QGS UI
-Contract owner: QGS backend-neutral Broadcast Runtime
+Contract owner: QGS backend-neutral Broadcast Player Runtime
 Proxy video: 1920x1080 H.264 High 8-bit Cs420 source_frames=106 selected_preview_frames=53
 Original audio: tracks=4 sample_rate=48000Hz blocks=424 duration=2.120s
 Frames checked: 53 complete=53 incomplete=0 outside_audio_range=0 max_av_delta_ms=0.000
-Suitable for Broadcast Runtime contract: yes
+Suitable for Broadcast Player Runtime contract: yes
 ```
 
 Representative frame mappings:

@@ -1598,7 +1598,9 @@ impl std::fmt::Display for PlaybackError {
             Self::InvalidCapacity => write!(f, "invalid playback queue capacity"),
             Self::InvalidLatePolicy => write!(f, "invalid playback late/drop policy"),
             Self::InvalidAudioFormat => write!(f, "invalid audio format"),
-            Self::InvalidRuntimeTransition => write!(f, "invalid broadcast runtime transition"),
+            Self::InvalidRuntimeTransition => {
+                write!(f, "invalid broadcast player runtime transition")
+            }
             Self::TimestampOverflow => write!(f, "playback timestamp overflow"),
         }
     }

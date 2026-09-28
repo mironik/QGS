@@ -1,6 +1,6 @@
-# M2 Step 20F — QGS Broadcast Runtime Preroll Plan
+# M2 Step 20F — QGS Broadcast Player Runtime Preroll Plan
 
-This milestone adds a backend-neutral preroll planning layer to the QGS Broadcast Runtime state-machine skeleton from Step 20E.
+This milestone adds a backend-neutral preroll planning layer to the QGS Broadcast Player Runtime state-machine skeleton from Step 20E.
 
 It is still not real playback. QGS does not open an audio device, does not present to a display, does not run a real-time Broadcast Player loop, and does not import QNC crates. The purpose is to model the conditions a future QNC application can require before a runtime session is allowed to enter `Ready`.
 
@@ -59,7 +59,7 @@ These are bounded proof values, not final product policy constants.
 
 only when media facts are valid and the preroll status is ready.
 
-If preroll is not ready, the runtime remains in `Preparing`; `Play` remains invalid until `Ready` is reached. This preserves the broadcast-runtime rule that `Play` must not discover media or build the first usable working set.
+If preroll is not ready, the runtime remains in `Preparing`; `Play` remains invalid until `Ready` is reached. This preserves the Broadcast Player Runtime rule that `Play` must not discover media or build the first usable working set.
 
 Intentional `journalist-50i-preview` source-frame skips are profile behavior. They are not counted as missing preroll frames and are not lateness drops.
 
