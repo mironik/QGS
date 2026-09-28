@@ -1333,6 +1333,42 @@ pub enum BroadcastVideoPayloadBindingStatus {
     Missing,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastVideoPayloadKind {
+    DecodedVaSurface,
+    CpuNv12Surface,
+    ProcessedGpuFrame,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastVideoPayloadFormat {
+    Nv12,
+    RgbaU16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastVideoPayloadBackendPath {
+    VaapiCpuNv12Vulkan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastVideoPayloadReference {
+    pub payload_id: u64,
+    pub kind: BroadcastVideoPayloadKind,
+    pub format: BroadcastVideoPayloadFormat,
+    pub backend_path: BroadcastVideoPayloadBackendPath,
+    pub source_frame_index: u64,
+    pub selected_preview_frame_index: Option<u64>,
+    pub presentation_time: Duration,
+    pub duration: Duration,
+    pub coded_width: u32,
+    pub coded_height: u32,
+    pub visible_width: u32,
+    pub visible_height: u32,
+    pub bounded_slot_index: usize,
+    pub session_index: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BroadcastVideoPayloadBinding {
     pub video_slot_index: usize,
@@ -1342,6 +1378,7 @@ pub struct BroadcastVideoPayloadBinding {
     pub selected_preview_frame_index: Option<u64>,
     pub status: BroadcastVideoPayloadBindingStatus,
     pub payload_id: Option<u64>,
+    pub payload: Option<BroadcastVideoPayloadReference>,
 }
 
 pub fn bind_broadcast_video_payload_accounting(
@@ -1374,12 +1411,46 @@ pub fn bind_broadcast_video_payload_accounting(
         selected_preview_frame_index: slot.selected_preview_frame_index,
         status,
         payload_id: None,
+        payload: None,
     }
+}
+
+pub fn bind_broadcast_video_payload_ready(
+    slot: &BroadcastPreparedVideoSlot,
+    payload: BroadcastVideoPayloadReference,
+) -> Result<BroadcastVideoPayloadBinding, PlaybackError> {
+    if slot.status != BroadcastPreparedVideoSlotStatus::Prepared {
+        return Err(PlaybackError::InvalidRuntimeTransition);
+    }
+    if slot.source_mode != BroadcastVideoSourceMode::ProxyPreview {
+        return Err(PlaybackError::InvalidRuntimeTransition);
+    }
+    if slot.video_source_role != BroadcastMediaSourceRole::ProxyPreviewVideo {
+        return Err(PlaybackError::InvalidRuntimeTransition);
+    }
+    if slot.source_frame_index != Some(payload.source_frame_index)
+        || slot.selected_preview_frame_index != payload.selected_preview_frame_index
+        || slot.presentation_time != payload.presentation_time
+        || slot.duration != payload.duration
+    {
+        return Err(PlaybackError::InvalidRuntimeTransition);
+    }
+    Ok(BroadcastVideoPayloadBinding {
+        video_slot_index: slot.slot_index,
+        source_mode: slot.source_mode,
+        video_source_role: slot.video_source_role,
+        source_frame_index: slot.source_frame_index,
+        selected_preview_frame_index: slot.selected_preview_frame_index,
+        status: BroadcastVideoPayloadBindingStatus::PayloadReady,
+        payload_id: Some(payload.payload_id),
+        payload: Some(payload),
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BroadcastPresentationPayloadReadiness {
     RuntimeAccountingReady,
+    PayloadReady,
     DevicePayloadReady,
     CapabilityMissing,
     NotReady,
@@ -1403,7 +1474,7 @@ pub fn bind_broadcast_presentation_payload(
 ) -> BroadcastPresentationPayloadBinding {
     let readiness = match (video_binding.status, audio_binding.complete) {
         (BroadcastVideoPayloadBindingStatus::PayloadReady, true) => {
-            BroadcastPresentationPayloadReadiness::DevicePayloadReady
+            BroadcastPresentationPayloadReadiness::PayloadReady
         }
         (BroadcastVideoPayloadBindingStatus::AccountedOnly, true) => {
             BroadcastPresentationPayloadReadiness::RuntimeAccountingReady
@@ -1422,6 +1493,7 @@ pub fn bind_broadcast_presentation_payload(
         ready: matches!(
             readiness,
             BroadcastPresentationPayloadReadiness::RuntimeAccountingReady
+                | BroadcastPresentationPayloadReadiness::PayloadReady
                 | BroadcastPresentationPayloadReadiness::DevicePayloadReady
         ),
         readiness,
@@ -1439,6 +1511,7 @@ pub struct BroadcastPayloadBindingSummary {
     pub presentation_binding_count: usize,
     pub complete_audio_bindings: usize,
     pub runtime_accounting_ready_presentations: usize,
+    pub payload_ready_presentations: usize,
     pub device_payload_ready_presentations: usize,
     pub capability_missing_presentations: usize,
     pub total_referenced_audio_bytes: u64,
@@ -1467,6 +1540,12 @@ pub fn summarize_broadcast_payload_bindings(
             .iter()
             .filter(|binding| {
                 binding.readiness == BroadcastPresentationPayloadReadiness::RuntimeAccountingReady
+            })
+            .count(),
+        payload_ready_presentations: presentation_bindings
+            .iter()
+            .filter(|binding| {
+                binding.readiness == BroadcastPresentationPayloadReadiness::PayloadReady
             })
             .count(),
         device_payload_ready_presentations: presentation_bindings
@@ -2951,6 +3030,7 @@ mod tests {
             BroadcastVideoPayloadBindingStatus::AccountedOnly
         );
         assert_eq!(proxy_binding.payload_id, None);
+        assert_eq!(proxy_binding.payload, None);
 
         let original_video = BroadcastPreparedVideoSlot {
             status: BroadcastPreparedVideoSlotStatus::CapabilityMissing,
@@ -2960,6 +3040,38 @@ mod tests {
         assert_eq!(
             original_binding.status,
             BroadcastVideoPayloadBindingStatus::CapabilityMissing
+        );
+    }
+
+    #[test]
+    fn video_payload_binding_can_become_payload_ready_with_real_reference() {
+        let proxy_video = &test_prepared_video_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
+        let payload = BroadcastVideoPayloadReference {
+            payload_id: 42,
+            kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+            format: BroadcastVideoPayloadFormat::RgbaU16,
+            backend_path: BroadcastVideoPayloadBackendPath::VaapiCpuNv12Vulkan,
+            source_frame_index: proxy_video.source_frame_index.unwrap(),
+            selected_preview_frame_index: proxy_video.selected_preview_frame_index,
+            presentation_time: proxy_video.presentation_time,
+            duration: proxy_video.duration,
+            coded_width: 1920,
+            coded_height: 1088,
+            visible_width: 1920,
+            visible_height: 1080,
+            bounded_slot_index: proxy_video.slot_index,
+            session_index: 0,
+        };
+        let binding = bind_broadcast_video_payload_ready(proxy_video, payload).unwrap();
+
+        assert_eq!(
+            binding.status,
+            BroadcastVideoPayloadBindingStatus::PayloadReady
+        );
+        assert_eq!(binding.payload_id, Some(42));
+        assert_eq!(
+            binding.payload.as_ref().map(|payload| payload.kind),
+            Some(BroadcastVideoPayloadKind::ProcessedGpuFrame)
         );
     }
 
@@ -2979,6 +3091,37 @@ mod tests {
         assert_eq!(
             presentation_binding.readiness,
             BroadcastPresentationPayloadReadiness::RuntimeAccountingReady
+        );
+
+        let payload_ready_video = bind_broadcast_video_payload_ready(
+            video_slot,
+            BroadcastVideoPayloadReference {
+                payload_id: 7,
+                kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+                format: BroadcastVideoPayloadFormat::RgbaU16,
+                backend_path: BroadcastVideoPayloadBackendPath::VaapiCpuNv12Vulkan,
+                source_frame_index: video_slot.source_frame_index.unwrap(),
+                selected_preview_frame_index: video_slot.selected_preview_frame_index,
+                presentation_time: video_slot.presentation_time,
+                duration: video_slot.duration,
+                coded_width: 1920,
+                coded_height: 1088,
+                visible_width: 1920,
+                visible_height: 1080,
+                bounded_slot_index: video_slot.slot_index,
+                session_index: 0,
+            },
+        )
+        .unwrap();
+        let payload_ready_binding = bind_broadcast_presentation_payload(
+            presentation_slot,
+            &payload_ready_video,
+            &audio_binding,
+        );
+        assert!(payload_ready_binding.ready);
+        assert_eq!(
+            payload_ready_binding.readiness,
+            BroadcastPresentationPayloadReadiness::PayloadReady
         );
 
         let original_video = BroadcastPreparedVideoSlot {

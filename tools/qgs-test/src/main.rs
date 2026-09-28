@@ -14,17 +14,19 @@ use qgs_linux::{
 use qgs_media_runtime::{
     audio_samples_for_duration, av_frame_audio_range, bind_broadcast_audio_payload,
     bind_broadcast_presentation_payload, bind_broadcast_video_payload_accounting,
-    build_broadcast_player_event_surface, classify_presentation, duration_abs_delta,
-    duration_from_audio_samples, evaluate_broadcast_preroll,
-    max_video_timestamp_outside_audio_range, summarize_broadcast_payload_bindings,
-    summarize_broadcast_player_runtime_events, summarize_broadcast_prepared_slots,
-    summarize_broadcast_runtime_contract, AudioFormat, AudioSampleFormat, AudioTimeline,
-    AudioTimingPacket, AvFrameAudioRange, BoundedQueue, BroadcastMediaSourceRole,
-    BroadcastPreparedAudioSlot, BroadcastPreparedPresentationSlot, BroadcastPreparedVideoSlot,
-    BroadcastPreparedVideoSlotStatus, BroadcastPrerollConfig, BroadcastPrerollPlan,
-    BroadcastPreviewProfile, BroadcastRuntimeCapabilities, BroadcastRuntimePrepareFacts,
-    BroadcastRuntimeQueueLimits, BroadcastRuntimeSessionDescription, BroadcastRuntimeStateMachine,
-    BroadcastVideoPayloadBindingStatus, BroadcastVideoSourceMode,
+    bind_broadcast_video_payload_ready, build_broadcast_player_event_surface,
+    classify_presentation, duration_abs_delta, duration_from_audio_samples,
+    evaluate_broadcast_preroll, max_video_timestamp_outside_audio_range,
+    summarize_broadcast_payload_bindings, summarize_broadcast_player_runtime_events,
+    summarize_broadcast_prepared_slots, summarize_broadcast_runtime_contract, AudioFormat,
+    AudioSampleFormat, AudioTimeline, AudioTimingPacket, AvFrameAudioRange, BoundedQueue,
+    BroadcastMediaSourceRole, BroadcastPreparedAudioSlot, BroadcastPreparedPresentationSlot,
+    BroadcastPreparedVideoSlot, BroadcastPreparedVideoSlotStatus, BroadcastPrerollConfig,
+    BroadcastPrerollPlan, BroadcastPreviewProfile, BroadcastRuntimeCapabilities,
+    BroadcastRuntimePrepareFacts, BroadcastRuntimeQueueLimits, BroadcastRuntimeSessionDescription,
+    BroadcastRuntimeStateMachine, BroadcastVideoPayloadBackendPath,
+    BroadcastVideoPayloadBindingStatus, BroadcastVideoPayloadFormat, BroadcastVideoPayloadKind,
+    BroadcastVideoPayloadReference, BroadcastVideoSourceMode,
     FrameIdentity as PlaybackFrameIdentity, OriginalAudioTrack, PcmAudioBlock, PcmAudioBlockLayout,
     PcmAudioPacket, PcmEndian, PcmSampleFormat, PlaybackClock, PlaybackConfig, PlaybackState,
     PresentationDecision, RationalRate, RealTimeClock, TestAudioSink, TestPresentationSink,
@@ -78,6 +80,8 @@ const BROADCAST_RUNTIME_PREROLL_ARG: &str = "--broadcast-runtime-preroll";
 const BROADCAST_RUNTIME_PREPARED_SLOTS_ARG: &str = "--broadcast-runtime-prepared-slots";
 const BROADCAST_PLAYER_RUNTIME_EVENTS_ARG: &str = "--broadcast-player-runtime-events";
 const BROADCAST_PLAYER_RUNTIME_PAYLOADS_ARG: &str = "--broadcast-player-runtime-payloads";
+const BROADCAST_PLAYER_RUNTIME_VIDEO_PAYLOADS_ARG: &str =
+    "--broadcast-player-runtime-video-payloads";
 const EXPECTED_FX6_SAMPLE001_MXF_SHA256: &str =
     "6bb8d23f91be8812f0bf9c09b6ee680dce0560757b9d778333d3e996b5f69653";
 const EXPECTED_FX6_SAMPLE001_PROXY_SHA256: &str =
@@ -148,6 +152,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &original,
             &proxy,
             BroadcastRuntimeReportFocus::Payloads,
+        );
+    }
+    if let Some((original, proxy)) = args.broadcast_player_runtime_video_payloads_paths {
+        return broadcast_runtime_prepared_slots(
+            &original,
+            &proxy,
+            BroadcastRuntimeReportFocus::VideoPayloads,
         );
     }
 
@@ -2448,6 +2459,250 @@ fn broadcast_runtime_preroll(
     Ok(())
 }
 
+struct ProxyVideoPayloadBindingProof {
+    bindings: Vec<qgs_media_runtime::BroadcastVideoPayloadBinding>,
+    gpu_processor: Nv12FrameProcessor,
+    gpu_submissions: usize,
+    gpu_completions: usize,
+    device_name: String,
+}
+
+impl ProxyVideoPayloadBindingProof {
+    fn bounded_gpu_slots(&self) -> usize {
+        usize::try_from(self.gpu_processor.counters().command_buffer_count).unwrap_or(0)
+    }
+}
+
+fn finish_proxy_video_payload_bindings(
+    proxy_video_slots: &[BroadcastPreparedVideoSlot],
+    bindings_by_source: &mut BTreeMap<u64, qgs_media_runtime::BroadcastVideoPayloadBinding>,
+    gpu_processor: Nv12FrameProcessor,
+    gpu_submissions: usize,
+    gpu_completions: usize,
+    device_name: String,
+) -> Result<ProxyVideoPayloadBindingProof, Box<dyn std::error::Error>> {
+    let bindings = proxy_video_slots
+        .iter()
+        .map(|slot| {
+            let source_frame_index = slot
+                .source_frame_index
+                .ok_or("proxy video payload slot missing source frame index")?;
+            bindings_by_source
+                .remove(&source_frame_index)
+                .ok_or_else(|| {
+                    format!(
+                        "missing proxy video payload binding for source frame {source_frame_index}"
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ProxyVideoPayloadBindingProof {
+        bindings,
+        gpu_processor,
+        gpu_submissions,
+        gpu_completions,
+        device_name,
+    })
+}
+
+fn bind_proxy_preview_video_payloads(
+    proxy_video: &qgs_mp4::Mp4VideoTrack,
+    proxy_h264: &qgs_mp4::Mp4H264Summary,
+    proxy_video_slots: &[BroadcastPreparedVideoSlot],
+) -> Result<ProxyVideoPayloadBindingProof, Box<dyn std::error::Error>> {
+    let discovery = VulkanDeviceDiscovery::new()?;
+    let devices = discovery.enumerate_devices()?;
+    let Some(device) = devices
+        .iter()
+        .find(|device| {
+            device.vendor_id == 0x8086 && matches!(device.class, DeviceClass::IntegratedGpu)
+        })
+        .or_else(|| {
+            devices
+                .iter()
+                .find(|device| matches!(device.class, DeviceClass::IntegratedGpu))
+        })
+    else {
+        return Err("Broadcast Player proxy payload binding: no integrated GPU advertised".into());
+    };
+    let proxy_config = decoder_config_for_surface(
+        device.id,
+        proxy_h264.profile,
+        BitDepth::new(proxy_h264.bit_depth)?,
+        proxy_h264.chroma,
+        proxy_h264.coded_width,
+        proxy_h264.coded_height,
+    );
+    let vaapi = qgs_vaapi::VaapiVideoDiscovery::new(&devices);
+    let capabilities = vaapi.query_video_capabilities(device.id)?;
+    let supports_proxy = capabilities
+        .decode
+        .iter()
+        .any(|capability| proxy_config.is_satisfied_by(capability));
+    if !supports_proxy {
+        return Err("Broadcast Player proxy payload binding: Intel VA backend does not support proxy configuration".into());
+    }
+
+    let mut targets = BTreeMap::new();
+    for slot in proxy_video_slots {
+        let source_frame_index = slot
+            .source_frame_index
+            .ok_or("proxy video payload slot missing source frame index")?;
+        targets.insert(source_frame_index, slot);
+    }
+
+    let mut decoder = vaapi.create_decoder(&CreateDecoderRequest {
+        config: proxy_config.clone(),
+    })?;
+    let decoder_id = DecoderId::new(20)?;
+    let visible_region = VisibleRegion {
+        x: 0,
+        y: 0,
+        width: proxy_h264.width,
+        height: proxy_h264.height,
+    };
+    let mut cpu_pool = qgs_vaapi::CpuNv12FramePool::new(
+        proxy_h264.coded_width,
+        proxy_h264.coded_height,
+        visible_region,
+        proxy_video_slots.len().max(1),
+    )?;
+    let mut gpu_processor = Nv12FrameProcessor::new(
+        &discovery,
+        Nv12FrameProcessorConfig {
+            device_id: device.id,
+            coded_width: proxy_h264.coded_width,
+            coded_height: proxy_h264.coded_height,
+            visible_width: proxy_h264.width,
+            visible_height: proxy_h264.height,
+            slot_count: proxy_video_slots.len().max(1),
+            conversion: YcbcrConversion::Rec709Limited,
+            validation_readback: false,
+        },
+    )?;
+
+    let mut bindings_by_source = BTreeMap::new();
+    let mut output_index = 0_u64;
+    let mut gpu_submissions = 0_usize;
+    let mut gpu_completions = 0_usize;
+
+    for sample in &proxy_video.samples {
+        let outputs = decoder.submit_access_unit(&SubmitAccessUnitRequest {
+            decoder_id,
+            data: sample.annex_b.clone(),
+        })?;
+        for output in outputs {
+            if let Some(slot) = targets.get(&output_index) {
+                let identity = FrameIdentity {
+                    presentation_position: slot
+                        .selected_preview_frame_index
+                        .ok_or("proxy video payload slot missing selected preview index")?,
+                };
+                let cpu_frame = cpu_pool.acquire()?;
+                let (cpu_frame, _) =
+                    qgs_vaapi::transfer_nv12_surface_timed(output.resource.as_ref(), cpu_frame)?;
+                let upload = nv12_upload_for_cpu_surface(device.id, &cpu_frame)?;
+                let token = gpu_processor.submit_frame(&upload, identity)?;
+                gpu_submissions += 1;
+                cpu_pool.release(cpu_frame)?;
+                gpu_processor.wait_for_completion(token)?;
+                gpu_completions += 1;
+                let payload = BroadcastVideoPayloadReference {
+                    payload_id: token.get(),
+                    kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+                    format: BroadcastVideoPayloadFormat::RgbaU16,
+                    backend_path: BroadcastVideoPayloadBackendPath::VaapiCpuNv12Vulkan,
+                    source_frame_index: output_index,
+                    selected_preview_frame_index: slot.selected_preview_frame_index,
+                    presentation_time: slot.presentation_time,
+                    duration: slot.duration,
+                    coded_width: proxy_h264.coded_width,
+                    coded_height: proxy_h264.coded_height,
+                    visible_width: proxy_h264.width,
+                    visible_height: proxy_h264.height,
+                    bounded_slot_index: slot.slot_index,
+                    session_index: 0,
+                };
+                let binding = bind_broadcast_video_payload_ready(slot, payload)?;
+                bindings_by_source.insert(output_index, binding);
+                if bindings_by_source.len() == targets.len() {
+                    return finish_proxy_video_payload_bindings(
+                        proxy_video_slots,
+                        &mut bindings_by_source,
+                        gpu_processor,
+                        gpu_submissions,
+                        gpu_completions,
+                        device.name.clone(),
+                    );
+                }
+            }
+            output_index = output_index
+                .checked_add(1)
+                .ok_or("proxy video output index overflow")?;
+        }
+    }
+
+    let outputs = decoder.flush(&FlushDecoderRequest { decoder_id })?;
+    for output in outputs {
+        if let Some(slot) = targets.get(&output_index) {
+            let identity = FrameIdentity {
+                presentation_position: slot
+                    .selected_preview_frame_index
+                    .ok_or("proxy video payload slot missing selected preview index")?,
+            };
+            let cpu_frame = cpu_pool.acquire()?;
+            let (cpu_frame, _) =
+                qgs_vaapi::transfer_nv12_surface_timed(output.resource.as_ref(), cpu_frame)?;
+            let upload = nv12_upload_for_cpu_surface(device.id, &cpu_frame)?;
+            let token = gpu_processor.submit_frame(&upload, identity)?;
+            gpu_submissions += 1;
+            cpu_pool.release(cpu_frame)?;
+            gpu_processor.wait_for_completion(token)?;
+            gpu_completions += 1;
+            let payload = BroadcastVideoPayloadReference {
+                payload_id: token.get(),
+                kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+                format: BroadcastVideoPayloadFormat::RgbaU16,
+                backend_path: BroadcastVideoPayloadBackendPath::VaapiCpuNv12Vulkan,
+                source_frame_index: output_index,
+                selected_preview_frame_index: slot.selected_preview_frame_index,
+                presentation_time: slot.presentation_time,
+                duration: slot.duration,
+                coded_width: proxy_h264.coded_width,
+                coded_height: proxy_h264.coded_height,
+                visible_width: proxy_h264.width,
+                visible_height: proxy_h264.height,
+                bounded_slot_index: slot.slot_index,
+                session_index: 0,
+            };
+            let binding = bind_broadcast_video_payload_ready(slot, payload)?;
+            bindings_by_source.insert(output_index, binding);
+            if bindings_by_source.len() == targets.len() {
+                return finish_proxy_video_payload_bindings(
+                    proxy_video_slots,
+                    &mut bindings_by_source,
+                    gpu_processor,
+                    gpu_submissions,
+                    gpu_completions,
+                    device.name.clone(),
+                );
+            }
+        }
+        output_index = output_index
+            .checked_add(1)
+            .ok_or("proxy video output index overflow")?;
+    }
+
+    let missing = proxy_video_slots
+        .iter()
+        .filter_map(|slot| slot.source_frame_index)
+        .filter(|source| !bindings_by_source.contains_key(source))
+        .map(|source| source.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!("missing proxy video payload bindings for source frames: {missing}").into())
+}
+
 fn broadcast_runtime_prepared_slots(
     original_path: &Path,
     proxy_path: &Path,
@@ -2460,6 +2715,7 @@ fn broadcast_runtime_prepared_slots(
         .video
         .as_ref()
         .ok_or("proxy has no H.264 video track")?;
+    let proxy_h264 = classify_video_track(proxy_video)?;
     let audio_tracks = original
         .tracks
         .iter()
@@ -2609,10 +2865,24 @@ fn broadcast_runtime_prepared_slots(
         .iter()
         .map(|slot| bind_broadcast_audio_payload(slot, &blocks))
         .collect::<Result<Vec<_>, _>>()?;
-    let proxy_video_payload_bindings = proxy_video_slots
-        .iter()
-        .map(bind_broadcast_video_payload_accounting)
-        .collect::<Vec<_>>();
+    let proxy_video_payload_proof = if report_focus == BroadcastRuntimeReportFocus::VideoPayloads {
+        Some(bind_proxy_preview_video_payloads(
+            proxy_video,
+            &proxy_h264,
+            &proxy_video_slots,
+        )?)
+    } else {
+        None
+    };
+    let proxy_video_payload_bindings = proxy_video_payload_proof
+        .as_ref()
+        .map(|proof| proof.bindings.clone())
+        .unwrap_or_else(|| {
+            proxy_video_slots
+                .iter()
+                .map(bind_broadcast_video_payload_accounting)
+                .collect::<Vec<_>>()
+        });
     let proxy_presentation_payload_bindings = proxy_presentation_slots
         .iter()
         .enumerate()
@@ -2810,6 +3080,10 @@ fn broadcast_runtime_prepared_slots(
             println!("QGS Broadcast Player Runtime Payload Binding");
             println!("--------------------------------------------");
         }
+        BroadcastRuntimeReportFocus::VideoPayloads => {
+            println!("QGS Broadcast Player Runtime Proxy Video Payload Binding");
+            println!("-------------------------------------------------------");
+        }
     }
     println!(
         "Not real playback: no speaker output, no display output, no real-time Broadcast Player loop"
@@ -2886,7 +3160,10 @@ fn broadcast_runtime_prepared_slots(
             proxy_event_summary.intentional_skip_events
         );
     }
-    if report_focus == BroadcastRuntimeReportFocus::Payloads {
+    if matches!(
+        report_focus,
+        BroadcastRuntimeReportFocus::Payloads | BroadcastRuntimeReportFocus::VideoPayloads
+    ) {
         let blocks_per_presentation = proxy_audio_payload_bindings
             .first()
             .map(|binding| binding.block_coverage.len())
@@ -2936,9 +3213,46 @@ fn broadcast_runtime_prepared_slots(
             proxy_payload_summary.runtime_accounting_ready_presentations
         );
         println!(
+            "  Payload-ready presentations: {}",
+            proxy_payload_summary.payload_ready_presentations
+        );
+        println!(
             "  Device-payload-ready presentations: {}",
             proxy_payload_summary.device_payload_ready_presentations
         );
+        if let Some(proof) = &proxy_video_payload_proof {
+            let first_payload = proxy_video_payload_bindings
+                .first()
+                .and_then(|binding| binding.payload.as_ref());
+            let source_frames = proxy_video_payload_bindings
+                .iter()
+                .filter_map(|binding| binding.source_frame_index)
+                .map(|frame| frame.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "  Proxy video payloads: bound={} submissions={} completions={} bounded_gpu_slots={} device={}",
+                proof.bindings.len(),
+                proof.gpu_submissions,
+                proof.gpu_completions,
+                proof.bounded_gpu_slots(),
+                proof.device_name
+            );
+            println!("  Bound source frame indices: {source_frames}");
+            if let Some(payload) = first_payload {
+                println!(
+                    "  Payload kind: {:?} format={:?} backend={:?}",
+                    payload.kind, payload.format, payload.backend_path
+                );
+                println!(
+                    "  Payload dimensions: visible={}x{} coded={}x{}",
+                    payload.visible_width,
+                    payload.visible_height,
+                    payload.coded_width,
+                    payload.coded_height
+                );
+            }
+        }
     }
     println!("OriginalMedia:");
     println!("  video source: original MXF");
@@ -2977,7 +3291,10 @@ fn broadcast_runtime_prepared_slots(
             "  Event sequence summary: SessionCreated -> PrepareStarted -> PrerollPlanned -> CapabilityMissing"
         );
     }
-    if report_focus == BroadcastRuntimeReportFocus::Payloads {
+    if matches!(
+        report_focus,
+        BroadcastRuntimeReportFocus::Payloads | BroadcastRuntimeReportFocus::VideoPayloads
+    ) {
         let video_binding_status = original_video_payload_bindings
             .first()
             .map(|binding| binding.status)
@@ -3021,6 +3338,7 @@ enum BroadcastRuntimeReportFocus {
     PreparedSlots,
     Events,
     Payloads,
+    VideoPayloads,
 }
 
 #[derive(Clone, Debug)]
@@ -7780,6 +8098,7 @@ struct Args {
     broadcast_runtime_prepared_slots_paths: Option<(PathBuf, PathBuf)>,
     broadcast_player_runtime_events_paths: Option<(PathBuf, PathBuf)>,
     broadcast_player_runtime_payloads_paths: Option<(PathBuf, PathBuf)>,
+    broadcast_player_runtime_video_payloads_paths: Option<(PathBuf, PathBuf)>,
 }
 
 impl Args {
@@ -7816,6 +8135,8 @@ impl Args {
         let mut broadcast_player_runtime_events_paths = None;
         let mut broadcast_player_runtime_payloads_original = None;
         let mut broadcast_player_runtime_payloads_paths = None;
+        let mut broadcast_player_runtime_video_payloads_original = None;
+        let mut broadcast_player_runtime_video_payloads_paths = None;
         let mut next_arg_is_proxy_original = false;
         let mut next_arg_is_proxy_proxy = false;
         let mut next_arg_is_proxy_throughput_original = false;
@@ -7838,9 +8159,22 @@ impl Args {
         let mut next_arg_is_broadcast_player_runtime_events_proxy = false;
         let mut next_arg_is_broadcast_player_runtime_payloads_original = false;
         let mut next_arg_is_broadcast_player_runtime_payloads_proxy = false;
+        let mut next_arg_is_broadcast_player_runtime_video_payloads_original = false;
+        let mut next_arg_is_broadcast_player_runtime_video_payloads_proxy = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_broadcast_player_runtime_payloads_proxy {
+            if next_arg_is_broadcast_player_runtime_video_payloads_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = broadcast_player_runtime_video_payloads_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                broadcast_player_runtime_video_payloads_paths = Some((original, proxy));
+                next_arg_is_broadcast_player_runtime_video_payloads_proxy = false;
+            } else if next_arg_is_broadcast_player_runtime_video_payloads_original {
+                broadcast_player_runtime_video_payloads_original = Some(PathBuf::from(arg));
+                next_arg_is_broadcast_player_runtime_video_payloads_original = false;
+                next_arg_is_broadcast_player_runtime_video_payloads_proxy = true;
+            } else if next_arg_is_broadcast_player_runtime_payloads_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = broadcast_player_runtime_payloads_original
                     .take()
@@ -8003,6 +8337,8 @@ impl Args {
                 next_arg_is_broadcast_player_runtime_events_original = true;
             } else if arg == BROADCAST_PLAYER_RUNTIME_PAYLOADS_ARG {
                 next_arg_is_broadcast_player_runtime_payloads_original = true;
+            } else if arg == BROADCAST_PLAYER_RUNTIME_VIDEO_PAYLOADS_ARG {
+                next_arg_is_broadcast_player_runtime_video_payloads_original = true;
             } else if socket_path.is_none() {
                 socket_path = Some(PathBuf::from(arg));
             }
@@ -8028,6 +8364,7 @@ impl Args {
             broadcast_runtime_prepared_slots_paths,
             broadcast_player_runtime_events_paths,
             broadcast_player_runtime_payloads_paths,
+            broadcast_player_runtime_video_payloads_paths,
         }
     }
 }
