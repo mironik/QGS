@@ -727,6 +727,134 @@ pub fn evaluate_broadcast_preroll(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BroadcastPreparedVideoSlotStatus {
+    Prepared,
+    IntentionalSkip,
+    CapabilityMissing,
+    NotSupported,
+    Missing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastPreparedAudioSlot {
+    pub slot_index: usize,
+    pub source_mode: BroadcastVideoSourceMode,
+    pub audio_source_role: BroadcastMediaSourceRole,
+    pub start_time: Duration,
+    pub duration: Duration,
+    pub start_sample: u64,
+    pub sample_count: u64,
+    pub track_coverage: Vec<AudioRangeCoverage>,
+    pub complete: bool,
+}
+
+impl BroadcastPreparedAudioSlot {
+    pub fn from_audio_range(
+        slot_index: usize,
+        source_mode: BroadcastVideoSourceMode,
+        range: &AvFrameAudioRange,
+    ) -> Self {
+        Self {
+            slot_index,
+            source_mode,
+            audio_source_role: BroadcastMediaSourceRole::OriginalAuthoritativeAudio,
+            start_time: range.audio_start_time,
+            duration: range.audio_duration,
+            start_sample: range.audio_start_sample,
+            sample_count: range.audio_sample_count,
+            track_coverage: range.covered_tracks.clone(),
+            complete: range.complete,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastPreparedVideoSlot {
+    pub slot_index: usize,
+    pub source_mode: BroadcastVideoSourceMode,
+    pub video_source_role: BroadcastMediaSourceRole,
+    pub source_frame_index: Option<u64>,
+    pub selected_preview_frame_index: Option<u64>,
+    pub presentation_time: Duration,
+    pub duration: Duration,
+    pub status: BroadcastPreparedVideoSlotStatus,
+}
+
+impl BroadcastPreparedVideoSlot {
+    pub fn is_ready(&self) -> bool {
+        self.status == BroadcastPreparedVideoSlotStatus::Prepared
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastPreparedPresentationSlot {
+    pub presentation_index: usize,
+    pub source_mode: BroadcastVideoSourceMode,
+    pub selected_source_frame: Option<u64>,
+    pub video_slot_index: usize,
+    pub audio_slot_index: usize,
+    pub presentation_time: Duration,
+    pub duration: Duration,
+    pub ready: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastPreparedSlotSummary {
+    pub source_mode: BroadcastVideoSourceMode,
+    pub video_slot_capacity: usize,
+    pub video_slot_count: usize,
+    pub video_slots_prepared: usize,
+    pub audio_slot_capacity: usize,
+    pub audio_slot_count: usize,
+    pub audio_slots_complete: usize,
+    pub presentation_slot_capacity: usize,
+    pub presentation_slot_count: usize,
+    pub presentation_slots_ready: usize,
+    pub tracks_covered: usize,
+    pub preroll_status: BroadcastPrerollStatus,
+}
+
+pub fn summarize_broadcast_prepared_slots(
+    config: BroadcastPrerollConfig,
+    plan: BroadcastPrerollPlan,
+    video_slots: &[BroadcastPreparedVideoSlot],
+    audio_slots: &[BroadcastPreparedAudioSlot],
+    presentation_slots: &[BroadcastPreparedPresentationSlot],
+) -> BroadcastPreparedSlotSummary {
+    let video_slots_prepared = video_slots.iter().filter(|slot| slot.is_ready()).count();
+    let audio_slots_complete = audio_slots.iter().filter(|slot| slot.complete).count();
+    let presentation_slots_ready = presentation_slots.iter().filter(|slot| slot.ready).count();
+    let preroll_status =
+        evaluate_broadcast_preroll(config, plan, video_slots_prepared, audio_slots_complete);
+    let mut covered_tracks = Vec::new();
+    for slot in audio_slots.iter().filter(|slot| slot.complete) {
+        for coverage in &slot.track_coverage {
+            if coverage.complete && !covered_tracks.contains(&coverage.track_id) {
+                covered_tracks.push(coverage.track_id);
+            }
+        }
+    }
+
+    BroadcastPreparedSlotSummary {
+        source_mode: plan.video_source_mode,
+        video_slot_capacity: config.max_video_queue,
+        video_slot_count: video_slots.len(),
+        video_slots_prepared,
+        audio_slot_capacity: config.max_audio_queue,
+        audio_slot_count: audio_slots.len(),
+        audio_slots_complete,
+        presentation_slot_capacity: config.max_presentation_queue,
+        presentation_slot_count: presentation_slots.len(),
+        presentation_slots_ready,
+        tracks_covered: covered_tracks.len(),
+        preroll_status: BroadcastPrerollStatus {
+            ready: preroll_status.ready && presentation_slots_ready >= config.video_frames_required,
+            ..preroll_status
+        },
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BroadcastRuntimeAccounting {
     pub selected_frames_accounted: usize,
     pub audio_ranges_accounted: usize,
@@ -1983,6 +2111,115 @@ mod tests {
         assert!(machine.play().is_ok());
     }
 
+    #[test]
+    fn prepared_audio_slot_preserves_original_audio_coverage() {
+        let range = av_frame_audio_range(
+            0,
+            Duration::ZERO,
+            Duration::from_millis(40),
+            48_000,
+            &clock_ready_blocks(),
+            2,
+        )
+        .unwrap();
+        let slot = BroadcastPreparedAudioSlot::from_audio_range(
+            0,
+            BroadcastVideoSourceMode::ProxyPreview,
+            &range,
+        );
+
+        assert_eq!(
+            slot.audio_source_role,
+            BroadcastMediaSourceRole::OriginalAuthoritativeAudio
+        );
+        assert_eq!(slot.start_sample, 0);
+        assert_eq!(slot.sample_count, 1920);
+        assert_eq!(slot.track_coverage.len(), 2);
+        assert!(slot.complete);
+    }
+
+    #[test]
+    fn prepared_proxy_preview_slots_satisfy_preroll() {
+        let video_slots = test_prepared_video_slots(BroadcastVideoSourceMode::ProxyPreview);
+        let audio_slots = test_prepared_audio_slots(BroadcastVideoSourceMode::ProxyPreview);
+        let presentation_slots =
+            test_prepared_presentation_slots(BroadcastVideoSourceMode::ProxyPreview, true);
+        let summary = summarize_broadcast_prepared_slots(
+            test_preroll_config(),
+            test_preroll_plan(),
+            &video_slots,
+            &audio_slots,
+            &presentation_slots,
+        );
+
+        assert!(summary.preroll_status.ready);
+        assert_eq!(summary.video_slot_count, 3);
+        assert_eq!(summary.video_slots_prepared, 3);
+        assert_eq!(summary.audio_slot_count, 3);
+        assert_eq!(summary.audio_slots_complete, 3);
+        assert_eq!(summary.presentation_slots_ready, 3);
+        assert_eq!(summary.tracks_covered, 2);
+    }
+
+    #[test]
+    fn prepared_original_media_slots_report_capability_missing() {
+        let video_slots = (0..3)
+            .map(|slot_index| BroadcastPreparedVideoSlot {
+                slot_index,
+                source_mode: BroadcastVideoSourceMode::OriginalMedia,
+                video_source_role: BroadcastMediaSourceRole::OriginalFinishingMedia,
+                source_frame_index: Some(u64::try_from(slot_index).unwrap()),
+                selected_preview_frame_index: None,
+                presentation_time: Duration::from_millis(u64::try_from(slot_index * 40).unwrap()),
+                duration: Duration::from_millis(40),
+                status: BroadcastPreparedVideoSlotStatus::CapabilityMissing,
+            })
+            .collect::<Vec<_>>();
+        let audio_slots = test_prepared_audio_slots(BroadcastVideoSourceMode::OriginalMedia);
+        let presentation_slots =
+            test_prepared_presentation_slots(BroadcastVideoSourceMode::OriginalMedia, false);
+        let summary = summarize_broadcast_prepared_slots(
+            BroadcastPrerollConfig {
+                video_source_mode: BroadcastVideoSourceMode::OriginalMedia,
+                ..test_preroll_config()
+            },
+            BroadcastPrerollPlan {
+                video_source_mode: BroadcastVideoSourceMode::OriginalMedia,
+                video_source_available: true,
+                video_runtime_supported: false,
+                selected_video_frames_planned: 106,
+                intentional_skips_planned: 0,
+                ..test_preroll_plan()
+            },
+            &video_slots,
+            &audio_slots,
+            &presentation_slots,
+        );
+
+        assert!(!summary.preroll_status.ready);
+        assert_eq!(
+            summary.preroll_status.reason,
+            Some(BroadcastPrerollNotReadyReason::CapabilityMissing)
+        );
+        assert_eq!(summary.video_slots_prepared, 0);
+        assert_eq!(summary.audio_slots_complete, 3);
+        assert_eq!(summary.presentation_slots_ready, 0);
+    }
+
+    #[test]
+    fn prepared_presentation_slots_link_selected_frames_not_intentional_skips() {
+        let presentation_slots =
+            test_prepared_presentation_slots(BroadcastVideoSourceMode::ProxyPreview, true);
+
+        assert_eq!(presentation_slots.len(), 3);
+        assert_eq!(presentation_slots[0].selected_source_frame, Some(0));
+        assert_eq!(presentation_slots[1].selected_source_frame, Some(2));
+        assert_eq!(presentation_slots[2].selected_source_frame, Some(4));
+        assert!(presentation_slots
+            .iter()
+            .all(|slot| slot.selected_source_frame.unwrap().is_multiple_of(2)));
+    }
+
     fn test_broadcast_session() -> BroadcastRuntimeSessionDescription {
         BroadcastRuntimeSessionDescription {
             audio_source: BroadcastMediaSourceRole::OriginalAuthoritativeAudio,
@@ -2046,6 +2283,72 @@ mod tests {
         }
     }
 
+    fn test_prepared_video_slots(
+        source_mode: BroadcastVideoSourceMode,
+    ) -> Vec<BroadcastPreparedVideoSlot> {
+        (0..3)
+            .map(|slot_index| BroadcastPreparedVideoSlot {
+                slot_index,
+                source_mode,
+                video_source_role: match source_mode {
+                    BroadcastVideoSourceMode::ProxyPreview => {
+                        BroadcastMediaSourceRole::ProxyPreviewVideo
+                    }
+                    BroadcastVideoSourceMode::OriginalMedia => {
+                        BroadcastMediaSourceRole::OriginalFinishingMedia
+                    }
+                },
+                source_frame_index: Some(u64::try_from(slot_index * 2).unwrap()),
+                selected_preview_frame_index: match source_mode {
+                    BroadcastVideoSourceMode::ProxyPreview => {
+                        Some(u64::try_from(slot_index).unwrap())
+                    }
+                    BroadcastVideoSourceMode::OriginalMedia => None,
+                },
+                presentation_time: Duration::from_millis(u64::try_from(slot_index * 40).unwrap()),
+                duration: Duration::from_millis(40),
+                status: BroadcastPreparedVideoSlotStatus::Prepared,
+            })
+            .collect()
+    }
+
+    fn test_prepared_audio_slots(
+        source_mode: BroadcastVideoSourceMode,
+    ) -> Vec<BroadcastPreparedAudioSlot> {
+        (0..3)
+            .map(|index| {
+                let range = av_frame_audio_range(
+                    u64::try_from(index).unwrap(),
+                    Duration::from_millis(u64::try_from(index * 40).unwrap()),
+                    Duration::from_millis(40),
+                    48_000,
+                    &clock_ready_blocks_120ms(),
+                    2,
+                )
+                .unwrap();
+                BroadcastPreparedAudioSlot::from_audio_range(index, source_mode, &range)
+            })
+            .collect()
+    }
+
+    fn test_prepared_presentation_slots(
+        source_mode: BroadcastVideoSourceMode,
+        ready: bool,
+    ) -> Vec<BroadcastPreparedPresentationSlot> {
+        (0..3)
+            .map(|index| BroadcastPreparedPresentationSlot {
+                presentation_index: index,
+                source_mode,
+                selected_source_frame: Some(u64::try_from(index * 2).unwrap()),
+                video_slot_index: index,
+                audio_slot_index: index,
+                presentation_time: Duration::from_millis(u64::try_from(index * 40).unwrap()),
+                duration: Duration::from_millis(40),
+                ready,
+            })
+            .collect()
+    }
+
     fn clock_ready_blocks() -> Vec<PcmAudioBlock> {
         vec![
             test_pcm_block(3, 0, 0, 960),
@@ -2056,6 +2359,23 @@ mod tests {
             test_pcm_block(4, 1, 960, 960),
             test_pcm_block(4, 1, 1920, 960),
             test_pcm_block(4, 1, 2880, 960),
+        ]
+    }
+
+    fn clock_ready_blocks_120ms() -> Vec<PcmAudioBlock> {
+        vec![
+            test_pcm_block(3, 0, 0, 960),
+            test_pcm_block(3, 0, 960, 960),
+            test_pcm_block(3, 0, 1920, 960),
+            test_pcm_block(3, 0, 2880, 960),
+            test_pcm_block(3, 0, 3840, 960),
+            test_pcm_block(3, 0, 4800, 960),
+            test_pcm_block(4, 1, 0, 960),
+            test_pcm_block(4, 1, 960, 960),
+            test_pcm_block(4, 1, 1920, 960),
+            test_pcm_block(4, 1, 2880, 960),
+            test_pcm_block(4, 1, 3840, 960),
+            test_pcm_block(4, 1, 4800, 960),
         ]
     }
 
