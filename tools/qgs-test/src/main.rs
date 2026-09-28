@@ -124,6 +124,7 @@ const BROADCAST_RUNTIME_AUDIO_PIPEWIRE_AUDIBLE_ARG: &str =
     "--broadcast-runtime-audio-pipewire-audible";
 const PIPEWIRE_AUDIO_CONTENT_AUDIT_ARG: &str = "--pipewire-audio-content-audit";
 const PIPEWIRE_AUDIO_MONO_MONITOR_ARG: &str = "--pipewire-audio-mono-monitor";
+const PIPEWIRE_AUDIO_DISCRETE_4MONO_ARG: &str = "--pipewire-audio-discrete-4mono";
 const WRITE_DIAGNOSTIC_WAV_ARG: &str = "--write-diagnostic-wav";
 const AUDIO_AUDIT_START_MS_ARG: &str = "--start-ms";
 const AUDIO_AUDIT_DURATION_MS_ARG: &str = "--duration-ms";
@@ -291,6 +292,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 start_ms: args.audio_content_audit_start_ms.unwrap_or(0),
                 duration_ms: args.audio_content_audit_duration_ms.unwrap_or(1_000),
                 source_channel_index: args.audio_monitor_track.unwrap_or(3),
+            },
+        );
+    }
+    if let Some((original, proxy)) = args.pipewire_audio_discrete_4mono_paths {
+        return pipewire_audio_discrete_4mono(
+            &original,
+            &proxy,
+            AudioDiscrete4MonoOptions {
+                start_ms: args.audio_content_audit_start_ms.unwrap_or(0),
+                duration_ms: args.audio_content_audit_duration_ms.unwrap_or(1_000),
             },
         );
     }
@@ -2636,6 +2647,14 @@ fn mono_monitor_diagnostic_evidence_label(
     }
 }
 
+fn discrete_4mono_evidence_label(submitted: bool, drain_completed: bool) -> &'static str {
+    match (submitted, drain_completed) {
+        (true, true) => "Discrete4MonoOutputDrainCompleted",
+        (true, false) => "Discrete4MonoOutputSubmitted",
+        _ => "Discrete4MonoOutputNotSubmitted",
+    }
+}
+
 fn smoke_test_buffer_count(
     target_duration: Duration,
     sample_rate: u32,
@@ -3908,6 +3927,190 @@ fn pipewire_audio_mono_monitor(
     Ok(())
 }
 
+fn pipewire_audio_discrete_4mono(
+    original_path: &Path,
+    proxy_path: &Path,
+    options: AudioDiscrete4MonoOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let plan = build_discrete_4mono_output_plan(original_path, options)?;
+    let first_buffer = plan
+        .buffers
+        .first()
+        .cloned()
+        .ok_or("discrete 4-mono output produced no buffers")?;
+    let report_buffer = LinuxPipewirePrototypeBuffer {
+        sample_rate: plan.sample_rate,
+        channels: 4,
+        sample_count: plan.samples_per_buffer,
+        sample_format: LinuxPipewirePrototypeSampleFormat::F32Interleaved,
+        bytes: first_buffer,
+    };
+    let report = inspect_native_pipewire_stream_boundary(&report_buffer)?;
+
+    println!("Native PipeWire Discrete 4-Mono Output Boundary");
+    println!("-----------------------------------------------");
+    println!("Audio source: original MXF");
+    println!("Source original path: {}", original_path.display());
+    println!("Source proxy path: {}", proxy_path.display());
+    println!("Proxy AAC: not used");
+    println!("Original MXF audio authoritative: yes");
+    println!("Source mapping:");
+    println!("  track 1 -> output channel 1");
+    println!("  track 2 -> output channel 2");
+    println!("  track 3 -> output channel 3");
+    println!("  track 4 -> output channel 4");
+    println!("Stereo fold: no");
+    println!("Duplicated mono: no");
+    println!("Production routing: no");
+    println!("Channel certification: no");
+    println!("Full playback: no");
+    println!("Realtime playback: no");
+    println!("A/V sync: no");
+    println!("AudioDeviceVerified: no");
+    println!("Bounded extraction: yes");
+    println!("Full MXF loaded into memory: no");
+    println!(
+        "Source duration: {:.3} ms",
+        plan.source_duration.as_secs_f64() * 1000.0
+    );
+    println!("Selected start: {} ms", plan.start_ms);
+    println!("Selected duration: {} ms", plan.duration_ms);
+    println!(
+        "Selected duration exact: {:.3} ms",
+        plan.selected_duration.as_secs_f64() * 1000.0
+    );
+    println!(
+        "Selected sample range: {}..{}",
+        plan.start_sample, plan.end_sample
+    );
+    println!("Output format: F32Interleaved 48000Hz 4ch");
+    println!("Output channels: {}", plan.output_channels);
+    println!("Output frames: {}", plan.output_frames);
+    println!("Output bytes planned: {}", plan.total_bytes);
+    println!("Output buffers planned: {}", plan.buffers.len());
+    println!("Samples per source track: {}", plan.output_frames);
+    println!("PipeWire API position labels: FL/FR/RL/RR if accepted by the default sink");
+    println!("QGS source identity: track 1/2/3/4 remains authoritative");
+    for summary in &plan.track_summaries {
+        println!("Source mono track audit:");
+        println!(
+            "  track {} -> output channel {}",
+            u32::from(summary.channel_index) + 1,
+            u32::from(summary.channel_index) + 1
+        );
+        println!("  peak_f32={:.6}", summary.stats.peak_f32);
+        println!("  rms_f32={:.6}", summary.stats.rms_f32);
+        println!("  relative level: {:.2} dBFS", summary.stats.rms_dbfs);
+        println!("  likely silent: {}", yes_no(summary.stats.likely_silent));
+    }
+    println!(
+        "PipeWire runtime library available: {}",
+        yes_no(report.runtime_library_available)
+    );
+    println!(
+        "PipeWire server reachable: {}",
+        yes_no(report.pipewire_server_reachable)
+    );
+    println!(
+        "PipeWire pkg-config entry available: {}",
+        yes_no(report.pkg_config_entry_available)
+    );
+    println!(
+        "PipeWire headers available: {}",
+        yes_no(report.headers_available)
+    );
+    if !report.pkg_config_entry_available || !report.headers_available {
+        println!(
+            "Stream create attempted: {}",
+            yes_no(report.stream_create_attempted)
+        );
+        println!("Buffers submitted: 0");
+        println!("Drain requested: no");
+        println!("Drain completed: no");
+        println!("Evidence level: {:?}", report.evidence_level);
+        println!("AudioDeviceBoundaryEvidence: Discrete4MonoOutputNotSubmitted");
+        println!("AudioDeviceVerified: no");
+        println!("AudioDeviceVerified scope: not upgraded by discrete 4-mono boundary");
+        println!("Status: {}", report.status_message);
+        return Ok(());
+    }
+
+    let stream_format = PipeWireStreamFormat {
+        sample_rate: plan.sample_rate,
+        channels: 4,
+        sample_format: PipeWireAudioSampleFormat::F32Interleaved,
+    };
+    let submission_report = submit_native_pipewire_buffers(
+        stream_format,
+        plan.buffers,
+        plan.samples_per_buffer,
+        Duration::from_secs(5),
+    )?;
+    let evidence = discrete_4mono_evidence_label(
+        submission_report.buffer_submitted,
+        submission_report.drain_completed,
+    );
+
+    println!(
+        "Stream configured: {}",
+        yes_no(submission_report.stream_report.stream_configured)
+    );
+    println!(
+        "Observed stream states: {:?}",
+        submission_report.stream_report.observed_states
+    );
+    println!(
+        "Final stream state: {:?}",
+        submission_report.stream_report.final_state
+    );
+    println!(
+        "Process callback reached: {}",
+        yes_no(submission_report.process_callback_reached)
+    );
+    println!("Buffer capacity: {}", submission_report.buffer_capacity);
+    println!("Buffers planned: {}", submission_report.buffers_planned);
+    println!("Buffers submitted: {}", submission_report.buffers_submitted);
+    println!(
+        "Samples submitted per source track: {}",
+        submission_report.samples_converted
+    );
+    println!("Output channels: {}", submission_report.output_channels);
+    println!(
+        "F32 samples written: {}",
+        submission_report.f32_samples_written
+    );
+    println!("Bytes copied: {}", submission_report.bytes_copied);
+    println!(
+        "Drain requested: {}",
+        yes_no(submission_report.drain_requested)
+    );
+    println!(
+        "Drain completed: {}",
+        yes_no(submission_report.drain_completed)
+    );
+    println!(
+        "Post-submit callbacks observed: {}",
+        submission_report.post_submit_process_callbacks
+    );
+    println!(
+        "Post-submit timeout: {}",
+        yes_no(submission_report.post_submit_timeout)
+    );
+    println!(
+        "PipeWire evidence level: {:?}",
+        submission_report.evidence_level
+    );
+    println!("Discrete 4-mono evidence level: {}", evidence);
+    println!("AudioDeviceBoundaryEvidence: {}", evidence);
+    println!("AudioDeviceVerified: no");
+    println!("AudioDeviceVerified scope: not upgraded by discrete 4-mono boundary");
+    println!("Physical channel mapping certified: no");
+    println!(
+        "Status: discrete 4-mono boundary completed; production routing and physical channel mapping are not certified"
+    );
+    Ok(())
+}
+
 struct AudioContentAuditOptions {
     start_ms: u64,
     duration_ms: u64,
@@ -3921,6 +4124,12 @@ struct AudioMonoMonitorOptions {
     start_ms: u64,
     duration_ms: u64,
     source_channel_index: u16,
+}
+
+#[derive(Clone, Copy)]
+struct AudioDiscrete4MonoOptions {
+    start_ms: u64,
+    duration_ms: u64,
 }
 
 struct MonoMonitorDiagnosticPlan {
@@ -3937,6 +4146,22 @@ struct MonoMonitorDiagnosticPlan {
     total_bytes: usize,
     buffers: Vec<Vec<u8>>,
     selected_track_summaries: Vec<AudioAuditTrackSummary>,
+}
+
+struct Discrete4MonoOutputPlan {
+    sample_rate: u32,
+    start_ms: u64,
+    duration_ms: u64,
+    start_sample: u64,
+    end_sample: u64,
+    source_duration: Duration,
+    selected_duration: Duration,
+    samples_per_buffer: u32,
+    output_channels: u16,
+    output_frames: u32,
+    total_bytes: usize,
+    buffers: Vec<Vec<u8>>,
+    track_summaries: Vec<AudioAuditTrackSummary>,
 }
 
 impl MonoMonitorDiagnosticPlan {
@@ -4062,6 +4287,136 @@ fn build_mono_monitor_diagnostic_plan(
         total_bytes,
         buffers,
         selected_track_summaries,
+    })
+}
+
+fn build_discrete_4mono_output_plan(
+    original_path: &Path,
+    options: AudioDiscrete4MonoOptions,
+) -> Result<Discrete4MonoOutputPlan, Box<dyn std::error::Error>> {
+    let duration_ms = bounded_audio_audit_duration_ms(options.duration_ms)?;
+    let audio_index = open_pcm_audio_index(original_path)?;
+    let audio_tracks = audio_index
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Audio)
+        .collect::<Vec<_>>();
+    if audio_tracks.is_empty() {
+        return Err("original MXF has no audio tracks".into());
+    }
+    let source_format = original_linux_pcm_audio_format(&audio_tracks)?;
+    if source_format.sample_rate != 48_000 {
+        return Err("discrete 4-mono output currently expects 48 kHz original PCM".into());
+    }
+    let source_total_samples = audio_audit_total_samples_from_index(&audio_index)?;
+    let source_duration =
+        duration_from_audio_samples(source_total_samples, source_format.sample_rate)?;
+    let requested_sample_count = u32::try_from(audio_samples_for_duration(
+        Duration::from_millis(duration_ms),
+        source_format.sample_rate,
+    )?)?;
+    let start_sample = audio_samples_for_duration(
+        Duration::from_millis(options.start_ms),
+        source_format.sample_rate,
+    )?;
+    let end_sample = start_sample
+        .checked_add(u64::from(requested_sample_count))
+        .ok_or("discrete 4-mono sample range overflow")?;
+    if end_sample > source_total_samples {
+        return Err(format!(
+            "discrete 4-mono range {}..{} exceeds source duration {} samples",
+            start_sample, end_sample, source_total_samples
+        )
+        .into());
+    }
+    let blocks = build_original_pcm_blocks_from_index_range(
+        original_path,
+        &audio_index,
+        start_sample,
+        end_sample,
+    )?;
+    let track_groups = original_pcm_blocks_by_channel(&blocks, source_format.sample_rate)?;
+    let output_channels = [0_u16, 1, 2, 3];
+    for channel in output_channels {
+        if !track_groups.contains_key(&channel) {
+            return Err(format!(
+                "required original mono track {} is missing",
+                u32::from(channel) + 1
+            )
+            .into());
+        }
+    }
+    let first_channel_blocks = track_groups
+        .get(&0)
+        .ok_or("required original mono track 1 is missing")?;
+    let samples_per_buffer = first_channel_blocks
+        .first()
+        .ok_or("discrete 4-mono source has no blocks")?
+        .sample_count;
+    if samples_per_buffer == 0 {
+        return Err("discrete 4-mono source block has zero samples".into());
+    }
+    if requested_sample_count % samples_per_buffer != 0 {
+        return Err("discrete 4-mono duration must align to source PCM block size".into());
+    }
+    let buffers_needed = usize::try_from(requested_sample_count / samples_per_buffer)?;
+    for channel in output_channels {
+        let blocks = track_groups
+            .get(&channel)
+            .ok_or("required original mono track is missing")?;
+        if blocks.len() != buffers_needed {
+            return Err(
+                "discrete 4-mono selected range is not fully covered by every track".into(),
+            );
+        }
+    }
+
+    let mut buffers = Vec::with_capacity(buffers_needed);
+    for block_index in 0..buffers_needed {
+        let block_start = start_sample
+            .checked_add(
+                u64::try_from(block_index)?
+                    .checked_mul(u64::from(samples_per_buffer))
+                    .ok_or("discrete 4-mono block start overflow")?,
+            )
+            .ok_or("discrete 4-mono block start overflow")?;
+        buffers.push(build_audio_audit_f32_interleaved_range(
+            &track_groups,
+            &output_channels,
+            source_format.sample_rate,
+            block_start,
+            samples_per_buffer,
+        )?);
+    }
+    let selected_duration =
+        duration_from_audio_samples(u64::from(requested_sample_count), source_format.sample_rate)?;
+    let track_summaries = audio_audit_track_summaries(
+        &track_groups,
+        source_format.sample_rate,
+        start_sample,
+        requested_sample_count,
+    )?
+    .into_iter()
+    .filter(|summary| output_channels.contains(&summary.channel_index))
+    .collect::<Vec<_>>();
+    if track_summaries.len() != 4 {
+        return Err("discrete 4-mono track summaries are incomplete".into());
+    }
+    let total_bytes = buffers.iter().map(Vec::len).sum();
+    Ok(Discrete4MonoOutputPlan {
+        sample_rate: source_format.sample_rate,
+        start_ms: options.start_ms,
+        duration_ms,
+        start_sample,
+        end_sample,
+        source_duration,
+        selected_duration,
+        samples_per_buffer,
+        output_channels: 4,
+        output_frames: requested_sample_count,
+        total_bytes,
+        buffers,
+        track_summaries,
     })
 }
 
@@ -12098,6 +12453,7 @@ struct Args {
     broadcast_runtime_audio_pipewire_audible_paths: Option<(PathBuf, PathBuf)>,
     pipewire_audio_content_audit_paths: Option<(PathBuf, PathBuf)>,
     pipewire_audio_mono_monitor_paths: Option<(PathBuf, PathBuf)>,
+    pipewire_audio_discrete_4mono_paths: Option<(PathBuf, PathBuf)>,
     diagnostic_wav_path: Option<PathBuf>,
     audio_content_audit_start_ms: Option<u64>,
     audio_content_audit_duration_ms: Option<u64>,
@@ -12167,6 +12523,8 @@ impl Args {
         let mut pipewire_audio_content_audit_paths = None;
         let mut pipewire_audio_mono_monitor_original = None;
         let mut pipewire_audio_mono_monitor_paths = None;
+        let mut pipewire_audio_discrete_4mono_original = None;
+        let mut pipewire_audio_discrete_4mono_paths = None;
         let mut diagnostic_wav_path = None;
         let mut audio_content_audit_start_ms = None;
         let mut audio_content_audit_duration_ms = None;
@@ -12222,6 +12580,8 @@ impl Args {
         let mut next_arg_is_pipewire_audio_content_audit_proxy = false;
         let mut next_arg_is_pipewire_audio_mono_monitor_original = false;
         let mut next_arg_is_pipewire_audio_mono_monitor_proxy = false;
+        let mut next_arg_is_pipewire_audio_discrete_4mono_original = false;
+        let mut next_arg_is_pipewire_audio_discrete_4mono_proxy = false;
         let mut next_arg_is_diagnostic_wav_path = false;
         let mut next_arg_is_audio_content_audit_start_ms = false;
         let mut next_arg_is_audio_content_audit_duration_ms = false;
@@ -12267,6 +12627,17 @@ impl Args {
                 pipewire_audio_mono_monitor_original = Some(PathBuf::from(arg));
                 next_arg_is_pipewire_audio_mono_monitor_original = false;
                 next_arg_is_pipewire_audio_mono_monitor_proxy = true;
+            } else if next_arg_is_pipewire_audio_discrete_4mono_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = pipewire_audio_discrete_4mono_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                pipewire_audio_discrete_4mono_paths = Some((original, proxy));
+                next_arg_is_pipewire_audio_discrete_4mono_proxy = false;
+            } else if next_arg_is_pipewire_audio_discrete_4mono_original {
+                pipewire_audio_discrete_4mono_original = Some(PathBuf::from(arg));
+                next_arg_is_pipewire_audio_discrete_4mono_original = false;
+                next_arg_is_pipewire_audio_discrete_4mono_proxy = true;
             } else if next_arg_is_pipewire_audio_content_audit_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = pipewire_audio_content_audit_original
@@ -12596,6 +12967,8 @@ impl Args {
                 next_arg_is_pipewire_audio_content_audit_original = true;
             } else if arg == PIPEWIRE_AUDIO_MONO_MONITOR_ARG {
                 next_arg_is_pipewire_audio_mono_monitor_original = true;
+            } else if arg == PIPEWIRE_AUDIO_DISCRETE_4MONO_ARG {
+                next_arg_is_pipewire_audio_discrete_4mono_original = true;
             } else if arg == WRITE_DIAGNOSTIC_WAV_ARG {
                 next_arg_is_diagnostic_wav_path = true;
             } else if arg == AUDIO_AUDIT_START_MS_ARG {
@@ -12649,6 +13022,7 @@ impl Args {
             broadcast_runtime_audio_pipewire_audible_paths,
             pipewire_audio_content_audit_paths,
             pipewire_audio_mono_monitor_paths,
+            pipewire_audio_discrete_4mono_paths,
             diagnostic_wav_path,
             audio_content_audit_start_ms,
             audio_content_audit_duration_ms,
@@ -12690,7 +13064,7 @@ mod tests {
         build_pipewire_f32_interleaved_prototype_buffer,
         build_runtime_audio_payload_pipewire_buffer,
         build_sequential_original_audio_segment_for_duration, decode_s24be_i32, decode_s24le_i32,
-        decode_u24le, f32_buffer_stats, loudest_monitor_pair,
+        decode_u24le, discrete_4mono_evidence_label, f32_buffer_stats, loudest_monitor_pair,
         mono_monitor_diagnostic_evidence_label, mxf_file_label, original_pcm_blocks_by_channel,
         original_segment_evidence_label, parse_manual_audible_confirmation,
         parse_monitor_track_arg, pcm_s24le_sample_to_f32, proxy_presentation_ordinals,
@@ -13027,6 +13401,22 @@ mod tests {
     }
 
     #[test]
+    fn discrete_4mono_evidence_reports_submission_and_drain() {
+        assert_eq!(
+            discrete_4mono_evidence_label(true, true),
+            "Discrete4MonoOutputDrainCompleted"
+        );
+        assert_eq!(
+            discrete_4mono_evidence_label(true, false),
+            "Discrete4MonoOutputSubmitted"
+        );
+        assert_eq!(
+            discrete_4mono_evidence_label(false, false),
+            "Discrete4MonoOutputNotSubmitted"
+        );
+    }
+
+    #[test]
     fn mono_monitor_track_parser_uses_one_based_original_track_numbers() {
         assert_eq!(parse_monitor_track_arg("4".as_ref()).unwrap(), 3);
         assert_eq!(parse_monitor_track_arg("1".as_ref()).unwrap(), 0);
@@ -13153,6 +13543,53 @@ mod tests {
         assert_eq!(values[2], values[3]);
         assert_eq!(values[0], 0.5);
         assert_eq!(values[2], 0.25);
+    }
+
+    #[test]
+    fn discrete_4mono_interleaves_tracks_without_fold_or_duplication() {
+        let blocks = vec![
+            mono_block(10, 0, &[[0x01, 0x00, 0x00], [0x02, 0x00, 0x00]]),
+            mono_block(11, 1, &[[0x03, 0x00, 0x00], [0x04, 0x00, 0x00]]),
+            mono_block(12, 2, &[[0x05, 0x00, 0x00], [0x06, 0x00, 0x00]]),
+            mono_block(13, 3, &[[0x07, 0x00, 0x00], [0x08, 0x00, 0x00]]),
+        ];
+        let groups = original_pcm_blocks_by_channel(&blocks, 48_000).unwrap();
+        let bytes =
+            build_audio_audit_f32_interleaved_range(&groups, &[0, 1, 2, 3], 48_000, 0, 2).unwrap();
+        let values = bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(bytes.len(), 2 * 4 * 4);
+        assert_eq!(
+            values,
+            vec![
+                1.0 / 8_388_608.0,
+                3.0 / 8_388_608.0,
+                5.0 / 8_388_608.0,
+                7.0 / 8_388_608.0,
+                2.0 / 8_388_608.0,
+                4.0 / 8_388_608.0,
+                6.0 / 8_388_608.0,
+                8.0 / 8_388_608.0,
+            ]
+        );
+        assert_ne!(values[0], values[1]);
+        assert_ne!(values[0], values[2]);
+        assert_ne!(values[0], values[3]);
+    }
+
+    #[test]
+    fn discrete_4mono_default_duration_geometry_is_bounded() {
+        let sample_count = u32::try_from(
+            qgs_media_runtime::audio_samples_for_duration(Duration::from_secs(1), 48_000).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(sample_count, 48_000);
+        assert_eq!(usize::try_from(sample_count).unwrap() * 4, 192_000);
+        assert_eq!(usize::try_from(sample_count).unwrap() * 4 * 4, 768_000);
     }
 
     #[test]

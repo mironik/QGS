@@ -576,6 +576,7 @@ pub enum BroadcastRuntimeVerificationLevel {
     ManualMonitorPairPreferenceObserved,
     DesktopMonoListeningHelperDrainCompleted,
     ManualDesktopMonoListeningHelperHeard,
+    Discrete4MonoOutputDrainCompleted,
     VisualVerified,
     AudioDeviceVerified,
     RealtimeVerified,
@@ -607,6 +608,7 @@ impl BroadcastRuntimeVerificationLevel {
                 "DesktopMonoListeningHelperDrainCompleted"
             }
             Self::ManualDesktopMonoListeningHelperHeard => "ManualDesktopMonoListeningHelperHeard",
+            Self::Discrete4MonoOutputDrainCompleted => "Discrete4MonoOutputDrainCompleted",
             Self::VisualVerified => "VisualVerified",
             Self::AudioDeviceVerified => "AudioDeviceVerified",
             Self::RealtimeVerified => "RealtimeVerified",
@@ -829,8 +831,8 @@ impl BroadcastRuntimeVerificationMatrix {
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::NativePipeWireDiscrete4MonoOutputBoundary,
-                    level: Level::NotImplemented,
-                    summary: "discrete track 1/2/3/4 to output channel 1/2/3/4 PipeWire boundary is the required next direction and is not verified yet",
+                    level: Level::Discrete4MonoOutputDrainCompleted,
+                    summary: "original MXF track 1/2/3/4 can be submitted as output channel 1/2/3/4 to a native PipeWire 4-channel f32 boundary and drained; physical channel mapping and production routing are not certified",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::BroadcastRuntimeAudioPayloadPipeWire,
@@ -4292,6 +4294,10 @@ mod tests {
             BroadcastRuntimeVerificationLevel::ManualDesktopMonoListeningHelperHeard
                 < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
         );
+        assert!(
+            BroadcastRuntimeVerificationLevel::Discrete4MonoOutputDrainCompleted
+                < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
     }
 
     #[test]
@@ -4426,7 +4432,7 @@ mod tests {
                 .entry(BroadcastRuntimeVerifiedSubsystem::NativePipeWireDiscrete4MonoOutputBoundary)
                 .unwrap()
                 .level,
-            BroadcastRuntimeVerificationLevel::NotImplemented
+            BroadcastRuntimeVerificationLevel::Discrete4MonoOutputDrainCompleted
         );
         assert_ne!(
             matrix

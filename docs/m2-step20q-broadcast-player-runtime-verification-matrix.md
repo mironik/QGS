@@ -52,6 +52,11 @@ and what remains unimplemented.
   mono listening helper. This remains a diagnostic helper observation and is
   below discrete 4-mono output verification, channel certification, production
   routing, realtime playback, A/V sync, and full audio-device verification.
+- `Discrete4MonoOutputDrainCompleted`: original MXF tracks 1, 2, 3, and 4 were
+  submitted as output channels 1, 2, 3, and 4 to a native PipeWire 4-channel
+  f32 boundary and drained. This does not certify physical channel mapping,
+  production routing, realtime playback, A/V sync, or full audio-device
+  verification.
 - `VisualVerified`: visual/image correctness was verified by comparison or
   display evidence.
 - `AudioDeviceVerified`: a real audio device path was verified.
@@ -90,7 +95,7 @@ For Sony FX6 sample 002:
 | PipeWire audio content sanity audit | `MediaInspected` | Original MXF PCM statistics, endian/sign interpretation, f32 conversion, segment/runtime path equality, and PipeWire buffer geometry audited; manual listening partially supports content audibility, but routing and device-output correctness remain unverified. |
 | Mironik 2002 monitor diagnostic | `ManualMonitorPairPreferenceObserved` | For the 0-1000 ms bounded original-MXF audit range, the track 4 / track 1 loudest-pair stereo monitor WAV sounded best among tested diagnostics and matches the RMS statistics. Proxy AAC was not used; this is diagnostic monitor preference only. |
 | native PipeWire desktop mono listening helper | `DesktopMonoListeningHelperDrainCompleted` | One original MXF mono track is duplicated to L/R as an ad-hoc desktop listening helper and drained through PipeWire. This is not discrete mono broadcast output, production routing, channel certification, full playback, realtime playback, A/V sync, or `AudioDeviceVerified`. |
-| native PipeWire discrete 4-mono output boundary | `NotImplemented` | Required next direction: original MXF track 1/2/3/4 to output channel 1/2/3/4, preserving discrete mono identity with no stereo fold or duplicated-mono evidence. |
+| native PipeWire discrete 4-mono output boundary | `Discrete4MonoOutputDrainCompleted` | Original MXF track 1/2/3/4 can be submitted as output channel 1/2/3/4 to a native PipeWire 4-channel f32 boundary and drained. Physical channel mapping, production routing, full playback, realtime playback, A/V sync, and `AudioDeviceVerified` are not claimed. |
 | broadcast runtime audio payload to PipeWire | `RuntimeAudioPayloadDrainCompleted` | First prepared `ProxyPreview` Broadcast Player Runtime original-audio payload binding submits to native PipeWire and drains; an audible helper path exists but manual confirmation is tracked separately and does not imply full playback, realtime playback, A/V sync, channel certification, or full audio-device verification. |
 | simulated playback loop | `TestBoundaryEvidence` | Prepared slots flow through test audio/video boundaries deterministically. |
 | real speaker output | `NotImplemented` | No audible speaker output, audio-device clock, or full audio playback path exists; native PipeWire buffer submission is tracked separately. |
@@ -119,7 +124,9 @@ The matrix intentionally does not overstate these areas:
   channel output. Duplicated L/R output is an ad-hoc desktop listening helper
   only, not stereo runtime truth, production routing, or channel-correct
   broadcast output.
-- Discrete 4-mono PipeWire output remains unimplemented and unverified.
+- Discrete 4-mono PipeWire output has bounded submit/drain evidence only. It
+  does not certify physical channel mapping, production routing, full playback,
+  realtime playback, A/V sync, or full `AudioDeviceVerified`.
 - Runtime-prepared audio payload submission/drain evidence is not full playback,
   realtime playback, A/V sync, channel certification, or full
   `AudioDeviceVerified`.
