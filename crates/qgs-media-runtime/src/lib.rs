@@ -224,6 +224,157 @@ pub struct QueueStats {
     pub backpressure_events: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioSampleFormat {
+    PcmSignedInt { bits_per_sample: u8 },
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioFormat {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub sample_format: AudioSampleFormat,
+}
+
+impl AudioFormat {
+    pub fn validate(self) -> Result<Self, PlaybackError> {
+        if self.sample_rate == 0 || self.channels == 0 {
+            return Err(PlaybackError::InvalidAudioFormat);
+        }
+        if let AudioSampleFormat::PcmSignedInt { bits_per_sample } = self.sample_format {
+            if bits_per_sample == 0 {
+                return Err(PlaybackError::InvalidAudioFormat);
+            }
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OriginalAudioTrack {
+    pub track_id: u32,
+    pub channel_index: u16,
+    pub format: AudioFormat,
+    pub sample_count: Option<u64>,
+    pub duration: Duration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioTimeline {
+    pub tracks: Vec<OriginalAudioTrack>,
+    pub duration: Duration,
+}
+
+impl AudioTimeline {
+    pub fn new(tracks: Vec<OriginalAudioTrack>) -> Result<Self, PlaybackError> {
+        if tracks.is_empty() {
+            return Err(PlaybackError::InvalidAudioFormat);
+        }
+        let duration = tracks
+            .iter()
+            .map(|track| track.duration)
+            .max()
+            .ok_or(PlaybackError::InvalidAudioFormat)?;
+        Ok(Self { tracks, duration })
+    }
+
+    pub fn sample_rate(&self) -> Option<u32> {
+        self.tracks.first().map(|track| track.format.sample_rate)
+    }
+
+    pub fn bit_depth(&self) -> Option<u8> {
+        self.tracks
+            .first()
+            .and_then(|track| match track.format.sample_format {
+                AudioSampleFormat::PcmSignedInt { bits_per_sample } => Some(bits_per_sample),
+                AudioSampleFormat::Unknown => None,
+            })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioTimingPacket {
+    pub track_id: u32,
+    pub start: Duration,
+    pub duration: Duration,
+    pub sample_count: u32,
+    pub has_payload: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TestAudioSink {
+    packets: Vec<AudioTimingPacket>,
+}
+
+impl TestAudioSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record(&mut self, packet: AudioTimingPacket) {
+        self.packets.push(packet);
+    }
+
+    pub fn packets(&self) -> &[AudioTimingPacket] {
+        &self.packets
+    }
+
+    pub fn monotonic(&self) -> bool {
+        self.packets
+            .windows(2)
+            .all(|pair| pair[0].start <= pair[1].start)
+    }
+}
+
+pub fn duration_from_audio_samples(
+    sample_count: u64,
+    sample_rate: u32,
+) -> Result<Duration, PlaybackError> {
+    if sample_rate == 0 {
+        return Err(PlaybackError::InvalidAudioFormat);
+    }
+    let nanos = u128::from(sample_count)
+        .checked_mul(NANOS_PER_SECOND)
+        .ok_or(PlaybackError::TimestampOverflow)?
+        / u128::from(sample_rate);
+    duration_from_nanos(nanos)
+}
+
+pub fn audio_samples_for_duration(
+    duration: Duration,
+    sample_rate: u32,
+) -> Result<u64, PlaybackError> {
+    if sample_rate == 0 {
+        return Err(PlaybackError::InvalidAudioFormat);
+    }
+    let nanos = duration.as_nanos();
+    let samples = nanos
+        .checked_mul(u128::from(sample_rate))
+        .ok_or(PlaybackError::TimestampOverflow)?
+        / NANOS_PER_SECOND;
+    u64::try_from(samples).map_err(|_| PlaybackError::TimestampOverflow)
+}
+
+pub fn duration_abs_delta(a: Duration, b: Duration) -> Duration {
+    if a >= b {
+        a - b
+    } else {
+        b - a
+    }
+}
+
+pub fn max_video_timestamp_outside_audio_range(
+    video_timestamps: &[Duration],
+    audio_duration: Duration,
+) -> Duration {
+    video_timestamps
+        .iter()
+        .map(|timestamp| timestamp.saturating_sub(audio_duration))
+        .max()
+        .unwrap_or(Duration::ZERO)
+}
+
 pub struct BoundedQueue<T> {
     capacity: usize,
     items: VecDeque<T>,
@@ -364,6 +515,7 @@ pub enum PlaybackError {
     InvalidRate,
     InvalidCapacity,
     InvalidLatePolicy,
+    InvalidAudioFormat,
     TimestampOverflow,
 }
 
@@ -373,6 +525,7 @@ impl std::fmt::Display for PlaybackError {
             Self::InvalidRate => write!(f, "invalid playback rate"),
             Self::InvalidCapacity => write!(f, "invalid playback queue capacity"),
             Self::InvalidLatePolicy => write!(f, "invalid playback late/drop policy"),
+            Self::InvalidAudioFormat => write!(f, "invalid audio format"),
             Self::TimestampOverflow => write!(f, "playback timestamp overflow"),
         }
     }
@@ -418,6 +571,126 @@ mod tests {
         assert_eq!(queue.len(), 2);
         assert_eq!(queue.stats().peak_depth, 2);
         assert_eq!(queue.stats().backpressure_events, 1);
+    }
+
+    #[test]
+    fn audio_format_rejects_invalid_values() {
+        assert!(AudioFormat {
+            sample_rate: 48_000,
+            channels: 2,
+            sample_format: AudioSampleFormat::PcmSignedInt {
+                bits_per_sample: 24
+            },
+        }
+        .validate()
+        .is_ok());
+        assert!(AudioFormat {
+            sample_rate: 0,
+            channels: 2,
+            sample_format: AudioSampleFormat::PcmSignedInt {
+                bits_per_sample: 24
+            },
+        }
+        .validate()
+        .is_err());
+        assert!(AudioFormat {
+            sample_rate: 48_000,
+            channels: 1,
+            sample_format: AudioSampleFormat::PcmSignedInt { bits_per_sample: 0 },
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn audio_duration_uses_exact_sample_rate_math() {
+        assert_eq!(
+            duration_from_audio_samples(48_000, 48_000).unwrap(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            audio_samples_for_duration(Duration::from_millis(2120), 48_000).unwrap(),
+            101_760
+        );
+    }
+
+    #[test]
+    fn audio_timeline_models_multiple_original_tracks() {
+        let format = AudioFormat {
+            sample_rate: 48_000,
+            channels: 1,
+            sample_format: AudioSampleFormat::PcmSignedInt {
+                bits_per_sample: 24,
+            },
+        };
+        let timeline = AudioTimeline::new(vec![
+            OriginalAudioTrack {
+                track_id: 3,
+                channel_index: 0,
+                format,
+                sample_count: Some(101_760),
+                duration: Duration::from_millis(2120),
+            },
+            OriginalAudioTrack {
+                track_id: 4,
+                channel_index: 1,
+                format,
+                sample_count: Some(101_760),
+                duration: Duration::from_millis(2120),
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(timeline.tracks.len(), 2);
+        assert_eq!(timeline.sample_rate(), Some(48_000));
+        assert_eq!(timeline.bit_depth(), Some(24));
+        assert_eq!(timeline.duration, Duration::from_millis(2120));
+    }
+
+    #[test]
+    fn bounded_audio_queue_and_sink_preserve_monotonic_timing() {
+        let mut queue = BoundedQueue::new(2).unwrap();
+        let first = AudioTimingPacket {
+            track_id: 3,
+            start: Duration::ZERO,
+            duration: Duration::from_millis(20),
+            sample_count: 960,
+            has_payload: false,
+        };
+        let second = AudioTimingPacket {
+            start: Duration::from_millis(20),
+            ..first
+        };
+        let third = AudioTimingPacket {
+            start: Duration::from_millis(40),
+            ..first
+        };
+        queue.try_push(first).unwrap();
+        queue.try_push(second).unwrap();
+        assert_eq!(queue.try_push(third), Err(third));
+
+        let mut sink = TestAudioSink::new();
+        sink.record(queue.pop_front().unwrap());
+        sink.record(queue.pop_front().unwrap());
+        assert!(sink.monotonic());
+        assert_eq!(queue.stats().peak_depth, 2);
+        assert_eq!(queue.stats().backpressure_events, 1);
+    }
+
+    #[test]
+    fn video_timestamp_range_compares_against_audio_duration() {
+        let rate = RationalRate::new(25, 1).unwrap();
+        let timestamps = (0..53)
+            .map(|position| rate.frame_offset(position).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            max_video_timestamp_outside_audio_range(&timestamps, Duration::from_millis(2120)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            duration_abs_delta(Duration::from_millis(2120), Duration::from_millis(2100)),
+            Duration::from_millis(20)
+        );
     }
 
     #[test]

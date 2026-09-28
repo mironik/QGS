@@ -12,9 +12,11 @@ use qgs_linux::{
     send_message,
 };
 use qgs_media_runtime::{
-    classify_presentation, BoundedQueue, FrameIdentity as PlaybackFrameIdentity, PlaybackClock,
-    PlaybackConfig, PlaybackState, PresentationDecision, RationalRate, RealTimeClock,
-    TestPresentationSink,
+    audio_samples_for_duration, classify_presentation, duration_abs_delta,
+    max_video_timestamp_outside_audio_range, AudioFormat, AudioSampleFormat, AudioTimeline,
+    AudioTimingPacket, BoundedQueue, FrameIdentity as PlaybackFrameIdentity, OriginalAudioTrack,
+    PlaybackClock, PlaybackConfig, PlaybackState, PresentationDecision, RationalRate,
+    RealTimeClock, TestAudioSink, TestPresentationSink,
 };
 use qgs_mp4::{
     classify_video_track, nearest_random_access_before, MediaHealth, Mp4Source, Mp4TrackKind,
@@ -1242,6 +1244,7 @@ fn qnc_journalist_demo(
         .ok_or("proxy has no H.264 video track")?;
     let proxy_h264 = classify_video_track(proxy_video)?;
     let source_frames = proxy_video.samples.len();
+    let audio_report = build_original_audio_report(&original, proxy_video)?;
     let preview_frames =
         ProxyPlaybackProfile::Journalist50iPreview.selected_frame_count(source_frames);
     let intentional_skips = source_frames.saturating_sub(preview_frames);
@@ -1279,6 +1282,7 @@ fn qnc_journalist_demo(
         proxy_video.frame_rate.denominator
     );
     println!("Original edit units: {}", original.index.video.len());
+    print_original_audio_report(&audio_report);
     println!("Preview profile: journalist-50i-preview");
     println!("Broadcast target: 1080i50-compatible news preview");
     println!("Processing workload: 25 frame periods/s");
@@ -1306,6 +1310,30 @@ fn qnc_journalist_demo(
     println!("Lateness drops: 0");
     println!("Duplicated frames: 0");
     println!("GPU processing: completed for all selected preview frames");
+    println!("Audio source: original MXF");
+    println!("Video source: proxy MP4");
+    println!(
+        "A/V timing: original_audio={:.3}s proxy_video={:.3}s delta={:.3} ms",
+        audio_report.audio_duration.as_secs_f64(),
+        audio_report.proxy_video_duration.as_secs_f64(),
+        audio_report.duration_delta.as_secs_f64() * 1000.0
+    );
+    println!(
+        "Audio timeline: tracks={} total_channels={} sample_rate={} bit_depth={:?} bounded_queue_peak={} payload_extraction=not implemented",
+        audio_report.timeline.tracks.len(),
+        audio_report.total_channels,
+        audio_report
+            .uniform_sample_rate
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "mixed".to_string()),
+        audio_report.uniform_bit_depth,
+        audio_report.audio_queue_peak
+    );
+    println!(
+        "A/V clock foundation: max selected video timestamp outside audio range {:.3} ms, usable_as_future_master_clock={}",
+        audio_report.max_selected_video_outside_audio.as_secs_f64() * 1000.0,
+        yes_no(audio_report.usable_as_master_clock)
+    );
     println!("News cut:");
     println!(
         "  start: preview frame {} / source frame {} / {:.3}s",
@@ -1328,6 +1356,7 @@ fn qnc_journalist_demo(
     println!("  profile: journalist-50i-preview");
     println!("  source: Sony FX6 original/proxy pair");
     println!("  preview media: proxy MP4");
+    println!("  audio source: original MXF");
     println!("  finishing media: original MXF available");
     println!(
         "  selected range: {:.3}s..{:.3}s",
@@ -1337,6 +1366,218 @@ fn qnc_journalist_demo(
     println!("  target delivery: future milestone");
 
     Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct OriginalAudioReport {
+    timeline: AudioTimeline,
+    total_channels: u16,
+    uniform_sample_rate: Option<u32>,
+    uniform_bit_depth: Option<u8>,
+    audio_duration: Duration,
+    proxy_video_duration: Duration,
+    duration_delta: Duration,
+    audio_queue_capacity: usize,
+    audio_queue_peak: usize,
+    audio_queue_backpressure: u64,
+    audio_packets_recorded: usize,
+    audio_timestamps_monotonic: bool,
+    max_selected_video_outside_audio: Duration,
+    usable_as_master_clock: bool,
+}
+
+fn build_original_audio_report(
+    original: &MediaSource,
+    proxy_video: &qgs_mp4::Mp4VideoTrack,
+) -> Result<OriginalAudioReport, Box<dyn std::error::Error>> {
+    let edit_units = original
+        .duration
+        .ok_or("original MXF duration is missing")?;
+    let edit_rate = original
+        .edit_rate
+        .ok_or("original MXF edit rate is missing")?;
+    let audio_duration = duration_from_units(
+        edit_units,
+        u64::from(edit_rate.numerator),
+        u64::from(edit_rate.denominator),
+    )?;
+    let proxy_video_duration = duration_from_units(
+        proxy_video.duration_units,
+        u64::from(proxy_video.timescale),
+        1,
+    )?;
+    let duration_delta = duration_abs_delta(audio_duration, proxy_video_duration);
+
+    let audio_tracks = original
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Audio)
+        .collect::<Vec<_>>();
+    if audio_tracks.is_empty() {
+        return Err("original MXF has no audio tracks".into());
+    }
+
+    let mut tracks = Vec::with_capacity(audio_tracks.len());
+    let mut total_channels = 0_u16;
+    for (index, track) in audio_tracks.iter().enumerate() {
+        let audio = track
+            .audio
+            .as_ref()
+            .ok_or("original MXF audio track missing descriptor")?;
+        let sample_rate = rational_to_u32(audio.sample_rate.ok_or("audio sample rate missing")?)?;
+        let channels = audio.channels.ok_or("audio channel count missing")?;
+        let bit_depth = audio.bit_depth;
+        let sample_count = audio_samples_for_duration(audio_duration, sample_rate)?;
+        let format = AudioFormat {
+            sample_rate,
+            channels,
+            sample_format: bit_depth
+                .map(|bits_per_sample| AudioSampleFormat::PcmSignedInt { bits_per_sample })
+                .unwrap_or(AudioSampleFormat::Unknown),
+        }
+        .validate()?;
+        total_channels = total_channels
+            .checked_add(channels)
+            .ok_or("audio channel count overflow")?;
+        tracks.push(OriginalAudioTrack {
+            track_id: track.id.0,
+            channel_index: u16::try_from(index).map_err(|_| "audio channel index overflow")?,
+            format,
+            sample_count: Some(sample_count),
+            duration: audio_duration,
+        });
+    }
+    let timeline = AudioTimeline::new(tracks)?;
+    let uniform_sample_rate = uniform_value(
+        timeline
+            .tracks
+            .iter()
+            .map(|track| track.format.sample_rate)
+            .collect::<Vec<_>>()
+            .as_slice(),
+    );
+    let uniform_bit_depth = {
+        let depths = timeline
+            .tracks
+            .iter()
+            .map(|track| match track.format.sample_format {
+                AudioSampleFormat::PcmSignedInt { bits_per_sample } => Some(bits_per_sample),
+                AudioSampleFormat::Unknown => None,
+            })
+            .collect::<Vec<_>>();
+        uniform_value(depths.as_slice()).flatten()
+    };
+
+    let audio_queue_capacity = timeline.tracks.len().max(1);
+    let mut queue = BoundedQueue::new(audio_queue_capacity)?;
+    for track in &timeline.tracks {
+        let sample_count = track
+            .sample_count
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or("audio timing packet sample count overflow")?;
+        queue
+            .try_push(AudioTimingPacket {
+                track_id: track.track_id,
+                start: Duration::ZERO,
+                duration: track.duration,
+                sample_count,
+                has_payload: false,
+            })
+            .map_err(|_| "bounded audio timing queue unexpectedly full")?;
+    }
+    let stats = queue.stats();
+    let mut sink = TestAudioSink::new();
+    while let Some(packet) = queue.pop_front() {
+        sink.record(packet);
+    }
+
+    let preview_rate = RationalRate::new(25, 1)?;
+    let selected_frame_count =
+        ProxyPlaybackProfile::Journalist50iPreview.selected_frame_count(proxy_video.samples.len());
+    let selected_timestamps = (0..selected_frame_count)
+        .map(|position| preview_rate.frame_offset(position as u64))
+        .collect::<Result<Vec<_>, _>>()?;
+    let max_selected_video_outside_audio =
+        max_video_timestamp_outside_audio_range(&selected_timestamps, timeline.duration);
+
+    Ok(OriginalAudioReport {
+        timeline,
+        total_channels,
+        uniform_sample_rate,
+        uniform_bit_depth,
+        audio_duration,
+        proxy_video_duration,
+        duration_delta,
+        audio_queue_capacity,
+        audio_queue_peak: stats.peak_depth,
+        audio_queue_backpressure: stats.backpressure_events,
+        audio_packets_recorded: sink.packets().len(),
+        audio_timestamps_monotonic: sink.monotonic(),
+        max_selected_video_outside_audio,
+        usable_as_master_clock: max_selected_video_outside_audio == Duration::ZERO,
+    })
+}
+
+fn print_original_audio_report(report: &OriginalAudioReport) {
+    println!("Audio source: original MXF");
+    println!("Video preview source: proxy MP4");
+    println!("Proxy audio: diagnostic/fallback only");
+    println!(
+        "Original audio: tracks={} total_channels={} sample_rate={} bit_depth={:?}",
+        report.timeline.tracks.len(),
+        report.total_channels,
+        report
+            .uniform_sample_rate
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "mixed".to_string()),
+        report.uniform_bit_depth
+    );
+    println!(
+        "Original audio timeline: duration={:.3}s packets={} queue_capacity={} queue_peak={} backpressure={} monotonic={}",
+        report.audio_duration.as_secs_f64(),
+        report.audio_packets_recorded,
+        report.audio_queue_capacity,
+        report.audio_queue_peak,
+        report.audio_queue_backpressure,
+        yes_no(report.audio_timestamps_monotonic)
+    );
+    println!(
+        "Original/proxy A/V duration: original_audio={:.3}s proxy_video={:.3}s delta={:.3} ms",
+        report.audio_duration.as_secs_f64(),
+        report.proxy_video_duration.as_secs_f64(),
+        report.duration_delta.as_secs_f64() * 1000.0
+    );
+}
+
+fn duration_from_units(
+    units: u64,
+    units_per_second: u64,
+    second_scale: u64,
+) -> Result<Duration, Box<dyn std::error::Error>> {
+    if units_per_second == 0 || second_scale == 0 {
+        return Err("invalid duration rate".into());
+    }
+    let nanos = u128::from(units)
+        .checked_mul(u128::from(second_scale))
+        .and_then(|value| value.checked_mul(1_000_000_000))
+        .ok_or("duration overflow")?
+        / u128::from(units_per_second);
+    Ok(Duration::new(
+        u64::try_from(nanos / 1_000_000_000).map_err(|_| "duration seconds overflow")?,
+        u32::try_from(nanos % 1_000_000_000).map_err(|_| "duration nanos overflow")?,
+    ))
+}
+
+fn rational_to_u32(value: qgs_mxf::Rational) -> Result<u32, Box<dyn std::error::Error>> {
+    if value.denominator == 0 || value.numerator % value.denominator != 0 {
+        return Err("non-integer audio sample rate is not supported in Step 20A".into());
+    }
+    Ok(value.numerator / value.denominator)
+}
+
+fn uniform_value<T: Copy + Eq>(values: &[T]) -> Option<T> {
+    let first = *values.first()?;
+    values.iter().all(|value| *value == first).then_some(first)
 }
 
 fn proxy_throughput(
