@@ -31,8 +31,8 @@ VA NV12 surface
   -> compact qgs-vulkan NV12 processing
 ```
 
-Step 18A proved a stable journalist 25fps preview profile on Intel
-Haswell/i965:
+Step 18A proved a stable journalist 50i-compatible broadcast preview profile on
+Intel Haswell/i965:
 
 - 50p source proxy
 - every second source frame selected
@@ -46,7 +46,7 @@ Step 18B packages those pieces into a QNC-shaped flow:
 ```text
 camera media
   -> original/proxy association
-  -> journalist-25p preview profile
+  -> journalist-50i-preview profile
   -> frame/time selection accounting
   -> simple edit-decision summary
   -> export-plan stub
@@ -60,7 +60,7 @@ The demo performs:
 2. MXF inspection through qgs-mxf for the original media.
 3. MP4/proxy inspection through qgs-mp4.
 4. H.264 classification through qgs-codec-h264.
-5. The Step 18A journalist-25p preview acceptance path.
+5. The Step 18A journalist-50i-preview acceptance path.
 6. A deterministic news cut from 0.400 s to 1.600 s.
 7. A structured export-plan stub.
 
@@ -79,7 +79,10 @@ Input:
 
 Preview profile:
 
-- `journalist-25p`
+- `journalist-50i-preview`
+- broadcast target: 1080i50-compatible news preview
+- processing workload: 25 frame periods/s
+- true interlaced output: not implemented in this milestone
 - selected presentation frames: 53
 - intentionally skipped source frames: 53
 - presentation clock: 25/1 fps
@@ -138,7 +141,7 @@ render a file.
 The demo prints:
 
 - status: planned only, not rendered
-- profile: broadcast-news-25fps-preview
+- profile: journalist-50i-preview
 - source: Sony FX6 original/proxy pair
 - preview media: proxy MP4
 - finishing media: original MXF available
@@ -155,7 +158,7 @@ The demo supports the QNC Journalist value proposition by showing:
 - camera-original media remains available for finishing
 - camera proxy media can drive responsive preview
 - preview playback is bounded and deterministic
-- intentional 50p -> 25fps profile skips are explicit
+- intentional 50p -> 50i-compatible preview skips are explicit
 - late drops and duplicates are reported separately
 - a simple news cut can be summarized in source-frame and preview-frame terms
 

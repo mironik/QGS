@@ -1242,7 +1242,8 @@ fn qnc_journalist_demo(
         .ok_or("proxy has no H.264 video track")?;
     let proxy_h264 = classify_video_track(proxy_video)?;
     let source_frames = proxy_video.samples.len();
-    let preview_frames = ProxyPlaybackProfile::Journalist25p.selected_frame_count(source_frames);
+    let preview_frames =
+        ProxyPlaybackProfile::Journalist50iPreview.selected_frame_count(source_frames);
     let intentional_skips = source_frames.saturating_sub(preview_frames);
     let preview_rate = RationalRate::new(25, 1)?;
     let cut_start_preview = 10_u64;
@@ -1278,7 +1279,10 @@ fn qnc_journalist_demo(
         proxy_video.frame_rate.denominator
     );
     println!("Original edit units: {}", original.index.video.len());
-    println!("Preview profile: journalist-25p");
+    println!("Preview profile: journalist-50i-preview");
+    println!("Broadcast target: 1080i50-compatible news preview");
+    println!("Processing workload: 25 frame periods/s");
+    println!("True interlaced output: not implemented in this milestone");
     println!("Source frames: {source_frames}");
     println!("Preview frames: {preview_frames}");
     println!("Intentional profile skips: {intentional_skips}");
@@ -1287,12 +1291,15 @@ fn qnc_journalist_demo(
     proxy_playback(
         original_path,
         proxy_path,
-        ProxyPlaybackProfile::Journalist25p,
+        ProxyPlaybackProfile::Journalist50iPreview,
     )?;
 
     println!("QNC Journalist Demo Summary");
     println!("---------------------------");
-    println!("Preview profile: broadcast-news-25fps-preview");
+    println!("Preview profile: journalist-50i-preview");
+    println!("Broadcast target: 1080i50-compatible news preview");
+    println!("Processing workload: 25 frame periods/s");
+    println!("True interlaced output: not implemented in this milestone");
     println!("Source frames: {source_frames}");
     println!("Preview frames: {preview_frames}");
     println!("Intentional profile skips: {intentional_skips}");
@@ -1318,7 +1325,7 @@ fn qnc_journalist_demo(
     println!("  estimated duration: {:.3}s", cut_duration.as_secs_f64());
     println!("QNC export plan:");
     println!("  status: planned only, not rendered");
-    println!("  profile: broadcast-news-25fps-preview");
+    println!("  profile: journalist-50i-preview");
     println!("  source: Sony FX6 original/proxy pair");
     println!("  preview media: proxy MP4");
     println!("  finishing media: original MXF available");
@@ -2145,10 +2152,12 @@ fn proxy_playback(
     if counts.dropped != 0 || counts.duplicated != 0 {
         return Err("real-time playback produced drops or duplicates".into());
     }
-    if profile == ProxyPlaybackProfile::Journalist25p
+    if profile == ProxyPlaybackProfile::Journalist50iPreview
         && intentionally_skipped_source_frames != frame_count.saturating_sub(selected_frame_count)
     {
-        return Err("journalist-25p profile skipped an unexpected number of source frames".into());
+        return Err(
+            "journalist-50i-preview profile skipped an unexpected number of source frames".into(),
+        );
     }
 
     let selected = selected_proxy_ordinals(frame_count);
@@ -2237,14 +2246,14 @@ struct GpuPendingPlaybackFrame {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProxyPlaybackProfile {
     SourceRate,
-    Journalist25p,
+    Journalist50iPreview,
 }
 
 impl ProxyPlaybackProfile {
     fn parse(value: &std::ffi::OsStr) -> Result<Self, Box<dyn std::error::Error>> {
         match value.to_str() {
             Some("source-rate") => Ok(Self::SourceRate),
-            Some("journalist-25p") => Ok(Self::Journalist25p),
+            Some("journalist-50i-preview") => Ok(Self::Journalist50iPreview),
             Some(other) => Err(format!("unsupported proxy playback profile: {other}").into()),
             None => Err("proxy playback profile must be valid UTF-8".into()),
         }
@@ -2253,14 +2262,16 @@ impl ProxyPlaybackProfile {
     fn label(self) -> &'static str {
         match self {
             Self::SourceRate => "source-rate",
-            Self::Journalist25p => "journalist-25p",
+            Self::Journalist50iPreview => "journalist-50i-preview",
         }
     }
 
     fn description(self) -> &'static str {
         match self {
             Self::SourceRate => "source-rate realtime proxy playback",
-            Self::Journalist25p => "25fps broadcast preview over 50p source",
+            Self::Journalist50iPreview => {
+                "50i-compatible broadcast journalist preview over 50p source"
+            }
         }
     }
 
@@ -2270,14 +2281,14 @@ impl ProxyPlaybackProfile {
     ) -> Result<RationalRate, Box<dyn std::error::Error>> {
         match self {
             Self::SourceRate => Ok(source_rate),
-            Self::Journalist25p => Ok(RationalRate::new(25, 1)?),
+            Self::Journalist50iPreview => Ok(RationalRate::new(25, 1)?),
         }
     }
 
     fn presentation_position(self, source_position: u64) -> Option<u64> {
         match self {
             Self::SourceRate => Some(source_position),
-            Self::Journalist25p => source_position
+            Self::Journalist50iPreview => source_position
                 .is_multiple_of(2)
                 .then_some(source_position / 2),
         }
@@ -2286,7 +2297,7 @@ impl ProxyPlaybackProfile {
     fn selected_frame_count(self, source_frame_count: usize) -> usize {
         match self {
             Self::SourceRate => source_frame_count,
-            Self::Journalist25p => source_frame_count.div_ceil(2),
+            Self::Journalist50iPreview => source_frame_count.div_ceil(2),
         }
     }
 }

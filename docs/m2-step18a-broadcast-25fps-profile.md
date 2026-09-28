@@ -1,12 +1,13 @@
-# QGS M2 Step 18A Broadcast 25fps Journalist Profile
+# QGS M2 Step 18A Broadcast 50i Journalist Preview Profile
 
 M2 Step 18A adds an explicit broadcast preview profile for journalist/news
-workflows that need a lower presentation workload than full 1080p50.
+workflows targeting 1080i50-style delivery while using the existing bounded
+fallback path.
 
 This is not a full 50i renderer. It does not implement field rendering,
 field cadence, deinterlacing, or interlaced output. It is a conservative
-25fps presentation profile over the existing progressive Sony FX6 sample 002
-proxy path.
+50i-compatible broadcast journalist preview over the existing progressive Sony
+FX6 sample 002 proxy path. The processing workload is 25 frame periods/s.
 
 ## Why This Profile Exists
 
@@ -27,16 +28,16 @@ Haswell/i965 because the safe VA -> CPU bridge has almost no headroom at
 50 frames/s.
 
 Many TV/news delivery workflows still target 1080i50, which has 50 fields/s
-but 25 frames/s. Step 18A demonstrates a practical journalist preview profile
-where the presentation workload is 25 frames/s while using the same proven
-bounded fallback path.
+but 25 frame periods/s. Step 18A demonstrates a practical
+50i-compatible journalist preview profile where the processing workload is 25
+frame periods/s while using the same proven bounded fallback path.
 
 ## Profile Semantics
 
 The profile is selected in qgs-test with:
 
 ```text
---proxy-playback-profile journalist-25p
+--proxy-playback-profile journalist-50i-preview
 ```
 
 The normal source-rate path remains available as:
@@ -45,7 +46,7 @@ The normal source-rate path remains available as:
 --proxy-playback-profile source-rate
 ```
 
-For `journalist-25p`:
+For `journalist-50i-preview`:
 
 - all 106 H.264 access units are submitted to the VA decoder
 - all 106 decoder outputs are produced
@@ -55,8 +56,9 @@ For `journalist-25p`:
 - the presentation clock runs at 25/1 fps
 - the selected 53 presentation frames cover the same 2.12 s source duration
 
-This is a 25fps broadcast preview / 50i-compatible presentation profile. It is
-not full interlaced output.
+This is a 50i-compatible broadcast journalist preview profile. It uses a 25
+frame-period/s progressive processing workload as a conservative preview
+representation for 50i news workflows. It is not full interlaced output.
 
 ## Measured Result
 
@@ -75,7 +77,7 @@ Source properties:
 Command:
 
 ```text
-cargo run -q -p qgs-test -- --proxy-playback-profile journalist-25p --proxy-playback "Sony FX6 sample 002" "Sony FX6 sample 002 proxy"
+cargo run -q -p qgs-test -- --proxy-playback-profile journalist-50i-preview --proxy-playback "Sony FX6 sample 002" "Sony FX6 sample 002 proxy"
 ```
 
 Observed playback result:
@@ -121,9 +123,10 @@ intentional source-frame skips are profile behavior, not playback failure.
 
 ## Interpretation
 
-The journalist 25fps profile demonstrates that the existing bounded CPU-bridge
-fallback can support a stable news-preview workload on Intel Haswell/i965 when
-the presentation workload is 25 frames/s rather than 50 frames/s.
+The journalist 50i-compatible preview profile demonstrates that the existing
+bounded CPU-bridge fallback can support a stable news-preview workload on Intel
+Haswell/i965 when the processing workload is 25 frame periods/s rather than
+full 50 progressive frames/s.
 
 This does not change the Step 17 conclusion. The CPU bridge remains a
 compatibility fallback and should not be treated as the production full-50p
