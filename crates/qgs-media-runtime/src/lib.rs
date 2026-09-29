@@ -1160,6 +1160,8 @@ pub enum QgsPreparedPayloadKind {
 pub enum QgsBufferDiscardReason {
     BehindBackwardWindow,
     LimitPressure,
+    SourceClosed,
+    SourceUnloaded,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1255,6 +1257,10 @@ pub enum QgsTickPreparationEvent {
         frame: u64,
         reason: QgsBufferDiscardReason,
     },
+    PreparedStateDiscarded {
+        frames: Vec<u64>,
+        reason: QgsBufferDiscardReason,
+    },
     BufferLimitReached {
         max_prepared_frames: usize,
     },
@@ -1326,8 +1332,24 @@ impl QgsPlayoutBufferState {
         self.slots.values().cloned().collect()
     }
 
+    pub fn prepared_frame_count(&self) -> usize {
+        self.slots.len()
+    }
+
     pub fn events(&self) -> &[QgsTickPreparationEvent] {
         &self.events
+    }
+
+    pub fn discard_all(&mut self, reason: QgsBufferDiscardReason) -> Vec<u64> {
+        let frames = self.slots.keys().copied().collect::<Vec<_>>();
+        self.slots.clear();
+        self.last_accounted_frame = None;
+        self.events
+            .push(QgsTickPreparationEvent::PreparedStateDiscarded {
+                frames: frames.clone(),
+                reason,
+            });
+        frames
     }
 
     pub fn tick_prepare(
@@ -1674,9 +1696,354 @@ pub enum QgsTransportEvent {
     },
     TransportPaused,
     TransportStopped,
+    ActiveSourceCleared {
+        source_id: String,
+        revision: QgsTransportSourceRevision,
+    },
+    SourceRevisionInvalidated {
+        source_id: String,
+        revision: QgsTransportSourceRevision,
+    },
+    SourceUnloaded {
+        source_id: String,
+        revision: QgsTransportSourceRevision,
+    },
+    PreparedStateDiscarded {
+        frames: usize,
+    },
     TransportValidationFailed {
         reason: &'static str,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsRuntimeEventSequence(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsRuntimeEventGeneration(pub u64);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsRuntimeEventSource {
+    pub source_id: String,
+    pub revision: QgsTransportSourceRevision,
+}
+
+impl QgsRuntimeEventSource {
+    pub fn exposes_private_path(&self) -> bool {
+        self.source_id.starts_with('/') || self.source_id.starts_with("file:")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsRuntimeEventKind {
+    RuntimeEngineCreated,
+    SourceLoaded,
+    SourcePreloaded,
+    ActiveSourceChanged,
+    ActiveRangeSet,
+    CueCompleted,
+    PreparedAnchorReady,
+    PlayReadinessChanged,
+    TransportStarted,
+    TransportPaused,
+    TransportStopped,
+    TickPreparationCompleted,
+    PreparedStateDiscarded,
+    ActiveSourceCleared,
+    SourceRevisionInvalidated,
+    SourceUnloaded,
+    TransportCommandRejected,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsRuntimeEventPayload {
+    pub summary: String,
+    pub evidence_level: Option<&'static str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsRuntimeEventEnvelope {
+    pub sequence: QgsRuntimeEventSequence,
+    pub generation: QgsRuntimeEventGeneration,
+    pub source: Option<QgsRuntimeEventSource>,
+    pub kind: QgsRuntimeEventKind,
+    pub payload: QgsRuntimeEventPayload,
+}
+
+impl QgsRuntimeEventEnvelope {
+    pub fn exposes_private_path(&self) -> bool {
+        self.source
+            .as_ref()
+            .is_some_and(QgsRuntimeEventSource::exposes_private_path)
+            || self.payload.summary.starts_with('/')
+            || self.payload.summary.contains("file:")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsRuntimeEventLog {
+    next_sequence: u64,
+    pub generation: QgsRuntimeEventGeneration,
+    envelopes: Vec<QgsRuntimeEventEnvelope>,
+}
+
+impl QgsRuntimeEventLog {
+    pub fn new() -> Self {
+        Self {
+            next_sequence: 0,
+            generation: QgsRuntimeEventGeneration(0),
+            envelopes: Vec::new(),
+        }
+    }
+
+    pub fn increment_generation(&mut self) -> QgsRuntimeEventGeneration {
+        self.generation.0 = self.generation.0.saturating_add(1);
+        self.generation
+    }
+
+    pub fn push(
+        &mut self,
+        kind: QgsRuntimeEventKind,
+        source: Option<QgsRuntimeEventSource>,
+        summary: impl Into<String>,
+    ) -> QgsRuntimeEventEnvelope {
+        let envelope = QgsRuntimeEventEnvelope {
+            sequence: QgsRuntimeEventSequence(self.next_sequence),
+            generation: self.generation,
+            source,
+            kind,
+            payload: QgsRuntimeEventPayload {
+                summary: summary.into(),
+                evidence_level: None,
+            },
+        };
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.envelopes.push(envelope.clone());
+        envelope
+    }
+
+    pub fn push_transport_event(&mut self, event: &QgsTransportEvent) -> QgsRuntimeEventEnvelope {
+        let (kind, source, summary) = runtime_payload_from_transport_event(event);
+        self.push(kind, source, summary)
+    }
+
+    pub fn push_tick_event(&mut self, event: &QgsTickPreparationEvent) -> QgsRuntimeEventEnvelope {
+        let (kind, summary) = runtime_payload_from_tick_event(event);
+        self.push(kind, None, summary)
+    }
+
+    pub fn envelopes(&self) -> &[QgsRuntimeEventEnvelope] {
+        &self.envelopes
+    }
+
+    pub fn sequence_is_monotonic(&self) -> bool {
+        self.envelopes
+            .iter()
+            .enumerate()
+            .all(|(index, event)| event.sequence.0 == u64::try_from(index).unwrap_or(u64::MAX))
+    }
+}
+
+impl Default for QgsRuntimeEventLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn runtime_payload_from_transport_event(
+    event: &QgsTransportEvent,
+) -> (QgsRuntimeEventKind, Option<QgsRuntimeEventSource>, String) {
+    match event {
+        QgsTransportEvent::TransportEngineCreated => (
+            QgsRuntimeEventKind::RuntimeEngineCreated,
+            None,
+            "transport engine created".to_string(),
+        ),
+        QgsTransportEvent::SourceLoaded {
+            source_id,
+            revision,
+        } => (
+            QgsRuntimeEventKind::SourceLoaded,
+            Some(QgsRuntimeEventSource {
+                source_id: source_id.clone(),
+                revision: *revision,
+            }),
+            format!("source loaded revision={}", revision.0),
+        ),
+        QgsTransportEvent::SourcePreloaded {
+            source_id,
+            revision,
+        } => (
+            QgsRuntimeEventKind::SourcePreloaded,
+            Some(QgsRuntimeEventSource {
+                source_id: source_id.clone(),
+                revision: *revision,
+            }),
+            format!("source preloaded revision={}", revision.0),
+        ),
+        QgsTransportEvent::ActiveSourceChanged {
+            source_id,
+            revision,
+        } => (
+            QgsRuntimeEventKind::ActiveSourceChanged,
+            source_id
+                .as_ref()
+                .zip(revision.as_ref())
+                .map(|(source_id, revision)| QgsRuntimeEventSource {
+                    source_id: source_id.clone(),
+                    revision: *revision,
+                }),
+            "active source changed".to_string(),
+        ),
+        QgsTransportEvent::ActiveRangeSet {
+            start_frame,
+            end_frame,
+            start_sample,
+            end_sample,
+        } => (
+            QgsRuntimeEventKind::ActiveRangeSet,
+            None,
+            format!(
+                "active range frames=[{start_frame}..{end_frame}) samples=[{start_sample}..{end_sample})"
+            ),
+        ),
+        QgsTransportEvent::CueCompleted { frame, sample } => (
+            QgsRuntimeEventKind::CueCompleted,
+            None,
+            format!("cue completed frame={frame} sample={sample}"),
+        ),
+        QgsTransportEvent::PreparedAnchorReady { frame, revision } => (
+            QgsRuntimeEventKind::PreparedAnchorReady,
+            None,
+            format!("prepared anchor frame={frame} revision={}", revision.0),
+        ),
+        QgsTransportEvent::PlayReadinessChanged { ready } => (
+            QgsRuntimeEventKind::PlayReadinessChanged,
+            None,
+            format!("play_ready={ready}"),
+        ),
+        QgsTransportEvent::TransportStarted { frame } => (
+            QgsRuntimeEventKind::TransportStarted,
+            None,
+            format!("transport started frame={frame}"),
+        ),
+        QgsTransportEvent::ActiveSourceCleared {
+            source_id,
+            revision,
+        } => (
+            QgsRuntimeEventKind::ActiveSourceCleared,
+            Some(QgsRuntimeEventSource {
+                source_id: source_id.clone(),
+                revision: *revision,
+            }),
+            format!("active source cleared revision={}", revision.0),
+        ),
+        QgsTransportEvent::SourceRevisionInvalidated {
+            source_id,
+            revision,
+        } => (
+            QgsRuntimeEventKind::SourceRevisionInvalidated,
+            Some(QgsRuntimeEventSource {
+                source_id: source_id.clone(),
+                revision: *revision,
+            }),
+            format!("source revision invalidated revision={}", revision.0),
+        ),
+        QgsTransportEvent::SourceUnloaded {
+            source_id,
+            revision,
+        } => (
+            QgsRuntimeEventKind::SourceUnloaded,
+            Some(QgsRuntimeEventSource {
+                source_id: source_id.clone(),
+                revision: *revision,
+            }),
+            format!("source unloaded revision={}", revision.0),
+        ),
+        QgsTransportEvent::PreparedStateDiscarded { frames } => (
+            QgsRuntimeEventKind::PreparedStateDiscarded,
+            None,
+            format!("prepared state discarded frames={frames}"),
+        ),
+        QgsTransportEvent::TransportPlayRejected { reason }
+        | QgsTransportEvent::TransportValidationFailed { reason } => (
+            QgsRuntimeEventKind::TransportCommandRejected,
+            None,
+            format!("command rejected reason={reason}"),
+        ),
+        QgsTransportEvent::TransportPaused => (
+            QgsRuntimeEventKind::TransportPaused,
+            None,
+            "transport paused".to_string(),
+        ),
+        QgsTransportEvent::TransportStopped => (
+            QgsRuntimeEventKind::TransportStopped,
+            None,
+            "transport stopped".to_string(),
+        ),
+    }
+}
+
+fn runtime_payload_from_tick_event(
+    event: &QgsTickPreparationEvent,
+) -> (QgsRuntimeEventKind, String) {
+    match event {
+        QgsTickPreparationEvent::TickPreparationCompleted { prepared_frames } => (
+            QgsRuntimeEventKind::TickPreparationCompleted,
+            format!("tick preparation completed prepared_frames={prepared_frames}"),
+        ),
+        QgsTickPreparationEvent::PreparedStateDiscarded { frames, reason } => (
+            QgsRuntimeEventKind::PreparedStateDiscarded,
+            format!("prepared state discarded frames={frames:?} reason={reason:?}"),
+        ),
+        QgsTickPreparationEvent::TickValidationFailed { reason } => (
+            QgsRuntimeEventKind::TransportCommandRejected,
+            format!("tick validation failed reason={reason}"),
+        ),
+        other => (
+            QgsRuntimeEventKind::TickPreparationCompleted,
+            format!("tick event {other:?}"),
+        ),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsSourceUnloadResult {
+    pub source_id: String,
+    pub revision: QgsTransportSourceRevision,
+    pub unloaded: bool,
+    pub was_active: bool,
+    pub revision_invalidated: bool,
+    pub already_missing_or_invalid: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsSourceCloseResult {
+    pub source_id: String,
+    pub revision: QgsTransportSourceRevision,
+    pub active_source_cleared: bool,
+    pub source_preserved_loaded: bool,
+    pub play_ready: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsSourceRevisionInvalidation {
+    pub revision: QgsTransportSourceRevision,
+    pub invalidated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsRuntimeLifecycleSnapshot {
+    pub active_source: Option<QgsTransportSourceHandle>,
+    pub play_ready: bool,
+    pub prepared_buffer_frames: usize,
+    pub generation: QgsRuntimeEventGeneration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsRuntimeCommandOutcome {
+    pub accepted: bool,
+    pub reason: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1958,6 +2325,121 @@ impl QgsTransportEngine {
         self.play_ready = false;
         self.events.push(QgsTransportEvent::TransportStopped);
         Ok(())
+    }
+
+    pub fn close_active_source(&mut self) -> Result<QgsSourceCloseResult, PlaybackError> {
+        let handle = self
+            .active_source()
+            .cloned()
+            .ok_or(PlaybackError::InvalidRuntimeTransition)?;
+        self.clear_active_state_for_handle(&handle);
+        self.status = if self.sources.is_empty() {
+            QgsTransportStatus::Empty
+        } else {
+            QgsTransportStatus::Loaded
+        };
+        Ok(QgsSourceCloseResult {
+            source_id: handle.source_id,
+            revision: handle.revision,
+            active_source_cleared: true,
+            source_preserved_loaded: true,
+            play_ready: self.play_ready,
+        })
+    }
+
+    pub fn clear_active_source(&mut self) -> Result<QgsSourceCloseResult, PlaybackError> {
+        self.close_active_source()
+    }
+
+    pub fn unload_source(&mut self, handle: &QgsTransportSourceHandle) -> QgsSourceUnloadResult {
+        let Some(state) = self.sources.get(&handle.source_id).cloned() else {
+            self.events
+                .push(QgsTransportEvent::TransportValidationFailed {
+                    reason: "source already unloaded or invalid",
+                });
+            return QgsSourceUnloadResult {
+                source_id: handle.source_id.clone(),
+                revision: handle.revision,
+                unloaded: false,
+                was_active: false,
+                revision_invalidated: false,
+                already_missing_or_invalid: true,
+            };
+        };
+        if state.handle.revision != handle.revision {
+            self.events
+                .push(QgsTransportEvent::TransportValidationFailed {
+                    reason: "source revision mismatch",
+                });
+            return QgsSourceUnloadResult {
+                source_id: handle.source_id.clone(),
+                revision: handle.revision,
+                unloaded: false,
+                was_active: false,
+                revision_invalidated: false,
+                already_missing_or_invalid: true,
+            };
+        }
+        let was_active = self
+            .active_source_id
+            .as_ref()
+            .is_some_and(|source_id| source_id == &handle.source_id);
+        if was_active {
+            self.clear_active_state_for_handle(handle);
+        }
+        self.sources.remove(&handle.source_id);
+        self.events
+            .push(QgsTransportEvent::SourceRevisionInvalidated {
+                source_id: handle.source_id.clone(),
+                revision: handle.revision,
+            });
+        self.events.push(QgsTransportEvent::SourceUnloaded {
+            source_id: handle.source_id.clone(),
+            revision: handle.revision,
+        });
+        self.status = if self.sources.is_empty() {
+            QgsTransportStatus::Empty
+        } else {
+            QgsTransportStatus::Loaded
+        };
+        QgsSourceUnloadResult {
+            source_id: handle.source_id.clone(),
+            revision: handle.revision,
+            unloaded: true,
+            was_active,
+            revision_invalidated: true,
+            already_missing_or_invalid: false,
+        }
+    }
+
+    pub fn invalidate_source_revision(
+        &mut self,
+        handle: &QgsTransportSourceHandle,
+    ) -> QgsSourceRevisionInvalidation {
+        let result = self.unload_source(handle);
+        QgsSourceRevisionInvalidation {
+            revision: handle.revision,
+            invalidated: result.revision_invalidated,
+        }
+    }
+
+    pub fn record_prepared_state_discarded(&mut self, frames: usize) {
+        self.events
+            .push(QgsTransportEvent::PreparedStateDiscarded { frames });
+    }
+
+    fn clear_active_state_for_handle(&mut self, handle: &QgsTransportSourceHandle) {
+        self.active_source_id = None;
+        self.active_range = None;
+        self.cue = None;
+        self.prepared_anchor = None;
+        self.play_ready = false;
+        self.events.push(QgsTransportEvent::ActiveSourceCleared {
+            source_id: handle.source_id.clone(),
+            revision: handle.revision,
+        });
+        self.events
+            .push(QgsTransportEvent::PlayReadinessChanged { ready: false });
     }
 
     pub fn active_source(&self) -> Option<&QgsTransportSourceHandle> {
@@ -5596,6 +6078,180 @@ mod tests {
             snapshot.no_work_on_play,
             QgsTransportNoWorkOnPlayCounters::default()
         );
+    }
+
+    fn sample_ready_transport_engine() -> (QgsTransportEngine, QgsTransportSourceHandle) {
+        let mut engine = QgsTransportEngine::new();
+        let handle = engine.load_source(&sample_qgs_input_plan()).unwrap();
+        engine.preload_source(&handle).unwrap();
+        engine.set_active_source(&handle).unwrap();
+        engine.set_active_range_frames(0, 50).unwrap();
+        engine.cue_frame(0).unwrap();
+        engine.prepare_anchor().unwrap();
+        assert!(engine.evaluate_play_ready());
+        (engine, handle)
+    }
+
+    #[test]
+    fn qgs_transport_unloads_inactive_source_and_invalidates_revision() {
+        let mut engine = QgsTransportEngine::new();
+        let handle = engine.load_source(&sample_qgs_input_plan()).unwrap();
+        let result = engine.unload_source(&handle);
+        assert!(result.unloaded);
+        assert!(!result.was_active);
+        assert!(result.revision_invalidated);
+        assert_eq!(
+            engine.preload_source(&handle),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+        assert!(engine.snapshot().active_source.is_none());
+    }
+
+    #[test]
+    fn qgs_transport_unloads_active_source_and_clears_state() {
+        let (mut engine, handle) = sample_ready_transport_engine();
+        assert!(engine.snapshot().play_ready);
+        let result = engine.unload_source(&handle);
+        assert!(result.unloaded);
+        assert!(result.was_active);
+        let snapshot = engine.snapshot();
+        assert!(snapshot.active_source.is_none());
+        assert!(snapshot.active_range.is_none());
+        assert!(snapshot.cue.is_none());
+        assert!(snapshot.prepared_anchor.is_none());
+        assert!(!snapshot.play_ready);
+        assert_eq!(snapshot.status, QgsTransportStatus::Empty);
+        assert!(snapshot
+            .events
+            .contains(&QgsTransportEvent::ActiveSourceCleared {
+                source_id: handle.source_id.clone(),
+                revision: handle.revision,
+            }));
+        assert!(snapshot
+            .events
+            .contains(&QgsTransportEvent::PlayReadinessChanged { ready: false }));
+        assert!(snapshot
+            .events
+            .contains(&QgsTransportEvent::SourceRevisionInvalidated {
+                source_id: handle.source_id.clone(),
+                revision: handle.revision,
+            }));
+    }
+
+    #[test]
+    fn qgs_transport_close_active_source_preserves_loaded_source() {
+        let (mut engine, handle) = sample_ready_transport_engine();
+        let result = engine.close_active_source().unwrap();
+        assert!(result.active_source_cleared);
+        assert!(result.source_preserved_loaded);
+        assert!(!result.play_ready);
+        assert!(engine.snapshot().active_source.is_none());
+        engine.set_active_source(&handle).unwrap();
+        assert!(engine.snapshot().active_source.is_some());
+    }
+
+    #[test]
+    fn qgs_transport_rejects_stale_handle_after_unload() {
+        let (mut engine, handle) = sample_ready_transport_engine();
+        engine.unload_source(&handle);
+        assert_eq!(
+            engine.set_active_source(&handle),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+        assert_eq!(
+            engine.preload_source(&handle),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+        assert_eq!(
+            engine.cue_frame(0),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+        assert_eq!(
+            engine.prepare_anchor(),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+        let stale_unload = engine.unload_source(&handle);
+        assert!(!stale_unload.unloaded);
+        assert!(stale_unload.already_missing_or_invalid);
+    }
+
+    #[test]
+    fn qgs_playout_buffer_discards_all_on_source_unload() {
+        let (mut buffer, clock) = sample_qgs_playout_buffer();
+        buffer
+            .tick_prepare(
+                clock,
+                QgsTickPreparationInput {
+                    carrier_frame: 0,
+                    elapsed: Duration::ZERO,
+                    max_due_frames: 8,
+                },
+            )
+            .unwrap();
+        assert_eq!(buffer.prepared_frame_count(), 6);
+        let discarded = buffer.discard_all(QgsBufferDiscardReason::SourceUnloaded);
+        assert_eq!(discarded, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(buffer.prepared_frame_count(), 0);
+        assert!(buffer
+            .events()
+            .contains(&QgsTickPreparationEvent::PreparedStateDiscarded {
+                frames: vec![0, 1, 2, 3, 4, 5],
+                reason: QgsBufferDiscardReason::SourceUnloaded,
+            }));
+    }
+
+    #[test]
+    fn qgs_runtime_event_envelope_sequence_is_monotonic_and_public() {
+        let (mut engine, handle) = sample_ready_transport_engine();
+        let mut log = QgsRuntimeEventLog::new();
+        for event in &engine.snapshot().events {
+            log.push_transport_event(event);
+        }
+        let previous_count = log.envelopes().len();
+        log.increment_generation();
+        engine.unload_source(&handle);
+        for event in engine.snapshot().events.iter().skip(previous_count) {
+            log.push_transport_event(event);
+        }
+        assert!(log.sequence_is_monotonic());
+        assert!(log
+            .envelopes()
+            .iter()
+            .all(|event| !event.exposes_private_path()));
+        assert!(log
+            .envelopes()
+            .iter()
+            .any(|event| event.kind == QgsRuntimeEventKind::SourceUnloaded));
+        assert!(log
+            .envelopes()
+            .iter()
+            .any(|event| event.generation == QgsRuntimeEventGeneration(1)));
+    }
+
+    #[test]
+    fn qgs_runtime_event_envelope_wraps_tick_discard_without_verified_claims() {
+        let (mut buffer, clock) = sample_qgs_playout_buffer();
+        buffer
+            .tick_prepare(
+                clock,
+                QgsTickPreparationInput {
+                    carrier_frame: 0,
+                    elapsed: Duration::ZERO,
+                    max_due_frames: 8,
+                },
+            )
+            .unwrap();
+        buffer.discard_all(QgsBufferDiscardReason::SourceClosed);
+        let mut log = QgsRuntimeEventLog::new();
+        for event in buffer.events() {
+            log.push_tick_event(event);
+        }
+        let transcript = format!("{:?}", log.envelopes());
+        assert!(log.sequence_is_monotonic());
+        assert!(transcript.contains("PreparedStateDiscarded"));
+        assert!(!transcript.contains("FramePresented"));
+        assert!(!transcript.contains("RealtimeVerified"));
+        assert!(!transcript.contains("AudioDeviceVerified"));
     }
 
     #[test]
