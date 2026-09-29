@@ -42,7 +42,8 @@ use qgs_media_runtime::{
     BroadcastVideoPayloadFormat, BroadcastVideoPayloadKind, BroadcastVideoPayloadReference,
     BroadcastVideoSourceMode, FrameIdentity as PlaybackFrameIdentity, OriginalAudioTrack,
     PcmAudioBlock, PcmAudioBlockLayout, PcmAudioPacket, PcmEndian, PcmSampleFormat, PlaybackClock,
-    PlaybackConfig, PlaybackState, PresentationDecision, QgsAudioRepresentation, QgsInputPlan,
+    PlaybackConfig, PlaybackState, PresentationDecision, QgsActiveRangeTiming,
+    QgsAudioRepresentation, QgsFrameClock, QgsFrameClockMode, QgsFrameClockRate, QgsInputPlan,
     QgsInputPlanQueueRequirements, QgsOriginalProxyAssociationStatus, QgsPlaybackRepresentation,
     QgsPreparedAudioChannel, QgsPreparedAudioLayout, QgsPreparedInputDescriptor,
     QgsPreparedMediaBinding, QgsPreparedSourceIdentity, QgsPreparedStreamLayout,
@@ -132,6 +133,7 @@ const PIPEWIRE_AUDIO_DISCRETE_4MONO_ARG: &str = "--pipewire-audio-discrete-4mono
 const QNC_PREPARED_INPUT_DESCRIPTOR_ARG: &str = "--qnc-prepared-input-descriptor";
 const QGS_INPUT_PLAN_ARG: &str = "--qgs-input-plan";
 const QGS_TRANSPORT_ENGINE_PARITY_ARG: &str = "--qgs-transport-engine-parity";
+const QGS_FRAME_CLOCK_PARITY_ARG: &str = "--qgs-frame-clock-parity";
 const WRITE_DIAGNOSTIC_WAV_ARG: &str = "--write-diagnostic-wav";
 const AUDIO_AUDIT_START_MS_ARG: &str = "--start-ms";
 const AUDIO_AUDIT_DURATION_MS_ARG: &str = "--duration-ms";
@@ -263,6 +265,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.qgs_transport_engine_parity_paths {
         return qgs_transport_engine_parity_report(&original, &proxy);
+    }
+    if let Some((original, proxy)) = args.qgs_frame_clock_parity_paths {
+        return qgs_frame_clock_parity_report(&original, &proxy);
     }
     if let Some(path) = args.linux_audio_device_probe_path {
         return linux_audio_device_probe(&path);
@@ -1914,6 +1919,134 @@ fn qgs_transport_event_label(event: &QgsTransportEvent) -> String {
         QgsTransportEvent::TransportValidationFailed { reason } => {
             format!("TransportValidationFailed reason={reason}")
         }
+    }
+}
+
+fn qgs_frame_clock_parity_report(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let descriptor = build_qnc_prepared_input_descriptor(original_path, proxy_path)?;
+    descriptor.validate()?;
+    let plan =
+        QgsInputPlan::from_descriptor(&descriptor, default_qgs_input_plan_queue_requirements())?;
+    let active_duration = Duration::from_millis(1_000);
+    let active_frames = qgs_frames_for_duration(active_duration, plan.video_source.timebase)?;
+    let timing = QgsActiveRangeTiming::new(
+        plan.video_source.duration_frames,
+        plan.video_source.timebase,
+        plan.audio_source.sample_rate,
+        0,
+        active_frames,
+    )?;
+    let cue = timing.validate_cue(0)?;
+    let cue_at_end_rejected = timing.validate_cue(timing.end_frame).is_err();
+    let frame0 = timing.frame_audio_sample_range(0)?;
+    let frame1 = timing.frame_audio_sample_range(1)?;
+    let forward_clock = QgsFrameClock::forward(timing)?;
+    let still_clock = QgsFrameClock::still(timing, 0)?;
+    let reverse_clock = QgsFrameClock::reverse(timing)?;
+    let double_rate_clock = QgsFrameClock::new(
+        timing,
+        QgsFrameClockMode::Forward,
+        QgsFrameClockRate::two(),
+        0,
+    )?;
+    let latest_0 = forward_clock.latest_due_frame(Duration::ZERO)?;
+    let latest_60 = forward_clock.latest_due_frame(Duration::from_millis(60))?;
+    let latest_1000 = forward_clock.latest_due_frame(active_duration)?;
+    let forward_drain = forward_clock.drain_due_frames(None, Duration::from_millis(60), 16)?;
+    let forward_next = forward_clock.drain_due_frames(Some(3), Duration::from_millis(120), 16)?;
+    let still_drain = still_clock.drain_due_frames(None, Duration::from_millis(500), 16)?;
+    let reverse_drain = reverse_clock.drain_due_frames(None, Duration::from_millis(80), 16)?;
+    let double_latest = double_rate_clock.latest_due_frame(Duration::from_millis(40))?;
+
+    println!("QGS FrameClock / ActiveRange / Cue Parity");
+    println!("-----------------------------------------");
+    println!("Public source URI: {}", plan.video_source.media_uri);
+    println!(
+        "Source frame rate rational: {}/{}",
+        plan.video_source.timebase.numerator(),
+        plan.video_source.timebase.denominator()
+    );
+    println!("Audio sample rate: {}Hz", plan.audio_source.sample_rate);
+    println!("Active range convention: half-open [start_frame..end_frame)");
+    println!(
+        "Active range: [{}..{}) frames, samples [{}..{})",
+        timing.start_frame, timing.end_frame, timing.start_sample, timing.end_sample
+    );
+    println!("Active duration: {:.3}s", timing.duration()?.as_secs_f64());
+    println!("Cue frame 0 valid: {}", yes_no(cue.valid));
+    println!("Cue frame 0 sample: {}", cue.sample);
+    println!("Cue at end_frame rejected: {}", yes_no(cue_at_end_rejected));
+    println!(
+        "Frame 0 sample range: [{}..{}) samples, duration {:.3}ms",
+        frame0.start_sample,
+        frame0.end_sample,
+        frame0.duration.as_secs_f64() * 1000.0
+    );
+    println!(
+        "Frame 1 sample range: [{}..{}) samples, duration {:.3}ms",
+        frame1.start_sample,
+        frame1.end_sample,
+        frame1.duration.as_secs_f64() * 1000.0
+    );
+    println!(
+        "1000 ms sample range: [{}..{}) samples",
+        timing.start_sample, timing.end_sample
+    );
+    println!(
+        "latest_due_frame examples: 0ms={} 60ms={} 1000ms={}",
+        optional_frame(latest_0),
+        optional_frame(latest_60),
+        optional_frame(latest_1000)
+    );
+    println!(
+        "drain_due_frames forward 0..60ms: {}",
+        frame_list_label(&forward_drain.frames)
+    );
+    println!(
+        "drain_due_frames forward after frame 3 at 120ms: {}",
+        frame_list_label(&forward_next.frames)
+    );
+    println!(
+        "drain_due_frames still at 500ms: {}",
+        frame_list_label(&still_drain.frames)
+    );
+    println!(
+        "drain_due_frames reverse at 80ms: {}",
+        frame_list_label(&reverse_drain.frames)
+    );
+    println!(
+        "Mode summaries: forward_latest_60ms={} still_advances={} reverse_first={} double_rate_latest_40ms={}",
+        optional_frame(latest_60),
+        yes_no(!still_drain.frames.is_empty()),
+        reverse_drain
+            .frames
+            .first()
+            .map(|frame| frame.to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
+        optional_frame(double_latest)
+    );
+    println!("Realtime playback: no");
+    println!("Playout buffer: no");
+    println!("Device output: no");
+    println!("A/V sync: no");
+
+    Ok(())
+}
+
+fn optional_frame(frame: Option<u64>) -> String {
+    frame
+        .map(|frame| frame.to_string())
+        .unwrap_or_else(|| "<none>".to_string())
+}
+
+fn frame_list_label(frames: &[u64]) -> String {
+    if frames.is_empty() {
+        "[]".to_string()
+    } else {
+        format!("{frames:?}")
     }
 }
 
@@ -12997,6 +13130,7 @@ struct Args {
     qnc_prepared_input_descriptor_paths: Option<(PathBuf, PathBuf)>,
     qgs_input_plan_paths: Option<(PathBuf, PathBuf)>,
     qgs_transport_engine_parity_paths: Option<(PathBuf, PathBuf)>,
+    qgs_frame_clock_parity_paths: Option<(PathBuf, PathBuf)>,
     linux_audio_device_probe_path: Option<PathBuf>,
     pipewire_audio_prototype_path: Option<PathBuf>,
     pipewire_audio_native_prototype_path: Option<PathBuf>,
@@ -13069,6 +13203,8 @@ impl Args {
         let mut qgs_input_plan_paths = None;
         let mut qgs_transport_engine_parity_original = None;
         let mut qgs_transport_engine_parity_paths = None;
+        let mut qgs_frame_clock_parity_original = None;
+        let mut qgs_frame_clock_parity_paths = None;
         let mut linux_audio_device_probe_path = None;
         let mut pipewire_audio_prototype_path = None;
         let mut pipewire_audio_native_prototype_path = None;
@@ -13132,6 +13268,8 @@ impl Args {
         let mut next_arg_is_qgs_input_plan_proxy = false;
         let mut next_arg_is_qgs_transport_engine_parity_original = false;
         let mut next_arg_is_qgs_transport_engine_parity_proxy = false;
+        let mut next_arg_is_qgs_frame_clock_parity_original = false;
+        let mut next_arg_is_qgs_frame_clock_parity_proxy = false;
         let mut next_arg_is_linux_audio_device_probe_path = false;
         let mut next_arg_is_pipewire_audio_prototype_path = false;
         let mut next_arg_is_pipewire_audio_native_prototype_path = false;
@@ -13270,6 +13408,17 @@ impl Args {
                 qgs_transport_engine_parity_original = Some(PathBuf::from(arg));
                 next_arg_is_qgs_transport_engine_parity_original = false;
                 next_arg_is_qgs_transport_engine_parity_proxy = true;
+            } else if next_arg_is_qgs_frame_clock_parity_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = qgs_frame_clock_parity_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                qgs_frame_clock_parity_paths = Some((original, proxy));
+                next_arg_is_qgs_frame_clock_parity_proxy = false;
+            } else if next_arg_is_qgs_frame_clock_parity_original {
+                qgs_frame_clock_parity_original = Some(PathBuf::from(arg));
+                next_arg_is_qgs_frame_clock_parity_original = false;
+                next_arg_is_qgs_frame_clock_parity_proxy = true;
             } else if next_arg_is_qnc_prepared_input_descriptor_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = qnc_prepared_input_descriptor_original
@@ -13553,6 +13702,8 @@ impl Args {
                 next_arg_is_qgs_input_plan_original = true;
             } else if arg == QGS_TRANSPORT_ENGINE_PARITY_ARG {
                 next_arg_is_qgs_transport_engine_parity_original = true;
+            } else if arg == QGS_FRAME_CLOCK_PARITY_ARG {
+                next_arg_is_qgs_frame_clock_parity_original = true;
             } else if arg == LINUX_AUDIO_DEVICE_PROBE_ARG {
                 next_arg_is_linux_audio_device_probe_path = true;
             } else if arg == PIPEWIRE_AUDIO_PROTOTYPE_ARG {
@@ -13620,6 +13771,7 @@ impl Args {
             qnc_prepared_input_descriptor_paths,
             qgs_input_plan_paths,
             qgs_transport_engine_parity_paths,
+            qgs_frame_clock_parity_paths,
             linux_audio_device_probe_path,
             pipewire_audio_prototype_path,
             pipewire_audio_native_prototype_path,

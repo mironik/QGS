@@ -828,6 +828,313 @@ pub fn qgs_frames_for_duration(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsFrameClockRate {
+    pub multiplier: u32,
+}
+
+impl QgsFrameClockRate {
+    pub const fn zero() -> Self {
+        Self { multiplier: 0 }
+    }
+
+    pub const fn one() -> Self {
+        Self { multiplier: 1 }
+    }
+
+    pub const fn two() -> Self {
+        Self { multiplier: 2 }
+    }
+
+    pub fn validate(self) -> Result<(), PlaybackError> {
+        if self.multiplier > 2 {
+            return Err(PlaybackError::InvalidRate);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsFrameClockMode {
+    Forward,
+    Reverse,
+    Still,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsFrameAudioSampleRange {
+    pub frame: u64,
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub start_time: Duration,
+    pub duration: Duration,
+}
+
+impl QgsFrameAudioSampleRange {
+    pub fn sample_count(self) -> u64 {
+        self.end_sample.saturating_sub(self.start_sample)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsCueValidation {
+    pub frame: u64,
+    pub sample: u64,
+    pub valid: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsActiveRangeTiming {
+    pub start_frame: u64,
+    pub end_frame: u64,
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub source_duration_frames: u64,
+    pub frame_rate: RationalRate,
+    pub audio_sample_rate: u32,
+}
+
+impl QgsActiveRangeTiming {
+    pub fn new(
+        source_duration_frames: u64,
+        frame_rate: RationalRate,
+        audio_sample_rate: u32,
+        start_frame: u64,
+        end_frame: u64,
+    ) -> Result<Self, PlaybackError> {
+        if audio_sample_rate == 0
+            || source_duration_frames == 0
+            || start_frame >= end_frame
+            || end_frame > source_duration_frames
+        {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        let start_sample = frame_to_sample_boundary(start_frame, frame_rate, audio_sample_rate)?;
+        let end_sample = frame_to_sample_boundary(end_frame, frame_rate, audio_sample_rate)?;
+        Ok(Self {
+            start_frame,
+            end_frame,
+            start_sample,
+            end_sample,
+            source_duration_frames,
+            frame_rate,
+            audio_sample_rate,
+        })
+    }
+
+    pub fn contains_frame(self, frame: u64) -> bool {
+        frame >= self.start_frame && frame < self.end_frame
+    }
+
+    pub fn validate_cue(self, frame: u64) -> Result<QgsCueValidation, PlaybackError> {
+        if !self.contains_frame(frame) {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        Ok(QgsCueValidation {
+            frame,
+            sample: frame_to_sample_boundary(frame, self.frame_rate, self.audio_sample_rate)?,
+            valid: true,
+        })
+    }
+
+    pub fn frame_audio_sample_range(
+        self,
+        frame: u64,
+    ) -> Result<QgsFrameAudioSampleRange, PlaybackError> {
+        self.validate_cue(frame)?;
+        let start_sample =
+            frame_to_sample_boundary(frame, self.frame_rate, self.audio_sample_rate)?;
+        let end_sample = frame_to_sample_boundary(
+            frame
+                .checked_add(1)
+                .ok_or(PlaybackError::TimestampOverflow)?,
+            self.frame_rate,
+            self.audio_sample_rate,
+        )?;
+        Ok(QgsFrameAudioSampleRange {
+            frame,
+            start_sample,
+            end_sample,
+            start_time: self.frame_rate.frame_offset(frame)?,
+            duration: self.frame_rate.duration_for_frames(1)?,
+        })
+    }
+
+    pub fn duration(self) -> Result<Duration, PlaybackError> {
+        self.frame_rate
+            .duration_for_frames(self.end_frame - self.start_frame)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsDueFrameDrain {
+    pub frames: Vec<u64>,
+    pub latest_due_frame: Option<u64>,
+    pub bounded_by_start: bool,
+    pub bounded_by_end: bool,
+    pub truncated_by_limit: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsFrameClock {
+    pub active_range: QgsActiveRangeTiming,
+    pub mode: QgsFrameClockMode,
+    pub rate: QgsFrameClockRate,
+    pub anchor_frame: u64,
+}
+
+impl QgsFrameClock {
+    pub fn new(
+        active_range: QgsActiveRangeTiming,
+        mode: QgsFrameClockMode,
+        rate: QgsFrameClockRate,
+        anchor_frame: u64,
+    ) -> Result<Self, PlaybackError> {
+        rate.validate()?;
+        if !active_range.contains_frame(anchor_frame) {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        Ok(Self {
+            active_range,
+            mode,
+            rate,
+            anchor_frame,
+        })
+    }
+
+    pub fn forward(active_range: QgsActiveRangeTiming) -> Result<Self, PlaybackError> {
+        Self::new(
+            active_range,
+            QgsFrameClockMode::Forward,
+            QgsFrameClockRate::one(),
+            active_range.start_frame,
+        )
+    }
+
+    pub fn reverse(active_range: QgsActiveRangeTiming) -> Result<Self, PlaybackError> {
+        Self::new(
+            active_range,
+            QgsFrameClockMode::Reverse,
+            QgsFrameClockRate::one(),
+            active_range.end_frame - 1,
+        )
+    }
+
+    pub fn still(active_range: QgsActiveRangeTiming, frame: u64) -> Result<Self, PlaybackError> {
+        Self::new(
+            active_range,
+            QgsFrameClockMode::Still,
+            QgsFrameClockRate::zero(),
+            frame,
+        )
+    }
+
+    pub fn latest_due_frame(self, elapsed: Duration) -> Result<Option<u64>, PlaybackError> {
+        if self.mode == QgsFrameClockMode::Still || self.rate.multiplier == 0 {
+            return Ok(Some(self.anchor_frame));
+        }
+        let elapsed_frames = qgs_frames_for_duration(elapsed, self.active_range.frame_rate)?;
+        let offset = elapsed_frames
+            .checked_mul(u64::from(self.rate.multiplier))
+            .ok_or(PlaybackError::TimestampOverflow)?;
+        match self.mode {
+            QgsFrameClockMode::Forward => Ok(Some(
+                self.anchor_frame
+                    .saturating_add(offset)
+                    .min(self.active_range.end_frame - 1),
+            )),
+            QgsFrameClockMode::Reverse => Ok(Some(
+                self.anchor_frame
+                    .saturating_sub(offset)
+                    .max(self.active_range.start_frame),
+            )),
+            QgsFrameClockMode::Still => Ok(Some(self.anchor_frame)),
+        }
+    }
+
+    pub fn drain_due_frames(
+        self,
+        last_emitted_frame: Option<u64>,
+        elapsed: Duration,
+        max_frames: usize,
+    ) -> Result<QgsDueFrameDrain, PlaybackError> {
+        if max_frames == 0 {
+            return Err(PlaybackError::InvalidCapacity);
+        }
+        let latest_due_frame = self.latest_due_frame(elapsed)?;
+        let Some(latest) = latest_due_frame else {
+            return Ok(QgsDueFrameDrain {
+                frames: Vec::new(),
+                latest_due_frame,
+                bounded_by_start: false,
+                bounded_by_end: false,
+                truncated_by_limit: false,
+            });
+        };
+        if self.mode == QgsFrameClockMode::Still || self.rate.multiplier == 0 {
+            return Ok(QgsDueFrameDrain {
+                frames: Vec::new(),
+                latest_due_frame,
+                bounded_by_start: false,
+                bounded_by_end: false,
+                truncated_by_limit: false,
+            });
+        }
+
+        let mut frames = Vec::new();
+        let mut truncated_by_limit = false;
+        match self.mode {
+            QgsFrameClockMode::Forward => {
+                let mut next = last_emitted_frame
+                    .and_then(|frame| frame.checked_add(1))
+                    .unwrap_or(self.anchor_frame)
+                    .max(self.active_range.start_frame);
+                while next <= latest && next < self.active_range.end_frame {
+                    if frames.len() == max_frames {
+                        truncated_by_limit = true;
+                        break;
+                    }
+                    frames.push(next);
+                    next = next
+                        .checked_add(1)
+                        .ok_or(PlaybackError::TimestampOverflow)?;
+                }
+            }
+            QgsFrameClockMode::Reverse => {
+                let mut next = last_emitted_frame
+                    .and_then(|frame| frame.checked_sub(1))
+                    .unwrap_or(self.anchor_frame)
+                    .min(self.active_range.end_frame - 1);
+                loop {
+                    if next < latest || next < self.active_range.start_frame {
+                        break;
+                    }
+                    if frames.len() == max_frames {
+                        truncated_by_limit = true;
+                        break;
+                    }
+                    frames.push(next);
+                    if next == 0 {
+                        break;
+                    }
+                    next -= 1;
+                }
+            }
+            QgsFrameClockMode::Still => {}
+        }
+
+        Ok(QgsDueFrameDrain {
+            frames,
+            latest_due_frame,
+            bounded_by_start: self.mode == QgsFrameClockMode::Reverse
+                && latest == self.active_range.start_frame,
+            bounded_by_end: self.mode == QgsFrameClockMode::Forward
+                && latest == self.active_range.end_frame - 1,
+            truncated_by_limit,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QgsTransportSourceRevision(pub u64);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -890,18 +1197,18 @@ impl QgsTransportActiveRange {
         start_frame: u64,
         end_frame: u64,
     ) -> Result<Self, PlaybackError> {
-        if start_frame >= end_frame || end_frame > handle.duration_frames {
-            return Err(PlaybackError::InvalidRuntimeTransition);
-        }
-        let start_sample =
-            frame_to_sample_boundary(start_frame, handle.timebase, handle.audio_sample_rate)?;
-        let end_sample =
-            frame_to_sample_boundary(end_frame, handle.timebase, handle.audio_sample_rate)?;
-        Ok(Self {
+        let timing = QgsActiveRangeTiming::new(
+            handle.duration_frames,
+            handle.timebase,
+            handle.audio_sample_rate,
             start_frame,
             end_frame,
-            start_sample,
-            end_sample,
+        )?;
+        Ok(Self {
+            start_frame: timing.start_frame,
+            end_frame: timing.end_frame,
+            start_sample: timing.start_sample,
+            end_sample: timing.end_sample,
         })
     }
 
@@ -1152,20 +1459,34 @@ impl QgsTransportEngine {
         let range = self
             .active_range
             .ok_or(PlaybackError::InvalidRuntimeTransition)?;
-        if !range.contains_frame(frame) {
-            self.events
-                .push(QgsTransportEvent::TransportValidationFailed {
-                    reason: "cue outside active range",
-                });
-            return Err(PlaybackError::InvalidRuntimeTransition);
-        }
-        let sample = frame_to_sample_boundary(frame, handle.timebase, handle.audio_sample_rate)?;
-        let cue = QgsTransportCuePoint { frame, sample };
+        let timing = QgsActiveRangeTiming::new(
+            handle.duration_frames,
+            handle.timebase,
+            handle.audio_sample_rate,
+            range.start_frame,
+            range.end_frame,
+        )?;
+        let cue_validation = match timing.validate_cue(frame) {
+            Ok(cue) => cue,
+            Err(err) => {
+                self.events
+                    .push(QgsTransportEvent::TransportValidationFailed {
+                        reason: "cue outside active range",
+                    });
+                return Err(err);
+            }
+        };
+        let cue = QgsTransportCuePoint {
+            frame,
+            sample: cue_validation.sample,
+        };
         self.cue = Some(cue);
         self.prepared_anchor = None;
         self.play_ready = false;
-        self.events
-            .push(QgsTransportEvent::CueCompleted { frame, sample });
+        self.events.push(QgsTransportEvent::CueCompleted {
+            frame,
+            sample: cue.sample,
+        });
         Ok(cue)
     }
 
@@ -4425,6 +4746,217 @@ mod tests {
             plan.samples_for_duration(Duration::from_millis(1_000))
                 .unwrap(),
             48_000
+        );
+    }
+
+    fn sample_qgs_active_range(rate: RationalRate) -> QgsActiveRangeTiming {
+        QgsActiveRangeTiming::new(120, rate, 48_000, 0, 50).unwrap()
+    }
+
+    #[test]
+    fn qgs_frame_clock_counts_integer_rates_exactly() {
+        assert_eq!(
+            qgs_frames_for_duration(Duration::from_secs(1), RationalRate::new(25, 1).unwrap())
+                .unwrap(),
+            25
+        );
+        assert_eq!(
+            qgs_frames_for_duration(Duration::from_secs(1), RationalRate::new(50, 1).unwrap())
+                .unwrap(),
+            50
+        );
+    }
+
+    #[test]
+    fn qgs_frame_clock_preserves_fractional_rates() {
+        let ntsc_30 = RationalRate::new(30_000, 1_001).unwrap();
+        let ntsc_60 = RationalRate::new(60_000, 1_001).unwrap();
+        assert_eq!(
+            qgs_frames_for_duration(Duration::from_millis(1_000), ntsc_30).unwrap(),
+            29
+        );
+        assert_eq!(
+            qgs_frames_for_duration(Duration::from_millis(1_001), ntsc_30).unwrap(),
+            30
+        );
+        assert_eq!(
+            qgs_frames_for_duration(Duration::from_millis(1_000), ntsc_60).unwrap(),
+            59
+        );
+        assert_eq!(
+            qgs_frames_for_duration(Duration::from_millis(1_001), ntsc_60).unwrap(),
+            60
+        );
+    }
+
+    #[test]
+    fn qgs_active_range_timing_validates_half_open_edges() {
+        let rate = RationalRate::new(50, 1).unwrap();
+        assert!(QgsActiveRangeTiming::new(106, rate, 48_000, 0, 50).is_ok());
+        assert_eq!(
+            QgsActiveRangeTiming::new(106, rate, 48_000, 10, 10),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+        assert_eq!(
+            QgsActiveRangeTiming::new(106, rate, 48_000, 50, 49),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+        assert_eq!(
+            QgsActiveRangeTiming::new(106, rate, 48_000, 0, 107),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+        let timing = QgsActiveRangeTiming::new(106, rate, 48_000, 0, 50).unwrap();
+        assert!(timing.validate_cue(0).is_ok());
+        assert!(timing.validate_cue(49).is_ok());
+        assert_eq!(
+            timing.validate_cue(50),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+    }
+
+    #[test]
+    fn qgs_frame_audio_sample_mapping_uses_original_audio_rate() {
+        let timing_50 =
+            QgsActiveRangeTiming::new(106, RationalRate::new(50, 1).unwrap(), 48_000, 0, 50)
+                .unwrap();
+        assert_eq!(
+            timing_50.frame_audio_sample_range(0).unwrap(),
+            QgsFrameAudioSampleRange {
+                frame: 0,
+                start_sample: 0,
+                end_sample: 960,
+                start_time: Duration::ZERO,
+                duration: Duration::from_millis(20),
+            }
+        );
+        assert_eq!(
+            timing_50.frame_audio_sample_range(1).unwrap().start_sample,
+            960
+        );
+        assert_eq!(
+            timing_50.frame_audio_sample_range(1).unwrap().end_sample,
+            1_920
+        );
+        assert_eq!(timing_50.start_sample, 0);
+        assert_eq!(timing_50.end_sample, 48_000);
+
+        let timing_25 =
+            QgsActiveRangeTiming::new(53, RationalRate::new(25, 1).unwrap(), 48_000, 0, 25)
+                .unwrap();
+        assert_eq!(
+            timing_25.frame_audio_sample_range(0).unwrap().end_sample,
+            1_920
+        );
+        assert_eq!(
+            timing_25.frame_audio_sample_range(1).unwrap().start_sample,
+            1_920
+        );
+        assert_eq!(
+            timing_25.frame_audio_sample_range(1).unwrap().end_sample,
+            3_840
+        );
+    }
+
+    #[test]
+    fn qgs_fractional_frame_audio_mapping_uses_floor_boundaries_without_overlap() {
+        let timing = QgsActiveRangeTiming::new(
+            120,
+            RationalRate::new(30_000, 1_001).unwrap(),
+            48_000,
+            0,
+            10,
+        )
+        .unwrap();
+        let first = timing.frame_audio_sample_range(0).unwrap();
+        let second = timing.frame_audio_sample_range(1).unwrap();
+        assert_eq!(first.start_sample, 0);
+        assert_eq!(first.end_sample, 1_601);
+        assert_eq!(second.start_sample, first.end_sample);
+        assert_eq!(second.end_sample, 3_203);
+    }
+
+    #[test]
+    fn qgs_frame_clock_latest_due_frame_is_range_bounded() {
+        let timing = sample_qgs_active_range(RationalRate::new(50, 1).unwrap());
+        let clock = QgsFrameClock::forward(timing).unwrap();
+        assert_eq!(clock.latest_due_frame(Duration::ZERO).unwrap(), Some(0));
+        assert_eq!(
+            clock.latest_due_frame(Duration::from_millis(60)).unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            clock.latest_due_frame(Duration::from_secs(2)).unwrap(),
+            Some(49)
+        );
+    }
+
+    #[test]
+    fn qgs_frame_clock_drains_forward_without_duplicates_or_skips() {
+        let timing = sample_qgs_active_range(RationalRate::new(50, 1).unwrap());
+        let clock = QgsFrameClock::forward(timing).unwrap();
+        let first = clock
+            .drain_due_frames(None, Duration::from_millis(60), 16)
+            .unwrap();
+        assert_eq!(first.frames, vec![0, 1, 2, 3]);
+        let second = clock
+            .drain_due_frames(Some(3), Duration::from_millis(120), 16)
+            .unwrap();
+        assert_eq!(second.frames, vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn qgs_frame_clock_reverse_is_bounded_by_range_start() {
+        let timing = sample_qgs_active_range(RationalRate::new(50, 1).unwrap());
+        let clock = QgsFrameClock::reverse(timing).unwrap();
+        let drain = clock
+            .drain_due_frames(None, Duration::from_secs(2), 128)
+            .unwrap();
+        assert_eq!(drain.frames.first().copied(), Some(49));
+        assert_eq!(drain.frames.last().copied(), Some(0));
+        assert!(drain.bounded_by_start);
+    }
+
+    #[test]
+    fn qgs_frame_clock_still_does_not_advance_due_frames() {
+        let timing = sample_qgs_active_range(RationalRate::new(50, 1).unwrap());
+        let clock = QgsFrameClock::still(timing, 12).unwrap();
+        assert_eq!(
+            clock.latest_due_frame(Duration::from_secs(10)).unwrap(),
+            Some(12)
+        );
+        assert!(clock
+            .drain_due_frames(None, Duration::from_secs(10), 16)
+            .unwrap()
+            .frames
+            .is_empty());
+    }
+
+    #[test]
+    fn qgs_frame_clock_supports_simple_double_rate() {
+        let timing = sample_qgs_active_range(RationalRate::new(50, 1).unwrap());
+        let clock = QgsFrameClock::new(
+            timing,
+            QgsFrameClockMode::Forward,
+            QgsFrameClockRate::two(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            clock.latest_due_frame(Duration::from_millis(40)).unwrap(),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn qgs_transport_cue_uses_timing_layer() {
+        let mut engine = QgsTransportEngine::new();
+        let handle = engine.load_source(&sample_qgs_input_plan()).unwrap();
+        engine.set_active_source(&handle).unwrap();
+        engine.set_active_range_frames(0, 50).unwrap();
+        assert_eq!(engine.cue_frame(1).unwrap().sample, 960);
+        assert_eq!(
+            engine.cue_frame(50),
+            Err(PlaybackError::InvalidRuntimeTransition)
         );
     }
 
