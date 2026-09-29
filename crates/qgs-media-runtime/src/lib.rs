@@ -7285,6 +7285,11 @@ pub enum BroadcastRuntimeVerificationLevel {
     OperationalStateEvidence,
     FaultRecoveryPolicyEvidence,
     RuntimeBehaviorEvidence,
+    AssemblySurfaceEvidence,
+    ArchitectureAuditEvidence,
+    ContractPlanEvidence,
+    DescriptorMappingEvidence,
+    QncControlSurfaceShapeEvidence,
     MediaInspected,
     PayloadExtracted,
     PayloadBound,
@@ -7318,6 +7323,11 @@ impl BroadcastRuntimeVerificationLevel {
             Self::OperationalStateEvidence => "OperationalStateEvidence",
             Self::FaultRecoveryPolicyEvidence => "FaultRecoveryPolicyEvidence",
             Self::RuntimeBehaviorEvidence => "RuntimeBehaviorEvidence",
+            Self::AssemblySurfaceEvidence => "AssemblySurfaceEvidence",
+            Self::ArchitectureAuditEvidence => "ArchitectureAuditEvidence",
+            Self::ContractPlanEvidence => "ContractPlanEvidence",
+            Self::DescriptorMappingEvidence => "DescriptorMappingEvidence",
+            Self::QncControlSurfaceShapeEvidence => "QncControlSurfaceShapeEvidence",
             Self::MediaInspected => "MediaInspected",
             Self::PayloadExtracted => "PayloadExtracted",
             Self::PayloadBound => "PayloadBound",
@@ -7384,6 +7394,11 @@ pub enum BroadcastRuntimeVerifiedSubsystem {
     BroadcastPlayerOperationalRuntime,
     BroadcastPlayerFaultRecoveryRules,
     BroadcastPlayerRunningRuntimeDemo,
+    BroadcastPlayerModularRuntimeAssembly,
+    QncBroadcastEngineReuseParityAudit,
+    QncQgsSharedContractCratePlan,
+    QncPreparedInputToQgsDescriptorMapping,
+    QncCompatibleQgsControlSurfaceShape,
     SimulatedPlaybackLoop,
     RealSpeakerOutput,
     RealDisplayOutput,
@@ -7436,6 +7451,15 @@ impl BroadcastRuntimeVerifiedSubsystem {
             Self::BroadcastPlayerOperationalRuntime => "broadcast player operational runtime",
             Self::BroadcastPlayerFaultRecoveryRules => "broadcast player fault and recovery rules",
             Self::BroadcastPlayerRunningRuntimeDemo => "broadcast player running runtime demo",
+            Self::BroadcastPlayerModularRuntimeAssembly => {
+                "broadcast player modular runtime assembly"
+            }
+            Self::QncBroadcastEngineReuseParityAudit => "QNC broadcast engine reuse/parity audit",
+            Self::QncQgsSharedContractCratePlan => "QNC/QGS shared contract crate plan",
+            Self::QncPreparedInputToQgsDescriptorMapping => {
+                "QNC PreparedInput to QGS descriptor mapping"
+            }
+            Self::QncCompatibleQgsControlSurfaceShape => "QNC-compatible QGS control surface shape",
             Self::SimulatedPlaybackLoop => "simulated playback loop",
             Self::RealSpeakerOutput => "real speaker output",
             Self::RealDisplayOutput => "real display output",
@@ -7632,6 +7656,31 @@ impl BroadcastRuntimeVerificationMatrix {
                     subsystem: Subsystem::BroadcastPlayerRunningRuntimeDemo,
                     level: Level::RuntimeBehaviorEvidence,
                     summary: "running Broadcast Player operational demo streams step-by-step state, frame/audio progression, pause freeze, seek/reprepare/replay, stop, unload, buffer health, and non-claims using the operational runtime",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::BroadcastPlayerModularRuntimeAssembly,
+                    level: Level::AssemblySurfaceEvidence,
+                    summary: "QgsBroadcastPlayerAssembly is a composition root and factory over existing runtime modules; it does not duplicate player logic or claim real display, realtime, A/V sync, or production audio-device verification",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::QncBroadcastEngineReuseParityAudit,
+                    level: Level::ArchitectureAuditEvidence,
+                    summary: "QNC broadcast/player contracts, behavior, backend responsibilities, UI/DB/workflow ownership, QGS equivalents, reusable concepts, non-reusable implementation areas, and remaining QGS gaps were audited; no runtime feature or device claim was added",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::QncQgsSharedContractCratePlan,
+                    level: Level::ContractPlanEvidence,
+                    summary: "future shared contract scope, versioning, source identity, prepared input descriptor, command/reply/snapshot/event/fault fields, mapping tables, ownership, and privacy rules were planned; no shared crate, IPC, runtime behavior, or device claim was added",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::QncPreparedInputToQgsDescriptorMapping,
+                    level: Level::DescriptorMappingEvidence,
+                    summary: "QGS-side QNC-like adapter types validate source identity, private binding opacity, source mode, original-audio authority, discrete mono lanes, project audio, timing compatibility, and map into QGS descriptors/input plans/assemblies without IPC, QNC UI, realtime, A/V sync, or device-output claims",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::QncCompatibleQgsControlSurfaceShape,
+                    level: Level::QncControlSurfaceShapeEvidence,
+                    summary: "QgsQncControlSurface accepts QNC-shaped command envelopes, echoes command ids, checks generation, rejects stale commands without mutation, returns public-safe snapshots/events/faults/recovery, and preserves device/source non-claims over existing runtime modules; no shared crate, IPC, QNC UI, realtime, A/V sync, or device-output claim was added",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::SimulatedPlaybackLoop,
@@ -14123,6 +14172,34 @@ mod tests {
                 < BroadcastRuntimeVerificationLevel::RealtimeVerified
         );
         assert!(
+            BroadcastRuntimeVerificationLevel::AssemblySurfaceEvidence
+                < BroadcastRuntimeVerificationLevel::VisualVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::ArchitectureAuditEvidence
+                < BroadcastRuntimeVerificationLevel::VisualVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::ContractPlanEvidence
+                < BroadcastRuntimeVerificationLevel::VisualVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::DescriptorMappingEvidence
+                < BroadcastRuntimeVerificationLevel::VisualVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::QncControlSurfaceShapeEvidence
+                < BroadcastRuntimeVerificationLevel::VisualVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::QncControlSurfaceShapeEvidence
+                < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::QncControlSurfaceShapeEvidence
+                < BroadcastRuntimeVerificationLevel::RealtimeVerified
+        );
+        assert!(
             BroadcastRuntimeVerificationLevel::FilePresenterManifestWritten
                 < BroadcastRuntimeVerificationLevel::VisualVerified
         );
@@ -14361,6 +14438,48 @@ mod tests {
                 .unwrap()
                 .level,
             BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
+        assert_eq!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::BroadcastPlayerModularRuntimeAssembly)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::AssemblySurfaceEvidence
+        );
+        assert_eq!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::QncBroadcastEngineReuseParityAudit)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::ArchitectureAuditEvidence
+        );
+        assert_eq!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::QncQgsSharedContractCratePlan)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::ContractPlanEvidence
+        );
+        assert_eq!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::QncPreparedInputToQgsDescriptorMapping)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::DescriptorMappingEvidence
+        );
+        assert_eq!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::QncCompatibleQgsControlSurfaceShape)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::QncControlSurfaceShapeEvidence
+        );
+        assert_ne!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::QncCompatibleQgsControlSurfaceShape)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::RealtimeVerified
         );
     }
 

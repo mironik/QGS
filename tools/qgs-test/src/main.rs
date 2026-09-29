@@ -11288,7 +11288,14 @@ fn broadcast_player_runtime_verification(
     println!();
     println!("Truth rules:");
     println!("  Test video presenter evidence is not real display output");
+    println!("  Test presenter evidence is not real FramePresented from a display backend");
     println!("  Test audio sink evidence is not real speaker output");
+    println!("  VisualVerified: no");
+    println!("  AudioDeviceVerified: no");
+    println!("  RealtimeVerified: no");
+    println!("  A/V sync verified: no");
+    println!("  Production audio output: no");
+    println!("  Completed QNC integration: no");
     println!("  Haswell CPU-bridge 50p is not marked realtime verified");
     println!("  Modern-hardware zero-copy remains frozen/not verified");
     println!("  Matrix truth-rule validation: passed");
