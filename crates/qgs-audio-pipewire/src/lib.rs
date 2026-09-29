@@ -327,7 +327,9 @@ pub fn submit_native_pipewire_buffers(
         .add_local_listener::<()>()
         .state_changed(move |_stream, _user_data, _old, new| {
             let observed = observed_stream_state(&new);
-            let mut observation = state_observation.borrow_mut();
+            let Ok(mut observation) = state_observation.try_borrow_mut() else {
+                return;
+            };
             observation.states.push(observed);
             if observation.buffer_submitted {
                 observation.states_after_submit.push(observed);
@@ -342,7 +344,9 @@ pub fn submit_native_pipewire_buffers(
             }
         })
         .process(move |stream, _user_data| {
-            let mut observation = process_observation.borrow_mut();
+            let Ok(mut observation) = process_observation.try_borrow_mut() else {
+                return;
+            };
             observation.process_callback_reached = true;
             observation.process_callbacks = observation.process_callbacks.saturating_add(1);
             if observation.buffer_submitted {
@@ -387,19 +391,24 @@ pub fn submit_native_pipewire_buffers(
                 .unwrap_or(usize::MAX)
                 >= process_payloads.len();
             drop(buffer);
-            if observation.buffer_submitted {
-                match stream.flush(true) {
-                    Ok(()) => {
-                        observation.drain_requested = true;
-                    }
-                    Err(_) => {
-                        observation.drain_request_failed = true;
-                    }
+            let request_drain = observation.buffer_submitted;
+            drop(observation);
+            if request_drain {
+                let drain_result = stream.flush(true);
+                let Ok(mut observation) = process_observation.try_borrow_mut() else {
+                    return;
+                };
+                match drain_result {
+                    Ok(()) => observation.drain_requested = true,
+                    Err(_) => observation.drain_request_failed = true,
                 }
             }
         })
         .drained(move |_stream, _user_data| {
-            let mut observation = drained_observation.borrow_mut();
+            let Ok(mut observation) = drained_observation.try_borrow_mut() else {
+                drained_mainloop.quit();
+                return;
+            };
             observation.drain_completed = true;
             drained_mainloop.quit();
         })
@@ -427,13 +436,17 @@ pub fn submit_native_pipewire_buffers(
         mainloop
             .loop_()
             .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(50)));
-        let observation = observation.borrow();
+        let Ok(observation) = observation.try_borrow() else {
+            continue;
+        };
         if observation.drain_completed || observation.stream_error_after_submit {
             break;
         }
     }
 
-    let observation = observation.borrow();
+    let observation = observation.try_borrow().map_err(|_| {
+        PipeWireStreamError::StreamConnect("PipeWire observation was busy".to_string())
+    })?;
     let states = observation.states.clone();
     if states.is_empty() && !observation.process_callback_reached {
         return Err(PipeWireStreamError::Timeout);

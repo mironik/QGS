@@ -181,6 +181,11 @@ const QGS_BROADCAST_PLAYER_LIVE_STATUS_EVERY_ARG: &str = "--status-every";
 const QGS_BROADCAST_PLAYER_LIVE_MAX_FRAMES_ARG: &str = "--max-frames";
 const QGS_BROADCAST_PLAYER_LIVE_PACE_ARG: &str = "--pace";
 const QGS_BROADCAST_PLAYER_LIVE_NO_INTERACTIVE_ARG: &str = "--no-interactive";
+const QGS_BROADCAST_PLAYER_LIVE_VIDEO_OUTPUT_ARG: &str = "--video-output";
+const QGS_BROADCAST_PLAYER_LIVE_AUDIO_OUTPUT_ARG: &str = "--audio-output";
+const QGS_BROADCAST_PLAYER_LIVE_OUTPUT_DIR_ARG: &str = "--output-dir";
+const QGS_BROADCAST_PLAYER_LIVE_PREVIEW_EVERY_ARG: &str = "--preview-every";
+const QGS_BROADCAST_PLAYER_LIVE_AUDIO_MAX_FRAMES_PER_CHUNK: u64 = 5;
 const QGS_BROADCAST_PLAYER_RUN_SEEK_FRAME_ARG: &str = "--seek-frame";
 const QGS_BROADCAST_PLAYER_RUN_VIEW_ARG: &str = "--view";
 const QGS_BROADCAST_PLAYER_CONTROL_SCRIPT_ARG: &str = "--script";
@@ -4772,6 +4777,58 @@ impl QgsBroadcastPlayerLivePace {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QgsBroadcastPlayerLiveVideoOutputMode {
+    None,
+    PreviewFiles,
+    PreviewWindow,
+}
+
+impl QgsBroadcastPlayerLiveVideoOutputMode {
+    fn parse(value: &std::ffi::OsStr) -> Result<Self, &'static str> {
+        match value.to_string_lossy().as_ref() {
+            "none" => Ok(Self::None),
+            "preview-files" => Ok(Self::PreviewFiles),
+            "preview-window" => Ok(Self::PreviewWindow),
+            _ => Err("expects none, preview-files, or preview-window"),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::PreviewFiles => "preview-files",
+            Self::PreviewWindow => "preview-window",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QgsBroadcastPlayerLiveAudioOutputMode {
+    None,
+    PipeWireMonitor,
+    PipeWire4Mono,
+}
+
+impl QgsBroadcastPlayerLiveAudioOutputMode {
+    fn parse(value: &std::ffi::OsStr) -> Result<Self, &'static str> {
+        match value.to_string_lossy().as_ref() {
+            "none" => Ok(Self::None),
+            "pipewire-monitor" => Ok(Self::PipeWireMonitor),
+            "pipewire-4mono" => Ok(Self::PipeWire4Mono),
+            _ => Err("expects none, pipewire-monitor, or pipewire-4mono"),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::PipeWireMonitor => "pipewire-monitor",
+            Self::PipeWire4Mono => "pipewire-4mono",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct QgsBroadcastPlayerLiveOptions {
     start_frame: u64,
     status_every: u64,
@@ -4780,6 +4837,10 @@ struct QgsBroadcastPlayerLiveOptions {
     view: QgsBroadcastPlayerRunView,
     pace: QgsBroadcastPlayerLivePace,
     no_interactive: bool,
+    video_output: QgsBroadcastPlayerLiveVideoOutputMode,
+    audio_output: QgsBroadcastPlayerLiveAudioOutputMode,
+    output_dir: PathBuf,
+    preview_every: u64,
 }
 
 impl Default for QgsBroadcastPlayerLiveOptions {
@@ -4792,6 +4853,10 @@ impl Default for QgsBroadcastPlayerLiveOptions {
             view: QgsBroadcastPlayerRunView::Compact,
             pace: QgsBroadcastPlayerLivePace::Logical,
             no_interactive: false,
+            video_output: QgsBroadcastPlayerLiveVideoOutputMode::PreviewFiles,
+            audio_output: QgsBroadcastPlayerLiveAudioOutputMode::None,
+            output_dir: PathBuf::from("target/qgs-live-preview"),
+            preview_every: 5,
         }
     }
 }
@@ -4844,6 +4909,393 @@ impl QgsBroadcastPlayerLiveInputCommand {
             _ => Self::Invalid(format!("unknown live control: {trimmed}")),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct QgsLiveOutputTickResult {
+    video_status: &'static str,
+    audio_status: &'static str,
+}
+
+struct QgsLivePreviewFileOutput {
+    proxy_path: PathBuf,
+    output_dir: PathBuf,
+    preview_every: u64,
+    output_index: u64,
+}
+
+struct QgsLiveAudioOutput {
+    original_path: PathBuf,
+    index: PcmAudioIndex,
+    sample_rate: u32,
+    mode: QgsBroadcastPlayerLiveAudioOutputMode,
+    preview_every: u64,
+    submitted: bool,
+    submissions: u64,
+    bytes_copied: usize,
+}
+
+struct QgsLiveOutputCoordinator {
+    video: Option<QgsLivePreviewFileOutput>,
+    audio: Option<QgsLiveAudioOutput>,
+}
+
+impl QgsLiveOutputCoordinator {
+    fn new(
+        original_path: &Path,
+        proxy_path: &Path,
+        options: &QgsBroadcastPlayerLiveOptions,
+        source_timebase: RationalRate,
+        start_frame: u64,
+        run_limit: u64,
+        active_frames: u64,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let video = match options.video_output {
+            QgsBroadcastPlayerLiveVideoOutputMode::None => None,
+            QgsBroadcastPlayerLiveVideoOutputMode::PreviewFiles => {
+                Some(QgsLivePreviewFileOutput::new(
+                    proxy_path,
+                    &options.output_dir,
+                    options.preview_every,
+                    source_timebase,
+                    start_frame,
+                    run_limit,
+                    active_frames,
+                )?)
+            }
+            QgsBroadcastPlayerLiveVideoOutputMode::PreviewWindow => {
+                return Err("preview-window output is not implemented yet; use --video-output preview-files".into());
+            }
+        };
+        let audio = match options.audio_output {
+            QgsBroadcastPlayerLiveAudioOutputMode::None => None,
+            QgsBroadcastPlayerLiveAudioOutputMode::PipeWireMonitor
+            | QgsBroadcastPlayerLiveAudioOutputMode::PipeWire4Mono => {
+                Some(QgsLiveAudioOutput::new(
+                    original_path,
+                    options.audio_output,
+                    options.preview_every,
+                )?)
+            }
+        };
+        Ok(Self { video, audio })
+    }
+
+    fn emit_for_snapshot(
+        &mut self,
+        tick: u64,
+        snapshot: &QgsQncRuntimeSnapshot,
+        source_timebase: RationalRate,
+    ) -> QgsLiveOutputTickResult {
+        let video_status = self
+            .video
+            .as_mut()
+            .map(|video| video.emit(tick, snapshot, source_timebase))
+            .unwrap_or("off");
+        let audio_status = self
+            .audio
+            .as_mut()
+            .map(|audio| audio.emit(tick, snapshot))
+            .unwrap_or("off");
+        QgsLiveOutputTickResult {
+            video_status,
+            audio_status,
+        }
+    }
+
+    fn video_label(&self) -> &'static str {
+        if self.video.is_some() {
+            "preview-files"
+        } else {
+            "none"
+        }
+    }
+
+    fn audio_label(&self) -> &'static str {
+        self.audio
+            .as_ref()
+            .map(|audio| audio.mode.label())
+            .unwrap_or("none")
+    }
+
+    fn video_output_dir(&self) -> Option<&Path> {
+        self.video.as_ref().map(|video| video.output_dir.as_path())
+    }
+
+    fn audio_submitted(&self) -> bool {
+        self.audio.as_ref().is_some_and(|audio| audio.submitted)
+    }
+
+    fn audio_submissions(&self) -> u64 {
+        self.audio
+            .as_ref()
+            .map(|audio| audio.submissions)
+            .unwrap_or(0)
+    }
+
+    fn audio_bytes_copied(&self) -> usize {
+        self.audio
+            .as_ref()
+            .map(|audio| audio.bytes_copied)
+            .unwrap_or(0)
+    }
+}
+
+impl QgsLivePreviewFileOutput {
+    fn new(
+        proxy_path: &Path,
+        output_dir: &Path,
+        preview_every: u64,
+        _source_timebase: RationalRate,
+        _start_frame: u64,
+        _run_limit: u64,
+        _active_frames: u64,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        std::fs::create_dir_all(output_dir)?;
+        Ok(Self {
+            proxy_path: proxy_path.to_path_buf(),
+            output_dir: output_dir.to_path_buf(),
+            preview_every: preview_every.max(1),
+            output_index: 0,
+        })
+    }
+
+    fn emit(
+        &mut self,
+        tick: u64,
+        snapshot: &QgsQncRuntimeSnapshot,
+        source_timebase: RationalRate,
+    ) -> &'static str {
+        if !tick.is_multiple_of(self.preview_every) {
+            return "skipped";
+        }
+        let Some(frame) = snapshot.current_frame else {
+            return "missing-frame";
+        };
+        let readback = match self.read_proxy_frame(frame, source_timebase) {
+            Ok(readback) => readback,
+            Err(_) => return "failed",
+        };
+        match self.write_frame_artifacts(frame, snapshot, source_timebase, &readback) {
+            Ok(()) => {
+                self.output_index = self.output_index.saturating_add(1);
+                "written"
+            }
+            Err(_) => "failed",
+        }
+    }
+
+    fn read_proxy_frame(
+        &self,
+        frame: u64,
+        source_timebase: RationalRate,
+    ) -> Result<qgs_vulkan::ProcessedFrameOutput, Box<dyn std::error::Error>> {
+        let proxy = Mp4Source::open(&self.proxy_path)?;
+        let proxy_video = proxy
+            .video
+            .as_ref()
+            .ok_or("proxy has no H.264 video track")?;
+        let proxy_h264 = classify_video_track(proxy_video)?;
+        let slot = BroadcastPreparedVideoSlot {
+            slot_index: 0,
+            source_mode: BroadcastVideoSourceMode::ProxyPreview,
+            video_source_role: BroadcastMediaSourceRole::ProxyPreviewVideo,
+            source_frame_index: Some(frame),
+            selected_preview_frame_index: Some(frame),
+            presentation_time: source_timebase.frame_offset(frame)?,
+            duration: source_timebase.frame_duration()?,
+            status: BroadcastPreparedVideoSlotStatus::Prepared,
+        };
+        let proof = bind_proxy_preview_video_payloads_with_readback(
+            proxy_video,
+            &proxy_h264,
+            std::slice::from_ref(&slot),
+            true,
+        )?;
+        proof
+            .readback_outputs
+            .into_iter()
+            .next()
+            .map(|(_, readback)| readback)
+            .ok_or_else(|| "live preview proxy readback missing".into())
+    }
+
+    fn write_frame_artifacts(
+        &self,
+        frame: u64,
+        snapshot: &QgsQncRuntimeSnapshot,
+        source_timebase: RationalRate,
+        readback: &qgs_vulkan::ProcessedFrameOutput,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let ppm_bytes =
+            rgba_u16_to_ppm_p6_rgb8(&readback.rgba_u16, readback.width, readback.height)?;
+        let frame_name = qgs_live_preview_frame_file_name(self.output_index);
+        let frame_path = self.output_dir.join(&frame_name);
+        let latest_path = self.output_dir.join("latest.ppm");
+        File::create(&frame_path)?.write_all(&ppm_bytes)?;
+        File::create(&latest_path)?.write_all(&ppm_bytes)?;
+        let latest_json = qgs_live_preview_latest_json(
+            frame,
+            snapshot,
+            source_timebase,
+            &frame_name,
+            readback.width,
+            readback.height,
+            ppm_bytes.len(),
+            readback.checksum,
+        );
+        File::create(self.output_dir.join("latest.json"))?.write_all(latest_json.as_bytes())?;
+        Ok(())
+    }
+}
+
+impl QgsLiveAudioOutput {
+    fn new(
+        original_path: &Path,
+        mode: QgsBroadcastPlayerLiveAudioOutputMode,
+        preview_every: u64,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let index = open_pcm_audio_index(original_path)?;
+        let audio_tracks = index
+            .tracks
+            .iter()
+            .filter(|track| track.kind == TrackKind::Audio)
+            .collect::<Vec<_>>();
+        let source_format = original_linux_pcm_audio_format(&audio_tracks)?;
+        Ok(Self {
+            original_path: original_path.to_path_buf(),
+            index,
+            sample_rate: source_format.sample_rate,
+            mode,
+            preview_every: preview_every.max(1),
+            submitted: false,
+            submissions: 0,
+            bytes_copied: 0,
+        })
+    }
+
+    fn emit(&mut self, tick: u64, snapshot: &QgsQncRuntimeSnapshot) -> &'static str {
+        if !tick.is_multiple_of(self.preview_every) {
+            return "skipped";
+        }
+        let Some((start_sample, end_sample)) = snapshot.current_audio_sample_range else {
+            return "missing-range";
+        };
+        let per_frame_samples = end_sample.saturating_sub(start_sample).max(1);
+        let audio_frames_per_chunk = self
+            .preview_every
+            .min(QGS_BROADCAST_PLAYER_LIVE_AUDIO_MAX_FRAMES_PER_CHUNK)
+            .max(1);
+        let sample_count = match per_frame_samples.checked_mul(audio_frames_per_chunk) {
+            Some(value) => value,
+            None => return "failed",
+        };
+        let buffer = match self.build_buffer(start_sample, sample_count) {
+            Ok(buffer) => buffer,
+            Err(_) => return "failed",
+        };
+        let output_frames = match u32::try_from(sample_count) {
+            Ok(value) => value,
+            Err(_) => return "failed",
+        };
+        let stream_format = PipeWireStreamFormat {
+            sample_rate: self.sample_rate,
+            channels: 4,
+            sample_format: PipeWireAudioSampleFormat::F32Interleaved,
+        };
+        match submit_native_pipewire_buffers(
+            stream_format,
+            vec![buffer],
+            output_frames,
+            Duration::from_secs(2),
+        ) {
+            Ok(report) if report.buffer_submitted => {
+                self.submitted = true;
+                self.submissions = self.submissions.saturating_add(1);
+                self.bytes_copied = self.bytes_copied.saturating_add(report.bytes_copied);
+                if self.mode == QgsBroadcastPlayerLiveAudioOutputMode::PipeWireMonitor {
+                    "submitted-monitor"
+                } else {
+                    "submitted-4mono"
+                }
+            }
+            Ok(_) => "not-submitted",
+            Err(_) => "failed",
+        }
+    }
+
+    fn build_buffer(
+        &self,
+        start_sample: u64,
+        sample_count: u64,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let end_sample = start_sample
+            .checked_add(sample_count)
+            .ok_or("live audio sample range overflow")?;
+        let blocks = build_original_pcm_blocks_from_index_range(
+            &self.original_path,
+            &self.index,
+            start_sample,
+            end_sample,
+        )?;
+        let track_groups = original_pcm_blocks_by_channel(&blocks, self.sample_rate)?;
+        let channels = [0_u16, 1, 2, 3];
+        build_audio_audit_f32_interleaved_range(
+            &track_groups,
+            &channels,
+            self.sample_rate,
+            start_sample,
+            u32::try_from(sample_count)?,
+        )
+    }
+}
+
+fn qgs_live_preview_frame_file_name(output_index: u64) -> String {
+    format!("frame_{output_index:06}.ppm")
+}
+
+fn qgs_live_preview_latest_json(
+    frame: u64,
+    snapshot: &QgsQncRuntimeSnapshot,
+    source_timebase: RationalRate,
+    frame_file_name: &str,
+    width: u32,
+    height: u32,
+    image_bytes: usize,
+    checksum: u64,
+) -> String {
+    format!(
+        concat!(
+            "{{\n",
+            "  \"schema\": \"qgs.live-preview.latest.v1\",\n",
+            "  \"current_frame\": {},\n",
+            "  \"media_time\": \"{}\",\n",
+            "  \"audio_sample_range\": \"{}\",\n",
+            "  \"prepared_window\": \"{}\",\n",
+            "  \"source_mode\": \"ProxyPreview\",\n",
+            "  \"video_source\": \"proxy MP4\",\n",
+            "  \"audio_source\": \"original MXF\",\n",
+            "  \"proxy_aac_authoritative\": false,\n",
+            "  \"real_display\": \"no\",\n",
+            "  \"visual_verified\": false,\n",
+            "  \"private_path_exposed\": false,\n",
+            "  \"artifact\": \"{}\",\n",
+            "  \"width\": {},\n",
+            "  \"height\": {},\n",
+            "  \"image_bytes\": {},\n",
+            "  \"checksum\": \"0x{:016x}\"\n",
+            "}}\n"
+        ),
+        frame,
+        qgs_live_snapshot_media_time_label(snapshot, source_timebase),
+        qgs_optional_sample_range_label(snapshot.current_audio_sample_range),
+        qgs_qnc_optional_frame_window_label(snapshot.prepared_window.as_ref()),
+        json_escape(frame_file_name),
+        width,
+        height,
+        image_bytes,
+        checksum
+    )
 }
 
 fn qgs_broadcast_player_run_report(
@@ -5164,6 +5616,15 @@ fn qgs_broadcast_player_live_report(
         .unwrap_or(remaining_frames)
         .max(1)
         .min(remaining_frames);
+    let mut live_outputs = QgsLiveOutputCoordinator::new(
+        original_path,
+        proxy_path,
+        &options,
+        source_timebase,
+        start_frame,
+        run_limit,
+        active_frames,
+    )?;
     let mut surface = QgsQncControlSurface::from_assembly(&assembly, "qgs-test-live-runtime-loop")?;
     let mut accepted = 0_u64;
     let mut rejected = 0_u64;
@@ -5174,11 +5635,14 @@ fn qgs_broadcast_player_live_report(
 
     match options.view {
         QgsBroadcastPlayerRunView::Compact => {
-            print_broadcast_player_live_compact_header(&assembly, options)
+            print_broadcast_player_live_compact_header(&assembly, &options, &live_outputs)
         }
-        QgsBroadcastPlayerRunView::Detailed => {
-            print_broadcast_player_live_detailed_header(&assembly, options, run_limit)
-        }
+        QgsBroadcastPlayerRunView::Detailed => print_broadcast_player_live_detailed_header(
+            &assembly,
+            &options,
+            &live_outputs,
+            run_limit,
+        ),
     }
     if interactive_enabled {
         print_broadcast_player_live_controls();
@@ -5306,14 +5770,21 @@ fn qgs_broadcast_player_live_report(
         }
 
         let snapshot = surface.snapshot();
+        let output_result = live_outputs.emit_for_snapshot(processed, &snapshot, source_timebase);
         if processed == 0 || processed % status_every == 0 {
             match options.view {
-                QgsBroadcastPlayerRunView::Compact => {
-                    print_broadcast_player_live_compact_tick(processed, &snapshot, source_timebase)
-                }
-                QgsBroadcastPlayerRunView::Detailed => {
-                    print_broadcast_player_live_detailed_tick(processed, &snapshot, source_timebase)
-                }
+                QgsBroadcastPlayerRunView::Compact => print_broadcast_player_live_compact_tick(
+                    processed,
+                    &snapshot,
+                    source_timebase,
+                    &output_result,
+                ),
+                QgsBroadcastPlayerRunView::Detailed => print_broadcast_player_live_detailed_tick(
+                    processed,
+                    &snapshot,
+                    source_timebase,
+                    &output_result,
+                ),
             }
             io::stdout().flush()?;
         }
@@ -5398,7 +5869,7 @@ fn qgs_broadcast_player_live_report(
         }
 
         if !live_ticking {
-            qgs_live_sleep_for_input(options, frame_duration, interactive_enabled);
+            qgs_live_sleep_for_input(&options, frame_duration, interactive_enabled);
             continue;
         }
 
@@ -5428,7 +5899,7 @@ fn qgs_broadcast_player_live_report(
             stop_reason = "max-frames";
             break;
         }
-        qgs_live_sleep_for_input(options, frame_duration, interactive_enabled);
+        qgs_live_sleep_for_input(&options, frame_duration, interactive_enabled);
     }
 
     let stop = qgs_live_send(
@@ -5474,6 +5945,17 @@ fn qgs_broadcast_player_live_report(
     );
     println!("run result: {}", qgs_live_run_result_label(stop_reason));
     println!("stop reason: {stop_reason}");
+    println!("video output: {}", live_outputs.video_label());
+    if let Some(output_dir) = live_outputs.video_output_dir() {
+        println!("video output dir: {}", output_dir.display());
+    }
+    println!("audio output: {}", live_outputs.audio_label());
+    println!(
+        "audio submitted: {}",
+        yes_no(live_outputs.audio_submitted())
+    );
+    println!("audio submissions: {}", live_outputs.audio_submissions());
+    println!("audio bytes copied: {}", live_outputs.audio_bytes_copied());
     println!("commands accepted: {accepted}");
     println!("commands rejected: {rejected}");
     println!("projected events: {projected_events}");
@@ -5741,7 +6223,7 @@ fn qgs_qnc_prepared_window_covers_current_frame(snapshot: &QgsQncRuntimeSnapshot
 }
 
 fn qgs_live_sleep_for_input(
-    options: QgsBroadcastPlayerLiveOptions,
+    options: &QgsBroadcastPlayerLiveOptions,
     frame_duration: Duration,
     interactive_enabled: bool,
 ) {
@@ -5806,14 +6288,25 @@ fn qgs_live_count_reply(
 
 fn print_broadcast_player_live_compact_header(
     assembly: &QgsBroadcastPlayerAssembly,
-    options: QgsBroadcastPlayerLiveOptions,
+    options: &QgsBroadcastPlayerLiveOptions,
+    outputs: &QgsLiveOutputCoordinator,
 ) {
     println!("QGS Broadcast Player Live");
     println!("mode: ProxyPreview");
-    println!("video: proxy MP4");
-    println!("audio: original MXF mono lanes");
+    let video_target = outputs
+        .video_output_dir()
+        .map(|path| format!("{} / latest.ppm", path.display()))
+        .unwrap_or_else(|| "none".to_string());
+    println!("video: proxy MP4 -> {video_target}");
+    println!(
+        "audio: original MXF mono lanes -> {}",
+        outputs.audio_label()
+    );
     println!("device: preview-qnc-os");
     println!("display: NotImplemented / target Wayland+Vulkan");
+    println!("video output mode: {}", options.video_output.label());
+    println!("audio output mode: {}", options.audio_output.label());
+    println!("preview every: {}", options.preview_every.max(1));
     println!("pace: {}", options.pace.label());
     println!("interactive stdin: {}", yes_no(!options.no_interactive));
     println!(
@@ -5834,7 +6327,8 @@ fn print_broadcast_player_live_compact_header(
 
 fn print_broadcast_player_live_detailed_header(
     assembly: &QgsBroadcastPlayerAssembly,
-    options: QgsBroadcastPlayerLiveOptions,
+    options: &QgsBroadcastPlayerLiveOptions,
+    outputs: &QgsLiveOutputCoordinator,
     run_limit: u64,
 ) {
     println!("QGS Broadcast Player Live");
@@ -5846,6 +6340,13 @@ fn print_broadcast_player_live_detailed_header(
     println!("mode: ProxyPreview");
     println!("video: proxy MP4");
     println!("audio: original MXF discrete mono lanes");
+    println!("video output mode: {}", options.video_output.label());
+    if let Some(output_dir) = outputs.video_output_dir() {
+        println!("video output dir: {}", output_dir.display());
+    }
+    println!("audio output mode: {}", options.audio_output.label());
+    println!("audio output label: {}", outputs.audio_label());
+    println!("preview every: {}", options.preview_every.max(1));
     println!("original MXF audio authoritative: yes");
     println!("proxy AAC authoritative: no");
     println!("device policy: preview-qnc-os");
@@ -5904,14 +6405,17 @@ fn print_broadcast_player_live_compact_tick(
     tick: u64,
     snapshot: &QgsQncRuntimeSnapshot,
     source_timebase: RationalRate,
+    output: &QgsLiveOutputTickResult,
 ) {
     println!(
-        "tick={tick:06} frame={:<4} t={} audio={:<18} window={:<9} buffer={}",
+        "tick={tick:06} frame={:<4} t={} audio={:<18} window={:<9} buffer={} video_out={} audio_out={}",
         qgs_optional_u64_label(snapshot.current_frame),
         qgs_live_snapshot_media_time_label(snapshot, source_timebase),
         qgs_optional_sample_range_label(snapshot.current_audio_sample_range),
         qgs_qnc_optional_frame_window_label(snapshot.prepared_window.as_ref()),
-        qgs_live_buffer_label(snapshot)
+        qgs_live_buffer_label(snapshot),
+        output.video_status,
+        output.audio_status
     );
 }
 
@@ -5919,6 +6423,7 @@ fn print_broadcast_player_live_detailed_tick(
     tick: u64,
     snapshot: &QgsQncRuntimeSnapshot,
     source_timebase: RationalRate,
+    output: &QgsLiveOutputTickResult,
 ) {
     println!("[LIVE TICK {tick:06}]");
     println!("status: {:?}", snapshot.status);
@@ -5936,6 +6441,8 @@ fn print_broadcast_player_live_detailed_tick(
         qgs_qnc_optional_frame_window_label(snapshot.prepared_window.as_ref())
     );
     println!("buffer: {}", snapshot.buffer_status);
+    println!("video output: {}", output.video_status);
+    println!("audio output: {}", output.audio_status);
     println!(
         "video payload ready: {}",
         yes_no(snapshot.video_payload_ready)
@@ -18932,6 +19439,10 @@ impl Args {
         let mut next_arg_is_qgs_broadcast_player_live_status_every = false;
         let mut next_arg_is_qgs_broadcast_player_live_max_frames = false;
         let mut next_arg_is_qgs_broadcast_player_live_pace = false;
+        let mut next_arg_is_qgs_broadcast_player_live_video_output = false;
+        let mut next_arg_is_qgs_broadcast_player_live_audio_output = false;
+        let mut next_arg_is_qgs_broadcast_player_live_output_dir = false;
+        let mut next_arg_is_qgs_broadcast_player_live_preview_every = false;
         let mut next_arg_is_qgs_broadcast_player_run_seek_frame = false;
         let mut next_arg_is_qgs_broadcast_player_run_view = false;
         let mut next_arg_is_qgs_broadcast_player_control_session_original = false;
@@ -18981,6 +19492,25 @@ impl Args {
                 qgs_broadcast_player_live_options.pace = QgsBroadcastPlayerLivePace::parse(&arg)
                     .unwrap_or_else(|err| panic!("{QGS_BROADCAST_PLAYER_LIVE_PACE_ARG}: {err}"));
                 next_arg_is_qgs_broadcast_player_live_pace = false;
+            } else if next_arg_is_qgs_broadcast_player_live_video_output {
+                qgs_broadcast_player_live_options.video_output =
+                    QgsBroadcastPlayerLiveVideoOutputMode::parse(&arg).unwrap_or_else(|err| {
+                        panic!("{QGS_BROADCAST_PLAYER_LIVE_VIDEO_OUTPUT_ARG}: {err}")
+                    });
+                next_arg_is_qgs_broadcast_player_live_video_output = false;
+            } else if next_arg_is_qgs_broadcast_player_live_audio_output {
+                qgs_broadcast_player_live_options.audio_output =
+                    QgsBroadcastPlayerLiveAudioOutputMode::parse(&arg).unwrap_or_else(|err| {
+                        panic!("{QGS_BROADCAST_PLAYER_LIVE_AUDIO_OUTPUT_ARG}: {err}")
+                    });
+                next_arg_is_qgs_broadcast_player_live_audio_output = false;
+            } else if next_arg_is_qgs_broadcast_player_live_output_dir {
+                qgs_broadcast_player_live_options.output_dir = PathBuf::from(arg);
+                next_arg_is_qgs_broadcast_player_live_output_dir = false;
+            } else if next_arg_is_qgs_broadcast_player_live_preview_every {
+                qgs_broadcast_player_live_options.preview_every =
+                    parse_u64_os_arg(&arg, QGS_BROADCAST_PLAYER_LIVE_PREVIEW_EVERY_ARG).max(1);
+                next_arg_is_qgs_broadcast_player_live_preview_every = false;
             } else if next_arg_is_qgs_broadcast_player_run_seek_frame {
                 let seek_frame = parse_u64_os_arg(&arg, QGS_BROADCAST_PLAYER_RUN_SEEK_FRAME_ARG);
                 qgs_broadcast_player_run_options.seek_frame = Some(seek_frame);
@@ -19632,6 +20162,14 @@ impl Args {
                 next_arg_is_qgs_broadcast_player_live_pace = true;
             } else if arg == QGS_BROADCAST_PLAYER_LIVE_NO_INTERACTIVE_ARG {
                 qgs_broadcast_player_live_options.no_interactive = true;
+            } else if arg == QGS_BROADCAST_PLAYER_LIVE_VIDEO_OUTPUT_ARG {
+                next_arg_is_qgs_broadcast_player_live_video_output = true;
+            } else if arg == QGS_BROADCAST_PLAYER_LIVE_AUDIO_OUTPUT_ARG {
+                next_arg_is_qgs_broadcast_player_live_audio_output = true;
+            } else if arg == QGS_BROADCAST_PLAYER_LIVE_OUTPUT_DIR_ARG {
+                next_arg_is_qgs_broadcast_player_live_output_dir = true;
+            } else if arg == QGS_BROADCAST_PLAYER_LIVE_PREVIEW_EVERY_ARG {
+                next_arg_is_qgs_broadcast_player_live_preview_every = true;
             } else if arg == QGS_BROADCAST_PLAYER_RUN_SEEK_FRAME_ARG {
                 next_arg_is_qgs_broadcast_player_run_seek_frame = true;
             } else if arg == QGS_BROADCAST_PLAYER_RUN_VIEW_ARG {
@@ -19806,14 +20344,17 @@ mod tests {
         qgs_running_runtime_persistent_warning_lines, repeated_smoke_test_buffers,
         rgba_u16_to_ppm_p6_rgb8, rgba_u16_to_rgb8_bytes, runtime_audio_payload_evidence_label,
         sanitized_source_stem, selected_proxy_ordinals, smoke_test_buffer_count,
-        ManualAudibleConfirmation, QgsBroadcastPlayerLiveInputCommand,
-        QgsBroadcastPlayerLiveOptions, QgsBroadcastPlayerLivePace, QgsBroadcastPlayerRunView,
-        QgsControlSessionScriptCommand, SonyXmlSummary,
+        ManualAudibleConfirmation, QgsBroadcastPlayerLiveAudioOutputMode,
+        QgsBroadcastPlayerLiveInputCommand, QgsBroadcastPlayerLiveOptions,
+        QgsBroadcastPlayerLivePace, QgsBroadcastPlayerLiveVideoOutputMode,
+        QgsBroadcastPlayerRunView, QgsControlSessionScriptCommand, SonyXmlSummary,
     };
-    use qgs_media_runtime::QgsDeviceSelectionPolicy;
     use qgs_media_runtime::{
         av_frame_audio_range, bind_broadcast_audio_payload, BroadcastPreparedAudioSlot,
         BroadcastVideoSourceMode, PcmAudioBlock, PcmAudioBlockLayout, PcmEndian, PcmSampleFormat,
+        QgsBroadcastPlayerStatus, QgsDeviceSelectionPolicy, QgsInputPlanSourceMode,
+        QgsPlaybackRepresentation, QgsQncControlDeviceStatus, QgsQncControlEvidenceLevel,
+        QgsQncGeneration, QgsQncPreparedWindowView, QgsQncRuntimeSnapshot, RationalRate,
     };
     use qgs_mp4::{Mp4VideoSample, Mp4VideoTrack, Rational};
     use qgs_mxf::{
@@ -19991,6 +20532,112 @@ mod tests {
         assert_eq!(options.max_frames, Some(500));
         assert_eq!(options.pace, QgsBroadcastPlayerLivePace::Logical);
         assert!(!options.no_interactive);
+        assert_eq!(
+            options.video_output,
+            QgsBroadcastPlayerLiveVideoOutputMode::PreviewFiles
+        );
+        assert_eq!(
+            options.audio_output,
+            QgsBroadcastPlayerLiveAudioOutputMode::None
+        );
+        assert_eq!(options.preview_every, 5);
+    }
+
+    #[test]
+    fn live_runtime_output_option_parsers_are_conservative() {
+        assert_eq!(
+            QgsBroadcastPlayerLiveVideoOutputMode::parse(std::ffi::OsStr::new("none")),
+            Ok(QgsBroadcastPlayerLiveVideoOutputMode::None)
+        );
+        assert_eq!(
+            QgsBroadcastPlayerLiveVideoOutputMode::parse(std::ffi::OsStr::new("preview-files")),
+            Ok(QgsBroadcastPlayerLiveVideoOutputMode::PreviewFiles)
+        );
+        assert_eq!(
+            QgsBroadcastPlayerLiveAudioOutputMode::parse(std::ffi::OsStr::new("pipewire-monitor")),
+            Ok(QgsBroadcastPlayerLiveAudioOutputMode::PipeWireMonitor)
+        );
+        assert_eq!(
+            QgsBroadcastPlayerLiveAudioOutputMode::parse(std::ffi::OsStr::new("pipewire-4mono")),
+            Ok(QgsBroadcastPlayerLiveAudioOutputMode::PipeWire4Mono)
+        );
+        assert!(QgsBroadcastPlayerLiveVideoOutputMode::parse(std::ffi::OsStr::new("x11")).is_err());
+        assert!(
+            QgsBroadcastPlayerLiveAudioOutputMode::parse(std::ffi::OsStr::new("proxy-aac"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn live_preview_frame_names_are_deterministic_and_public_safe() {
+        assert_eq!(
+            super::qgs_live_preview_frame_file_name(7),
+            "frame_000007.ppm"
+        );
+        assert!(!super::qgs_live_preview_frame_file_name(7).contains("/home/"));
+    }
+
+    #[test]
+    fn live_preview_latest_json_is_public_safe_and_non_claiming() {
+        let snapshot = QgsQncRuntimeSnapshot {
+            generation: QgsQncGeneration(3),
+            status: QgsBroadcastPlayerStatus::Playing,
+            source_loaded: true,
+            public_source_uri: Some("qgs://source/live-demo".to_string()),
+            source_mode: Some(QgsInputPlanSourceMode::ProxyPreview),
+            picture_representation: Some(QgsPlaybackRepresentation::Proxy),
+            authoritative_audio_source: "original MXF",
+            proxy_aac_authoritative: false,
+            broadcast_audio_model: "discrete original MXF mono lanes",
+            active_range: Some((0, 100)),
+            current_frame: Some(12),
+            current_audio_sample_range: Some((11520, 12480)),
+            media_time: Some(Duration::from_millis(240)),
+            prepared_window: Some(QgsQncPreparedWindowView {
+                start_frame: Some(10),
+                end_frame_exclusive: Some(18),
+                selected_frame: Some(12),
+                prepared_frame_count: 8,
+            }),
+            video_payload_ready: true,
+            audio_payload_ready: true,
+            buffer_status: "ready",
+            device_status: QgsQncControlDeviceStatus {
+                device_policy: "preview-qnc-os",
+                selected_video_backend: "file-presenter",
+                selected_audio_backend: "pipewire-monitor",
+                qnc_os_display_target: "Wayland+Vulkan",
+                x11_target_status: "legacy/non-target",
+                real_display_status: "NotImplemented",
+                presenter_evidence_level: QgsQncControlEvidenceLevel::NotImplemented,
+                audio_device_status: "NotProductionVerified",
+                visual_verified: false,
+                realtime_verified: false,
+                audio_device_verified: false,
+                av_sync_verified: false,
+            },
+            active_faults: Vec::new(),
+            warnings: Vec::new(),
+            private_path_exposed: false,
+        };
+        let json = super::qgs_live_preview_latest_json(
+            12,
+            &snapshot,
+            RationalRate::new(50, 1).unwrap(),
+            "frame_000002.ppm",
+            1920,
+            1080,
+            6_220_817,
+            0x1234,
+        );
+        assert!(json.contains("\"video_source\": \"proxy MP4\""));
+        assert!(json.contains("\"audio_source\": \"original MXF\""));
+        assert!(json.contains("\"proxy_aac_authoritative\": false"));
+        assert!(json.contains("\"real_display\": \"no\""));
+        assert!(json.contains("\"visual_verified\": false"));
+        assert!(json.contains("\"private_path_exposed\": false"));
+        assert!(!json.contains("/home/"));
+        assert!(!json.contains("Mironik"));
     }
 
     #[test]
