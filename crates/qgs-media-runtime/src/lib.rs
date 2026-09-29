@@ -1135,6 +1135,385 @@ impl QgsFrameClock {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsPreparedFrameKey {
+    pub frame: u64,
+    pub revision: QgsTransportSourceRevision,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsPreparedFrameStatus {
+    NotPrepared,
+    Preparing,
+    Prepared,
+    Accounted,
+    Discarded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsPreparedPayloadKind {
+    OriginalAudioRange,
+    ProxyVideoReference,
+    OriginalVideoReference,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsBufferDiscardReason {
+    BehindBackwardWindow,
+    LimitPressure,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsPlayoutBufferLimits {
+    pub backward_keep_frames: u64,
+    pub forward_prepare_frames: u64,
+    pub max_prepared_frames: usize,
+}
+
+impl QgsPlayoutBufferLimits {
+    pub const fn default_transport_window() -> Self {
+        Self {
+            backward_keep_frames: 2,
+            forward_prepare_frames: 5,
+            max_prepared_frames: 8,
+        }
+    }
+
+    pub fn validate(self) -> Result<(), PlaybackError> {
+        if self.max_prepared_frames == 0
+            || self.forward_prepare_frames == 0
+            || u64::try_from(self.max_prepared_frames)
+                .map_err(|_| PlaybackError::InvalidCapacity)?
+                == 0
+        {
+            return Err(PlaybackError::InvalidCapacity);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsPlayoutBufferWindow {
+    pub carrier_frame: u64,
+    pub start_frame: u64,
+    pub end_frame: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsPreparedAudioRangeSlot {
+    pub frame: u64,
+    pub sample_range: QgsFrameAudioSampleRange,
+    pub lanes: Vec<QgsPreparedAudioChannel>,
+    pub payload_kind: QgsPreparedPayloadKind,
+    pub status: QgsPreparedFrameStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsPreparedVideoSlot {
+    pub frame: u64,
+    pub source_mode: QgsInputPlanSourceMode,
+    pub payload_kind: QgsPreparedPayloadKind,
+    pub status: QgsPreparedFrameStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsPreparedFrameSlot {
+    pub key: QgsPreparedFrameKey,
+    pub audio: QgsPreparedAudioRangeSlot,
+    pub video: QgsPreparedVideoSlot,
+    pub status: QgsPreparedFrameStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QgsTickPreparationEvent {
+    PlayoutBufferCreated {
+        max_prepared_frames: usize,
+    },
+    TickPreparationStarted {
+        carrier_frame: u64,
+    },
+    DueFramesDrained {
+        frames: Vec<u64>,
+    },
+    FramePrepared {
+        frame: u64,
+    },
+    AudioRangePrepared {
+        frame: u64,
+        start_sample: u64,
+        end_sample: u64,
+        lanes: usize,
+    },
+    VideoPayloadMarkedReady {
+        frame: u64,
+        payload_kind: QgsPreparedPayloadKind,
+    },
+    PreparedWindowAdvanced {
+        start_frame: u64,
+        end_frame: u64,
+    },
+    OldFrameDiscarded {
+        frame: u64,
+        reason: QgsBufferDiscardReason,
+    },
+    BufferLimitReached {
+        max_prepared_frames: usize,
+    },
+    TickPreparationCompleted {
+        prepared_frames: usize,
+    },
+    TickValidationFailed {
+        reason: &'static str,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsTickPreparationInput {
+    pub carrier_frame: u64,
+    pub elapsed: Duration,
+    pub max_due_frames: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsTickPreparationResult {
+    pub carrier_frame: u64,
+    pub window: QgsPlayoutBufferWindow,
+    pub due_frames: Vec<u64>,
+    pub prepared_frames: Vec<u64>,
+    pub discarded_frames: Vec<u64>,
+    pub slots: Vec<QgsPreparedFrameSlot>,
+    pub events: Vec<QgsTickPreparationEvent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsPlayoutBufferState {
+    pub active_range: QgsActiveRangeTiming,
+    pub revision: QgsTransportSourceRevision,
+    pub source_mode: QgsInputPlanSourceMode,
+    pub lanes: Vec<QgsPreparedAudioChannel>,
+    pub limits: QgsPlayoutBufferLimits,
+    slots: BTreeMap<u64, QgsPreparedFrameSlot>,
+    last_accounted_frame: Option<u64>,
+    events: Vec<QgsTickPreparationEvent>,
+}
+
+impl QgsPlayoutBufferState {
+    pub fn new(
+        active_range: QgsActiveRangeTiming,
+        revision: QgsTransportSourceRevision,
+        source_mode: QgsInputPlanSourceMode,
+        lanes: Vec<QgsPreparedAudioChannel>,
+        limits: QgsPlayoutBufferLimits,
+    ) -> Result<Self, PlaybackError> {
+        limits.validate()?;
+        if lanes.is_empty() {
+            return Err(PlaybackError::InvalidAudioFormat);
+        }
+        Ok(Self {
+            active_range,
+            revision,
+            source_mode,
+            lanes,
+            limits,
+            slots: BTreeMap::new(),
+            last_accounted_frame: None,
+            events: vec![QgsTickPreparationEvent::PlayoutBufferCreated {
+                max_prepared_frames: limits.max_prepared_frames,
+            }],
+        })
+    }
+
+    pub fn slots(&self) -> Vec<QgsPreparedFrameSlot> {
+        self.slots.values().cloned().collect()
+    }
+
+    pub fn events(&self) -> &[QgsTickPreparationEvent] {
+        &self.events
+    }
+
+    pub fn tick_prepare(
+        &mut self,
+        clock: QgsFrameClock,
+        input: QgsTickPreparationInput,
+    ) -> Result<QgsTickPreparationResult, PlaybackError> {
+        if clock.active_range != self.active_range
+            || !self.active_range.contains_frame(input.carrier_frame)
+        {
+            self.events
+                .push(QgsTickPreparationEvent::TickValidationFailed {
+                    reason: "carrier outside active range",
+                });
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        let mut tick_events = Vec::new();
+        tick_events.push(QgsTickPreparationEvent::TickPreparationStarted {
+            carrier_frame: input.carrier_frame,
+        });
+        let drain = clock.drain_due_frames(
+            self.last_accounted_frame,
+            input.elapsed,
+            input.max_due_frames,
+        )?;
+        self.mark_frames_accounted(&drain.frames);
+        if let Some(last) = drain.frames.last().copied() {
+            self.last_accounted_frame = Some(last);
+        }
+        tick_events.push(QgsTickPreparationEvent::DueFramesDrained {
+            frames: drain.frames.clone(),
+        });
+
+        let discarded_frames = self.discard_old_frames(input.carrier_frame, &mut tick_events)?;
+        let window = self.window_for_carrier(input.carrier_frame)?;
+        if window.end_frame < self.natural_window_end(input.carrier_frame)? {
+            tick_events.push(QgsTickPreparationEvent::BufferLimitReached {
+                max_prepared_frames: self.limits.max_prepared_frames,
+            });
+        }
+        let mut prepared_frames = Vec::new();
+        let mut frame = window.start_frame;
+        while frame < window.end_frame {
+            if self.slots.len() >= self.limits.max_prepared_frames
+                && !self.slots.contains_key(&frame)
+            {
+                tick_events.push(QgsTickPreparationEvent::BufferLimitReached {
+                    max_prepared_frames: self.limits.max_prepared_frames,
+                });
+                break;
+            }
+            if !self.slots.contains_key(&frame) {
+                let slot = self.prepare_slot(frame)?;
+                tick_events.push(QgsTickPreparationEvent::FramePrepared { frame });
+                tick_events.push(QgsTickPreparationEvent::AudioRangePrepared {
+                    frame,
+                    start_sample: slot.audio.sample_range.start_sample,
+                    end_sample: slot.audio.sample_range.end_sample,
+                    lanes: slot.audio.lanes.len(),
+                });
+                tick_events.push(QgsTickPreparationEvent::VideoPayloadMarkedReady {
+                    frame,
+                    payload_kind: slot.video.payload_kind,
+                });
+                self.slots.insert(frame, slot);
+                prepared_frames.push(frame);
+            }
+            frame = frame
+                .checked_add(1)
+                .ok_or(PlaybackError::TimestampOverflow)?;
+        }
+        self.mark_frames_accounted(&drain.frames);
+
+        tick_events.push(QgsTickPreparationEvent::PreparedWindowAdvanced {
+            start_frame: window.start_frame,
+            end_frame: window.end_frame,
+        });
+        tick_events.push(QgsTickPreparationEvent::TickPreparationCompleted {
+            prepared_frames: self.slots.len(),
+        });
+        self.events.extend(tick_events.clone());
+        Ok(QgsTickPreparationResult {
+            carrier_frame: input.carrier_frame,
+            window,
+            due_frames: drain.frames,
+            prepared_frames,
+            discarded_frames,
+            slots: self.slots(),
+            events: tick_events,
+        })
+    }
+
+    fn prepare_slot(&self, frame: u64) -> Result<QgsPreparedFrameSlot, PlaybackError> {
+        let sample_range = self.active_range.frame_audio_sample_range(frame)?;
+        let video_payload_kind = match self.source_mode {
+            QgsInputPlanSourceMode::ProxyPreview => QgsPreparedPayloadKind::ProxyVideoReference,
+            QgsInputPlanSourceMode::OriginalMedia => QgsPreparedPayloadKind::OriginalVideoReference,
+        };
+        Ok(QgsPreparedFrameSlot {
+            key: QgsPreparedFrameKey {
+                frame,
+                revision: self.revision,
+            },
+            audio: QgsPreparedAudioRangeSlot {
+                frame,
+                sample_range,
+                lanes: self.lanes.clone(),
+                payload_kind: QgsPreparedPayloadKind::OriginalAudioRange,
+                status: QgsPreparedFrameStatus::Prepared,
+            },
+            video: QgsPreparedVideoSlot {
+                frame,
+                source_mode: self.source_mode,
+                payload_kind: video_payload_kind,
+                status: QgsPreparedFrameStatus::Prepared,
+            },
+            status: QgsPreparedFrameStatus::Prepared,
+        })
+    }
+
+    fn mark_frames_accounted(&mut self, frames: &[u64]) {
+        for frame in frames {
+            if let Some(slot) = self.slots.get_mut(frame) {
+                slot.status = QgsPreparedFrameStatus::Accounted;
+                slot.audio.status = QgsPreparedFrameStatus::Accounted;
+                slot.video.status = QgsPreparedFrameStatus::Accounted;
+            }
+        }
+    }
+
+    fn window_for_carrier(
+        &self,
+        carrier_frame: u64,
+    ) -> Result<QgsPlayoutBufferWindow, PlaybackError> {
+        let start_frame = carrier_frame
+            .saturating_sub(self.limits.backward_keep_frames)
+            .max(self.active_range.start_frame);
+        let mut end_frame = self.natural_window_end(carrier_frame)?;
+        let max_end = start_frame
+            .checked_add(
+                u64::try_from(self.limits.max_prepared_frames)
+                    .map_err(|_| PlaybackError::InvalidCapacity)?,
+            )
+            .ok_or(PlaybackError::TimestampOverflow)?;
+        end_frame = end_frame.min(max_end);
+        Ok(QgsPlayoutBufferWindow {
+            carrier_frame,
+            start_frame,
+            end_frame,
+        })
+    }
+
+    fn natural_window_end(&self, carrier_frame: u64) -> Result<u64, PlaybackError> {
+        Ok(carrier_frame
+            .checked_add(self.limits.forward_prepare_frames)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(PlaybackError::TimestampOverflow)?
+            .min(self.active_range.end_frame))
+    }
+
+    fn discard_old_frames(
+        &mut self,
+        carrier_frame: u64,
+        tick_events: &mut Vec<QgsTickPreparationEvent>,
+    ) -> Result<Vec<u64>, PlaybackError> {
+        let keep_start = carrier_frame
+            .saturating_sub(self.limits.backward_keep_frames)
+            .max(self.active_range.start_frame);
+        let old_frames = self
+            .slots
+            .keys()
+            .copied()
+            .filter(|frame| *frame < keep_start)
+            .collect::<Vec<_>>();
+        for frame in &old_frames {
+            self.slots.remove(frame);
+            tick_events.push(QgsTickPreparationEvent::OldFrameDiscarded {
+                frame: *frame,
+                reason: QgsBufferDiscardReason::BehindBackwardWindow,
+            });
+        }
+        Ok(old_frames)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QgsTransportSourceRevision(pub u64);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4957,6 +5336,265 @@ mod tests {
         assert_eq!(
             engine.cue_frame(50),
             Err(PlaybackError::InvalidRuntimeTransition)
+        );
+    }
+
+    fn sample_qgs_playout_buffer() -> (QgsPlayoutBufferState, QgsFrameClock) {
+        let plan = sample_qgs_input_plan();
+        let active_range = QgsActiveRangeTiming::new(
+            plan.video_source.duration_frames,
+            plan.video_source.timebase,
+            plan.audio_source.sample_rate,
+            0,
+            50,
+        )
+        .unwrap();
+        let buffer = QgsPlayoutBufferState::new(
+            active_range,
+            QgsTransportSourceRevision(1),
+            plan.source_mode,
+            plan.audio_source.lanes,
+            QgsPlayoutBufferLimits::default_transport_window(),
+        )
+        .unwrap();
+        let clock = QgsFrameClock::forward(active_range).unwrap();
+        (buffer, clock)
+    }
+
+    #[test]
+    fn qgs_playout_buffer_rejects_invalid_limits() {
+        let plan = sample_qgs_input_plan();
+        let active_range = QgsActiveRangeTiming::new(
+            plan.video_source.duration_frames,
+            plan.video_source.timebase,
+            plan.audio_source.sample_rate,
+            0,
+            50,
+        )
+        .unwrap();
+        assert_eq!(
+            QgsPlayoutBufferState::new(
+                active_range,
+                QgsTransportSourceRevision(1),
+                plan.source_mode,
+                plan.audio_source.lanes.clone(),
+                QgsPlayoutBufferLimits {
+                    backward_keep_frames: 2,
+                    forward_prepare_frames: 5,
+                    max_prepared_frames: 0,
+                },
+            ),
+            Err(PlaybackError::InvalidCapacity)
+        );
+        assert_eq!(
+            QgsPlayoutBufferState::new(
+                active_range,
+                QgsTransportSourceRevision(1),
+                plan.source_mode,
+                Vec::new(),
+                QgsPlayoutBufferLimits::default_transport_window(),
+            ),
+            Err(PlaybackError::InvalidAudioFormat)
+        );
+    }
+
+    #[test]
+    fn qgs_playout_buffer_prepares_initial_forward_window() {
+        let (mut buffer, clock) = sample_qgs_playout_buffer();
+        let result = buffer
+            .tick_prepare(
+                clock,
+                QgsTickPreparationInput {
+                    carrier_frame: 0,
+                    elapsed: Duration::ZERO,
+                    max_due_frames: 8,
+                },
+            )
+            .unwrap();
+        assert_eq!(result.window.start_frame, 0);
+        assert_eq!(result.window.end_frame, 6);
+        assert_eq!(result.prepared_frames, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(result.slots.len(), 6);
+        assert_eq!(
+            result.slots[0].audio.sample_range,
+            QgsFrameAudioSampleRange {
+                frame: 0,
+                start_sample: 0,
+                end_sample: 960,
+                start_time: Duration::ZERO,
+                duration: Duration::from_millis(20),
+            }
+        );
+        assert_eq!(
+            result.slots[0].audio.payload_kind,
+            QgsPreparedPayloadKind::OriginalAudioRange
+        );
+        assert_eq!(result.slots[0].audio.lanes.len(), 4);
+        assert_eq!(
+            result.slots[0].video.payload_kind,
+            QgsPreparedPayloadKind::ProxyVideoReference
+        );
+    }
+
+    #[test]
+    fn qgs_playout_buffer_discards_old_frames_when_carrier_advances() {
+        let (mut buffer, clock) = sample_qgs_playout_buffer();
+        buffer
+            .tick_prepare(
+                clock,
+                QgsTickPreparationInput {
+                    carrier_frame: 0,
+                    elapsed: Duration::ZERO,
+                    max_due_frames: 8,
+                },
+            )
+            .unwrap();
+        let result = buffer
+            .tick_prepare(
+                clock,
+                QgsTickPreparationInput {
+                    carrier_frame: 6,
+                    elapsed: Duration::from_millis(120),
+                    max_due_frames: 8,
+                },
+            )
+            .unwrap();
+        assert_eq!(result.discarded_frames, vec![0, 1, 2, 3]);
+        assert!(result.slots.iter().all(|slot| slot.key.frame >= 4));
+        assert!(result.slots.iter().all(|slot| slot.key.frame < 12));
+        assert_eq!(result.slots.len(), 8);
+    }
+
+    #[test]
+    fn qgs_playout_buffer_respects_active_range_end() {
+        let (mut buffer, clock) = sample_qgs_playout_buffer();
+        let result = buffer
+            .tick_prepare(
+                clock,
+                QgsTickPreparationInput {
+                    carrier_frame: 48,
+                    elapsed: Duration::from_millis(960),
+                    max_due_frames: 64,
+                },
+            )
+            .unwrap();
+        assert_eq!(result.window.start_frame, 46);
+        assert_eq!(result.window.end_frame, 50);
+        assert_eq!(result.prepared_frames, vec![46, 47, 48, 49]);
+        assert_eq!(
+            result
+                .slots
+                .iter()
+                .find(|slot| slot.key.frame == 49)
+                .unwrap()
+                .audio
+                .sample_range
+                .start_sample,
+            47_040
+        );
+        assert_eq!(
+            result
+                .slots
+                .iter()
+                .find(|slot| slot.key.frame == 49)
+                .unwrap()
+                .audio
+                .sample_range
+                .end_sample,
+            48_000
+        );
+    }
+
+    #[test]
+    fn qgs_playout_buffer_enforces_max_prepared_frames() {
+        let plan = sample_qgs_input_plan();
+        let active_range = QgsActiveRangeTiming::new(
+            plan.video_source.duration_frames,
+            plan.video_source.timebase,
+            plan.audio_source.sample_rate,
+            0,
+            50,
+        )
+        .unwrap();
+        let mut buffer = QgsPlayoutBufferState::new(
+            active_range,
+            QgsTransportSourceRevision(1),
+            plan.source_mode,
+            plan.audio_source.lanes,
+            QgsPlayoutBufferLimits {
+                backward_keep_frames: 2,
+                forward_prepare_frames: 8,
+                max_prepared_frames: 3,
+            },
+        )
+        .unwrap();
+        let result = buffer
+            .tick_prepare(
+                QgsFrameClock::forward(active_range).unwrap(),
+                QgsTickPreparationInput {
+                    carrier_frame: 0,
+                    elapsed: Duration::ZERO,
+                    max_due_frames: 8,
+                },
+            )
+            .unwrap();
+        assert_eq!(result.slots.len(), 3);
+        assert!(result
+            .events
+            .contains(&QgsTickPreparationEvent::BufferLimitReached {
+                max_prepared_frames: 3
+            }));
+    }
+
+    #[test]
+    fn qgs_playout_buffer_events_are_deterministic_and_non_presenting() {
+        let (mut buffer, clock) = sample_qgs_playout_buffer();
+        let result = buffer
+            .tick_prepare(
+                clock,
+                QgsTickPreparationInput {
+                    carrier_frame: 0,
+                    elapsed: Duration::ZERO,
+                    max_due_frames: 8,
+                },
+            )
+            .unwrap();
+        let labels = result
+            .events
+            .iter()
+            .map(|event| match event {
+                QgsTickPreparationEvent::TickPreparationStarted { .. } => "started",
+                QgsTickPreparationEvent::DueFramesDrained { .. } => "drained",
+                QgsTickPreparationEvent::FramePrepared { .. } => "frame",
+                QgsTickPreparationEvent::AudioRangePrepared { .. } => "audio",
+                QgsTickPreparationEvent::VideoPayloadMarkedReady { .. } => "video",
+                QgsTickPreparationEvent::PreparedWindowAdvanced { .. } => "window",
+                QgsTickPreparationEvent::TickPreparationCompleted { .. } => "completed",
+                _ => "other",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &labels[..8],
+            &["started", "drained", "frame", "audio", "video", "frame", "audio", "video"]
+        );
+        assert!(!labels.contains(&"presented"));
+        assert!(!labels.contains(&"realtime"));
+    }
+
+    #[test]
+    fn qgs_transport_play_does_not_fill_playout_buffer() {
+        let mut engine = QgsTransportEngine::new();
+        let handle = engine.load_source(&sample_qgs_input_plan()).unwrap();
+        engine.preload_source(&handle).unwrap();
+        engine.set_active_source(&handle).unwrap();
+        engine.set_active_range_frames(0, 50).unwrap();
+        engine.cue_frame(0).unwrap();
+        engine.prepare_anchor().unwrap();
+        engine.play().unwrap();
+        let snapshot = engine.snapshot();
+        assert_eq!(
+            snapshot.no_work_on_play,
+            QgsTransportNoWorkOnPlayCounters::default()
         );
     }
 

@@ -45,9 +45,10 @@ use qgs_media_runtime::{
     PlaybackConfig, PlaybackState, PresentationDecision, QgsActiveRangeTiming,
     QgsAudioRepresentation, QgsFrameClock, QgsFrameClockMode, QgsFrameClockRate, QgsInputPlan,
     QgsInputPlanQueueRequirements, QgsOriginalProxyAssociationStatus, QgsPlaybackRepresentation,
-    QgsPreparedAudioChannel, QgsPreparedAudioLayout, QgsPreparedInputDescriptor,
-    QgsPreparedMediaBinding, QgsPreparedSourceIdentity, QgsPreparedStreamLayout,
-    QgsPreparedVideoTiming, QgsTransportEngine, QgsTransportEvent, RationalRate, RealTimeClock,
+    QgsPlayoutBufferLimits, QgsPlayoutBufferState, QgsPreparedAudioChannel, QgsPreparedAudioLayout,
+    QgsPreparedInputDescriptor, QgsPreparedMediaBinding, QgsPreparedSourceIdentity,
+    QgsPreparedStreamLayout, QgsPreparedVideoTiming, QgsTickPreparationEvent,
+    QgsTickPreparationInput, QgsTransportEngine, QgsTransportEvent, RationalRate, RealTimeClock,
     TestAudioSink, TestPresentationSink,
 };
 use qgs_mp4::{
@@ -134,6 +135,7 @@ const QNC_PREPARED_INPUT_DESCRIPTOR_ARG: &str = "--qnc-prepared-input-descriptor
 const QGS_INPUT_PLAN_ARG: &str = "--qgs-input-plan";
 const QGS_TRANSPORT_ENGINE_PARITY_ARG: &str = "--qgs-transport-engine-parity";
 const QGS_FRAME_CLOCK_PARITY_ARG: &str = "--qgs-frame-clock-parity";
+const QGS_PLAYOUT_BUFFER_TICK_ARG: &str = "--qgs-playout-buffer-tick";
 const WRITE_DIAGNOSTIC_WAV_ARG: &str = "--write-diagnostic-wav";
 const AUDIO_AUDIT_START_MS_ARG: &str = "--start-ms";
 const AUDIO_AUDIT_DURATION_MS_ARG: &str = "--duration-ms";
@@ -268,6 +270,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.qgs_frame_clock_parity_paths {
         return qgs_frame_clock_parity_report(&original, &proxy);
+    }
+    if let Some((original, proxy)) = args.qgs_playout_buffer_tick_paths {
+        return qgs_playout_buffer_tick_report(&original, &proxy);
     }
     if let Some(path) = args.linux_audio_device_probe_path {
         return linux_audio_device_probe(&path);
@@ -2047,6 +2052,199 @@ fn frame_list_label(frames: &[u64]) -> String {
         "[]".to_string()
     } else {
         format!("{frames:?}")
+    }
+}
+
+fn qgs_playout_buffer_tick_report(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let descriptor = build_qnc_prepared_input_descriptor(original_path, proxy_path)?;
+    descriptor.validate()?;
+    let plan =
+        QgsInputPlan::from_descriptor(&descriptor, default_qgs_input_plan_queue_requirements())?;
+    let active_duration = Duration::from_millis(1_000);
+    let active_frames = qgs_frames_for_duration(active_duration, plan.video_source.timebase)?;
+
+    let mut engine = QgsTransportEngine::new();
+    let handle = engine.load_source(&plan)?;
+    engine.preload_source(&handle)?;
+    engine.set_active_source(&handle)?;
+    let transport_range = engine.set_active_range_frames(0, active_frames)?;
+    engine.cue_frame(0)?;
+    engine.prepare_anchor()?;
+    let play_ready = engine.evaluate_play_ready();
+    let before_play_snapshot = engine.snapshot();
+
+    let active_range = QgsActiveRangeTiming::new(
+        handle.duration_frames,
+        handle.timebase,
+        handle.audio_sample_rate,
+        transport_range.start_frame,
+        transport_range.end_frame,
+    )?;
+    let limits = QgsPlayoutBufferLimits::default_transport_window();
+    let clock = QgsFrameClock::forward(active_range)?;
+    let mut buffer = QgsPlayoutBufferState::new(
+        active_range,
+        handle.revision,
+        plan.source_mode,
+        plan.audio_source.lanes.clone(),
+        limits,
+    )?;
+    let carriers = [0_u64, 3, 6];
+    let mut results = Vec::new();
+    for carrier_frame in carriers {
+        let elapsed = handle.timebase.frame_offset(carrier_frame)?;
+        results.push(buffer.tick_prepare(
+            clock,
+            QgsTickPreparationInput {
+                carrier_frame,
+                elapsed,
+                max_due_frames: limits.max_prepared_frames,
+            },
+        )?);
+    }
+
+    println!("QGS Prepared/Playout Buffer Tick Preparation");
+    println!("--------------------------------------------");
+    println!("Public source URI: {}", handle.source_id);
+    println!(
+        "Active range: [{}..{}) frames, samples [{}..{})",
+        transport_range.start_frame,
+        transport_range.end_frame,
+        transport_range.start_sample,
+        transport_range.end_sample
+    );
+    println!(
+        "Buffer limits: backward_keep_frames={} forward_prepare_frames={} max_prepared_frames={}",
+        limits.backward_keep_frames, limits.forward_prepare_frames, limits.max_prepared_frames
+    );
+    println!("Transport play_ready before ticks: {}", yes_no(play_ready));
+    println!("Tick count: {}", results.len());
+    println!("Carrier frames: {}", frame_list_label(&carriers));
+    for (index, result) in results.iter().enumerate() {
+        println!("Tick {}:", index + 1);
+        println!("  carrier frame: {}", result.carrier_frame);
+        println!(
+            "  prepared window: [{}..{})",
+            result.window.start_frame, result.window.end_frame
+        );
+        println!(
+            "  due frames drained: {}",
+            frame_list_label(&result.due_frames)
+        );
+        println!(
+            "  frames prepared this tick: {}",
+            frame_list_label(&result.prepared_frames)
+        );
+        println!(
+            "  frames discarded this tick: {}",
+            frame_list_label(&result.discarded_frames)
+        );
+        println!(
+            "  buffered frames after tick: {}",
+            frame_list_label(
+                &result
+                    .slots
+                    .iter()
+                    .map(|slot| slot.key.frame)
+                    .collect::<Vec<_>>()
+            )
+        );
+        for slot in result.slots.iter().take(3) {
+            println!(
+                "    frame {}: audio [{}..{}) lanes={} audio_status={:?} video_status={:?} video_payload={:?}",
+                slot.key.frame,
+                slot.audio.sample_range.start_sample,
+                slot.audio.sample_range.end_sample,
+                slot.audio.lanes.len(),
+                slot.audio.status,
+                slot.video.status,
+                slot.video.payload_kind
+            );
+        }
+        println!("  event count: {}", result.events.len());
+        for event in &result.events {
+            println!("    {}", qgs_tick_event_label(event));
+        }
+    }
+    println!("No work on Play counters before tick preparation:");
+    println!(
+        "  source_open_on_play: {}",
+        before_play_snapshot.no_work_on_play.source_open_on_play
+    );
+    println!(
+        "  decode_on_play: {}",
+        before_play_snapshot.no_work_on_play.decode_on_play
+    );
+    println!(
+        "  queue_fill_on_play: {}",
+        before_play_snapshot.no_work_on_play.queue_fill_on_play
+    );
+    println!(
+        "  preroll_on_play: {}",
+        before_play_snapshot.no_work_on_play.preroll_on_play
+    );
+    println!(
+        "  anchor_prepare_on_play: {}",
+        before_play_snapshot.no_work_on_play.anchor_prepare_on_play
+    );
+    println!("Proxy AAC used: no");
+    println!(
+        "Original mono audio lanes preserved: {}",
+        plan.audio_source.lanes.len()
+    );
+    println!("Realtime playback: no");
+    println!("Device output: no");
+    println!("Frame presented: no");
+    println!("A/V sync: no");
+
+    Ok(())
+}
+
+fn qgs_tick_event_label(event: &QgsTickPreparationEvent) -> String {
+    match event {
+        QgsTickPreparationEvent::PlayoutBufferCreated {
+            max_prepared_frames,
+        } => format!("PlayoutBufferCreated max_prepared_frames={max_prepared_frames}"),
+        QgsTickPreparationEvent::TickPreparationStarted { carrier_frame } => {
+            format!("TickPreparationStarted carrier_frame={carrier_frame}")
+        }
+        QgsTickPreparationEvent::DueFramesDrained { frames } => {
+            format!("DueFramesDrained frames={}", frame_list_label(frames))
+        }
+        QgsTickPreparationEvent::FramePrepared { frame } => {
+            format!("FramePrepared frame={frame}")
+        }
+        QgsTickPreparationEvent::AudioRangePrepared {
+            frame,
+            start_sample,
+            end_sample,
+            lanes,
+        } => format!(
+            "AudioRangePrepared frame={frame} samples=[{start_sample}..{end_sample}) lanes={lanes}"
+        ),
+        QgsTickPreparationEvent::VideoPayloadMarkedReady {
+            frame,
+            payload_kind,
+        } => format!("VideoPayloadMarkedReady frame={frame} payload={payload_kind:?}"),
+        QgsTickPreparationEvent::PreparedWindowAdvanced {
+            start_frame,
+            end_frame,
+        } => format!("PreparedWindowAdvanced frames=[{start_frame}..{end_frame})"),
+        QgsTickPreparationEvent::OldFrameDiscarded { frame, reason } => {
+            format!("OldFrameDiscarded frame={frame} reason={reason:?}")
+        }
+        QgsTickPreparationEvent::BufferLimitReached {
+            max_prepared_frames,
+        } => format!("BufferLimitReached max_prepared_frames={max_prepared_frames}"),
+        QgsTickPreparationEvent::TickPreparationCompleted { prepared_frames } => {
+            format!("TickPreparationCompleted prepared_frames={prepared_frames}")
+        }
+        QgsTickPreparationEvent::TickValidationFailed { reason } => {
+            format!("TickValidationFailed reason={reason}")
+        }
     }
 }
 
@@ -13131,6 +13329,7 @@ struct Args {
     qgs_input_plan_paths: Option<(PathBuf, PathBuf)>,
     qgs_transport_engine_parity_paths: Option<(PathBuf, PathBuf)>,
     qgs_frame_clock_parity_paths: Option<(PathBuf, PathBuf)>,
+    qgs_playout_buffer_tick_paths: Option<(PathBuf, PathBuf)>,
     linux_audio_device_probe_path: Option<PathBuf>,
     pipewire_audio_prototype_path: Option<PathBuf>,
     pipewire_audio_native_prototype_path: Option<PathBuf>,
@@ -13205,6 +13404,8 @@ impl Args {
         let mut qgs_transport_engine_parity_paths = None;
         let mut qgs_frame_clock_parity_original = None;
         let mut qgs_frame_clock_parity_paths = None;
+        let mut qgs_playout_buffer_tick_original = None;
+        let mut qgs_playout_buffer_tick_paths = None;
         let mut linux_audio_device_probe_path = None;
         let mut pipewire_audio_prototype_path = None;
         let mut pipewire_audio_native_prototype_path = None;
@@ -13270,6 +13471,8 @@ impl Args {
         let mut next_arg_is_qgs_transport_engine_parity_proxy = false;
         let mut next_arg_is_qgs_frame_clock_parity_original = false;
         let mut next_arg_is_qgs_frame_clock_parity_proxy = false;
+        let mut next_arg_is_qgs_playout_buffer_tick_original = false;
+        let mut next_arg_is_qgs_playout_buffer_tick_proxy = false;
         let mut next_arg_is_linux_audio_device_probe_path = false;
         let mut next_arg_is_pipewire_audio_prototype_path = false;
         let mut next_arg_is_pipewire_audio_native_prototype_path = false;
@@ -13419,6 +13622,17 @@ impl Args {
                 qgs_frame_clock_parity_original = Some(PathBuf::from(arg));
                 next_arg_is_qgs_frame_clock_parity_original = false;
                 next_arg_is_qgs_frame_clock_parity_proxy = true;
+            } else if next_arg_is_qgs_playout_buffer_tick_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = qgs_playout_buffer_tick_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                qgs_playout_buffer_tick_paths = Some((original, proxy));
+                next_arg_is_qgs_playout_buffer_tick_proxy = false;
+            } else if next_arg_is_qgs_playout_buffer_tick_original {
+                qgs_playout_buffer_tick_original = Some(PathBuf::from(arg));
+                next_arg_is_qgs_playout_buffer_tick_original = false;
+                next_arg_is_qgs_playout_buffer_tick_proxy = true;
             } else if next_arg_is_qnc_prepared_input_descriptor_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = qnc_prepared_input_descriptor_original
@@ -13704,6 +13918,8 @@ impl Args {
                 next_arg_is_qgs_transport_engine_parity_original = true;
             } else if arg == QGS_FRAME_CLOCK_PARITY_ARG {
                 next_arg_is_qgs_frame_clock_parity_original = true;
+            } else if arg == QGS_PLAYOUT_BUFFER_TICK_ARG {
+                next_arg_is_qgs_playout_buffer_tick_original = true;
             } else if arg == LINUX_AUDIO_DEVICE_PROBE_ARG {
                 next_arg_is_linux_audio_device_probe_path = true;
             } else if arg == PIPEWIRE_AUDIO_PROTOTYPE_ARG {
@@ -13772,6 +13988,7 @@ impl Args {
             qgs_input_plan_paths,
             qgs_transport_engine_parity_paths,
             qgs_frame_clock_parity_paths,
+            qgs_playout_buffer_tick_paths,
             linux_audio_device_probe_path,
             pipewire_audio_prototype_path,
             pipewire_audio_native_prototype_path,
