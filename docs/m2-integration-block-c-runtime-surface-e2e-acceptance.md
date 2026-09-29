@@ -7,6 +7,11 @@ This is an acceptance block. It does not add a new subsystem, IPC, QNC UI, real
 display output, realtime playback, A/V sync, audio output policy, or
 export/render.
 
+It also does not justify collapsing the runtime into a monolith. Block C is a
+wiring proof for narrow Lego modules: session control remains orchestration,
+transport/prepared-buffer semantics remain in their existing modules, and the
+presenter/monitor boundary remains independent from command execution.
+
 The accepted path is:
 
 ```text
@@ -45,6 +50,10 @@ Block B added the presenter/monitor boundary:
 
 Block C uses that boundary after the session runtime reaches prepared-buffer
 state through `TickPrepare`.
+
+The presenter boundary remains an independent device/presenter-facing edge. It
+is not owned by the session control surface, and test-presenter evidence is not
+promoted into real display evidence.
 
 ## End-To-End Command
 
@@ -110,6 +119,10 @@ the original MXF payload to prove video presenter/monitor behavior.
 
 Block C keeps the important boundaries intact:
 
+- End-to-end wiring does not mean the modules should be merged.
+- Session control coordinates modules; it does not own media decode, timing, or
+  presenter evidence semantics.
+- The presenter boundary remains separately testable.
 - Prepared does not mean SubmittedToPresenter.
 - SubmittedToPresenter does not mean real display Presented.
 - `TestPresenterAccepted` does not mean real display output.

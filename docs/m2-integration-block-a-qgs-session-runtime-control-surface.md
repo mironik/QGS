@@ -25,6 +25,11 @@ The new work is the control surface around that executor: a bounded FIFO command
 queue, strict command-id duplicate rejection, deterministic command transcript,
 and final session snapshot.
 
+This is orchestration only. `QgsSessionRuntime` coordinates the existing Lego
+modules from Phases 22-28; it is not intended to become a God object that owns
+media decode, frame-clock semantics, presenter evidence, audio-device policy, or
+QNC projection semantics.
+
 ## Responsibilities Mirrored
 
 The control surface mirrors the QNC TransportEngine responsibilities that are
@@ -60,6 +65,20 @@ through an adapter.
 
 Configuration is carried by `QgsSessionRuntimeConfig`. The default command queue
 limit is 16 queued commands.
+
+It does not own:
+
+- Phase 22 input descriptor or `QgsInputPlan` semantics
+- Phase 23 transport source/range/cue/readiness rules
+- Phase 24 rational frame-clock semantics
+- Phase 25 prepared-buffer/tick-preparation semantics
+- Phase 26 internal event envelope semantics
+- Phase 27 QNC-shaped projection semantics
+- Integration Block B presenter evidence or monitor projection semantics
+- audio/video device output policy
+
+Those remain narrow backend modules that the session control surface calls or
+observes.
 
 The duplicate command policy is strict: a command id is rejected if it is
 already queued, was already executed, or was already seen as a duplicate. There
