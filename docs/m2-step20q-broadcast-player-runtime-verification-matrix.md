@@ -70,6 +70,11 @@ and what remains unimplemented.
   future shared contract. This is not crate implementation, IPC, runtime
   behavior, realtime playback, real display output, A/V sync, or production
   audio-device verification.
+- `DescriptorMappingEvidence`: QNC `PreparedInput`-shaped source identity,
+  media role, stream layout, project audio, timing, and private binding facts
+  can be validated and mapped into QGS descriptor/input-plan/assembly inputs.
+  This is not IPC, QNC UI integration, realtime playback, real display output,
+  A/V sync, or production audio-device verification.
 - `ManualAudibleSignalDetectedContentUnverified`: a human detected a slight
   hum/buzz from a native PipeWire path, but recognizable original audio content
   was not confirmed. This does not verify PCM content correctness, channel
@@ -149,6 +154,7 @@ For Sony FX6 sample 002:
 | broadcast player modular runtime assembly | `AssemblySurfaceEvidence` | `QgsBroadcastPlayerAssembly` is a composition root over input planning, transport, frame-clock facts, preroll, payload providers, device selection, fault/recovery, events, snapshots, and session/control surfaces. It creates existing operational runtimes without duplicating player logic or claiming real display, realtime playback, A/V sync, or production audio-device verification. |
 | QNC broadcast engine reuse/parity audit | `ArchitectureAuditEvidence` | QNC broadcast/player contracts, behavior, backend responsibilities, UI/DB/workflow ownership, QGS equivalents, reusable concepts, non-reusable implementation areas, and remaining QGS gaps were audited after Block M. No runtime feature or device claim was added. |
 | QNC/QGS shared contract crate plan | `ContractPlanEvidence` | Future shared contract scope, versioning, source identity, prepared input descriptor, command/reply/snapshot/event/fault fields, mapping tables, ownership, and privacy rules were planned. No shared crate, IPC, runtime behavior, or device claim was added. |
+| QNC PreparedInput to QGS descriptor mapping | `DescriptorMappingEvidence` | QGS-side QNC-like adapter types validate source identity, private binding opacity, source mode, original-audio authority, discrete mono lanes, project audio, timing compatibility, and map into `QgsPreparedInputDescriptor`, `QgsInputPlan`, and `QgsBroadcastPlayerAssembly`. No IPC, QNC UI integration, realtime playback, A/V sync, or device-output claim was added. |
 | simulated playback loop | `TestBoundaryEvidence` | Prepared slots flow through test audio/video boundaries deterministically. |
 | real speaker output | `NotImplemented` | No audible speaker output, audio-device clock, or full audio playback path exists; native PipeWire buffer submission is tracked separately. |
 | real display output | `NotImplemented` | No QNC OS Wayland/Vulkan presenter, optional DRM/KMS direct-output presenter, legacy X11 compatibility presenter, swapchain, or real display presenter exists. X11 is not a QNC OS target. |
@@ -224,6 +230,10 @@ The matrix intentionally does not overstate these areas:
   planning only. It is not a shared crate implementation, IPC, runtime behavior,
   device output, visual verification, realtime playback, A/V sync, production
   audio output, or completed QNC integration.
+- QNC PreparedInput to QGS descriptor mapping evidence proves descriptor/input
+  plan mapping only. It is not IPC, QNC UI integration, realtime playback,
+  device output, visual verification, A/V sync, production audio output, or a
+  completed backend replacement.
 - The audio content sanity audit is inspection evidence, not audible content
   verification.
 - Haswell CPU-bridge 1080p50 is not marked realtime verified.

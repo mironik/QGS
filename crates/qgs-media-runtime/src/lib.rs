@@ -668,6 +668,317 @@ impl QgsPreparedInputDescriptor {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsQncRepresentationLike {
+    Original,
+    Proxy,
+}
+
+impl From<QgsQncRepresentationLike> for QgsPlaybackRepresentation {
+    fn from(value: QgsQncRepresentationLike) -> Self {
+        match value {
+            QgsQncRepresentationLike::Original => Self::Original,
+            QgsQncRepresentationLike::Proxy => Self::Proxy,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsQncPlaybackInputLike {
+    Original,
+    Proxy,
+    ProxyIfAvailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsQncAudioRepresentationLike {
+    Original,
+    ProxyAac,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncSourceIdentityLike {
+    pub public_source_uri: String,
+    pub source_id: String,
+    pub workspace_db_uri: String,
+    pub original_media_id: Option<String>,
+    pub proxy_media_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncPrivateBindingLike {
+    pub original_binding_ref: String,
+    pub proxy_binding_ref: Option<String>,
+    pub original_bound: bool,
+    pub proxy_bound: bool,
+    pub private_path_exposed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsQncVideoInputLike {
+    pub timebase: RationalRate,
+    pub duration_frames: u64,
+    pub duration: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsQncAudioChannelKindLike {
+    Mono,
+    StereoCollapsed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsQncAudioChannelLike {
+    pub lane_index: u16,
+    pub source_track_index: u32,
+    pub source_channel_index: u16,
+    pub channel_kind: QgsQncAudioChannelKindLike,
+    pub authoritative: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncStreamLayoutLike {
+    pub original_video: QgsQncVideoInputLike,
+    pub proxy_video: Option<QgsQncVideoInputLike>,
+    pub audio_sample_rate: u32,
+    pub audio_bit_depth: u8,
+    pub audio_channels: Vec<QgsQncAudioChannelLike>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsQncProjectAudioLike {
+    pub channels: u16,
+    pub sample_rate_hz: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsQncFrameRangeLike {
+    pub start_frame: u64,
+    pub end_frame_exclusive: u64,
+}
+
+impl QgsQncFrameRangeLike {
+    pub fn validate(self) -> Result<(), QgsQncPreparedInputMappingError> {
+        if self.end_frame_exclusive <= self.start_frame {
+            return Err(QgsQncPreparedInputMappingError::InvalidActiveRange);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncPreparedInputLike {
+    pub contract_version: String,
+    pub descriptor_revision: u64,
+    pub source_identity: QgsQncSourceIdentityLike,
+    pub private_binding: QgsQncPrivateBindingLike,
+    pub playback_input: QgsQncPlaybackInputLike,
+    pub selected_picture_representation: QgsQncRepresentationLike,
+    pub authoritative_audio_representation: QgsQncAudioRepresentationLike,
+    pub source_mode: QgsInputPlanSourceMode,
+    pub active_range: Option<QgsQncFrameRangeLike>,
+    pub project_audio: QgsQncProjectAudioLike,
+    pub stream_layout: QgsQncStreamLayoutLike,
+    pub original_proxy_timing_compatible: Option<bool>,
+    pub proxy_aac_authoritative: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsQncPreparedInputMappingError {
+    MissingPublicSourceUri,
+    MissingOriginalAudio,
+    InvalidSourceMode,
+    SelectedPictureMismatch,
+    ProxyAudioCannotBeAuthoritative,
+    NoAudioLanes,
+    StereoCollapseRejected,
+    PrivatePathExposureRejected,
+    InvalidActiveRange,
+    TimingCompatibilityUnknown,
+    InvalidProjectAudio,
+    InvalidDescriptor,
+}
+
+impl std::fmt::Display for QgsQncPreparedInputMappingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::MissingPublicSourceUri => "missing public source URI",
+            Self::MissingOriginalAudio => "missing authoritative original audio",
+            Self::InvalidSourceMode => "invalid source mode",
+            Self::SelectedPictureMismatch => {
+                "selected picture representation does not match source mode"
+            }
+            Self::ProxyAudioCannotBeAuthoritative => "proxy AAC cannot be authoritative",
+            Self::NoAudioLanes => "no original audio lanes",
+            Self::StereoCollapseRejected => "stereo collapse is not a valid runtime audio model",
+            Self::PrivatePathExposureRejected => "private path exposure rejected",
+            Self::InvalidActiveRange => "invalid active range",
+            Self::TimingCompatibilityUnknown => "original/proxy timing compatibility unknown",
+            Self::InvalidProjectAudio => "invalid project audio",
+            Self::InvalidDescriptor => "mapped QGS descriptor did not validate",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for QgsQncPreparedInputMappingError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncPreparedInputMapping {
+    pub descriptor: QgsPreparedInputDescriptor,
+    pub descriptor_revision: u64,
+    pub active_range: Option<QgsQncFrameRangeLike>,
+    pub private_path_exposed: bool,
+}
+
+impl QgsQncPreparedInputLike {
+    pub fn validate_for_qgs_mapping(&self) -> Result<(), QgsQncPreparedInputMappingError> {
+        if self.source_identity.public_source_uri.trim().is_empty()
+            || !is_qgs_public_uri(&self.source_identity.public_source_uri)
+            || !is_qgs_public_uri(&self.source_identity.workspace_db_uri)
+        {
+            return Err(QgsQncPreparedInputMappingError::MissingPublicSourceUri);
+        }
+        if self.private_binding.private_path_exposed {
+            return Err(QgsQncPreparedInputMappingError::PrivatePathExposureRejected);
+        }
+        if self.authoritative_audio_representation != QgsQncAudioRepresentationLike::Original {
+            return Err(QgsQncPreparedInputMappingError::MissingOriginalAudio);
+        }
+        if self.proxy_aac_authoritative {
+            return Err(QgsQncPreparedInputMappingError::ProxyAudioCannotBeAuthoritative);
+        }
+        match (self.source_mode, self.selected_picture_representation) {
+            (QgsInputPlanSourceMode::ProxyPreview, QgsQncRepresentationLike::Proxy)
+            | (QgsInputPlanSourceMode::OriginalMedia, QgsQncRepresentationLike::Original) => {}
+            _ => return Err(QgsQncPreparedInputMappingError::SelectedPictureMismatch),
+        }
+        if self.stream_layout.audio_channels.is_empty() {
+            return Err(QgsQncPreparedInputMappingError::NoAudioLanes);
+        }
+        for (expected, channel) in self.stream_layout.audio_channels.iter().enumerate() {
+            if channel.channel_kind != QgsQncAudioChannelKindLike::Mono
+                || !channel.authoritative
+                || channel.lane_index as usize != expected
+            {
+                return Err(QgsQncPreparedInputMappingError::StereoCollapseRejected);
+            }
+        }
+        if self.stream_layout.audio_sample_rate == 0
+            || self.stream_layout.audio_bit_depth == 0
+            || self.project_audio.channels == 0
+            || self.project_audio.sample_rate_hz == 0
+            || self.project_audio.sample_rate_hz != self.stream_layout.audio_sample_rate
+            || usize::from(self.project_audio.channels) > self.stream_layout.audio_channels.len()
+        {
+            return Err(QgsQncPreparedInputMappingError::InvalidProjectAudio);
+        }
+        if let Some(range) = self.active_range {
+            range.validate()?;
+        }
+        match self.source_mode {
+            QgsInputPlanSourceMode::ProxyPreview => {
+                if !self.private_binding.proxy_bound
+                    || self.private_binding.proxy_binding_ref.is_none()
+                    || self.stream_layout.proxy_video.is_none()
+                {
+                    return Err(QgsQncPreparedInputMappingError::InvalidSourceMode);
+                }
+                if self.original_proxy_timing_compatible != Some(true) {
+                    return Err(QgsQncPreparedInputMappingError::TimingCompatibilityUnknown);
+                }
+            }
+            QgsInputPlanSourceMode::OriginalMedia => {}
+        }
+        Ok(())
+    }
+
+    pub fn map_to_qgs_descriptor(
+        &self,
+    ) -> Result<QgsQncPreparedInputMapping, QgsQncPreparedInputMappingError> {
+        self.validate_for_qgs_mapping()?;
+        let clip_id = if self.source_identity.source_id.trim().is_empty() {
+            self.source_identity.public_source_uri.clone()
+        } else {
+            self.source_identity.source_id.clone()
+        };
+        let original_media_uri = self
+            .source_identity
+            .original_media_id
+            .clone()
+            .unwrap_or_else(|| self.source_identity.public_source_uri.clone());
+        let proxy_media_uri = self.source_identity.proxy_media_id.clone();
+        let selected_picture =
+            QgsPlaybackRepresentation::from(self.selected_picture_representation);
+        let proxy_timing = self
+            .stream_layout
+            .proxy_video
+            .map(|video| QgsPreparedVideoTiming {
+                timebase: video.timebase,
+                duration_frames: video.duration_frames,
+                duration: video.duration,
+            });
+        let association_status = match self.original_proxy_timing_compatible {
+            Some(true) => QgsOriginalProxyAssociationStatus::TimingCompatible,
+            Some(false) => QgsOriginalProxyAssociationStatus::TimingMismatch,
+            None => QgsOriginalProxyAssociationStatus::MissingProxy,
+        };
+        let descriptor = QgsPreparedInputDescriptor {
+            contract_version: self.contract_version.clone(),
+            identity: QgsPreparedSourceIdentity {
+                clip_id,
+                workspace_db_uri: self.source_identity.workspace_db_uri.clone(),
+                source_record_uri: self.source_identity.public_source_uri.clone(),
+            },
+            binding: QgsPreparedMediaBinding {
+                original_media_uri,
+                proxy_media_uri,
+                private_original_path_bound: self.private_binding.original_bound,
+                private_proxy_path_bound: self.private_binding.proxy_bound,
+                association_status,
+            },
+            selected_picture,
+            authoritative_audio: QgsAudioRepresentation::Original,
+            project_audio_channels: self.project_audio.channels,
+            project_audio_sample_rate: self.project_audio.sample_rate_hz,
+            layout: QgsPreparedStreamLayout {
+                original_video: QgsPreparedVideoTiming {
+                    timebase: self.stream_layout.original_video.timebase,
+                    duration_frames: self.stream_layout.original_video.duration_frames,
+                    duration: self.stream_layout.original_video.duration,
+                },
+                proxy_video: proxy_timing,
+                audio_sample_rate: self.stream_layout.audio_sample_rate,
+            },
+            audio_layout: QgsPreparedAudioLayout {
+                representation: QgsAudioRepresentation::Original,
+                sample_rate: self.stream_layout.audio_sample_rate,
+                bit_depth: self.stream_layout.audio_bit_depth,
+                channels: self
+                    .stream_layout
+                    .audio_channels
+                    .iter()
+                    .map(|channel| QgsPreparedAudioChannel {
+                        track_id: channel.source_track_index,
+                        lane_index: channel.lane_index,
+                        channel_index: channel.source_channel_index,
+                    })
+                    .collect(),
+                proxy_aac_authoritative: false,
+            },
+        };
+        descriptor
+            .validate()
+            .map_err(|_| QgsQncPreparedInputMappingError::InvalidDescriptor)?;
+        Ok(QgsQncPreparedInputMapping {
+            descriptor,
+            descriptor_revision: self.descriptor_revision,
+            active_range: self.active_range,
+            private_path_exposed: self.private_binding.private_path_exposed,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QgsInputPlanSourceMode {
     ProxyPreview,
     OriginalMedia,
@@ -9047,6 +9358,71 @@ mod tests {
             .unwrap()
     }
 
+    fn sample_qnc_like_input() -> QgsQncPreparedInputLike {
+        let descriptor = sample_qgs_descriptor();
+        QgsQncPreparedInputLike {
+            contract_version: "qgs.phase22.qnc-prepared-input.v1".into(),
+            descriptor_revision: 1,
+            source_identity: QgsQncSourceIdentityLike {
+                public_source_uri: descriptor.identity.source_record_uri.clone(),
+                source_id: descriptor.identity.clip_id.clone(),
+                workspace_db_uri: descriptor.identity.workspace_db_uri.clone(),
+                original_media_id: Some(descriptor.binding.original_media_uri.clone()),
+                proxy_media_id: descriptor.binding.proxy_media_uri.clone(),
+            },
+            private_binding: QgsQncPrivateBindingLike {
+                original_binding_ref: "binding:original".into(),
+                proxy_binding_ref: Some("binding:proxy".into()),
+                original_bound: true,
+                proxy_bound: true,
+                private_path_exposed: false,
+            },
+            playback_input: QgsQncPlaybackInputLike::ProxyIfAvailable,
+            selected_picture_representation: QgsQncRepresentationLike::Proxy,
+            authoritative_audio_representation: QgsQncAudioRepresentationLike::Original,
+            source_mode: QgsInputPlanSourceMode::ProxyPreview,
+            active_range: Some(QgsQncFrameRangeLike {
+                start_frame: 0,
+                end_frame_exclusive: 50,
+            }),
+            project_audio: QgsQncProjectAudioLike {
+                channels: descriptor.project_audio_channels,
+                sample_rate_hz: descriptor.project_audio_sample_rate,
+            },
+            stream_layout: QgsQncStreamLayoutLike {
+                original_video: QgsQncVideoInputLike {
+                    timebase: descriptor.layout.original_video.timebase,
+                    duration_frames: descriptor.layout.original_video.duration_frames,
+                    duration: descriptor.layout.original_video.duration,
+                },
+                proxy_video: descriptor
+                    .layout
+                    .proxy_video
+                    .map(|video| QgsQncVideoInputLike {
+                        timebase: video.timebase,
+                        duration_frames: video.duration_frames,
+                        duration: video.duration,
+                    }),
+                audio_sample_rate: descriptor.audio_layout.sample_rate,
+                audio_bit_depth: descriptor.audio_layout.bit_depth,
+                audio_channels: descriptor
+                    .audio_layout
+                    .channels
+                    .iter()
+                    .map(|lane| QgsQncAudioChannelLike {
+                        lane_index: lane.lane_index,
+                        source_track_index: lane.track_id,
+                        source_channel_index: lane.channel_index,
+                        channel_kind: QgsQncAudioChannelKindLike::Mono,
+                        authoritative: true,
+                    })
+                    .collect(),
+            },
+            original_proxy_timing_compatible: Some(true),
+            proxy_aac_authoritative: false,
+        }
+    }
+
     #[test]
     fn qnc_prepared_descriptor_validates_proxy_picture_original_audio() {
         let descriptor = sample_qgs_descriptor();
@@ -9062,6 +9438,124 @@ mod tests {
         assert!(!descriptor.audio_layout.proxy_aac_authoritative);
         assert!(descriptor.binding.public_uris_are_valid());
         assert!(descriptor.identity.public_uris_are_valid());
+    }
+
+    #[test]
+    fn qnc_like_proxy_preview_maps_to_proxy_picture_and_original_audio() {
+        let mapping = sample_qnc_like_input()
+            .map_to_qgs_descriptor()
+            .expect("mapping");
+        let descriptor = mapping.descriptor;
+        assert_eq!(
+            descriptor.selected_picture,
+            QgsPlaybackRepresentation::Proxy
+        );
+        assert_eq!(
+            descriptor.authoritative_audio,
+            QgsAudioRepresentation::Original
+        );
+        assert!(!descriptor.audio_layout.proxy_aac_authoritative);
+        assert_eq!(descriptor.audio_layout.channels.len(), 4);
+        assert!(!mapping.private_path_exposed);
+        let plan = QgsInputPlan::from_descriptor(&descriptor, sample_qgs_queue_requirements())
+            .expect("plan");
+        assert_eq!(plan.source_mode, QgsInputPlanSourceMode::ProxyPreview);
+        assert_eq!(
+            plan.video_source.representation,
+            QgsPlaybackRepresentation::Proxy
+        );
+        assert_eq!(
+            plan.audio_source.representation,
+            QgsAudioRepresentation::Original
+        );
+    }
+
+    #[test]
+    fn qnc_like_original_media_maps_to_original_picture_and_original_audio() {
+        let mut input = sample_qnc_like_input();
+        input.source_mode = QgsInputPlanSourceMode::OriginalMedia;
+        input.selected_picture_representation = QgsQncRepresentationLike::Original;
+        input.playback_input = QgsQncPlaybackInputLike::Original;
+        let descriptor = input.map_to_qgs_descriptor().unwrap().descriptor;
+        assert_eq!(
+            descriptor.selected_picture,
+            QgsPlaybackRepresentation::Original
+        );
+        let plan = QgsInputPlan::from_descriptor(&descriptor, sample_qgs_queue_requirements())
+            .expect("plan");
+        assert_eq!(plan.source_mode, QgsInputPlanSourceMode::OriginalMedia);
+        assert_eq!(
+            plan.video_source.representation,
+            QgsPlaybackRepresentation::Original
+        );
+        assert_eq!(plan.audio_source.media_uri, plan.video_source.media_uri);
+    }
+
+    #[test]
+    fn qnc_like_mapping_rejects_proxy_aac_as_authoritative() {
+        let mut input = sample_qnc_like_input();
+        input.authoritative_audio_representation = QgsQncAudioRepresentationLike::ProxyAac;
+        assert_eq!(
+            input.map_to_qgs_descriptor().unwrap_err(),
+            QgsQncPreparedInputMappingError::MissingOriginalAudio
+        );
+        let mut input = sample_qnc_like_input();
+        input.proxy_aac_authoritative = true;
+        assert_eq!(
+            input.map_to_qgs_descriptor().unwrap_err(),
+            QgsQncPreparedInputMappingError::ProxyAudioCannotBeAuthoritative
+        );
+    }
+
+    #[test]
+    fn qnc_like_mapping_preserves_discrete_mono_and_rejects_stereo_collapse() {
+        let mapping = sample_qnc_like_input().map_to_qgs_descriptor().unwrap();
+        for (expected, lane) in mapping.descriptor.audio_layout.channels.iter().enumerate() {
+            assert_eq!(lane.lane_index as usize, expected);
+            assert_eq!(lane.channel_index, 0);
+        }
+        let mut input = sample_qnc_like_input();
+        input.stream_layout.audio_channels[0].channel_kind =
+            QgsQncAudioChannelKindLike::StereoCollapsed;
+        assert_eq!(
+            input.map_to_qgs_descriptor().unwrap_err(),
+            QgsQncPreparedInputMappingError::StereoCollapseRejected
+        );
+    }
+
+    #[test]
+    fn qnc_like_mapping_rejects_private_path_exposure_and_missing_public_uri() {
+        let mut input = sample_qnc_like_input();
+        input.private_binding.private_path_exposed = true;
+        assert_eq!(
+            input.map_to_qgs_descriptor().unwrap_err(),
+            QgsQncPreparedInputMappingError::PrivatePathExposureRejected
+        );
+        let mut input = sample_qnc_like_input();
+        input.source_identity.public_source_uri.clear();
+        assert_eq!(
+            input.map_to_qgs_descriptor().unwrap_err(),
+            QgsQncPreparedInputMappingError::MissingPublicSourceUri
+        );
+    }
+
+    #[test]
+    fn qnc_like_mapping_rejects_invalid_range_and_source_mode_mismatch() {
+        let mut input = sample_qnc_like_input();
+        input.active_range = Some(QgsQncFrameRangeLike {
+            start_frame: 10,
+            end_frame_exclusive: 10,
+        });
+        assert_eq!(
+            input.map_to_qgs_descriptor().unwrap_err(),
+            QgsQncPreparedInputMappingError::InvalidActiveRange
+        );
+        let mut input = sample_qnc_like_input();
+        input.source_mode = QgsInputPlanSourceMode::OriginalMedia;
+        assert_eq!(
+            input.map_to_qgs_descriptor().unwrap_err(),
+            QgsQncPreparedInputMappingError::SelectedPictureMismatch
+        );
     }
 
     #[test]

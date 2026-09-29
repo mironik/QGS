@@ -754,6 +754,17 @@ M2 Block R - QGS QNC Control Surface Shape Implementation
 That block can implement the command/reply/snapshot/event shapes once the input
 descriptor mapping is proven.
 
+## Block Q Follow-Up
+
+M2 Block Q implements the first QNC-to-QGS descriptor bridge using QGS-side
+QNC-like adapter types. It maps QNC `PreparedInput`-shaped source identity,
+selected representation, stream layout, project audio, original/proxy timing,
+and private binding facts into `QgsPreparedInputDescriptor`, `QgsInputPlan`, and
+`QgsBroadcastPlayerAssembly`.
+
+The final shared crate still does not exist. Block Q proves the descriptor
+mapping shape that the future `qnc-qgs-contract` crate should preserve.
+
 ## Non-Claims
 
 Block P does not claim:

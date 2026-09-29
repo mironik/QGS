@@ -53,17 +53,22 @@ use qgs_media_runtime::{
     QgsBroadcastPlayerSnapshot, QgsBroadcastPlayerStatus, QgsBufferDiscardReason,
     QgsDeviceBackendSelection, QgsDeviceBackendSelector, QgsDeviceSelectionPolicy,
     QgsFilePresenterSubmissionResult, QgsFrameClock, QgsFrameClockMode, QgsFrameClockRate,
-    QgsInputPlan, QgsInputPlanQueueRequirements, QgsOperationalRuntimeConfig,
-    QgsOperationalRuntimeSnapshot, QgsOriginalProxyAssociationStatus, QgsPlaybackRepresentation,
-    QgsPlayoutBufferLimits, QgsPlayoutBufferState, QgsPreparedAudioChannel, QgsPreparedAudioLayout,
-    QgsPreparedInputDescriptor, QgsPreparedMediaBinding, QgsPreparedSourceIdentity,
-    QgsPreparedStreamLayout, QgsPreparedVideoTiming, QgsQncCommandEnvelope, QgsQncEventEnvelope,
-    QgsQncMonitorProjection, QgsQncPassiveView, QgsQncPlayerCommand, QgsQncSessionCommandExecutor,
-    QgsQncTimelineProjection, QgsRuntimeEventEnvelope, QgsRuntimeEventLog,
-    QgsSessionCommandQueueLimits, QgsSessionDuplicateCommandPolicy, QgsSessionQueueRejection,
-    QgsSessionRuntime, QgsSessionRuntimeConfig, QgsTickPreparationEvent, QgsTickPreparationInput,
-    QgsTransportEngine, QgsTransportEvent, QgsVideoPresenterBackendKind, RationalRate,
-    RealTimeClock, TestAudioSink, TestPresentationSink,
+    QgsInputPlan, QgsInputPlanQueueRequirements, QgsInputPlanSourceMode,
+    QgsOperationalRuntimeConfig, QgsOperationalRuntimeSnapshot, QgsOriginalProxyAssociationStatus,
+    QgsPlaybackRepresentation, QgsPlayoutBufferLimits, QgsPlayoutBufferState,
+    QgsPreparedAudioChannel, QgsPreparedAudioLayout, QgsPreparedInputDescriptor,
+    QgsPreparedMediaBinding, QgsPreparedSourceIdentity, QgsPreparedStreamLayout,
+    QgsPreparedVideoTiming, QgsQncAudioChannelKindLike, QgsQncAudioChannelLike,
+    QgsQncAudioRepresentationLike, QgsQncCommandEnvelope, QgsQncEventEnvelope,
+    QgsQncFrameRangeLike, QgsQncMonitorProjection, QgsQncPassiveView, QgsQncPlaybackInputLike,
+    QgsQncPlayerCommand, QgsQncPreparedInputLike, QgsQncPrivateBindingLike, QgsQncProjectAudioLike,
+    QgsQncRepresentationLike, QgsQncSessionCommandExecutor, QgsQncSourceIdentityLike,
+    QgsQncStreamLayoutLike, QgsQncTimelineProjection, QgsQncVideoInputLike,
+    QgsRuntimeEventEnvelope, QgsRuntimeEventLog, QgsSessionCommandQueueLimits,
+    QgsSessionDuplicateCommandPolicy, QgsSessionQueueRejection, QgsSessionRuntime,
+    QgsSessionRuntimeConfig, QgsTickPreparationEvent, QgsTickPreparationInput, QgsTransportEngine,
+    QgsTransportEvent, QgsVideoPresenterBackendKind, RationalRate, RealTimeClock, TestAudioSink,
+    TestPresentationSink,
 };
 use qgs_mp4::{
     classify_video_track, nearest_random_access_before, MediaHealth, Mp4Source, Mp4TrackKind,
@@ -147,6 +152,7 @@ const PIPEWIRE_AUDIO_MONO_MONITOR_ARG: &str = "--pipewire-audio-mono-monitor";
 const PIPEWIRE_AUDIO_DISCRETE_4MONO_ARG: &str = "--pipewire-audio-discrete-4mono";
 const QNC_PREPARED_INPUT_DESCRIPTOR_ARG: &str = "--qnc-prepared-input-descriptor";
 const QGS_INPUT_PLAN_ARG: &str = "--qgs-input-plan";
+const QGS_QNC_PREPARED_INPUT_MAPPING_ARG: &str = "--qgs-qnc-prepared-input-mapping";
 const QGS_TRANSPORT_ENGINE_PARITY_ARG: &str = "--qgs-transport-engine-parity";
 const QGS_FRAME_CLOCK_PARITY_ARG: &str = "--qgs-frame-clock-parity";
 const QGS_PLAYOUT_BUFFER_TICK_ARG: &str = "--qgs-playout-buffer-tick";
@@ -294,6 +300,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.qnc_prepared_input_descriptor_paths {
         return qnc_prepared_input_descriptor_report(&original, &proxy);
+    }
+    if let Some((original, proxy)) = args.qgs_qnc_prepared_input_mapping_paths {
+        return qgs_qnc_prepared_input_mapping_report(&original, &proxy);
     }
     if let Some((original, proxy)) = args.qgs_input_plan_paths {
         return qgs_input_plan_report(&original, &proxy);
@@ -1863,6 +1872,142 @@ fn qgs_input_plan_report(
     println!("  A/V sync: no");
 
     descriptor_validation?;
+    Ok(())
+}
+
+fn qgs_qnc_prepared_input_mapping_report(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let qnc_like = build_qgs_qnc_prepared_input_like(original_path, proxy_path)?;
+    let validation = qnc_like.validate_for_qgs_mapping();
+    let mapping = qnc_like.map_to_qgs_descriptor();
+    let (descriptor_created, plan_created, assembly_created, descriptor, plan) = match mapping {
+        Ok(mapping) => {
+            let descriptor = mapping.descriptor;
+            let plan = QgsInputPlan::from_descriptor(
+                &descriptor,
+                default_qgs_input_plan_queue_requirements(),
+            );
+            let assembly = plan
+                .as_ref()
+                .ok()
+                .and_then(|plan| QgsBroadcastPlayerAssembly::from_input_plan(plan.clone()).ok());
+            (
+                true,
+                plan.is_ok(),
+                assembly.is_some(),
+                Some(descriptor),
+                plan.ok(),
+            )
+        }
+        Err(error) => {
+            println!("Mapping error: {error}");
+            (false, false, false, None, None)
+        }
+    };
+
+    println!("QGS QNC PreparedInput Mapping");
+    println!("-----------------------------");
+    println!(
+        "QNC-like source URI: {}",
+        qnc_like.source_identity.public_source_uri
+    );
+    println!("Source id: {}", qnc_like.source_identity.source_id);
+    println!("Source mode: {:?}", qnc_like.source_mode);
+    println!(
+        "Selected picture representation: {:?}",
+        qnc_like.selected_picture_representation
+    );
+    println!(
+        "Authoritative audio representation: {:?}",
+        qnc_like.authoritative_audio_representation
+    );
+    println!(
+        "Original media id: {}",
+        qnc_like
+            .source_identity
+            .original_media_id
+            .as_deref()
+            .unwrap_or("<none>")
+    );
+    println!(
+        "Proxy media id: {}",
+        qnc_like
+            .source_identity
+            .proxy_media_id
+            .as_deref()
+            .unwrap_or("<none>")
+    );
+    println!(
+        "Private original binding present: {}",
+        yes_no(qnc_like.private_binding.original_bound)
+    );
+    println!(
+        "Private proxy binding present: {}",
+        yes_no(qnc_like.private_binding.proxy_bound)
+    );
+    println!(
+        "Private path exposed: {}",
+        yes_no(qnc_like.private_binding.private_path_exposed)
+    );
+    println!(
+        "Proxy AAC authoritative: {}",
+        yes_no(qnc_like.proxy_aac_authoritative)
+    );
+    println!(
+        "Original audio lane count: {}",
+        qnc_like.stream_layout.audio_channels.len()
+    );
+    println!("Audio lane mapping:");
+    for lane in &qnc_like.stream_layout.audio_channels {
+        println!(
+            "  lane {}: source_track={} source_channel={} kind={:?} authoritative={}",
+            lane.lane_index + 1,
+            lane.source_track_index,
+            lane.source_channel_index,
+            lane.channel_kind,
+            yes_no(lane.authoritative)
+        );
+    }
+    println!(
+        "Project audio: channels={} sample_rate={}Hz",
+        qnc_like.project_audio.channels, qnc_like.project_audio.sample_rate_hz
+    );
+    println!(
+        "Original/proxy timing compatible: {}",
+        qnc_like
+            .original_proxy_timing_compatible
+            .map(yes_no)
+            .unwrap_or("unknown")
+    );
+    println!("Descriptor revision: {}", qnc_like.descriptor_revision);
+    println!("Validation result: {}", result_label(&validation));
+    println!("QGS descriptor created: {}", yes_no(descriptor_created));
+    println!("QGS input plan created: {}", yes_no(plan_created));
+    println!(
+        "Assembly construction from mapped descriptor: {}",
+        yes_no(assembly_created)
+    );
+    if let Some(descriptor) = descriptor.as_ref() {
+        println!(
+            "Mapped descriptor picture/audio: {:?} / {:?}",
+            descriptor.selected_picture, descriptor.authoritative_audio
+        );
+    }
+    if let Some(plan) = plan.as_ref() {
+        println!(
+            "Mapped input plan: source_mode={:?} video_uri={} audio_uri={} lanes={}",
+            plan.source_mode,
+            plan.video_source.media_uri,
+            plan.audio_source.media_uri,
+            plan.audio_source.lanes.len()
+        );
+    }
+    println!("Realtime playback claimed: no");
+    println!("A/V sync verified: no");
+    println!("Device output claimed: no");
+    validation?;
     Ok(())
 }
 
@@ -6089,9 +6234,7 @@ fn qgs_rate_label(rate: RationalRate) -> String {
     format!("{}/{}", rate.numerator(), rate.denominator())
 }
 
-fn result_label<T>(
-    result: &std::result::Result<T, qgs_media_runtime::PlaybackError>,
-) -> &'static str {
+fn result_label<T, E>(result: &std::result::Result<T, E>) -> &'static str {
     if result.is_ok() {
         "ok"
     } else {
@@ -6118,6 +6261,76 @@ fn build_qgs_broadcast_player_assembly(
         &descriptor,
         default_qgs_input_plan_queue_requirements(),
     )?)
+}
+
+fn build_qgs_qnc_prepared_input_like(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<QgsQncPreparedInputLike, Box<dyn std::error::Error>> {
+    let descriptor = build_qnc_prepared_input_descriptor(original_path, proxy_path)?;
+    Ok(QgsQncPreparedInputLike {
+        contract_version: "qnc-qgs-contract.m2-v1-draft".to_string(),
+        descriptor_revision: 1,
+        source_identity: QgsQncSourceIdentityLike {
+            public_source_uri: descriptor.identity.source_record_uri.clone(),
+            source_id: descriptor.identity.clip_id.clone(),
+            workspace_db_uri: descriptor.identity.workspace_db_uri.clone(),
+            original_media_id: Some(descriptor.binding.original_media_uri.clone()),
+            proxy_media_id: descriptor.binding.proxy_media_uri.clone(),
+        },
+        private_binding: QgsQncPrivateBindingLike {
+            original_binding_ref: format!("binding://original/{}", descriptor.identity.clip_id),
+            proxy_binding_ref: Some(format!("binding://proxy/{}", descriptor.identity.clip_id)),
+            original_bound: descriptor.binding.private_original_path_bound,
+            proxy_bound: descriptor.binding.private_proxy_path_bound,
+            private_path_exposed: false,
+        },
+        playback_input: QgsQncPlaybackInputLike::ProxyIfAvailable,
+        selected_picture_representation: QgsQncRepresentationLike::Proxy,
+        authoritative_audio_representation: QgsQncAudioRepresentationLike::Original,
+        source_mode: QgsInputPlanSourceMode::ProxyPreview,
+        active_range: Some(QgsQncFrameRangeLike {
+            start_frame: 0,
+            end_frame_exclusive: descriptor.layout.original_video.duration_frames,
+        }),
+        project_audio: QgsQncProjectAudioLike {
+            channels: descriptor.project_audio_channels,
+            sample_rate_hz: descriptor.project_audio_sample_rate,
+        },
+        stream_layout: QgsQncStreamLayoutLike {
+            original_video: QgsQncVideoInputLike {
+                timebase: descriptor.layout.original_video.timebase,
+                duration_frames: descriptor.layout.original_video.duration_frames,
+                duration: descriptor.layout.original_video.duration,
+            },
+            proxy_video: descriptor
+                .layout
+                .proxy_video
+                .map(|video| QgsQncVideoInputLike {
+                    timebase: video.timebase,
+                    duration_frames: video.duration_frames,
+                    duration: video.duration,
+                }),
+            audio_sample_rate: descriptor.audio_layout.sample_rate,
+            audio_bit_depth: descriptor.audio_layout.bit_depth,
+            audio_channels: descriptor
+                .audio_layout
+                .channels
+                .iter()
+                .map(|lane| QgsQncAudioChannelLike {
+                    lane_index: lane.lane_index,
+                    source_track_index: lane.track_id,
+                    source_channel_index: lane.channel_index,
+                    channel_kind: QgsQncAudioChannelKindLike::Mono,
+                    authoritative: true,
+                })
+                .collect(),
+        },
+        original_proxy_timing_compatible: Some(
+            descriptor.layout.proxy_original_timing_compatible(),
+        ),
+        proxy_aac_authoritative: false,
+    })
 }
 
 fn build_qnc_prepared_input_descriptor(
@@ -17550,6 +17763,7 @@ struct Args {
     broadcast_player_runtime_original_video_payloads_paths: Option<(PathBuf, PathBuf)>,
     broadcast_player_runtime_verification_paths: Option<(PathBuf, PathBuf)>,
     qnc_prepared_input_descriptor_paths: Option<(PathBuf, PathBuf)>,
+    qgs_qnc_prepared_input_mapping_paths: Option<(PathBuf, PathBuf)>,
     qgs_input_plan_paths: Option<(PathBuf, PathBuf)>,
     qgs_transport_engine_parity_paths: Option<(PathBuf, PathBuf)>,
     qgs_frame_clock_parity_paths: Option<(PathBuf, PathBuf)>,
@@ -17638,6 +17852,8 @@ impl Args {
         let mut broadcast_player_runtime_verification_paths = None;
         let mut qnc_prepared_input_descriptor_original = None;
         let mut qnc_prepared_input_descriptor_paths = None;
+        let mut qgs_qnc_prepared_input_mapping_original = None;
+        let mut qgs_qnc_prepared_input_mapping_paths = None;
         let mut qgs_input_plan_original = None;
         let mut qgs_input_plan_paths = None;
         let mut qgs_transport_engine_parity_original = None;
@@ -17735,6 +17951,8 @@ impl Args {
         let mut next_arg_is_broadcast_player_runtime_verification_proxy = false;
         let mut next_arg_is_qnc_prepared_input_descriptor_original = false;
         let mut next_arg_is_qnc_prepared_input_descriptor_proxy = false;
+        let mut next_arg_is_qgs_qnc_prepared_input_mapping_original = false;
+        let mut next_arg_is_qgs_qnc_prepared_input_mapping_proxy = false;
         let mut next_arg_is_qgs_input_plan_original = false;
         let mut next_arg_is_qgs_input_plan_proxy = false;
         let mut next_arg_is_qgs_transport_engine_parity_original = false;
@@ -18111,6 +18329,17 @@ impl Args {
                 qnc_prepared_input_descriptor_original = Some(PathBuf::from(arg));
                 next_arg_is_qnc_prepared_input_descriptor_original = false;
                 next_arg_is_qnc_prepared_input_descriptor_proxy = true;
+            } else if next_arg_is_qgs_qnc_prepared_input_mapping_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = qgs_qnc_prepared_input_mapping_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                qgs_qnc_prepared_input_mapping_paths = Some((original, proxy));
+                next_arg_is_qgs_qnc_prepared_input_mapping_proxy = false;
+            } else if next_arg_is_qgs_qnc_prepared_input_mapping_original {
+                qgs_qnc_prepared_input_mapping_original = Some(PathBuf::from(arg));
+                next_arg_is_qgs_qnc_prepared_input_mapping_original = false;
+                next_arg_is_qgs_qnc_prepared_input_mapping_proxy = true;
             } else if next_arg_is_linux_audio_device_probe_path {
                 linux_audio_device_probe_path = Some(PathBuf::from(arg));
                 next_arg_is_linux_audio_device_probe_path = false;
@@ -18379,6 +18608,8 @@ impl Args {
                 next_arg_is_broadcast_player_runtime_verification_original = true;
             } else if arg == QNC_PREPARED_INPUT_DESCRIPTOR_ARG {
                 next_arg_is_qnc_prepared_input_descriptor_original = true;
+            } else if arg == QGS_QNC_PREPARED_INPUT_MAPPING_ARG {
+                next_arg_is_qgs_qnc_prepared_input_mapping_original = true;
             } else if arg == QGS_INPUT_PLAN_ARG {
                 next_arg_is_qgs_input_plan_original = true;
             } else if arg == QGS_TRANSPORT_ENGINE_PARITY_ARG {
@@ -18488,6 +18719,7 @@ impl Args {
             broadcast_player_runtime_original_video_payloads_paths,
             broadcast_player_runtime_verification_paths,
             qnc_prepared_input_descriptor_paths,
+            qgs_qnc_prepared_input_mapping_paths,
             qgs_input_plan_paths,
             qgs_transport_engine_parity_paths,
             qgs_frame_clock_parity_paths,
