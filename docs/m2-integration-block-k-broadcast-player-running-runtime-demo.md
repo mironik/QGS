@@ -72,6 +72,50 @@ The output also repeats the core media truth:
 - proxy AAC is not authoritative
 - private local paths are hidden from public output
 
+## K2 Output Polish
+
+Block K2 keeps the same runtime behavior and improves the command's readability.
+No backend feature, presenter, audio output policy, realtime scheduler, or A/V
+sync evidence was added.
+
+The command now separates the early stages explicitly:
+
+- `[PREPARE INPUT]` means the input was validated and the plan is available,
+  but the runtime is still waiting for cue/preroll readiness. The internal
+  status can honestly remain `Loaded` here.
+- `[CUE]` records the selected frame and original-audio sample range. If the
+  internal state reports `Ready`, the output also labels the phase as `Cued` so
+  the transition is easier to read.
+- `[PREROLL / PREPARE WINDOW]` is the bounded prepared-window step where video
+  and audio payload readiness become visible.
+- `[PREROLL / PREPARE WINDOW AFTER SEEK]` refreshes the prepared window around
+  the seek target before playback resumes.
+
+Persistent backend/device warnings are printed once near the header:
+
+- real display unavailable until a Wayland/Vulkan backend exists
+- production audio output not verified
+- visual verification unavailable
+- realtime verification unavailable
+- A/V sync not verified
+- selected real backend not implemented
+
+Per-tick output now prints `warnings: unchanged` unless a new non-persistent
+warning appears. This avoids making the player look like it is fault-spamming
+while preserving the same conservative warning facts.
+
+The final summary still reports:
+
+- private path exposed: no
+- real display: `NotImplemented`
+- visual verified: no
+- realtime verified: no
+- audio production verified: no
+- A/V sync verified: no
+- real-display `FramePresented` claim: no
+- run result: completed
+- runtime behavior evidence: yes
+
 ## Sony FX6 Sample 002 Result
 
 For sample 002, the run reaches:

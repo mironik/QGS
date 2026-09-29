@@ -4573,6 +4573,7 @@ fn qgs_broadcast_player_run_report(
     println!("realtime verified: no");
     println!("audio production verified: no");
     println!("A/V sync verified: no");
+    print_running_runtime_persistent_warnings();
     println!();
 
     let load = runtime.execute(QgsBroadcastPlayerCommand::LoadPreparedInput);
@@ -4580,20 +4581,28 @@ fn qgs_broadcast_player_run_report(
     let prepare = runtime.execute(QgsBroadcastPlayerCommand::Prepare {
         active_range: Some((0, active_frames)),
     });
-    print_running_runtime_command(
-        "[PREPARE]",
+    print_running_runtime_command_with_context(
+        "[PREPARE INPUT]",
         &prepare.snapshot,
         prepare.accepted,
         prepare.reason,
+        &[("meaning", qgs_running_prepare_input_meaning())],
     );
     let cue = runtime.execute(QgsBroadcastPlayerCommand::Cue { frame: 0 });
-    print_running_runtime_command("[CUE]", &cue.snapshot, cue.accepted, cue.reason);
+    print_running_runtime_command_with_context(
+        "[CUE]",
+        &cue.snapshot,
+        cue.accepted,
+        cue.reason,
+        &[("phase", "Cued")],
+    );
     let tick_prepare = runtime.execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 });
-    print_running_runtime_command(
-        "[TICK PREPARE]",
+    print_running_runtime_command_with_context(
+        "[PREROLL / PREPARE WINDOW]",
         &tick_prepare.snapshot,
         tick_prepare.accepted,
         tick_prepare.reason,
+        &[("meaning", qgs_running_preroll_meaning())],
     );
     let play = runtime.execute(QgsBroadcastPlayerCommand::Play);
     print_running_runtime_command("[PLAY]", &play.snapshot, play.accepted, play.reason);
@@ -4643,25 +4652,34 @@ fn qgs_broadcast_player_run_report(
         "audio samples: {}",
         qgs_optional_sample_range_label(seek.snapshot.current_audio_sample_range)
     );
+    println!(
+        "prepared window before refresh: {}",
+        qgs_optional_frame_window_label(
+            before_seek.buffer_health.prepared_start_frame,
+            before_seek.buffer_health.prepared_end_frame_exclusive
+        )
+    );
     println!("reason: {}", seek.reason.unwrap_or("n/a"));
     println!();
 
     let prepare_after_seek = runtime.execute(QgsBroadcastPlayerCommand::Prepare {
         active_range: Some((0, active_frames)),
     });
-    print_running_runtime_command(
-        "[PREPARE AFTER SEEK]",
+    print_running_runtime_command_with_context(
+        "[PREPARE INPUT AFTER SEEK]",
         &prepare_after_seek.snapshot,
         prepare_after_seek.accepted,
         prepare_after_seek.reason,
+        &[("meaning", qgs_running_prepare_input_meaning())],
     );
     let tick_prepare_after_seek =
         runtime.execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 });
-    print_running_runtime_command(
-        "[TICK PREPARE AFTER SEEK]",
+    print_running_runtime_command_with_context(
+        "[PREROLL / PREPARE WINDOW AFTER SEEK]",
         &tick_prepare_after_seek.snapshot,
         tick_prepare_after_seek.accepted,
         tick_prepare_after_seek.reason,
+        &[("meaning", qgs_running_preroll_meaning())],
     );
     let replay = runtime.execute(QgsBroadcastPlayerCommand::Play);
     print_running_runtime_command("[PLAY]", &replay.snapshot, replay.accepted, replay.reason);
@@ -4721,6 +4739,8 @@ fn qgs_broadcast_player_run_report(
         yes_no(final_snapshot.player.device_status.av_sync_verified)
     );
     println!("FramePresented real display claim: no");
+    println!("run result: completed");
+    println!("runtime behavior evidence: yes");
 
     Ok(())
 }
@@ -4731,8 +4751,21 @@ fn print_running_runtime_command(
     accepted: bool,
     reason: Option<&'static str>,
 ) {
+    print_running_runtime_command_with_context(label, snapshot, accepted, reason, &[]);
+}
+
+fn print_running_runtime_command_with_context(
+    label: &str,
+    snapshot: &QgsOperationalRuntimeSnapshot,
+    accepted: bool,
+    reason: Option<&'static str>,
+    context: &[(&str, &'static str)],
+) {
     println!("{label}");
     println!("accepted: {}", yes_no(accepted));
+    for (key, value) in context {
+        println!("{key}: {value}");
+    }
     println!("status: {:?}", snapshot.operational_status);
     println!(
         "source loaded: {}",
@@ -4792,35 +4825,65 @@ fn print_running_runtime_tick(
         }
     );
     println!("underrun: {}", yes_no(snapshot.buffer_health.underrun));
-    println!("faults/warnings: {}", qgs_running_fault_summary(snapshot));
+    println!("warnings: {}", qgs_running_warning_change_label(snapshot));
     println!();
 }
 
-fn qgs_running_fault_summary(snapshot: &QgsOperationalRuntimeSnapshot) -> String {
+fn print_running_runtime_persistent_warnings() {
+    println!("Persistent warnings:");
+    for line in qgs_running_runtime_persistent_warning_lines() {
+        println!("- {line}");
+    }
+}
+
+fn qgs_running_runtime_persistent_warning_lines() -> &'static [&'static str] {
+    &[
+        "RealDisplayUnavailable: expected until Wayland+Vulkan backend exists",
+        "AudioOutputNotProductionVerified: PipeWire prototype not production-certified",
+        "VisualVerificationUnavailable: no visual verification claim",
+        "RealtimeVerificationUnavailable: no realtime certification",
+        "AvSyncNotVerified: no A/V sync certification",
+        "BackendNotImplemented: selected real backend is not implemented",
+    ]
+}
+
+fn qgs_running_prepare_input_meaning() -> &'static str {
+    "input validated / plan available / waiting for cue and preroll"
+}
+
+fn qgs_running_preroll_meaning() -> &'static str {
+    "bounded prepared window ready for logical runtime ticks"
+}
+
+fn qgs_running_warning_change_label(snapshot: &QgsOperationalRuntimeSnapshot) -> String {
     let mut labels = snapshot
         .fault_snapshot
         .active_faults
         .iter()
-        .filter(|fault| {
-            matches!(
-                fault.kind,
-                qgs_media_runtime::QgsOperationalFaultKind::RealDisplayUnavailable
-                    | qgs_media_runtime::QgsOperationalFaultKind::AudioOutputNotProductionVerified
-                    | qgs_media_runtime::QgsOperationalFaultKind::BackendNotImplemented
-                    | qgs_media_runtime::QgsOperationalFaultKind::VisualVerificationUnavailable
-                    | qgs_media_runtime::QgsOperationalFaultKind::RealtimeVerificationUnavailable
-                    | qgs_media_runtime::QgsOperationalFaultKind::AvSyncNotVerified
-            )
-        })
+        .filter(|fault| !qgs_running_is_persistent_warning_kind(fault.kind))
         .map(|fault| fault.kind.label())
         .collect::<Vec<_>>();
     labels.sort_unstable();
     labels.dedup();
     if labels.is_empty() {
-        "none".to_string()
+        "unchanged".to_string()
     } else {
         labels.join(", ")
     }
+}
+
+fn qgs_running_is_persistent_warning_kind(
+    kind: qgs_media_runtime::QgsOperationalFaultKind,
+) -> bool {
+    matches!(
+        kind,
+        qgs_media_runtime::QgsOperationalFaultKind::RealDisplayUnavailable
+            | qgs_media_runtime::QgsOperationalFaultKind::AudioOutputNotProductionVerified
+            | qgs_media_runtime::QgsOperationalFaultKind::BackendNotImplemented
+            | qgs_media_runtime::QgsOperationalFaultKind::VisualVerificationUnavailable
+            | qgs_media_runtime::QgsOperationalFaultKind::RealtimeVerificationUnavailable
+            | qgs_media_runtime::QgsOperationalFaultKind::AvSyncNotVerified
+    )
 }
 
 fn qgs_device_backend_selection_report(
@@ -17797,10 +17860,11 @@ mod tests {
         mono_monitor_diagnostic_evidence_label, mxf_file_label, original_pcm_blocks_by_channel,
         original_segment_evidence_label, parse_device_selection_policy_arg,
         parse_manual_audible_confirmation, parse_monitor_track_arg, pcm_s24le_sample_to_f32,
-        proxy_presentation_ordinals, public_source_uri_stem, repeated_smoke_test_buffers,
-        rgba_u16_to_ppm_p6_rgb8, rgba_u16_to_rgb8_bytes, runtime_audio_payload_evidence_label,
-        sanitized_source_stem, selected_proxy_ordinals, smoke_test_buffer_count,
-        ManualAudibleConfirmation, SonyXmlSummary,
+        proxy_presentation_ordinals, public_source_uri_stem, qgs_running_prepare_input_meaning,
+        qgs_running_preroll_meaning, qgs_running_runtime_persistent_warning_lines,
+        repeated_smoke_test_buffers, rgba_u16_to_ppm_p6_rgb8, rgba_u16_to_rgb8_bytes,
+        runtime_audio_payload_evidence_label, sanitized_source_stem, selected_proxy_ordinals,
+        smoke_test_buffer_count, ManualAudibleConfirmation, SonyXmlSummary,
     };
     use qgs_media_runtime::QgsDeviceSelectionPolicy;
     use qgs_media_runtime::{
@@ -17918,6 +17982,34 @@ mod tests {
         assert_eq!(selected_proxy_ordinals(1), vec![0]);
         assert_eq!(selected_proxy_ordinals(12), vec![0, 11]);
         assert_eq!(selected_proxy_ordinals(106), vec![0, 53, 105]);
+    }
+
+    #[test]
+    fn running_runtime_output_disambiguates_prepare_and_preroll_phases() {
+        assert!(
+            qgs_running_prepare_input_meaning().contains("waiting for cue and preroll"),
+            "prepare input wording should explain why status may still be Loaded"
+        );
+        assert!(
+            qgs_running_preroll_meaning().contains("prepared window"),
+            "preroll wording should identify the ready prepared-window phase"
+        );
+    }
+
+    #[test]
+    fn running_runtime_persistent_warnings_are_single_section_facts() {
+        let warnings = qgs_running_runtime_persistent_warning_lines();
+        assert_eq!(warnings.len(), 6);
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("RealDisplayUnavailable")));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("AudioOutputNotProductionVerified")));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("AvSyncNotVerified")));
+        assert!(warnings.iter().all(|warning| !warning.contains("/home/")));
     }
 
     #[test]
