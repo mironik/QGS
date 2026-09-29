@@ -36,6 +36,11 @@ and what remains unimplemented.
   boundary; this is still narrower than full Broadcast Player playback,
   realtime playback, A/V sync, channel certification, or full audio-device
   verification.
+- `ControlSurfaceEvidence`: a production-shaped control facade exposes stable
+  commands, snapshots, readiness, position, prepared-window, device-status, and
+  event summaries over already-separated runtime modules. This is not real
+  display output, realtime playback, A/V sync, or production audio-device
+  verification.
 - `ManualAudibleSignalDetectedContentUnverified`: a human detected a slight
   hum/buzz from a native PipeWire path, but recognizable original audio content
   was not confirmed. This does not verify PCM content correctness, channel
@@ -107,6 +112,7 @@ For Sony FX6 sample 002:
 | native PipeWire discrete 4-mono output boundary | `Discrete4MonoOutputDrainCompleted` | Original MXF track 1/2/3/4 can be submitted as output channel 1/2/3/4 to a native PipeWire 4-channel f32 boundary and drained. Physical channel mapping, production routing, full playback, realtime playback, A/V sync, and `AudioDeviceVerified` are not claimed. |
 | broadcast runtime audio payload to PipeWire | `RuntimeAudioPayloadDrainCompleted` | First prepared `ProxyPreview` Broadcast Player Runtime original-audio payload binding submits to native PipeWire and drains; an audible helper path exists but manual confirmation is tracked separately and does not imply full playback, realtime playback, A/V sync, channel certification, or full audio-device verification. |
 | runtime surface end-to-end acceptance | `TestBoundaryEvidence` | Integration Block A session orchestration and Block B test presenter/monitor boundary are wired together as separate backend modules. This is not monolithic runtime ownership; real display output, realtime playback, A/V sync, and visual verification remain unimplemented. |
+| broadcast player control core | `ControlSurfaceEvidence` | Production-shaped Broadcast Player control facade exposes commands, snapshots, readiness, position, prepared-window, device status, and product events over existing Lego modules without claiming real display, realtime playback, A/V sync, or production audio-device verification. |
 | simulated playback loop | `TestBoundaryEvidence` | Prepared slots flow through test audio/video boundaries deterministically. |
 | real speaker output | `NotImplemented` | No audible speaker output, audio-device clock, or full audio playback path exists; native PipeWire buffer submission is tracked separately. |
 | real display output | `NotImplemented` | No QNC OS Wayland/Vulkan presenter, optional DRM/KMS direct-output presenter, legacy X11 compatibility presenter, swapchain, or real display presenter exists. X11 is not a QNC OS target. |
@@ -149,6 +155,9 @@ The matrix intentionally does not overstate these areas:
 - Runtime-prepared audio payload submission/drain evidence is not full playback,
   realtime playback, A/V sync, channel certification, or full
   `AudioDeviceVerified`.
+- Broadcast Player control surface evidence proves product-shaped command and
+  snapshot orchestration only. It is not real display output, realtime playback,
+  A/V sync, visual verification, or production audio-device verification.
 - The audio content sanity audit is inspection evidence, not audible content
   verification.
 - Haswell CPU-bridge 1080p50 is not marked realtime verified.

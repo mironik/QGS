@@ -3432,6 +3432,536 @@ impl QgsSessionRuntime {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsBroadcastPlayerStatus {
+    Empty,
+    Loaded,
+    Preparing,
+    Ready,
+    Playing,
+    Paused,
+    Stopped,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QgsBroadcastPlayerCommand {
+    LoadPreparedInput,
+    Prepare { active_range: Option<(u64, u64)> },
+    Cue { frame: u64 },
+    Play,
+    Pause,
+    Seek { frame: u64 },
+    Stop,
+    Unload,
+    Tick { carrier_frame: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsBroadcastPlayerEventKind {
+    PlayerLoaded,
+    PlayerPreparing,
+    PlayerReady,
+    PlayerCued,
+    PlayerStarted,
+    PlayerPaused,
+    PlayerSeeked,
+    PlayerStopped,
+    PlayerUnloaded,
+    PlayerFailed,
+    PlayerTicked,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsBroadcastPlayerEvent {
+    pub sequence: u64,
+    pub kind: QgsBroadcastPlayerEventKind,
+    pub status: QgsBroadcastPlayerStatus,
+    pub public_source_uri: Option<String>,
+    pub summary: String,
+}
+
+impl QgsBroadcastPlayerEvent {
+    pub fn exposes_private_path(&self) -> bool {
+        self.public_source_uri
+            .as_deref()
+            .is_some_and(qgs_projection_text_exposes_private_path)
+            || qgs_projection_text_exposes_private_path(&self.summary)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsBroadcastPlayerReadiness {
+    pub input_valid: bool,
+    pub source_loaded: bool,
+    pub transport_ready: bool,
+    pub cue_ready: bool,
+    pub prepared_window_ready: bool,
+    pub video_payload_ready: bool,
+    pub audio_payload_ready: bool,
+    pub presenter_backend_ready: bool,
+    pub audio_backend_ready: bool,
+    pub real_display_ready: bool,
+    pub audio_device_verified: bool,
+    pub visual_verified: bool,
+    pub realtime_verified: bool,
+    pub av_sync_verified: bool,
+    pub proxy_aac_authoritative: bool,
+    pub discrete_mono_audio: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsBroadcastPlayerPosition {
+    pub current_frame: Option<u64>,
+    pub cue_frame: Option<u64>,
+    pub active_range: Option<QgsTransportActiveRange>,
+    pub current_audio_sample_range: Option<(u64, u64)>,
+    pub frame_rate: RationalRate,
+    pub audio_sample_rate: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsBroadcastPlayerPreparedWindow {
+    pub prepared_start_frame: Option<u64>,
+    pub prepared_end_frame_exclusive: Option<u64>,
+    pub selected_prepared_frame: Option<u64>,
+    pub prepared_frame_count: usize,
+    pub latest_discarded_frame_count: usize,
+    pub window_policy: QgsPlayoutBufferLimits,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsBroadcastPlayerDeviceStatus {
+    pub test_presenter_boundary_available: bool,
+    pub file_presenter_diagnostic_available: bool,
+    pub gpu_readback_diagnostic_available: bool,
+    pub real_display_backend: &'static str,
+    pub qnc_os_display_target: &'static str,
+    pub x11_target: &'static str,
+    pub visual_verified: bool,
+    pub realtime_verified: bool,
+    pub audio_device_production_verified: bool,
+    pub av_sync_verified: bool,
+}
+
+impl QgsBroadcastPlayerDeviceStatus {
+    pub const fn conservative() -> Self {
+        Self {
+            test_presenter_boundary_available: true,
+            file_presenter_diagnostic_available: true,
+            gpu_readback_diagnostic_available: true,
+            real_display_backend: "NotImplemented",
+            qnc_os_display_target: "Wayland + Vulkan",
+            x11_target: "no / legacy non-target",
+            visual_verified: false,
+            realtime_verified: false,
+            audio_device_production_verified: false,
+            av_sync_verified: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsBroadcastPlayerEventCounters {
+    pub product_events: usize,
+    pub lower_level_events: usize,
+    pub rejected_commands: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsBroadcastPlayerSnapshot {
+    pub status: QgsBroadcastPlayerStatus,
+    pub public_source_uri: Option<String>,
+    pub source_mode: QgsInputPlanSourceMode,
+    pub selected_representation: QgsPlaybackRepresentation,
+    pub position: QgsBroadcastPlayerPosition,
+    pub readiness: QgsBroadcastPlayerReadiness,
+    pub prepared_window: QgsBroadcastPlayerPreparedWindow,
+    pub device_status: QgsBroadcastPlayerDeviceStatus,
+    pub event_counters: QgsBroadcastPlayerEventCounters,
+    pub passive_view: QgsQncPassiveView,
+    pub private_path_exposed: bool,
+}
+
+impl QgsBroadcastPlayerSnapshot {
+    pub fn exposes_private_path(&self) -> bool {
+        self.private_path_exposed
+            || self
+                .public_source_uri
+                .as_deref()
+                .is_some_and(qgs_projection_text_exposes_private_path)
+            || self.passive_view.private_path_exposed
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsBroadcastPlayerCommandResult {
+    pub command: QgsBroadcastPlayerCommand,
+    pub accepted: bool,
+    pub reason: Option<&'static str>,
+    pub lower_level_results: Vec<QgsSessionCommandResult>,
+    pub product_events: Vec<QgsBroadcastPlayerEvent>,
+    pub snapshot: QgsBroadcastPlayerSnapshot,
+}
+
+pub struct QgsBroadcastPlayerCore {
+    plan: QgsInputPlan,
+    runtime: QgsSessionRuntime,
+    next_command_id: u64,
+    product_events: Vec<QgsBroadcastPlayerEvent>,
+    lower_level_event_count: usize,
+    rejected_command_count: usize,
+    failed: bool,
+}
+
+impl QgsBroadcastPlayerCore {
+    pub fn new(plan: QgsInputPlan) -> Result<Self, PlaybackError> {
+        plan.validate()?;
+        Ok(Self {
+            runtime: QgsSessionRuntime::new(plan.clone(), QgsSessionRuntimeConfig::default())?,
+            plan,
+            next_command_id: 1,
+            product_events: Vec::new(),
+            lower_level_event_count: 0,
+            rejected_command_count: 0,
+            failed: false,
+        })
+    }
+
+    pub fn execute(
+        &mut self,
+        command: QgsBroadcastPlayerCommand,
+    ) -> QgsBroadcastPlayerCommandResult {
+        let mut lower_level_results = Vec::new();
+        let mut command_accepted = true;
+        let mut reason = None;
+        let operations = self.lower_level_operations_for_command(&command);
+        if operations.is_empty() {
+            command_accepted = false;
+            reason = Some("command has no lower-level mapping");
+        }
+        for operation in operations {
+            let result = self.execute_lower_level(operation);
+            if result.status == QgsSessionCommandStatus::ExecutedRejected {
+                command_accepted = false;
+                reason = result
+                    .outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome.reason)
+                    .or(Some("lower-level command rejected"));
+            }
+            self.lower_level_event_count = self
+                .lower_level_event_count
+                .saturating_add(result.projected_events.len());
+            lower_level_results.push(result);
+            if !command_accepted {
+                break;
+            }
+        }
+        if !command_accepted {
+            self.rejected_command_count = self.rejected_command_count.saturating_add(1);
+            self.failed = matches!(command, QgsBroadcastPlayerCommand::LoadPreparedInput)
+                && reason == Some("command has no lower-level mapping");
+        }
+        let before_events = self.product_events.len();
+        self.push_product_event_for_command(&command, command_accepted, reason);
+        let product_events = self.product_events[before_events..].to_vec();
+        let snapshot = self.snapshot();
+        QgsBroadcastPlayerCommandResult {
+            command,
+            accepted: command_accepted,
+            reason,
+            lower_level_results,
+            product_events,
+            snapshot,
+        }
+    }
+
+    pub fn snapshot(&self) -> QgsBroadcastPlayerSnapshot {
+        let runtime_snapshot = self.runtime.snapshot();
+        self.snapshot_from_runtime(runtime_snapshot)
+    }
+
+    pub fn events(&self) -> &[QgsBroadcastPlayerEvent] {
+        &self.product_events
+    }
+
+    fn execute_lower_level(&mut self, command: QgsQncPlayerCommand) -> QgsSessionCommandResult {
+        let command_id = self.next_command_id;
+        self.next_command_id = self.next_command_id.saturating_add(1);
+        let source_uri = self
+            .runtime
+            .snapshot()
+            .passive_view
+            .source
+            .public_source_uri;
+        let envelope = QgsQncCommandEnvelope::new(
+            command_id,
+            Some(self.runtime.snapshot().generation),
+            source_uri,
+            command,
+            "broadcast player control core",
+        );
+        if self.runtime.enqueue(envelope).is_err() {
+            return QgsSessionCommandResult {
+                command_id: QgsSessionCommandId(command_id),
+                status: QgsSessionCommandStatus::EnqueueRejected,
+                outcome: None,
+                queue_rejection: Some(QgsSessionQueueRejection::QueueFull),
+                projected_events: Vec::new(),
+                passive_view: self.runtime.snapshot().passive_view,
+                generation_before: self.runtime.snapshot().generation,
+                generation_after: self.runtime.snapshot().generation,
+            };
+        }
+        self.runtime
+            .execute_next()
+            .expect("just-enqueued command must execute")
+    }
+
+    fn lower_level_operations_for_command(
+        &self,
+        command: &QgsBroadcastPlayerCommand,
+    ) -> Vec<QgsQncPlayerCommand> {
+        match *command {
+            QgsBroadcastPlayerCommand::LoadPreparedInput => {
+                vec![QgsQncPlayerCommand::LoadPreparedInput]
+            }
+            QgsBroadcastPlayerCommand::Prepare { active_range } => {
+                let snapshot = self.runtime.snapshot();
+                let mut operations = Vec::new();
+                if snapshot.passive_view.loaded_source_count > 0 {
+                    operations.push(QgsQncPlayerCommand::PreloadSource);
+                    if snapshot.passive_view.source.public_source_uri.is_none() {
+                        operations.push(QgsQncPlayerCommand::SetActiveSource);
+                    }
+                    let (start_frame, end_frame) =
+                        active_range.unwrap_or((0, self.plan.video_source.duration_frames));
+                    let range_already_active = snapshot
+                        .passive_view
+                        .transport
+                        .active_range
+                        .is_some_and(|range| {
+                            range.start_frame == start_frame && range.end_frame == end_frame
+                        });
+                    if !range_already_active {
+                        operations.push(QgsQncPlayerCommand::SetActiveRange {
+                            start_frame,
+                            end_frame,
+                        });
+                    }
+                    if snapshot.passive_view.transport.cue.is_some() {
+                        operations.push(QgsQncPlayerCommand::PrepareAnchor);
+                    }
+                }
+                operations
+            }
+            QgsBroadcastPlayerCommand::Cue { frame } => {
+                vec![
+                    QgsQncPlayerCommand::Cue { frame },
+                    QgsQncPlayerCommand::PrepareAnchor,
+                ]
+            }
+            QgsBroadcastPlayerCommand::Seek { frame } => vec![QgsQncPlayerCommand::Cue { frame }],
+            QgsBroadcastPlayerCommand::Play => vec![QgsQncPlayerCommand::Play],
+            QgsBroadcastPlayerCommand::Pause => vec![QgsQncPlayerCommand::Pause],
+            QgsBroadcastPlayerCommand::Stop => vec![QgsQncPlayerCommand::Stop],
+            QgsBroadcastPlayerCommand::Unload => {
+                let snapshot = self.runtime.snapshot();
+                if snapshot.passive_view.source.public_source_uri.is_some() {
+                    let mut operations = Vec::new();
+                    if snapshot.passive_view.transport.state != QgsTransportStatus::Stopped {
+                        operations.push(QgsQncPlayerCommand::Stop);
+                    }
+                    operations.push(QgsQncPlayerCommand::CloseActiveSource);
+                    operations.push(QgsQncPlayerCommand::UnloadSource);
+                    operations
+                } else {
+                    Vec::new()
+                }
+            }
+            QgsBroadcastPlayerCommand::Tick { carrier_frame } => {
+                vec![QgsQncPlayerCommand::TickPrepare { carrier_frame }]
+            }
+        }
+    }
+
+    fn push_product_event_for_command(
+        &mut self,
+        command: &QgsBroadcastPlayerCommand,
+        accepted: bool,
+        reason: Option<&'static str>,
+    ) {
+        let kind = if !accepted {
+            QgsBroadcastPlayerEventKind::PlayerFailed
+        } else {
+            match *command {
+                QgsBroadcastPlayerCommand::LoadPreparedInput => {
+                    QgsBroadcastPlayerEventKind::PlayerLoaded
+                }
+                QgsBroadcastPlayerCommand::Prepare { .. } => {
+                    if self.runtime.snapshot().passive_view.readiness.play_ready {
+                        QgsBroadcastPlayerEventKind::PlayerReady
+                    } else {
+                        QgsBroadcastPlayerEventKind::PlayerPreparing
+                    }
+                }
+                QgsBroadcastPlayerCommand::Cue { .. } => QgsBroadcastPlayerEventKind::PlayerCued,
+                QgsBroadcastPlayerCommand::Play => QgsBroadcastPlayerEventKind::PlayerStarted,
+                QgsBroadcastPlayerCommand::Pause => QgsBroadcastPlayerEventKind::PlayerPaused,
+                QgsBroadcastPlayerCommand::Seek { .. } => QgsBroadcastPlayerEventKind::PlayerSeeked,
+                QgsBroadcastPlayerCommand::Stop => QgsBroadcastPlayerEventKind::PlayerStopped,
+                QgsBroadcastPlayerCommand::Unload => QgsBroadcastPlayerEventKind::PlayerUnloaded,
+                QgsBroadcastPlayerCommand::Tick { .. } => {
+                    if self.runtime.snapshot().passive_view.readiness.play_ready {
+                        self.push_event(
+                            QgsBroadcastPlayerEventKind::PlayerReady,
+                            "prepared window ready",
+                        );
+                    }
+                    QgsBroadcastPlayerEventKind::PlayerTicked
+                }
+            }
+        };
+        self.push_event(kind, reason.unwrap_or("accepted"));
+    }
+
+    fn push_event(&mut self, kind: QgsBroadcastPlayerEventKind, summary: impl Into<String>) {
+        let snapshot = self.runtime.snapshot();
+        let status = self.status_from_passive(&snapshot.passive_view);
+        self.product_events.push(QgsBroadcastPlayerEvent {
+            sequence: u64::try_from(self.product_events.len() + 1).unwrap_or(u64::MAX),
+            kind,
+            status,
+            public_source_uri: snapshot.passive_view.source.public_source_uri.or_else(|| {
+                (snapshot.passive_view.loaded_source_count > 0)
+                    .then(|| self.plan.video_source.media_uri.clone())
+            }),
+            summary: summary.into(),
+        });
+    }
+
+    fn snapshot_from_runtime(
+        &self,
+        runtime_snapshot: QgsSessionRuntimeSnapshot,
+    ) -> QgsBroadcastPlayerSnapshot {
+        let passive = runtime_snapshot.passive_view.clone();
+        let position = self.position_from_passive(&passive);
+        let prepared_window = QgsBroadcastPlayerPreparedWindow {
+            prepared_start_frame: passive.prepared_buffer.prepared_start_frame,
+            prepared_end_frame_exclusive: passive.prepared_buffer.prepared_end_frame_exclusive,
+            selected_prepared_frame: passive.transport.carrier_frame,
+            prepared_frame_count: passive.prepared_buffer.prepared_frame_count,
+            latest_discarded_frame_count: passive.prepared_buffer.latest_discarded_frame_count,
+            window_policy: QgsPlayoutBufferLimits::default_transport_window(),
+        };
+        let public_source_uri = passive.source.public_source_uri.clone().or_else(|| {
+            (passive.loaded_source_count > 0).then(|| self.plan.video_source.media_uri.clone())
+        });
+        let source_loaded = public_source_uri.is_some();
+        let prepared_window_ready = passive.prepared_buffer.prepared_frame_count > 0;
+        let readiness = QgsBroadcastPlayerReadiness {
+            input_valid: true,
+            source_loaded,
+            transport_ready: passive.readiness.play_ready,
+            cue_ready: passive.readiness.prepared_anchor_ready,
+            prepared_window_ready,
+            video_payload_ready: prepared_window_ready,
+            audio_payload_ready: prepared_window_ready,
+            presenter_backend_ready: false,
+            audio_backend_ready: false,
+            real_display_ready: false,
+            audio_device_verified: false,
+            visual_verified: false,
+            realtime_verified: false,
+            av_sync_verified: false,
+            proxy_aac_authoritative: false,
+            discrete_mono_audio: !self.plan.audio_source.lanes.is_empty()
+                && self
+                    .plan
+                    .audio_source
+                    .lanes
+                    .iter()
+                    .all(|lane| lane.channel_index == 0),
+        };
+        QgsBroadcastPlayerSnapshot {
+            status: self.status_from_passive(&passive),
+            public_source_uri,
+            source_mode: self.plan.source_mode,
+            selected_representation: self.plan.video_source.representation,
+            position,
+            readiness,
+            prepared_window,
+            device_status: QgsBroadcastPlayerDeviceStatus::conservative(),
+            event_counters: QgsBroadcastPlayerEventCounters {
+                product_events: self.product_events.len(),
+                lower_level_events: self.lower_level_event_count,
+                rejected_commands: self.rejected_command_count
+                    + runtime_snapshot.rejected_enqueue_commands,
+            },
+            private_path_exposed: runtime_snapshot.private_path_exposed
+                || self
+                    .product_events
+                    .iter()
+                    .any(QgsBroadcastPlayerEvent::exposes_private_path),
+            passive_view: passive,
+        }
+    }
+
+    fn position_from_passive(&self, passive: &QgsQncPassiveView) -> QgsBroadcastPlayerPosition {
+        let cue_frame = passive.transport.cue.map(|cue| cue.frame);
+        let current_frame = passive.transport.carrier_frame.or(cue_frame);
+        let current_audio_sample_range = passive.transport.cue.and_then(|cue| {
+            self.plan
+                .video_source
+                .timebase
+                .frame_duration()
+                .ok()
+                .and_then(|duration| {
+                    audio_samples_for_duration(duration, self.plan.audio_source.sample_rate).ok()
+                })
+                .map(|samples| (cue.sample, cue.sample.saturating_add(samples)))
+        });
+        QgsBroadcastPlayerPosition {
+            current_frame,
+            cue_frame,
+            active_range: passive.transport.active_range,
+            current_audio_sample_range,
+            frame_rate: self.plan.video_source.timebase,
+            audio_sample_rate: self.plan.audio_source.sample_rate,
+        }
+    }
+
+    fn status_from_passive(&self, passive: &QgsQncPassiveView) -> QgsBroadcastPlayerStatus {
+        if self.failed {
+            return QgsBroadcastPlayerStatus::Failed;
+        }
+        match passive.transport.state {
+            QgsTransportStatus::Empty => QgsBroadcastPlayerStatus::Empty,
+            QgsTransportStatus::Loaded => {
+                if passive.readiness.play_ready {
+                    QgsBroadcastPlayerStatus::Ready
+                } else if passive.loaded_source_count > 0 {
+                    QgsBroadcastPlayerStatus::Loaded
+                } else {
+                    QgsBroadcastPlayerStatus::Empty
+                }
+            }
+            QgsTransportStatus::Ready => QgsBroadcastPlayerStatus::Ready,
+            QgsTransportStatus::Playing => QgsBroadcastPlayerStatus::Playing,
+            QgsTransportStatus::Paused => QgsBroadcastPlayerStatus::Paused,
+            QgsTransportStatus::Stopped => {
+                if passive.source.public_source_uri.is_none() {
+                    QgsBroadcastPlayerStatus::Empty
+                } else {
+                    QgsBroadcastPlayerStatus::Stopped
+                }
+            }
+        }
+    }
+}
+
 fn qgs_projection_text_exposes_private_path(value: &str) -> bool {
     value.starts_with('/') || value.starts_with("file:") || value.contains("file:")
 }
@@ -3930,6 +4460,7 @@ pub enum BroadcastRuntimeVerificationLevel {
     NotImplemented,
     CompileChecked,
     UnitTested,
+    ControlSurfaceEvidence,
     MediaInspected,
     PayloadExtracted,
     PayloadBound,
@@ -3958,6 +4489,7 @@ impl BroadcastRuntimeVerificationLevel {
             Self::NotImplemented => "NotImplemented",
             Self::CompileChecked => "CompileChecked",
             Self::UnitTested => "UnitTested",
+            Self::ControlSurfaceEvidence => "ControlSurfaceEvidence",
             Self::MediaInspected => "MediaInspected",
             Self::PayloadExtracted => "PayloadExtracted",
             Self::PayloadBound => "PayloadBound",
@@ -4019,6 +4551,7 @@ pub enum BroadcastRuntimeVerifiedSubsystem {
     NativePipeWireDiscrete4MonoOutputBoundary,
     BroadcastRuntimeAudioPayloadPipeWire,
     RuntimeSurfaceE2eAcceptance,
+    BroadcastPlayerControlCore,
     SimulatedPlaybackLoop,
     RealSpeakerOutput,
     RealDisplayOutput,
@@ -4066,6 +4599,7 @@ impl BroadcastRuntimeVerifiedSubsystem {
                 "broadcast runtime audio payload to PipeWire"
             }
             Self::RuntimeSurfaceE2eAcceptance => "runtime surface end-to-end acceptance",
+            Self::BroadcastPlayerControlCore => "broadcast player control core",
             Self::SimulatedPlaybackLoop => "simulated playback loop",
             Self::RealSpeakerOutput => "real speaker output",
             Self::RealDisplayOutput => "real display output",
@@ -4237,6 +4771,11 @@ impl BroadcastRuntimeVerificationMatrix {
                     subsystem: Subsystem::RuntimeSurfaceE2eAcceptance,
                     level: Level::TestBoundaryEvidence,
                     summary: "Integration Block A session runtime and Block B test presenter/monitor boundary run as one end-to-end backend scenario; real display, realtime, and visual verification are not claimed",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::BroadcastPlayerControlCore,
+                    level: Level::ControlSurfaceEvidence,
+                    summary: "production-shaped Broadcast Player control facade exposes commands, snapshots, readiness, position, prepared-window, device status, and product events over existing Lego modules without claiming real display, realtime, A/V sync, or audio-device verification",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::SimulatedPlaybackLoop,
@@ -8166,6 +8705,175 @@ mod tests {
         assert!(view.transport.active_range.is_none());
         assert_eq!(view.prepared_buffer.prepared_frame_count, 0);
         assert_eq!(view.prepared_buffer.latest_discarded_frame_count, 6);
+    }
+
+    #[test]
+    fn qgs_broadcast_player_core_runs_product_command_sequence() {
+        let mut core = QgsBroadcastPlayerCore::new(sample_qgs_input_plan()).unwrap();
+        for command in [
+            QgsBroadcastPlayerCommand::LoadPreparedInput,
+            QgsBroadcastPlayerCommand::Prepare {
+                active_range: Some((0, 50)),
+            },
+            QgsBroadcastPlayerCommand::Cue { frame: 0 },
+            QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 },
+            QgsBroadcastPlayerCommand::Play,
+            QgsBroadcastPlayerCommand::Tick { carrier_frame: 1 },
+            QgsBroadcastPlayerCommand::Pause,
+            QgsBroadcastPlayerCommand::Seek { frame: 2 },
+            QgsBroadcastPlayerCommand::Prepare {
+                active_range: Some((0, 50)),
+            },
+            QgsBroadcastPlayerCommand::Play,
+            QgsBroadcastPlayerCommand::Stop,
+            QgsBroadcastPlayerCommand::Unload,
+        ] {
+            let result = core.execute(command);
+            assert!(result.accepted, "{:?}", result);
+        }
+
+        let snapshot = core.snapshot();
+        assert_eq!(snapshot.status, QgsBroadcastPlayerStatus::Empty);
+        assert_eq!(snapshot.source_mode, QgsInputPlanSourceMode::ProxyPreview);
+        assert_eq!(
+            snapshot.selected_representation,
+            QgsPlaybackRepresentation::Proxy
+        );
+        assert!(core
+            .events()
+            .iter()
+            .any(|event| event.kind == QgsBroadcastPlayerEventKind::PlayerReady));
+        assert!(core
+            .events()
+            .iter()
+            .any(|event| event.kind == QgsBroadcastPlayerEventKind::PlayerStarted));
+        assert!(core
+            .events()
+            .iter()
+            .any(|event| event.kind == QgsBroadcastPlayerEventKind::PlayerUnloaded));
+        assert!(!snapshot.exposes_private_path());
+    }
+
+    #[test]
+    fn qgs_broadcast_player_core_rejects_play_before_ready() {
+        let mut core = QgsBroadcastPlayerCore::new(sample_qgs_input_plan()).unwrap();
+        let result = core.execute(QgsBroadcastPlayerCommand::Play);
+        assert!(!result.accepted);
+        assert_eq!(result.reason, Some("not ready"));
+        assert_eq!(result.snapshot.status, QgsBroadcastPlayerStatus::Empty);
+        assert_eq!(result.snapshot.event_counters.rejected_commands, 1);
+        assert!(result
+            .product_events
+            .iter()
+            .any(|event| event.kind == QgsBroadcastPlayerEventKind::PlayerFailed));
+    }
+
+    #[test]
+    fn qgs_broadcast_player_core_readiness_requires_tick_preparation() {
+        let mut core = QgsBroadcastPlayerCore::new(sample_qgs_input_plan()).unwrap();
+        assert!(
+            core.execute(QgsBroadcastPlayerCommand::LoadPreparedInput)
+                .accepted
+        );
+        assert!(
+            core.execute(QgsBroadcastPlayerCommand::Prepare {
+                active_range: Some((0, 50)),
+            })
+            .accepted
+        );
+        assert!(
+            core.execute(QgsBroadcastPlayerCommand::Cue { frame: 0 })
+                .accepted
+        );
+
+        let before_tick = core.snapshot();
+        assert_eq!(before_tick.status, QgsBroadcastPlayerStatus::Ready);
+        assert!(before_tick.readiness.transport_ready);
+        assert!(!before_tick.readiness.prepared_window_ready);
+        assert!(!before_tick.readiness.video_payload_ready);
+        assert!(!before_tick.readiness.audio_payload_ready);
+
+        assert!(
+            core.execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 })
+                .accepted
+        );
+        let after_tick = core.snapshot();
+        assert!(after_tick.readiness.prepared_window_ready);
+        assert!(after_tick.readiness.video_payload_ready);
+        assert!(after_tick.readiness.audio_payload_ready);
+        assert_eq!(after_tick.prepared_window.prepared_frame_count, 6);
+    }
+
+    #[test]
+    fn qgs_broadcast_player_core_seek_updates_cue_without_real_output_claims() {
+        let mut core = QgsBroadcastPlayerCore::new(sample_qgs_input_plan()).unwrap();
+        for command in [
+            QgsBroadcastPlayerCommand::LoadPreparedInput,
+            QgsBroadcastPlayerCommand::Prepare {
+                active_range: Some((0, 50)),
+            },
+            QgsBroadcastPlayerCommand::Cue { frame: 0 },
+            QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 },
+            QgsBroadcastPlayerCommand::Play,
+            QgsBroadcastPlayerCommand::Pause,
+            QgsBroadcastPlayerCommand::Seek { frame: 2 },
+        ] {
+            assert!(core.execute(command).accepted);
+        }
+        let snapshot = core.snapshot();
+        assert_eq!(snapshot.status, QgsBroadcastPlayerStatus::Paused);
+        assert_eq!(snapshot.position.cue_frame, Some(2));
+        assert_eq!(snapshot.position.current_frame, Some(2));
+        assert_eq!(
+            snapshot.position.current_audio_sample_range,
+            Some((1_920, 2_880))
+        );
+        assert!(!snapshot.device_status.visual_verified);
+        assert!(!snapshot.device_status.realtime_verified);
+        assert!(!snapshot.device_status.audio_device_production_verified);
+        assert!(!snapshot.device_status.av_sync_verified);
+    }
+
+    #[test]
+    fn qgs_broadcast_player_core_snapshot_preserves_media_and_device_policy() {
+        let mut core = QgsBroadcastPlayerCore::new(sample_qgs_input_plan()).unwrap();
+        for command in [
+            QgsBroadcastPlayerCommand::LoadPreparedInput,
+            QgsBroadcastPlayerCommand::Prepare {
+                active_range: Some((0, 50)),
+            },
+            QgsBroadcastPlayerCommand::Cue { frame: 0 },
+            QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 },
+        ] {
+            assert!(core.execute(command).accepted);
+        }
+        let snapshot = core.snapshot();
+        assert_eq!(snapshot.source_mode, QgsInputPlanSourceMode::ProxyPreview);
+        assert_eq!(
+            snapshot.selected_representation,
+            QgsPlaybackRepresentation::Proxy
+        );
+        assert!(snapshot.readiness.discrete_mono_audio);
+        assert!(!snapshot.readiness.proxy_aac_authoritative);
+        assert_eq!(
+            snapshot.device_status.real_display_backend,
+            "NotImplemented"
+        );
+        assert_eq!(
+            snapshot.device_status.qnc_os_display_target,
+            "Wayland + Vulkan"
+        );
+        assert_eq!(snapshot.device_status.x11_target, "no / legacy non-target");
+        assert!(!snapshot.readiness.real_display_ready);
+        assert!(!snapshot.readiness.audio_device_verified);
+        assert!(!snapshot.readiness.visual_verified);
+        assert!(!snapshot.readiness.realtime_verified);
+        assert!(!snapshot.readiness.av_sync_verified);
+        assert!(!snapshot.exposes_private_path());
+        assert!(core
+            .events()
+            .iter()
+            .all(|event| !event.exposes_private_path()));
     }
 
     #[test]
