@@ -179,6 +179,9 @@ It does not prove:
 M2 Integration Block D is the real display presenter backend audit. It preserves
 the same Lego shape and recommends a staged path: first a screenshot/file
 presenter visual diagnostic, then a minimal Wayland/Vulkan presenter prototype.
+QNC OS real display presenter work targets Wayland/Vulkan, not X11. DRM/KMS
+remains a possible later direct/appliance output path if QNC OS needs
+compositor-bypass output.
 
 It should preserve the Lego shape:
 

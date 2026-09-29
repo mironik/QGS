@@ -101,7 +101,7 @@ For Sony FX6 sample 002:
 | runtime surface end-to-end acceptance | `TestBoundaryEvidence` | Integration Block A session orchestration and Block B test presenter/monitor boundary are wired together as separate backend modules. This is not monolithic runtime ownership; real display output, realtime playback, A/V sync, and visual verification remain unimplemented. |
 | simulated playback loop | `TestBoundaryEvidence` | Prepared slots flow through test audio/video boundaries deterministically. |
 | real speaker output | `NotImplemented` | No audible speaker output, audio-device clock, or full audio playback path exists; native PipeWire buffer submission is tracked separately. |
-| real display output | `NotImplemented` | No swapchain, Wayland, X11, DRM/KMS, or real display presenter exists. |
+| real display output | `NotImplemented` | No QNC OS Wayland/Vulkan presenter, optional DRM/KMS direct-output presenter, legacy X11 compatibility presenter, swapchain, or real display presenter exists. X11 is not a QNC OS target. |
 | realtime playback | `NotImplemented` | Broadcast Player realtime scheduler has not been implemented or accepted. |
 | modern-hardware zero-copy | `NotImplemented` | VA/Vulkan zero-copy remains frozen and not verified on modern hardware. |
 

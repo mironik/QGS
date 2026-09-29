@@ -21,8 +21,9 @@ that QGS must replace or feed:
 - QGS owns prepared payloads and backend presenter evidence.
 - QNC monitor/timeline modules remain passive observers.
 - QNC UI does not own display/presenter readiness.
-- Real display presenter output remains a gap until a backend such as Wayland,
-  X11, DRM/KMS, or swapchain output is implemented.
+- Real display presenter output remains a gap. The QNC OS target is
+  Wayland/Vulkan; DRM/KMS is a possible later direct/appliance output path, and
+  X11 is legacy/non-target for QNC OS.
 
 Block B keeps that ownership line. It provides monitor projection facts from QGS
 backend evidence without importing QNC crates or implementing a QNC UI.
@@ -147,7 +148,7 @@ it does not slurp the original MXF to prove a video presenter boundary.
 Not implemented:
 
 - real display backend
-- Wayland/X11/DRM/KMS/swapchain output
+- Wayland/DRM/KMS/X11/swapchain output
 - real user-visible presentation
 - visual comparison or correctness verification
 - realtime scheduler
@@ -162,5 +163,6 @@ evidence remains test-boundary evidence only.
 
 Integration Block D audits real display presenter backend options. It keeps the
 presenter boundary independent, recommends a screenshot/file visual diagnostic
-before a minimal Wayland/Vulkan presenter prototype, and still keeps
+before a minimal Wayland/Vulkan presenter prototype, treats DRM/KMS as a later
+direct-output option, keeps X11 as legacy/non-target for QNC OS, and still keeps
 `VisualVerified` separate from merely submitting a frame to a presenter.

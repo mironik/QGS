@@ -3,7 +3,7 @@
 Integration Block D audits real display presenter backend options for QGS. It is
 an audit/planning block only.
 
-It does not implement a real display backend, Wayland/X11/DRM/KMS output,
+It does not implement a real display backend, Wayland/DRM/KMS/X11 output,
 realtime playback, A/V sync, QNC UI, export/render, or a monolithic player path.
 The presenter boundary remains its own module.
 
@@ -78,7 +78,7 @@ What QGS does not yet expose as a display-ready object:
 - a presenter-owned Vulkan image layout
 - display queue ownership
 - timeline semaphore/fence handoff to a present queue
-- Wayland/X11/DRM/KMS surface identity
+- Wayland, DRM/KMS, or legacy X11 surface identity
 - presentation callback/evidence from a real compositor/display backend
 
 ## Missing Real Presenter Capabilities
@@ -108,41 +108,43 @@ presenter acceptance.
 
 | Candidate | Strengths | Risks / Missing Work | Fit For QGS |
 | --- | --- | --- | --- |
-| Wayland + Vulkan WSI | Linux-first, strong fit for future QNC OS, avoids legacy X11 assumptions, natural with a Vulkan processing pipeline. | Requires surface/window lifecycle, compositor protocols, swapchain management, present callback/evidence semantics, resize handling, and careful separation from QNC UI. | Best first real display direction for QNC OS, once the presenter-boundary prototype is ready. |
-| X11 + Vulkan WSI | Broad desktop compatibility and useful fallback on developer machines. | Less aligned with future QNC OS direction, extra legacy window-system concerns, weaker fit as the primary architecture target. | Useful fallback/diagnostic backend, not the first strategic backend. |
-| DRM/KMS + Vulkan | Direct device path, strong appliance/broadcast-station potential, avoids desktop compositor. | Highest integration risk: permissions, mode setting, lease/session management, hotplug, VT ownership, and conflict with desktop UI. | Later dedicated output path, not the first journalist-laptop backend. |
-| Vulkan swapchain abstraction directly | Keeps the presenter close to the GPU pipeline and exposes correct sync/present concepts. | Still needs a platform surface provider; by itself it does not solve Wayland/X11/DRM ownership. | Good internal layer below a Wayland-first backend. |
+| Wayland + Vulkan WSI | Linux-first, strong fit for future QNC OS, avoids legacy X11 assumptions, natural with a Vulkan processing pipeline. | Requires surface/window lifecycle, compositor protocols, swapchain management, present callback/evidence semantics, resize handling, and careful separation from QNC UI. | Primary QNC OS real display presenter target. |
+| DRM/KMS + Vulkan | Direct device path, strong appliance/broadcast-station potential, avoids desktop compositor. | Highest integration risk: permissions, mode setting, lease/session management, hotplug, VT ownership, and conflict with desktop UI. | Possible future direct/appliance presenter path if QNC OS needs compositor-bypass output. |
+| X11 + Vulkan WSI | Legacy Linux compatibility path for non-QNC OS environments. | Not a QNC OS target; legacy window-system concerns and weaker fit for future presenter evidence/ownership. | Non-target for QNC OS. Do not recommend as a QNC OS backend. |
+| Vulkan swapchain abstraction directly | Keeps the presenter close to the GPU pipeline and exposes correct sync/present concepts. | Still needs a platform surface provider; by itself it does not solve Wayland/DRM/KMS ownership. | Good internal layer below the Wayland-first QNC OS backend. |
 | `winit`/`wgpu` style window abstraction | Fast prototype path, easier window creation, cross-platform habits, possible screenshot hooks. | May hide WSI details QGS needs for evidence, timing, swapchain ownership, and QNC OS integration. `wgpu` may duplicate/abstract away existing Vulkan choices. | Useful spike candidate only if it stays isolated and does not become the production contract. |
 | Headless/null presenter | CI friendly and deterministic. | Not real display output; cannot prove real presentation or visual correctness. | Keep as test boundary, not as real display milestone. |
 | Screenshot/file presenter | Deterministic visual artifact, can compare pixels, works with current RGBA-u16 readback payloads, good for visual QA. | Not real display output; does not prove compositor/display submission or timing. | Best near-term diagnostic visual verification step before real swapchain work. |
 
 ## Recommended First Backend
 
-Recommended real display direction: **Wayland + Vulkan presenter boundary**.
+QNC OS display presenter target: **Wayland + Vulkan, not X11**.
 
-Reasons:
+Recommended path:
 
-- QGS/QNC OS is Linux-first.
-- Journalist laptops and future QNC OS desktops are expected to have a
-  compositor/display session rather than exclusive KMS ownership.
-- QGS already has a Vulkan processing path and processed frame tokens.
-- Wayland keeps real display readiness in the QGS presenter boundary while QNC
-  applications remain UI/workflow observers and command issuers.
-- A Wayland presenter can later report real surface/swapchain/presentation
-  evidence without importing QNC crates.
+1. **M2 Integration Block E - Screenshot/File Presenter Visual Diagnostic**
 
-Recommended immediate next block: **M2 Integration Block E - Screenshot/File
-Presenter Visual Diagnostic**.
+   This is the immediate next block. It should produce a deterministic visual
+   artifact path, make no real display claim, and prepare visual verification
+   discipline using the current RGBA-u16 processed payload/readback shape.
 
-That block should not claim real display output. It should use the current
-RGBA-u16 processed payload/readback shape to produce a deterministic diagnostic
-image or screenshot artifact and establish visual comparison rules. This creates
-a low-risk visual baseline before the first Wayland/Vulkan surface prototype.
+2. **Wayland + Vulkan Presenter Boundary**
 
-The first real display implementation after that should be a minimal
-Wayland/Vulkan presenter prototype with one prepared frame, bounded lifetime,
-no realtime loop, and explicit evidence levels up to `SurfaceCreated` or
-`SwapchainReady` before attempting frame submission.
+   This is the first real QNC OS display target. Journalist laptops and future
+   QNC OS desktops are expected to have a compositor/display session rather than
+   exclusive KMS ownership. QGS already has a Vulkan processing path and
+   processed frame tokens, and a Wayland presenter can later report real
+   surface/swapchain/presentation evidence without importing QNC crates.
+
+3. **DRM/KMS + Vulkan**
+
+   This is a future optional direct/appliance presenter path if QNC OS needs
+   compositor-bypass output. It is not the first journalist-laptop target.
+
+Not recommended for QNC OS:
+
+- **X11 presenter**. X11 may be documented only as legacy Linux compatibility
+  for non-QNC OS environments. It is not a QNC OS display presenter target.
 
 ## Evidence Ladder
 
@@ -198,6 +200,8 @@ or QGS prepared payload state. QGS must not import QNC crates.
   realtime playback is attempted.
 - DRM/KMS may be attractive for appliance output but is too high-risk for the
   first journalist-laptop milestone.
+- X11 is a legacy/non-target path for QNC OS and should not shape the QGS
+  presenter contract.
 - `winit`/`wgpu` can help prototype but may obscure evidence QGS needs to own
   explicitly.
 
@@ -219,14 +223,16 @@ Suggested scope:
 
 After that, the next real display block should be a minimal Wayland/Vulkan
 presenter prototype that can create a surface and swapchain without tying the
-presenter boundary to session control or QNC UI.
+presenter boundary to session control or QNC UI. A DRM/KMS direct-output path
+can be considered later for appliance/compositor-bypass needs. X11 is not a QNC
+OS display target.
 
 ## Explicit Non-Claims
 
 This audit does not implement or claim:
 
 - real display output
-- Wayland/X11/DRM/KMS output
+- Wayland/DRM/KMS/X11 output
 - swapchain creation
 - real user-visible presentation
 - visual verification
