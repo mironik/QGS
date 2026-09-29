@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
@@ -2703,6 +2703,311 @@ impl QgsQncSessionCommandExecutor {
                 self.event_log.push_tick_event(event);
             }
             self.last_seen_buffer_events = buffer.events().len();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct QgsSessionCommandId(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsSessionCommandQueueLimits {
+    pub max_queued_commands: usize,
+}
+
+impl QgsSessionCommandQueueLimits {
+    pub const fn default_control_surface() -> Self {
+        Self {
+            max_queued_commands: 16,
+        }
+    }
+
+    pub fn validate(self) -> Result<Self, PlaybackError> {
+        if self.max_queued_commands == 0 {
+            Err(PlaybackError::InvalidCapacity)
+        } else {
+            Ok(self)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsSessionDuplicateCommandPolicy {
+    RejectStrict,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsSessionRuntimeConfig {
+    pub queue_limits: QgsSessionCommandQueueLimits,
+    pub duplicate_policy: QgsSessionDuplicateCommandPolicy,
+}
+
+impl QgsSessionRuntimeConfig {
+    pub fn validate(self) -> Result<Self, PlaybackError> {
+        self.queue_limits.validate()?;
+        Ok(self)
+    }
+}
+
+impl Default for QgsSessionRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            queue_limits: QgsSessionCommandQueueLimits::default_control_surface(),
+            duplicate_policy: QgsSessionDuplicateCommandPolicy::RejectStrict,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsSessionQueueRejection {
+    QueueFull,
+    DuplicateCommandId,
+    PrivatePathExposed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsSessionCommandStatus {
+    Enqueued,
+    ExecutedAccepted,
+    ExecutedRejected,
+    EnqueueRejected,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsSessionQueuedCommand {
+    pub id: QgsSessionCommandId,
+    pub envelope: QgsQncCommandEnvelope,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsSessionCommandTranscriptEntry {
+    pub command_id: QgsSessionCommandId,
+    pub command: QgsQncPlayerCommand,
+    pub status: QgsSessionCommandStatus,
+    pub rejection: Option<&'static str>,
+    pub generation_before: QgsRuntimeEventGeneration,
+    pub generation_after: QgsRuntimeEventGeneration,
+    pub projected_event_count: usize,
+    pub passive_view: QgsQncPassiveView,
+}
+
+impl QgsSessionCommandTranscriptEntry {
+    pub fn exposes_private_path(&self) -> bool {
+        self.passive_view.private_path_exposed
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QgsSessionCommandTranscript {
+    entries: Vec<QgsSessionCommandTranscriptEntry>,
+}
+
+impl QgsSessionCommandTranscript {
+    pub fn entries(&self) -> &[QgsSessionCommandTranscriptEntry] {
+        &self.entries
+    }
+
+    pub fn command_ids(&self) -> Vec<u64> {
+        self.entries
+            .iter()
+            .map(|entry| entry.command_id.0)
+            .collect()
+    }
+
+    pub fn exposes_private_path(&self) -> bool {
+        self.entries
+            .iter()
+            .any(QgsSessionCommandTranscriptEntry::exposes_private_path)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsSessionCommandResult {
+    pub command_id: QgsSessionCommandId,
+    pub status: QgsSessionCommandStatus,
+    pub outcome: Option<QgsQncCommandOutcome>,
+    pub queue_rejection: Option<QgsSessionQueueRejection>,
+    pub projected_events: Vec<QgsQncEventEnvelope>,
+    pub passive_view: QgsQncPassiveView,
+    pub generation_before: QgsRuntimeEventGeneration,
+    pub generation_after: QgsRuntimeEventGeneration,
+}
+
+impl QgsSessionCommandResult {
+    pub fn exposes_private_path(&self) -> bool {
+        self.projected_events
+            .iter()
+            .any(QgsQncEventEnvelope::exposes_private_path)
+            || self.passive_view.private_path_exposed
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsSessionRuntimeSnapshot {
+    pub generation: QgsRuntimeEventGeneration,
+    pub queued_commands: usize,
+    pub executed_commands: usize,
+    pub rejected_enqueue_commands: usize,
+    pub passive_view: QgsQncPassiveView,
+    pub private_path_exposed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsSessionCommandExecutionReport {
+    pub executed: usize,
+    pub accepted: usize,
+    pub rejected: usize,
+    pub projected_event_count: usize,
+    pub transcript: QgsSessionCommandTranscript,
+    pub final_snapshot: QgsSessionRuntimeSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsSessionRuntime {
+    config: QgsSessionRuntimeConfig,
+    executor: QgsQncSessionCommandExecutor,
+    queue: VecDeque<QgsSessionQueuedCommand>,
+    queued_command_ids: BTreeSet<QgsSessionCommandId>,
+    executed_command_ids: BTreeSet<QgsSessionCommandId>,
+    duplicate_rejected_command_ids: BTreeSet<QgsSessionCommandId>,
+    rejected_enqueue_commands: usize,
+    transcript: QgsSessionCommandTranscript,
+}
+
+impl QgsSessionRuntime {
+    pub fn new(plan: QgsInputPlan, config: QgsSessionRuntimeConfig) -> Result<Self, PlaybackError> {
+        Ok(Self {
+            config: config.validate()?,
+            executor: QgsQncSessionCommandExecutor::new(plan)?,
+            queue: VecDeque::new(),
+            queued_command_ids: BTreeSet::new(),
+            executed_command_ids: BTreeSet::new(),
+            duplicate_rejected_command_ids: BTreeSet::new(),
+            rejected_enqueue_commands: 0,
+            transcript: QgsSessionCommandTranscript::default(),
+        })
+    }
+
+    pub fn config(&self) -> &QgsSessionRuntimeConfig {
+        &self.config
+    }
+
+    pub fn queued_len(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn transcript(&self) -> &QgsSessionCommandTranscript {
+        &self.transcript
+    }
+
+    pub fn enqueue(
+        &mut self,
+        envelope: QgsQncCommandEnvelope,
+    ) -> Result<QgsSessionCommandStatus, QgsSessionQueueRejection> {
+        let id = QgsSessionCommandId(envelope.command_id);
+        if envelope.exposes_private_path() {
+            self.rejected_enqueue_commands = self.rejected_enqueue_commands.saturating_add(1);
+            return Err(QgsSessionQueueRejection::PrivatePathExposed);
+        }
+        if self.queued_command_ids.contains(&id)
+            || self.executed_command_ids.contains(&id)
+            || self.duplicate_rejected_command_ids.contains(&id)
+        {
+            self.duplicate_rejected_command_ids.insert(id);
+            self.rejected_enqueue_commands = self.rejected_enqueue_commands.saturating_add(1);
+            return Err(QgsSessionQueueRejection::DuplicateCommandId);
+        }
+        if self.queue.len() >= self.config.queue_limits.max_queued_commands {
+            self.rejected_enqueue_commands = self.rejected_enqueue_commands.saturating_add(1);
+            return Err(QgsSessionQueueRejection::QueueFull);
+        }
+        self.queued_command_ids.insert(id);
+        self.queue
+            .push_back(QgsSessionQueuedCommand { id, envelope });
+        Ok(QgsSessionCommandStatus::Enqueued)
+    }
+
+    pub fn execute_next(&mut self) -> Option<QgsSessionCommandResult> {
+        let queued = self.queue.pop_front()?;
+        self.queued_command_ids.remove(&queued.id);
+        let generation_before = self.executor.current_generation();
+        let result = self.executor.execute(&queued.envelope);
+        let generation_after = self.executor.current_generation();
+        let status = if result.outcome.accepted {
+            QgsSessionCommandStatus::ExecutedAccepted
+        } else {
+            QgsSessionCommandStatus::ExecutedRejected
+        };
+        self.executed_command_ids.insert(queued.id);
+        let command_result = QgsSessionCommandResult {
+            command_id: queued.id,
+            status,
+            outcome: Some(result.outcome.clone()),
+            queue_rejection: None,
+            projected_events: result.projected_events.clone(),
+            passive_view: result.passive_view.clone(),
+            generation_before,
+            generation_after,
+        };
+        self.transcript
+            .entries
+            .push(QgsSessionCommandTranscriptEntry {
+                command_id: queued.id,
+                command: queued.envelope.command,
+                status,
+                rejection: result.outcome.reason,
+                generation_before,
+                generation_after,
+                projected_event_count: result.projected_events.len(),
+                passive_view: result.passive_view,
+            });
+        Some(command_result)
+    }
+
+    pub fn drain_queue(&mut self) -> QgsSessionCommandExecutionReport {
+        let mut executed = 0usize;
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        let mut projected_event_count = 0usize;
+        while let Some(result) = self.execute_next() {
+            executed = executed.saturating_add(1);
+            projected_event_count =
+                projected_event_count.saturating_add(result.projected_events.len());
+            match result.status {
+                QgsSessionCommandStatus::ExecutedAccepted => {
+                    accepted = accepted.saturating_add(1);
+                }
+                QgsSessionCommandStatus::ExecutedRejected => {
+                    rejected = rejected.saturating_add(1);
+                }
+                QgsSessionCommandStatus::Enqueued | QgsSessionCommandStatus::EnqueueRejected => {}
+            }
+        }
+        QgsSessionCommandExecutionReport {
+            executed,
+            accepted,
+            rejected,
+            projected_event_count,
+            transcript: self.transcript.clone(),
+            final_snapshot: self.snapshot(),
+        }
+    }
+
+    pub fn snapshot(&self) -> QgsSessionRuntimeSnapshot {
+        let passive_view = self.executor.passive_view();
+        let private_path_exposed = passive_view.private_path_exposed
+            || self.transcript.exposes_private_path()
+            || self
+                .queue
+                .iter()
+                .any(|queued| queued.envelope.exposes_private_path());
+        QgsSessionRuntimeSnapshot {
+            generation: self.executor.current_generation(),
+            queued_commands: self.queue.len(),
+            executed_commands: self.executed_command_ids.len(),
+            rejected_enqueue_commands: self.rejected_enqueue_commands,
+            passive_view,
+            private_path_exposed,
         }
     }
 }
@@ -7211,6 +7516,204 @@ mod tests {
         assert_eq!(result.outcome.reason, Some("command exposes private path"));
         assert!(result.projected_events.is_empty());
         assert!(!result.passive_view.private_path_exposed);
+    }
+
+    fn qgs_test_session_runtime(max_queued_commands: usize) -> QgsSessionRuntime {
+        QgsSessionRuntime::new(
+            sample_qgs_input_plan(),
+            QgsSessionRuntimeConfig {
+                queue_limits: QgsSessionCommandQueueLimits {
+                    max_queued_commands,
+                },
+                duplicate_policy: QgsSessionDuplicateCommandPolicy::RejectStrict,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn qgs_session_runtime_enqueue_within_limit_is_accepted() {
+        let mut runtime = qgs_test_session_runtime(2);
+        assert_eq!(
+            runtime.enqueue(qgs_test_command(
+                1,
+                0,
+                QgsQncPlayerCommand::LoadPreparedInput
+            )),
+            Ok(QgsSessionCommandStatus::Enqueued)
+        );
+        assert_eq!(runtime.queued_len(), 1);
+        assert_eq!(runtime.snapshot().queued_commands, 1);
+    }
+
+    #[test]
+    fn qgs_session_runtime_enqueue_over_limit_is_rejected_without_mutation() {
+        let mut runtime = qgs_test_session_runtime(1);
+        runtime
+            .enqueue(qgs_test_command(
+                1,
+                0,
+                QgsQncPlayerCommand::LoadPreparedInput,
+            ))
+            .unwrap();
+        let before = runtime.snapshot();
+        assert_eq!(
+            runtime.enqueue(qgs_test_command(2, 0, QgsQncPlayerCommand::PreloadSource)),
+            Err(QgsSessionQueueRejection::QueueFull)
+        );
+        let after = runtime.snapshot();
+        assert_eq!(after.queued_commands, before.queued_commands);
+        assert_eq!(after.executed_commands, before.executed_commands);
+        assert_eq!(after.passive_view, before.passive_view);
+    }
+
+    #[test]
+    fn qgs_session_runtime_executes_fifo_and_records_deterministic_transcript() {
+        let mut runtime = qgs_test_session_runtime(4);
+        for (id, command) in [
+            QgsQncPlayerCommand::LoadPreparedInput,
+            QgsQncPlayerCommand::PreloadSource,
+            QgsQncPlayerCommand::SetActiveSource,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            runtime
+                .enqueue(qgs_test_command(id as u64 + 1, 0, command))
+                .unwrap();
+        }
+        let report = runtime.drain_queue();
+        assert_eq!(report.executed, 3);
+        assert_eq!(report.accepted, 3);
+        assert_eq!(report.transcript.command_ids(), vec![1, 2, 3]);
+        assert_eq!(report.final_snapshot.executed_commands, 3);
+        assert!(!report.final_snapshot.private_path_exposed);
+    }
+
+    #[test]
+    fn qgs_session_runtime_rejects_duplicate_queued_command_id() {
+        let mut runtime = qgs_test_session_runtime(4);
+        runtime
+            .enqueue(qgs_test_command(
+                1,
+                0,
+                QgsQncPlayerCommand::LoadPreparedInput,
+            ))
+            .unwrap();
+        assert_eq!(
+            runtime.enqueue(qgs_test_command(1, 0, QgsQncPlayerCommand::PreloadSource)),
+            Err(QgsSessionQueueRejection::DuplicateCommandId)
+        );
+        assert_eq!(
+            runtime.enqueue(qgs_test_command(1, 0, QgsQncPlayerCommand::SetActiveSource)),
+            Err(QgsSessionQueueRejection::DuplicateCommandId)
+        );
+    }
+
+    #[test]
+    fn qgs_session_runtime_rejects_duplicate_executed_command_id() {
+        let mut runtime = qgs_test_session_runtime(4);
+        runtime
+            .enqueue(qgs_test_command(
+                1,
+                0,
+                QgsQncPlayerCommand::LoadPreparedInput,
+            ))
+            .unwrap();
+        runtime.execute_next().unwrap();
+        assert_eq!(
+            runtime.enqueue(qgs_test_command(1, 0, QgsQncPlayerCommand::PreloadSource)),
+            Err(QgsSessionQueueRejection::DuplicateCommandId)
+        );
+    }
+
+    #[test]
+    fn qgs_session_runtime_rejects_stale_generation_at_execution_without_mutation() {
+        let mut runtime = qgs_test_session_runtime(8);
+        for (id, command) in [
+            QgsQncPlayerCommand::LoadPreparedInput,
+            QgsQncPlayerCommand::PreloadSource,
+            QgsQncPlayerCommand::SetActiveSource,
+            QgsQncPlayerCommand::SetActiveRange {
+                start_frame: 0,
+                end_frame: 50,
+            },
+            QgsQncPlayerCommand::Cue { frame: 0 },
+            QgsQncPlayerCommand::PrepareAnchor,
+            QgsQncPlayerCommand::CloseActiveSource,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            runtime
+                .enqueue(qgs_test_command(id as u64 + 1, 0, command))
+                .unwrap();
+        }
+        runtime.drain_queue();
+        let before = runtime.snapshot();
+        runtime
+            .enqueue(qgs_test_command(99, 0, QgsQncPlayerCommand::Stop))
+            .unwrap();
+        let result = runtime.execute_next().unwrap();
+        assert_eq!(result.status, QgsSessionCommandStatus::ExecutedRejected);
+        assert_eq!(
+            result.outcome.unwrap().reason,
+            Some("runtime generation mismatch")
+        );
+        let after = runtime.snapshot();
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.passive_view, before.passive_view);
+    }
+
+    #[test]
+    fn qgs_session_runtime_rejected_command_does_not_emit_false_evidence() {
+        let mut runtime = qgs_test_session_runtime(2);
+        runtime
+            .enqueue(qgs_test_command(1, 0, QgsQncPlayerCommand::Play))
+            .unwrap();
+        let report = runtime.drain_queue();
+        assert_eq!(report.accepted, 0);
+        assert_eq!(report.rejected, 1);
+        let transcript = format!("{:?}", report.transcript.entries());
+        assert!(!transcript.contains("FramePresented"));
+        assert!(!transcript.contains("AudioDeviceVerified"));
+        assert!(!transcript.contains("RealtimeVerified"));
+        assert!(!report.final_snapshot.private_path_exposed);
+    }
+
+    #[test]
+    fn qgs_session_runtime_final_close_clears_active_source_and_readiness() {
+        let mut runtime = qgs_test_session_runtime(12);
+        for (id, command) in [
+            QgsQncPlayerCommand::LoadPreparedInput,
+            QgsQncPlayerCommand::PreloadSource,
+            QgsQncPlayerCommand::SetActiveSource,
+            QgsQncPlayerCommand::SetActiveRange {
+                start_frame: 0,
+                end_frame: 50,
+            },
+            QgsQncPlayerCommand::Cue { frame: 0 },
+            QgsQncPlayerCommand::PrepareAnchor,
+            QgsQncPlayerCommand::Play,
+            QgsQncPlayerCommand::TickPrepare { carrier_frame: 0 },
+            QgsQncPlayerCommand::Pause,
+            QgsQncPlayerCommand::CloseActiveSource,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            runtime
+                .enqueue(qgs_test_command(id as u64 + 1, 0, command))
+                .unwrap();
+        }
+        let report = runtime.drain_queue();
+        assert_eq!(report.accepted, 10);
+        let view = report.final_snapshot.passive_view;
+        assert!(view.source.public_source_uri.is_none());
+        assert!(!view.readiness.play_ready);
+        assert!(view.transport.active_range.is_none());
+        assert_eq!(view.prepared_buffer.prepared_frame_count, 0);
+        assert_eq!(view.prepared_buffer.latest_discarded_frame_count, 6);
     }
 
     #[test]
