@@ -163,6 +163,9 @@ const QGS_BROADCAST_PLAYER_OPERATIONAL_RUNTIME_ARG: &str =
     "--qgs-broadcast-player-operational-runtime";
 const QGS_BROADCAST_PLAYER_FAULT_RECOVERY_ARG: &str = "--qgs-broadcast-player-fault-recovery";
 const QGS_BROADCAST_PLAYER_RUN_ARG: &str = "--qgs-broadcast-player-run";
+const QGS_BROADCAST_PLAYER_RUN_FRAMES_ARG: &str = "--frames";
+const QGS_BROADCAST_PLAYER_RUN_SEEK_FRAME_ARG: &str = "--seek-frame";
+const QGS_BROADCAST_PLAYER_RUN_VIEW_ARG: &str = "--view";
 const WRITE_DIAGNOSTIC_WAV_ARG: &str = "--write-diagnostic-wav";
 const AUDIO_AUDIT_START_MS_ARG: &str = "--start-ms";
 const AUDIO_AUDIT_DURATION_MS_ARG: &str = "--duration-ms";
@@ -343,7 +346,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return qgs_broadcast_player_fault_recovery_report(&original, &proxy);
     }
     if let Some((original, proxy)) = args.qgs_broadcast_player_run_paths {
-        return qgs_broadcast_player_run_report(&original, &proxy);
+        return qgs_broadcast_player_run_report(
+            &original,
+            &proxy,
+            args.qgs_broadcast_player_run_options,
+        );
     }
     if let Some(policy) = args.qgs_device_backend_selection_policy {
         return qgs_device_backend_selection_report(policy);
@@ -4537,178 +4544,307 @@ fn qgs_broadcast_player_fault_recovery_report(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QgsBroadcastPlayerRunView {
+    Compact,
+    Detailed,
+}
+
+impl QgsBroadcastPlayerRunView {
+    fn parse(value: &std::ffi::OsStr) -> Result<Self, &'static str> {
+        match value.to_string_lossy().as_ref() {
+            "compact" => Ok(Self::Compact),
+            "detailed" => Ok(Self::Detailed),
+            _ => Err("expects compact or detailed"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QgsBroadcastPlayerRunOptions {
+    frames: u64,
+    seek_frame: Option<u64>,
+    view: QgsBroadcastPlayerRunView,
+}
+
+impl Default for QgsBroadcastPlayerRunOptions {
+    fn default() -> Self {
+        Self {
+            frames: 25,
+            seek_frame: None,
+            view: QgsBroadcastPlayerRunView::Compact,
+        }
+    }
+}
+
 fn qgs_broadcast_player_run_report(
     original_path: &Path,
     proxy_path: &Path,
+    options: QgsBroadcastPlayerRunOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let descriptor = build_qnc_prepared_input_descriptor(original_path, proxy_path)?;
     descriptor.validate()?;
     let plan =
         QgsInputPlan::from_descriptor(&descriptor, default_qgs_input_plan_queue_requirements())?;
     let active_frames = plan.video_source.duration_frames;
-    let first_run_frames = 25_u64.min(active_frames.saturating_sub(1));
-    let seek_frame = if active_frames > 76 {
-        50
-    } else {
-        active_frames.saturating_div(2).max(1)
-    };
-    let second_run_frames = 25_u64.min(active_frames.saturating_sub(seek_frame + 1));
+    let requested_run_frames = options.frames.max(1);
+    let first_run_frames = requested_run_frames.min(active_frames.saturating_sub(1));
+    let seek_frame = qgs_resolve_run_seek_frame(options.seek_frame, active_frames);
+    let second_run_frames = requested_run_frames.min(active_frames.saturating_sub(seek_frame + 1));
     let mut runtime =
         QgsBroadcastPlayerOperationalRuntime::new(plan, QgsOperationalRuntimeConfig::default())?;
 
-    println!("QGS Broadcast Player Runtime");
-    println!("----------------------------");
-    println!("Runtime surface: running operational backend player");
-    println!("source: qnc://local media identity (private path hidden)");
-    println!("mode: ProxyPreview");
-    println!("video: proxy MP4");
-    println!("audio: original MXF discrete mono lanes");
-    println!("original MXF audio authoritative: yes");
-    println!("proxy AAC authoritative: no");
-    println!("device policy: preview-qnc-os");
-    println!("real display: NotImplemented");
-    println!("display target: Wayland + Vulkan");
-    println!("x11: legacy/non-target");
-    println!("visual verified: no");
-    println!("realtime verified: no");
-    println!("audio production verified: no");
-    println!("A/V sync verified: no");
-    print_running_runtime_persistent_warnings();
-    println!();
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => print_running_runtime_compact_header(),
+        QgsBroadcastPlayerRunView::Detailed => print_running_runtime_detailed_header(),
+    }
 
     let load = runtime.execute(QgsBroadcastPlayerCommand::LoadPreparedInput);
-    print_running_runtime_command("[LOAD]", &load.snapshot, load.accepted, load.reason);
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => {
+            print_running_runtime_compact_command("LOAD", &load.snapshot)
+        }
+        QgsBroadcastPlayerRunView::Detailed => {
+            print_running_runtime_command("[LOAD]", &load.snapshot, load.accepted, load.reason)
+        }
+    }
     let prepare = runtime.execute(QgsBroadcastPlayerCommand::Prepare {
         active_range: Some((0, active_frames)),
     });
-    print_running_runtime_command_with_context(
-        "[PREPARE INPUT]",
-        &prepare.snapshot,
-        prepare.accepted,
-        prepare.reason,
-        &[("meaning", qgs_running_prepare_input_meaning())],
-    );
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => {
+            println!(
+                "PREPARE  status={:?} phase=input-ready",
+                prepare.snapshot.operational_status
+            );
+        }
+        QgsBroadcastPlayerRunView::Detailed => print_running_runtime_command_with_context(
+            "[PREPARE INPUT]",
+            &prepare.snapshot,
+            prepare.accepted,
+            prepare.reason,
+            &[("meaning", qgs_running_prepare_input_meaning())],
+        ),
+    }
     let cue = runtime.execute(QgsBroadcastPlayerCommand::Cue { frame: 0 });
-    print_running_runtime_command_with_context(
-        "[CUE]",
-        &cue.snapshot,
-        cue.accepted,
-        cue.reason,
-        &[("phase", "Cued")],
-    );
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => println!(
+            "CUE      frame={} audio={}",
+            qgs_optional_u64_label(cue.snapshot.current_frame),
+            qgs_optional_sample_range_label(cue.snapshot.current_audio_sample_range)
+        ),
+        QgsBroadcastPlayerRunView::Detailed => print_running_runtime_command_with_context(
+            "[CUE]",
+            &cue.snapshot,
+            cue.accepted,
+            cue.reason,
+            &[("phase", "Cued")],
+        ),
+    }
     let tick_prepare = runtime.execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 });
-    print_running_runtime_command_with_context(
-        "[PREROLL / PREPARE WINDOW]",
-        &tick_prepare.snapshot,
-        tick_prepare.accepted,
-        tick_prepare.reason,
-        &[("meaning", qgs_running_preroll_meaning())],
-    );
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => {
+            print_running_runtime_compact_preroll("PREROLL", &tick_prepare.snapshot)
+        }
+        QgsBroadcastPlayerRunView::Detailed => print_running_runtime_command_with_context(
+            "[PREROLL / PREPARE WINDOW]",
+            &tick_prepare.snapshot,
+            tick_prepare.accepted,
+            tick_prepare.reason,
+            &[("meaning", qgs_running_preroll_meaning())],
+        ),
+    }
     let play = runtime.execute(QgsBroadcastPlayerCommand::Play);
-    print_running_runtime_command("[PLAY]", &play.snapshot, play.accepted, play.reason);
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => println!("\nPLAY"),
+        QgsBroadcastPlayerRunView::Detailed => {
+            print_running_runtime_command("[PLAY]", &play.snapshot, play.accepted, play.reason)
+        }
+    }
 
     for index in 0..first_run_frames {
         let snapshot = runtime.snapshot();
-        print_running_runtime_tick("[TICK", index, &snapshot);
+        match options.view {
+            QgsBroadcastPlayerRunView::Compact => {
+                print_running_runtime_compact_tick(index, &snapshot)
+            }
+            QgsBroadcastPlayerRunView::Detailed => {
+                print_running_runtime_tick("[TICK", index, &snapshot)
+            }
+        }
         io::stdout().flush()?;
         runtime.execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 });
     }
 
     let pause = runtime.execute(QgsBroadcastPlayerCommand::Pause);
-    print_running_runtime_command("[PAUSE]", &pause.snapshot, pause.accepted, pause.reason);
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => println!(
+            "\nPAUSE    frame={} audio={}",
+            qgs_optional_u64_label(pause.snapshot.current_frame),
+            qgs_optional_sample_range_label(pause.snapshot.current_audio_sample_range)
+        ),
+        QgsBroadcastPlayerRunView::Detailed => {
+            print_running_runtime_command("[PAUSE]", &pause.snapshot, pause.accepted, pause.reason)
+        }
+    }
     for index in 0..2 {
         let before = runtime.snapshot();
         let paused_tick = runtime.execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 });
-        println!("[TICK PAUSED {index:03}]");
-        println!("status: {:?}", paused_tick.snapshot.operational_status);
-        println!(
-            "frame: {}",
-            qgs_optional_u64_label(paused_tick.snapshot.current_frame)
-        );
-        println!(
-            "audio samples: {}",
-            qgs_optional_sample_range_label(paused_tick.snapshot.current_audio_sample_range)
-        );
-        println!(
-            "position changed: {}",
-            yes_no(before.current_frame != paused_tick.snapshot.current_frame)
-        );
-        println!();
+        match options.view {
+            QgsBroadcastPlayerRunView::Compact => {
+                println!(
+                    "PAUSED   position_changed={}",
+                    yes_no(before.current_frame != paused_tick.snapshot.current_frame)
+                );
+            }
+            QgsBroadcastPlayerRunView::Detailed => {
+                println!("[TICK PAUSED {index:03}]");
+                println!("status: {:?}", paused_tick.snapshot.operational_status);
+                println!(
+                    "frame: {}",
+                    qgs_optional_u64_label(paused_tick.snapshot.current_frame)
+                );
+                println!(
+                    "audio samples: {}",
+                    qgs_optional_sample_range_label(
+                        paused_tick.snapshot.current_audio_sample_range
+                    )
+                );
+                println!(
+                    "position changed: {}",
+                    yes_no(before.current_frame != paused_tick.snapshot.current_frame)
+                );
+                println!();
+            }
+        }
     }
 
     let before_seek = runtime.snapshot();
     let seek = runtime.execute(QgsBroadcastPlayerCommand::Seek { frame: seek_frame });
-    println!("[SEEK]");
-    println!("accepted: {}", yes_no(seek.accepted));
-    println!(
-        "from frame: {}",
-        qgs_optional_u64_label(before_seek.current_frame)
-    );
-    println!(
-        "to frame: {}",
-        qgs_optional_u64_label(seek.snapshot.current_frame)
-    );
-    println!(
-        "audio samples: {}",
-        qgs_optional_sample_range_label(seek.snapshot.current_audio_sample_range)
-    );
-    println!(
-        "prepared window before refresh: {}",
-        qgs_optional_frame_window_label(
-            before_seek.buffer_health.prepared_start_frame,
-            before_seek.buffer_health.prepared_end_frame_exclusive
-        )
-    );
-    println!("reason: {}", seek.reason.unwrap_or("n/a"));
-    println!();
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => println!(
+            "\nSEEK     {} -> {} audio={}",
+            qgs_optional_u64_label(before_seek.current_frame),
+            qgs_optional_u64_label(seek.snapshot.current_frame),
+            qgs_optional_sample_range_label(seek.snapshot.current_audio_sample_range)
+        ),
+        QgsBroadcastPlayerRunView::Detailed => {
+            println!("[SEEK]");
+            println!("accepted: {}", yes_no(seek.accepted));
+            println!(
+                "from frame: {}",
+                qgs_optional_u64_label(before_seek.current_frame)
+            );
+            println!(
+                "to frame: {}",
+                qgs_optional_u64_label(seek.snapshot.current_frame)
+            );
+            println!(
+                "audio samples: {}",
+                qgs_optional_sample_range_label(seek.snapshot.current_audio_sample_range)
+            );
+            println!(
+                "prepared window before refresh: {}",
+                qgs_optional_frame_window_label(
+                    before_seek.buffer_health.prepared_start_frame,
+                    before_seek.buffer_health.prepared_end_frame_exclusive
+                )
+            );
+            println!("reason: {}", seek.reason.unwrap_or("n/a"));
+            println!();
+        }
+    }
 
     let prepare_after_seek = runtime.execute(QgsBroadcastPlayerCommand::Prepare {
         active_range: Some((0, active_frames)),
     });
-    print_running_runtime_command_with_context(
-        "[PREPARE INPUT AFTER SEEK]",
-        &prepare_after_seek.snapshot,
-        prepare_after_seek.accepted,
-        prepare_after_seek.reason,
-        &[("meaning", qgs_running_prepare_input_meaning())],
-    );
+    if options.view == QgsBroadcastPlayerRunView::Detailed {
+        print_running_runtime_command_with_context(
+            "[PREPARE INPUT AFTER SEEK]",
+            &prepare_after_seek.snapshot,
+            prepare_after_seek.accepted,
+            prepare_after_seek.reason,
+            &[("meaning", qgs_running_prepare_input_meaning())],
+        );
+    }
     let tick_prepare_after_seek =
         runtime.execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 });
-    print_running_runtime_command_with_context(
-        "[PREROLL / PREPARE WINDOW AFTER SEEK]",
-        &tick_prepare_after_seek.snapshot,
-        tick_prepare_after_seek.accepted,
-        tick_prepare_after_seek.reason,
-        &[("meaning", qgs_running_preroll_meaning())],
-    );
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => {
+            print_running_runtime_compact_preroll("PREROLL", &tick_prepare_after_seek.snapshot)
+        }
+        QgsBroadcastPlayerRunView::Detailed => print_running_runtime_command_with_context(
+            "[PREROLL / PREPARE WINDOW AFTER SEEK]",
+            &tick_prepare_after_seek.snapshot,
+            tick_prepare_after_seek.accepted,
+            tick_prepare_after_seek.reason,
+            &[("meaning", qgs_running_preroll_meaning())],
+        ),
+    }
     let replay = runtime.execute(QgsBroadcastPlayerCommand::Play);
-    print_running_runtime_command("[PLAY]", &replay.snapshot, replay.accepted, replay.reason);
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => println!("\nPLAY"),
+        QgsBroadcastPlayerRunView::Detailed => print_running_runtime_command(
+            "[PLAY]",
+            &replay.snapshot,
+            replay.accepted,
+            replay.reason,
+        ),
+    }
 
     for index in 0..second_run_frames {
         let snapshot = runtime.snapshot();
-        print_running_runtime_tick("[TICK", index, &snapshot);
+        match options.view {
+            QgsBroadcastPlayerRunView::Compact => {
+                print_running_runtime_compact_tick(index, &snapshot)
+            }
+            QgsBroadcastPlayerRunView::Detailed => {
+                print_running_runtime_tick("[TICK", index, &snapshot)
+            }
+        }
         io::stdout().flush()?;
         runtime.execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 });
     }
 
     let stop = runtime.execute(QgsBroadcastPlayerCommand::Stop);
-    print_running_runtime_command("[STOP]", &stop.snapshot, stop.accepted, stop.reason);
-    println!(
-        "source loaded: {}",
-        yes_no(stop.snapshot.player.readiness.source_loaded)
-    );
-    println!();
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => {
+            print_running_runtime_compact_command("STOP", &stop.snapshot)
+        }
+        QgsBroadcastPlayerRunView::Detailed => {
+            print_running_runtime_command("[STOP]", &stop.snapshot, stop.accepted, stop.reason);
+            println!(
+                "source loaded: {}",
+                yes_no(stop.snapshot.player.readiness.source_loaded)
+            );
+            println!();
+        }
+    }
 
     let unload = runtime.execute(QgsBroadcastPlayerCommand::Unload);
-    print_running_runtime_command("[UNLOAD]", &unload.snapshot, unload.accepted, unload.reason);
-    println!(
-        "source loaded: {}",
-        yes_no(unload.snapshot.player.readiness.source_loaded)
-    );
-    println!();
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => {
+            print_running_runtime_compact_command("UNLOAD", &unload.snapshot)
+        }
+        QgsBroadcastPlayerRunView::Detailed => {
+            print_running_runtime_command(
+                "[UNLOAD]",
+                &unload.snapshot,
+                unload.accepted,
+                unload.reason,
+            );
+            println!(
+                "source loaded: {}",
+                yes_no(unload.snapshot.player.readiness.source_loaded)
+            );
+            println!();
+        }
+    }
 
     let final_snapshot = runtime.snapshot();
     println!("Final:");
+    println!("run result: completed");
+    println!("runtime behavior evidence: yes");
     println!(
         "private path exposed: {}",
         yes_no(final_snapshot.exposes_private_path())
@@ -4739,10 +4875,106 @@ fn qgs_broadcast_player_run_report(
         yes_no(final_snapshot.player.device_status.av_sync_verified)
     );
     println!("FramePresented real display claim: no");
-    println!("run result: completed");
-    println!("runtime behavior evidence: yes");
 
     Ok(())
+}
+
+fn qgs_resolve_run_seek_frame(requested: Option<u64>, active_frames: u64) -> u64 {
+    if active_frames <= 1 {
+        return 0;
+    }
+    if let Some(frame) = requested {
+        return frame.min(active_frames - 1);
+    }
+    if active_frames > 50 {
+        50
+    } else {
+        active_frames
+            .saturating_div(2)
+            .max(1)
+            .min(active_frames - 1)
+    }
+}
+
+fn print_running_runtime_compact_header() {
+    println!("QGS Broadcast Player Runtime");
+    println!("mode: ProxyPreview");
+    println!("video: proxy MP4");
+    println!("audio: original MXF mono lanes");
+    println!("device: preview-qnc-os");
+    println!("display: NotImplemented / target Wayland+Vulkan");
+    println!("x11: legacy/non-target");
+    println!("private source path: hidden");
+    println!("proxy AAC authoritative: no");
+    println!();
+}
+
+fn print_running_runtime_detailed_header() {
+    println!("QGS Broadcast Player Runtime");
+    println!("----------------------------");
+    println!("Runtime surface: running operational backend player");
+    println!("source: qnc://local media identity (private path hidden)");
+    println!("mode: ProxyPreview");
+    println!("video: proxy MP4");
+    println!("audio: original MXF discrete mono lanes");
+    println!("original MXF audio authoritative: yes");
+    println!("proxy AAC authoritative: no");
+    println!("device policy: preview-qnc-os");
+    println!("real display: NotImplemented");
+    println!("display target: Wayland + Vulkan");
+    println!("x11: legacy/non-target");
+    println!("visual verified: no");
+    println!("realtime verified: no");
+    println!("audio production verified: no");
+    println!("A/V sync verified: no");
+    print_running_runtime_persistent_warnings();
+    println!();
+}
+
+fn print_running_runtime_compact_command(label: &str, snapshot: &QgsOperationalRuntimeSnapshot) {
+    println!(
+        "{label:<8} status={:?} source={}",
+        snapshot.operational_status,
+        yes_no(snapshot.player.readiness.source_loaded)
+    );
+}
+
+fn print_running_runtime_compact_preroll(label: &str, snapshot: &QgsOperationalRuntimeSnapshot) {
+    println!(
+        "{label:<8} ready={} window={}",
+        yes_no(
+            snapshot.player.readiness.video_payload_ready
+                && snapshot.player.readiness.audio_payload_ready
+                && !snapshot.buffer_health.underrun
+        ),
+        qgs_optional_frame_window_label(
+            snapshot.buffer_health.prepared_start_frame,
+            snapshot.buffer_health.prepared_end_frame_exclusive
+        )
+    );
+}
+
+fn print_running_runtime_compact_tick(index: u64, snapshot: &QgsOperationalRuntimeSnapshot) {
+    println!(
+        "{index:03}  frame={:<4} audio={:<16} window={:<9} buffer={}",
+        qgs_optional_u64_label(snapshot.current_frame),
+        qgs_optional_sample_range_label(snapshot.current_audio_sample_range),
+        qgs_optional_frame_window_label(
+            snapshot.buffer_health.prepared_start_frame,
+            snapshot.buffer_health.prepared_end_frame_exclusive
+        ),
+        qgs_running_buffer_label(snapshot)
+    );
+}
+
+fn qgs_running_buffer_label(snapshot: &QgsOperationalRuntimeSnapshot) -> &'static str {
+    if snapshot.buffer_health.underrun {
+        "underrun"
+    } else if snapshot.buffer_health.prepared_frame_count > 0 {
+        "ready"
+    } else {
+        "empty"
+    }
 }
 
 fn print_running_runtime_command(
@@ -4814,16 +5046,7 @@ fn print_running_runtime_tick(
             snapshot.buffer_health.prepared_end_frame_exclusive
         )
     );
-    println!(
-        "buffer: {}",
-        if snapshot.buffer_health.underrun {
-            "underrun"
-        } else if snapshot.buffer_health.prepared_frame_count > 0 {
-            "ready"
-        } else {
-            "empty"
-        }
-    );
+    println!("buffer: {}", qgs_running_buffer_label(snapshot));
     println!("underrun: {}", yes_no(snapshot.buffer_health.underrun));
     println!("warnings: {}", qgs_running_warning_change_label(snapshot));
     println!();
@@ -16900,6 +17123,7 @@ struct Args {
     qgs_broadcast_player_operational_runtime_paths: Option<(PathBuf, PathBuf)>,
     qgs_broadcast_player_fault_recovery_paths: Option<(PathBuf, PathBuf)>,
     qgs_broadcast_player_run_paths: Option<(PathBuf, PathBuf)>,
+    qgs_broadcast_player_run_options: QgsBroadcastPlayerRunOptions,
     qgs_device_backend_selection_policy: Option<QgsDeviceSelectionPolicy>,
     linux_audio_device_probe_path: Option<PathBuf>,
     pipewire_audio_prototype_path: Option<PathBuf>,
@@ -17001,6 +17225,7 @@ impl Args {
         let mut qgs_broadcast_player_fault_recovery_paths = None;
         let mut qgs_broadcast_player_run_original = None;
         let mut qgs_broadcast_player_run_paths = None;
+        let mut qgs_broadcast_player_run_options = QgsBroadcastPlayerRunOptions::default();
         let mut qgs_device_backend_selection_policy = None;
         let mut linux_audio_device_probe_path = None;
         let mut pipewire_audio_prototype_path = None;
@@ -17093,6 +17318,9 @@ impl Args {
         let mut next_arg_is_qgs_broadcast_player_fault_recovery_proxy = false;
         let mut next_arg_is_qgs_broadcast_player_run_original = false;
         let mut next_arg_is_qgs_broadcast_player_run_proxy = false;
+        let mut next_arg_is_qgs_broadcast_player_run_frames = false;
+        let mut next_arg_is_qgs_broadcast_player_run_seek_frame = false;
+        let mut next_arg_is_qgs_broadcast_player_run_view = false;
         let mut next_arg_is_qgs_device_backend_selection_policy = false;
         let mut next_arg_is_linux_audio_device_probe_path = false;
         let mut next_arg_is_pipewire_audio_prototype_path = false;
@@ -17117,7 +17345,21 @@ impl Args {
         let mut next_arg_is_audio_monitor_track = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_qgs_broadcast_player_run_proxy {
+            if next_arg_is_qgs_broadcast_player_run_frames {
+                qgs_broadcast_player_run_options.frames =
+                    parse_u64_os_arg(&arg, QGS_BROADCAST_PLAYER_RUN_FRAMES_ARG).max(1);
+                next_arg_is_qgs_broadcast_player_run_frames = false;
+            } else if next_arg_is_qgs_broadcast_player_run_seek_frame {
+                qgs_broadcast_player_run_options.seek_frame = Some(parse_u64_os_arg(
+                    &arg,
+                    QGS_BROADCAST_PLAYER_RUN_SEEK_FRAME_ARG,
+                ));
+                next_arg_is_qgs_broadcast_player_run_seek_frame = false;
+            } else if next_arg_is_qgs_broadcast_player_run_view {
+                qgs_broadcast_player_run_options.view = QgsBroadcastPlayerRunView::parse(&arg)
+                    .unwrap_or_else(|err| panic!("{QGS_BROADCAST_PLAYER_RUN_VIEW_ARG}: {err}"));
+                next_arg_is_qgs_broadcast_player_run_view = false;
+            } else if next_arg_is_qgs_broadcast_player_run_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = qgs_broadcast_player_run_original
                     .take()
@@ -17703,6 +17945,12 @@ impl Args {
                 next_arg_is_qgs_broadcast_player_fault_recovery_original = true;
             } else if arg == QGS_BROADCAST_PLAYER_RUN_ARG {
                 next_arg_is_qgs_broadcast_player_run_original = true;
+            } else if arg == QGS_BROADCAST_PLAYER_RUN_FRAMES_ARG {
+                next_arg_is_qgs_broadcast_player_run_frames = true;
+            } else if arg == QGS_BROADCAST_PLAYER_RUN_SEEK_FRAME_ARG {
+                next_arg_is_qgs_broadcast_player_run_seek_frame = true;
+            } else if arg == QGS_BROADCAST_PLAYER_RUN_VIEW_ARG {
+                next_arg_is_qgs_broadcast_player_run_view = true;
             } else if arg == QGS_DEVICE_BACKEND_SELECTION_ARG {
                 next_arg_is_qgs_device_backend_selection_policy = true;
             } else if arg == LINUX_AUDIO_DEVICE_PROBE_ARG {
@@ -17786,6 +18034,7 @@ impl Args {
             qgs_broadcast_player_operational_runtime_paths,
             qgs_broadcast_player_fault_recovery_paths,
             qgs_broadcast_player_run_paths,
+            qgs_broadcast_player_run_options,
             qgs_device_backend_selection_policy,
             linux_audio_device_probe_path,
             pipewire_audio_prototype_path,
@@ -17860,11 +18109,12 @@ mod tests {
         mono_monitor_diagnostic_evidence_label, mxf_file_label, original_pcm_blocks_by_channel,
         original_segment_evidence_label, parse_device_selection_policy_arg,
         parse_manual_audible_confirmation, parse_monitor_track_arg, pcm_s24le_sample_to_f32,
-        proxy_presentation_ordinals, public_source_uri_stem, qgs_running_prepare_input_meaning,
-        qgs_running_preroll_meaning, qgs_running_runtime_persistent_warning_lines,
-        repeated_smoke_test_buffers, rgba_u16_to_ppm_p6_rgb8, rgba_u16_to_rgb8_bytes,
-        runtime_audio_payload_evidence_label, sanitized_source_stem, selected_proxy_ordinals,
-        smoke_test_buffer_count, ManualAudibleConfirmation, SonyXmlSummary,
+        proxy_presentation_ordinals, public_source_uri_stem, qgs_resolve_run_seek_frame,
+        qgs_running_prepare_input_meaning, qgs_running_preroll_meaning,
+        qgs_running_runtime_persistent_warning_lines, repeated_smoke_test_buffers,
+        rgba_u16_to_ppm_p6_rgb8, rgba_u16_to_rgb8_bytes, runtime_audio_payload_evidence_label,
+        sanitized_source_stem, selected_proxy_ordinals, smoke_test_buffer_count,
+        ManualAudibleConfirmation, QgsBroadcastPlayerRunView, SonyXmlSummary,
     };
     use qgs_media_runtime::QgsDeviceSelectionPolicy;
     use qgs_media_runtime::{
@@ -18010,6 +18260,23 @@ mod tests {
             .iter()
             .any(|warning| warning.contains("AvSyncNotVerified")));
         assert!(warnings.iter().all(|warning| !warning.contains("/home/")));
+    }
+
+    #[test]
+    fn running_runtime_options_parse_view_and_bound_seek_frame() {
+        assert_eq!(
+            QgsBroadcastPlayerRunView::parse(std::ffi::OsStr::new("compact")),
+            Ok(QgsBroadcastPlayerRunView::Compact)
+        );
+        assert_eq!(
+            QgsBroadcastPlayerRunView::parse(std::ffi::OsStr::new("detailed")),
+            Ok(QgsBroadcastPlayerRunView::Detailed)
+        );
+        assert!(QgsBroadcastPlayerRunView::parse(std::ffi::OsStr::new("wide")).is_err());
+        assert_eq!(qgs_resolve_run_seek_frame(None, 106), 50);
+        assert_eq!(qgs_resolve_run_seek_frame(Some(50), 106), 50);
+        assert_eq!(qgs_resolve_run_seek_frame(Some(999), 106), 105);
+        assert_eq!(qgs_resolve_run_seek_frame(None, 20), 10);
     }
 
     #[test]

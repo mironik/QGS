@@ -116,6 +116,72 @@ The final summary still reports:
 - run result: completed
 - runtime behavior evidence: yes
 
+## Operator Run Mode
+
+Block L turns the same command into a more usable operator-facing runtime mode.
+It still drives the existing `QgsBroadcastPlayerOperationalRuntime`; qgs-test
+only parses options, orchestrates commands, and prints the run.
+
+```text
+cargo run -q -p qgs-test -- --qgs-broadcast-player-run <original-mxf> <proxy-mp4> --frames 10 --seek-frame 50 --view compact
+```
+
+Options:
+
+- `--frames <count>` controls how many logical frames are run before pause and
+  after seek. The default is 25.
+- `--seek-frame <frame>` controls the seek target after pause. The default is
+  frame 50 when valid; shorter clips pick a safe bounded frame.
+- `--view compact|detailed` selects the output style. `compact` is the default
+  operator mode. `detailed` preserves the richer K/K2 report with persistent
+  warnings and per-command details.
+
+Compact mode presents the backend player as a running status stream:
+
+```text
+QGS Broadcast Player Runtime
+mode: ProxyPreview
+video: proxy MP4
+audio: original MXF mono lanes
+device: preview-qnc-os
+display: NotImplemented / target Wayland+Vulkan
+
+LOAD     status=Loaded source=yes
+PREPARE  status=Loaded phase=input-ready
+CUE      frame=0 audio=[0..960)
+PREROLL  ready=yes window=[0..6)
+
+PLAY
+000  frame=0    audio=[0..960)        window=[0..6)  buffer=ready
+001  frame=1    audio=[960..1920)     window=[0..6)  buffer=ready
+
+PAUSE    frame=10 audio=[9600..10560)
+PAUSED   position_changed=no
+
+SEEK     10 -> 50 audio=[48000..48960)
+PREROLL  ready=yes window=[48..56)
+
+PLAY
+000  frame=50   audio=[48000..48960)  window=[48..56) buffer=ready
+
+STOP     status=Stopped source=yes
+UNLOAD   status=Empty source=no
+
+Final:
+run result: completed
+private path exposed: no
+real display: NotImplemented
+visual verified: no
+realtime verified: no
+audio production verified: no
+A/V sync verified: no
+```
+
+Operator mode does not change the runtime behavior or evidence level. It does
+not add a backend, real display output, realtime certification, A/V sync
+certification, production audio output, QNC UI integration, export/render, or a
+real backend `FramePresented` claim.
+
 ## Sony FX6 Sample 002 Result
 
 For sample 002, the run reaches:
