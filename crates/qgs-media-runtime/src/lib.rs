@@ -3531,12 +3531,336 @@ pub struct QgsBroadcastPlayerPreparedWindow {
     pub window_policy: QgsPlayoutBufferLimits,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsDeviceSelectionPolicy {
+    DiagnosticOnly,
+    PreviewOnQncOs,
+    OriginalMediaOnQncOs,
+    HeadlessCi,
+    FutureApplianceDirect,
+}
+
+impl QgsDeviceSelectionPolicy {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DiagnosticOnly => "diagnostic-only",
+            Self::PreviewOnQncOs => "preview-qnc-os",
+            Self::OriginalMediaOnQncOs => "original-qnc-os",
+            Self::HeadlessCi => "headless-ci",
+            Self::FutureApplianceDirect => "future-appliance-direct",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsVideoPresenterBackendKind {
+    TestPresenter,
+    FilePresenterDiagnostic,
+    GpuReadbackDiagnostic,
+    WaylandVulkanPresenter,
+    DrmKmsVulkanPresenter,
+    X11LegacyNonTarget,
+}
+
+impl QgsVideoPresenterBackendKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::TestPresenter => "TestPresenter",
+            Self::FilePresenterDiagnostic => "FilePresenterDiagnostic",
+            Self::GpuReadbackDiagnostic => "GpuReadbackDiagnostic",
+            Self::WaylandVulkanPresenter => "WaylandVulkanPresenter",
+            Self::DrmKmsVulkanPresenter => "DrmKmsVulkanPresenter",
+            Self::X11LegacyNonTarget => "X11LegacyNonTarget",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsAudioOutputBackendKind {
+    NoAudioOutput,
+    TestAudioSink,
+    PipeWireCommandPrototype,
+    PipeWireNativePrototype,
+    PipeWireProductionFuture,
+}
+
+impl QgsAudioOutputBackendKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NoAudioOutput => "NoAudioOutput",
+            Self::TestAudioSink => "TestAudioSink",
+            Self::PipeWireCommandPrototype => "PipeWireCommandPrototype",
+            Self::PipeWireNativePrototype => "PipeWireNativePrototype",
+            Self::PipeWireProductionFuture => "PipeWireProductionFuture",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsDeviceBackendAvailability {
+    Available,
+    AvailableDiagnosticOnly,
+    NotImplemented,
+    UnsupportedForQncOs,
+    MissingRuntimeDependency,
+    HardwareUnavailable,
+    NotProductionVerified,
+    DisabledByPolicy,
+}
+
+impl QgsDeviceBackendAvailability {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Available => "Available",
+            Self::AvailableDiagnosticOnly => "AvailableDiagnosticOnly",
+            Self::NotImplemented => "NotImplemented",
+            Self::UnsupportedForQncOs => "UnsupportedForQncOs",
+            Self::MissingRuntimeDependency => "MissingRuntimeDependency",
+            Self::HardwareUnavailable => "HardwareUnavailable",
+            Self::NotProductionVerified => "NotProductionVerified",
+            Self::DisabledByPolicy => "DisabledByPolicy",
+        }
+    }
+
+    pub const fn is_ready(self) -> bool {
+        matches!(self, Self::Available)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsVideoBackendCandidate {
+    pub kind: QgsVideoPresenterBackendKind,
+    pub availability: QgsDeviceBackendAvailability,
+    pub reason: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsAudioBackendCandidate {
+    pub kind: QgsAudioOutputBackendKind,
+    pub availability: QgsDeviceBackendAvailability,
+    pub reason: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsDeviceBackendSelection {
+    pub policy: QgsDeviceSelectionPolicy,
+    pub selected_video_backend: QgsVideoPresenterBackendKind,
+    pub selected_video_availability: QgsDeviceBackendAvailability,
+    pub selected_audio_backend: QgsAudioOutputBackendKind,
+    pub selected_audio_availability: QgsDeviceBackendAvailability,
+    pub diagnostic_video_fallback: Option<QgsVideoPresenterBackendKind>,
+    pub diagnostic_audio_fallback: Option<QgsAudioOutputBackendKind>,
+    pub video_candidates: Vec<QgsVideoBackendCandidate>,
+    pub audio_candidates: Vec<QgsAudioBackendCandidate>,
+    pub unavailable_reasons: Vec<&'static str>,
+    pub qnc_os_display_target: &'static str,
+    pub x11_target: &'static str,
+    pub real_display_ready: bool,
+    pub real_audio_backend_ready: bool,
+    pub visual_verified: bool,
+    pub realtime_verified: bool,
+    pub audio_device_production_verified: bool,
+    pub av_sync_verified: bool,
+}
+
+impl QgsDeviceBackendSelection {
+    pub fn exposes_private_path(&self) -> bool {
+        self.video_candidates
+            .iter()
+            .any(|candidate| qgs_projection_text_exposes_private_path(candidate.reason))
+            || self
+                .audio_candidates
+                .iter()
+                .any(|candidate| qgs_projection_text_exposes_private_path(candidate.reason))
+            || self
+                .unavailable_reasons
+                .iter()
+                .any(|reason| qgs_projection_text_exposes_private_path(reason))
+    }
+}
+
+pub struct QgsDeviceBackendSelector;
+
+impl QgsDeviceBackendSelector {
+    pub fn select(policy: QgsDeviceSelectionPolicy) -> QgsDeviceBackendSelection {
+        let video_candidates = Self::video_candidates();
+        let audio_candidates = Self::audio_candidates();
+        let (
+            selected_video_backend,
+            diagnostic_video_fallback,
+            selected_audio_backend,
+            diagnostic_audio_fallback,
+            unavailable_reasons,
+        ) = match policy {
+            QgsDeviceSelectionPolicy::DiagnosticOnly => (
+                QgsVideoPresenterBackendKind::GpuReadbackDiagnostic,
+                Some(QgsVideoPresenterBackendKind::FilePresenterDiagnostic),
+                QgsAudioOutputBackendKind::TestAudioSink,
+                Some(QgsAudioOutputBackendKind::NoAudioOutput),
+                vec!["diagnostic-only policy does not select a real display or production audio backend"],
+            ),
+            QgsDeviceSelectionPolicy::PreviewOnQncOs => (
+                QgsVideoPresenterBackendKind::WaylandVulkanPresenter,
+                Some(QgsVideoPresenterBackendKind::GpuReadbackDiagnostic),
+                QgsAudioOutputBackendKind::PipeWireProductionFuture,
+                Some(QgsAudioOutputBackendKind::TestAudioSink),
+                vec![
+                    "Wayland/Vulkan presenter is the QNC OS target but is not implemented yet",
+                    "PipeWire production audio output is not implemented or production verified yet",
+                    "X11 is legacy/non-target for QNC OS and is not selected",
+                ],
+            ),
+            QgsDeviceSelectionPolicy::OriginalMediaOnQncOs => (
+                QgsVideoPresenterBackendKind::WaylandVulkanPresenter,
+                Some(QgsVideoPresenterBackendKind::GpuReadbackDiagnostic),
+                QgsAudioOutputBackendKind::PipeWireProductionFuture,
+                Some(QgsAudioOutputBackendKind::TestAudioSink),
+                vec![
+                    "OriginalMedia still targets Wayland/Vulkan for QNC OS display but the real presenter is not implemented",
+                    "OriginalMedia production audio output is not implemented or production verified yet",
+                    "X11 is legacy/non-target for QNC OS and is not selected",
+                ],
+            ),
+            QgsDeviceSelectionPolicy::HeadlessCi => (
+                QgsVideoPresenterBackendKind::TestPresenter,
+                Some(QgsVideoPresenterBackendKind::FilePresenterDiagnostic),
+                QgsAudioOutputBackendKind::NoAudioOutput,
+                Some(QgsAudioOutputBackendKind::TestAudioSink),
+                vec!["headless-ci policy selects deterministic non-real-display and non-production-audio boundaries"],
+            ),
+            QgsDeviceSelectionPolicy::FutureApplianceDirect => (
+                QgsVideoPresenterBackendKind::DrmKmsVulkanPresenter,
+                Some(QgsVideoPresenterBackendKind::GpuReadbackDiagnostic),
+                QgsAudioOutputBackendKind::PipeWireProductionFuture,
+                Some(QgsAudioOutputBackendKind::TestAudioSink),
+                vec![
+                    "DRM/KMS Vulkan direct-output presenter is a future appliance path and is not implemented",
+                    "PipeWire production audio output is not implemented or production verified yet",
+                ],
+            ),
+        };
+        let selected_video_availability =
+            Self::video_availability(&video_candidates, selected_video_backend);
+        let selected_audio_availability =
+            Self::audio_availability(&audio_candidates, selected_audio_backend);
+        QgsDeviceBackendSelection {
+            policy,
+            selected_video_backend,
+            selected_video_availability,
+            selected_audio_backend,
+            selected_audio_availability,
+            diagnostic_video_fallback,
+            diagnostic_audio_fallback,
+            video_candidates,
+            audio_candidates,
+            unavailable_reasons,
+            qnc_os_display_target: "Wayland + Vulkan",
+            x11_target: "no / legacy non-target",
+            real_display_ready: selected_video_availability.is_ready(),
+            real_audio_backend_ready: selected_audio_availability.is_ready(),
+            visual_verified: false,
+            realtime_verified: false,
+            audio_device_production_verified: false,
+            av_sync_verified: false,
+        }
+    }
+
+    fn video_candidates() -> Vec<QgsVideoBackendCandidate> {
+        vec![
+            QgsVideoBackendCandidate {
+                kind: QgsVideoPresenterBackendKind::TestPresenter,
+                availability: QgsDeviceBackendAvailability::AvailableDiagnosticOnly,
+                reason: "test boundary only; not real display output",
+            },
+            QgsVideoBackendCandidate {
+                kind: QgsVideoPresenterBackendKind::FilePresenterDiagnostic,
+                availability: QgsDeviceBackendAvailability::AvailableDiagnosticOnly,
+                reason: "deterministic file diagnostic only; not real display output",
+            },
+            QgsVideoBackendCandidate {
+                kind: QgsVideoPresenterBackendKind::GpuReadbackDiagnostic,
+                availability: QgsDeviceBackendAvailability::AvailableDiagnosticOnly,
+                reason: "GPU payload readback diagnostic only; not real display output or VisualVerified",
+            },
+            QgsVideoBackendCandidate {
+                kind: QgsVideoPresenterBackendKind::WaylandVulkanPresenter,
+                availability: QgsDeviceBackendAvailability::NotImplemented,
+                reason: "first real QNC OS display target; presenter boundary is not implemented yet",
+            },
+            QgsVideoBackendCandidate {
+                kind: QgsVideoPresenterBackendKind::DrmKmsVulkanPresenter,
+                availability: QgsDeviceBackendAvailability::NotImplemented,
+                reason: "future direct/appliance display path; not implemented",
+            },
+            QgsVideoBackendCandidate {
+                kind: QgsVideoPresenterBackendKind::X11LegacyNonTarget,
+                availability: QgsDeviceBackendAvailability::UnsupportedForQncOs,
+                reason: "legacy Linux compatibility only; not a QNC OS target and never selected by QNC OS policies",
+            },
+        ]
+    }
+
+    fn audio_candidates() -> Vec<QgsAudioBackendCandidate> {
+        vec![
+            QgsAudioBackendCandidate {
+                kind: QgsAudioOutputBackendKind::NoAudioOutput,
+                availability: QgsDeviceBackendAvailability::AvailableDiagnosticOnly,
+                reason: "explicit no-output boundary for deterministic non-production runs",
+            },
+            QgsAudioBackendCandidate {
+                kind: QgsAudioOutputBackendKind::TestAudioSink,
+                availability: QgsDeviceBackendAvailability::AvailableDiagnosticOnly,
+                reason: "test sink evidence only; not real speaker output",
+            },
+            QgsAudioBackendCandidate {
+                kind: QgsAudioOutputBackendKind::PipeWireCommandPrototype,
+                availability: QgsDeviceBackendAvailability::NotProductionVerified,
+                reason: "command-backed PipeWire prototype evidence only; not production verified",
+            },
+            QgsAudioBackendCandidate {
+                kind: QgsAudioOutputBackendKind::PipeWireNativePrototype,
+                availability: QgsDeviceBackendAvailability::NotProductionVerified,
+                reason: "native PipeWire prototype evidence only; not production audio output",
+            },
+            QgsAudioBackendCandidate {
+                kind: QgsAudioOutputBackendKind::PipeWireProductionFuture,
+                availability: QgsDeviceBackendAvailability::NotImplemented,
+                reason: "future production audio backend; device policy and verification are not implemented",
+            },
+        ]
+    }
+
+    fn video_availability(
+        candidates: &[QgsVideoBackendCandidate],
+        kind: QgsVideoPresenterBackendKind,
+    ) -> QgsDeviceBackendAvailability {
+        candidates
+            .iter()
+            .find(|candidate| candidate.kind == kind)
+            .map(|candidate| candidate.availability)
+            .unwrap_or(QgsDeviceBackendAvailability::NotImplemented)
+    }
+
+    fn audio_availability(
+        candidates: &[QgsAudioBackendCandidate],
+        kind: QgsAudioOutputBackendKind,
+    ) -> QgsDeviceBackendAvailability {
+        candidates
+            .iter()
+            .find(|candidate| candidate.kind == kind)
+            .map(|candidate| candidate.availability)
+            .unwrap_or(QgsDeviceBackendAvailability::NotImplemented)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QgsBroadcastPlayerDeviceStatus {
+    pub selection: QgsDeviceBackendSelection,
     pub test_presenter_boundary_available: bool,
     pub file_presenter_diagnostic_available: bool,
     pub gpu_readback_diagnostic_available: bool,
     pub real_display_backend: &'static str,
+    pub real_audio_backend: &'static str,
     pub qnc_os_display_target: &'static str,
     pub x11_target: &'static str,
     pub visual_verified: bool,
@@ -3546,18 +3870,21 @@ pub struct QgsBroadcastPlayerDeviceStatus {
 }
 
 impl QgsBroadcastPlayerDeviceStatus {
-    pub const fn conservative() -> Self {
+    pub fn for_policy(policy: QgsDeviceSelectionPolicy) -> Self {
+        let selection = QgsDeviceBackendSelector::select(policy);
         Self {
+            real_display_backend: selection.selected_video_availability.label(),
+            real_audio_backend: selection.selected_audio_availability.label(),
+            qnc_os_display_target: selection.qnc_os_display_target,
+            x11_target: selection.x11_target,
+            visual_verified: selection.visual_verified,
+            realtime_verified: selection.realtime_verified,
+            audio_device_production_verified: selection.audio_device_production_verified,
+            av_sync_verified: selection.av_sync_verified,
+            selection,
             test_presenter_boundary_available: true,
             file_presenter_diagnostic_available: true,
             gpu_readback_diagnostic_available: true,
-            real_display_backend: "NotImplemented",
-            qnc_os_display_target: "Wayland + Vulkan",
-            x11_target: "no / legacy non-target",
-            visual_verified: false,
-            realtime_verified: false,
-            audio_device_production_verified: false,
-            av_sync_verified: false,
         }
     }
 }
@@ -3859,6 +4186,9 @@ impl QgsBroadcastPlayerCore {
         let public_source_uri = passive.source.public_source_uri.clone().or_else(|| {
             (passive.loaded_source_count > 0).then(|| self.plan.video_source.media_uri.clone())
         });
+        let device_status =
+            QgsBroadcastPlayerDeviceStatus::for_policy(QgsDeviceSelectionPolicy::PreviewOnQncOs);
+        let device_selection_private_path = device_status.selection.exposes_private_path();
         let source_loaded = public_source_uri.is_some();
         let prepared_window_ready = passive.prepared_buffer.prepared_frame_count > 0;
         let readiness = QgsBroadcastPlayerReadiness {
@@ -3869,13 +4199,13 @@ impl QgsBroadcastPlayerCore {
             prepared_window_ready,
             video_payload_ready: prepared_window_ready,
             audio_payload_ready: prepared_window_ready,
-            presenter_backend_ready: false,
-            audio_backend_ready: false,
-            real_display_ready: false,
-            audio_device_verified: false,
-            visual_verified: false,
-            realtime_verified: false,
-            av_sync_verified: false,
+            presenter_backend_ready: device_status.selection.real_display_ready,
+            audio_backend_ready: device_status.selection.real_audio_backend_ready,
+            real_display_ready: device_status.selection.real_display_ready,
+            audio_device_verified: device_status.audio_device_production_verified,
+            visual_verified: device_status.visual_verified,
+            realtime_verified: device_status.realtime_verified,
+            av_sync_verified: device_status.av_sync_verified,
             proxy_aac_authoritative: false,
             discrete_mono_audio: !self.plan.audio_source.lanes.is_empty()
                 && self
@@ -3893,7 +4223,7 @@ impl QgsBroadcastPlayerCore {
             position,
             readiness,
             prepared_window,
-            device_status: QgsBroadcastPlayerDeviceStatus::conservative(),
+            device_status,
             event_counters: QgsBroadcastPlayerEventCounters {
                 product_events: self.product_events.len(),
                 lower_level_events: self.lower_level_event_count,
@@ -3904,7 +4234,8 @@ impl QgsBroadcastPlayerCore {
                 || self
                     .product_events
                     .iter()
-                    .any(QgsBroadcastPlayerEvent::exposes_private_path),
+                    .any(QgsBroadcastPlayerEvent::exposes_private_path)
+                || device_selection_private_path,
             passive_view: passive,
         }
     }
@@ -4461,6 +4792,7 @@ pub enum BroadcastRuntimeVerificationLevel {
     CompileChecked,
     UnitTested,
     ControlSurfaceEvidence,
+    SelectionPolicyEvidence,
     MediaInspected,
     PayloadExtracted,
     PayloadBound,
@@ -4490,6 +4822,7 @@ impl BroadcastRuntimeVerificationLevel {
             Self::CompileChecked => "CompileChecked",
             Self::UnitTested => "UnitTested",
             Self::ControlSurfaceEvidence => "ControlSurfaceEvidence",
+            Self::SelectionPolicyEvidence => "SelectionPolicyEvidence",
             Self::MediaInspected => "MediaInspected",
             Self::PayloadExtracted => "PayloadExtracted",
             Self::PayloadBound => "PayloadBound",
@@ -4552,6 +4885,7 @@ pub enum BroadcastRuntimeVerifiedSubsystem {
     BroadcastRuntimeAudioPayloadPipeWire,
     RuntimeSurfaceE2eAcceptance,
     BroadcastPlayerControlCore,
+    DeviceBackendSelection,
     SimulatedPlaybackLoop,
     RealSpeakerOutput,
     RealDisplayOutput,
@@ -4600,6 +4934,7 @@ impl BroadcastRuntimeVerifiedSubsystem {
             }
             Self::RuntimeSurfaceE2eAcceptance => "runtime surface end-to-end acceptance",
             Self::BroadcastPlayerControlCore => "broadcast player control core",
+            Self::DeviceBackendSelection => "device backend selection",
             Self::SimulatedPlaybackLoop => "simulated playback loop",
             Self::RealSpeakerOutput => "real speaker output",
             Self::RealDisplayOutput => "real display output",
@@ -4776,6 +5111,11 @@ impl BroadcastRuntimeVerificationMatrix {
                     subsystem: Subsystem::BroadcastPlayerControlCore,
                     level: Level::ControlSurfaceEvidence,
                     summary: "production-shaped Broadcast Player control facade exposes commands, snapshots, readiness, position, prepared-window, device status, and product events over existing Lego modules without claiming real display, realtime, A/V sync, or audio-device verification",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::DeviceBackendSelection,
+                    level: Level::SelectionPolicyEvidence,
+                    summary: "backend-neutral device selection policies choose diagnostic/future display and audio candidates truthfully; Wayland/Vulkan remains the QNC OS target but NotImplemented, X11 is unsupported for QNC OS, and PipeWire prototypes are not production verified",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::SimulatedPlaybackLoop,
@@ -8864,6 +9204,19 @@ mod tests {
             "Wayland + Vulkan"
         );
         assert_eq!(snapshot.device_status.x11_target, "no / legacy non-target");
+        assert_eq!(
+            snapshot.device_status.selection.policy,
+            QgsDeviceSelectionPolicy::PreviewOnQncOs
+        );
+        assert_eq!(
+            snapshot.device_status.selection.selected_video_backend,
+            QgsVideoPresenterBackendKind::WaylandVulkanPresenter
+        );
+        assert_eq!(
+            snapshot.device_status.selection.selected_audio_backend,
+            QgsAudioOutputBackendKind::PipeWireProductionFuture
+        );
+        assert_eq!(snapshot.device_status.real_audio_backend, "NotImplemented");
         assert!(!snapshot.readiness.real_display_ready);
         assert!(!snapshot.readiness.audio_device_verified);
         assert!(!snapshot.readiness.visual_verified);
@@ -8874,6 +9227,105 @@ mod tests {
             .events()
             .iter()
             .all(|event| !event.exposes_private_path()));
+    }
+
+    #[test]
+    fn qgs_device_selection_diagnostic_only_selects_diagnostic_backends() {
+        let selection = QgsDeviceBackendSelector::select(QgsDeviceSelectionPolicy::DiagnosticOnly);
+        assert_eq!(
+            selection.selected_video_backend,
+            QgsVideoPresenterBackendKind::GpuReadbackDiagnostic
+        );
+        assert_eq!(
+            selection.selected_video_availability,
+            QgsDeviceBackendAvailability::AvailableDiagnosticOnly
+        );
+        assert_eq!(
+            selection.selected_audio_backend,
+            QgsAudioOutputBackendKind::TestAudioSink
+        );
+        assert!(!selection.real_display_ready);
+        assert!(!selection.visual_verified);
+        assert!(!selection.realtime_verified);
+        assert!(!selection.audio_device_production_verified);
+        assert!(!selection.av_sync_verified);
+        assert!(!selection.exposes_private_path());
+    }
+
+    #[test]
+    fn qgs_device_selection_preview_qnc_os_targets_wayland_not_x11() {
+        let selection = QgsDeviceBackendSelector::select(QgsDeviceSelectionPolicy::PreviewOnQncOs);
+        assert_eq!(
+            selection.selected_video_backend,
+            QgsVideoPresenterBackendKind::WaylandVulkanPresenter
+        );
+        assert_eq!(
+            selection.selected_video_availability,
+            QgsDeviceBackendAvailability::NotImplemented
+        );
+        assert_ne!(
+            selection.selected_video_backend,
+            QgsVideoPresenterBackendKind::X11LegacyNonTarget
+        );
+        let x11 = selection
+            .video_candidates
+            .iter()
+            .find(|candidate| candidate.kind == QgsVideoPresenterBackendKind::X11LegacyNonTarget)
+            .expect("x11 candidate");
+        assert_eq!(
+            x11.availability,
+            QgsDeviceBackendAvailability::UnsupportedForQncOs
+        );
+        assert_eq!(selection.qnc_os_display_target, "Wayland + Vulkan");
+        assert_eq!(selection.x11_target, "no / legacy non-target");
+        assert!(!selection.real_display_ready);
+    }
+
+    #[test]
+    fn qgs_device_selection_headless_ci_uses_non_real_display_boundary() {
+        let selection = QgsDeviceBackendSelector::select(QgsDeviceSelectionPolicy::HeadlessCi);
+        assert_eq!(
+            selection.selected_video_backend,
+            QgsVideoPresenterBackendKind::TestPresenter
+        );
+        assert_eq!(
+            selection.selected_video_availability,
+            QgsDeviceBackendAvailability::AvailableDiagnosticOnly
+        );
+        assert_eq!(
+            selection.selected_audio_backend,
+            QgsAudioOutputBackendKind::NoAudioOutput
+        );
+        assert!(!selection.real_display_ready);
+        assert!(!selection.real_audio_backend_ready);
+    }
+
+    #[test]
+    fn qgs_device_selection_pipewire_prototypes_are_not_production_verified() {
+        let selection = QgsDeviceBackendSelector::select(QgsDeviceSelectionPolicy::PreviewOnQncOs);
+        for kind in [
+            QgsAudioOutputBackendKind::PipeWireCommandPrototype,
+            QgsAudioOutputBackendKind::PipeWireNativePrototype,
+        ] {
+            let candidate = selection
+                .audio_candidates
+                .iter()
+                .find(|candidate| candidate.kind == kind)
+                .expect("pipewire prototype candidate");
+            assert_eq!(
+                candidate.availability,
+                QgsDeviceBackendAvailability::NotProductionVerified
+            );
+        }
+        assert_eq!(
+            selection.selected_audio_backend,
+            QgsAudioOutputBackendKind::PipeWireProductionFuture
+        );
+        assert_eq!(
+            selection.selected_audio_availability,
+            QgsDeviceBackendAvailability::NotImplemented
+        );
+        assert!(!selection.audio_device_production_verified);
     }
 
     #[test]
@@ -10191,6 +10643,18 @@ mod tests {
         assert!(
             BroadcastRuntimeVerificationLevel::TestBoundaryEvidence
                 < BroadcastRuntimeVerificationLevel::VisualVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::SelectionPolicyEvidence
+                < BroadcastRuntimeVerificationLevel::VisualVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::SelectionPolicyEvidence
+                < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::SelectionPolicyEvidence
+                < BroadcastRuntimeVerificationLevel::RealtimeVerified
         );
         assert!(
             BroadcastRuntimeVerificationLevel::FilePresenterManifestWritten

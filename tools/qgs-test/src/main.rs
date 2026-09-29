@@ -48,18 +48,20 @@ use qgs_media_runtime::{
     BroadcastVideoSourceMode, FrameIdentity as PlaybackFrameIdentity, OriginalAudioTrack,
     PcmAudioBlock, PcmAudioBlockLayout, PcmAudioPacket, PcmEndian, PcmSampleFormat, PlaybackClock,
     PlaybackConfig, PlaybackState, PresentationDecision, QgsActiveRangeTiming,
-    QgsAudioRepresentation, QgsBroadcastPlayerCommand, QgsBroadcastPlayerCore,
-    QgsBroadcastPlayerSnapshot, QgsBufferDiscardReason, QgsFilePresenterSubmissionResult,
-    QgsFrameClock, QgsFrameClockMode, QgsFrameClockRate, QgsInputPlan,
-    QgsInputPlanQueueRequirements, QgsOriginalProxyAssociationStatus, QgsPlaybackRepresentation,
-    QgsPlayoutBufferLimits, QgsPlayoutBufferState, QgsPreparedAudioChannel, QgsPreparedAudioLayout,
-    QgsPreparedInputDescriptor, QgsPreparedMediaBinding, QgsPreparedSourceIdentity,
-    QgsPreparedStreamLayout, QgsPreparedVideoTiming, QgsQncCommandEnvelope, QgsQncEventEnvelope,
-    QgsQncMonitorProjection, QgsQncPassiveView, QgsQncPlayerCommand, QgsQncSessionCommandExecutor,
-    QgsQncTimelineProjection, QgsRuntimeEventEnvelope, QgsRuntimeEventLog,
-    QgsSessionCommandQueueLimits, QgsSessionDuplicateCommandPolicy, QgsSessionQueueRejection,
-    QgsSessionRuntime, QgsSessionRuntimeConfig, QgsTickPreparationEvent, QgsTickPreparationInput,
-    QgsTransportEngine, QgsTransportEvent, RationalRate, RealTimeClock, TestAudioSink,
+    QgsAudioOutputBackendKind, QgsAudioRepresentation, QgsBroadcastPlayerCommand,
+    QgsBroadcastPlayerCore, QgsBroadcastPlayerSnapshot, QgsBufferDiscardReason,
+    QgsDeviceBackendSelection, QgsDeviceBackendSelector, QgsDeviceSelectionPolicy,
+    QgsFilePresenterSubmissionResult, QgsFrameClock, QgsFrameClockMode, QgsFrameClockRate,
+    QgsInputPlan, QgsInputPlanQueueRequirements, QgsOriginalProxyAssociationStatus,
+    QgsPlaybackRepresentation, QgsPlayoutBufferLimits, QgsPlayoutBufferState,
+    QgsPreparedAudioChannel, QgsPreparedAudioLayout, QgsPreparedInputDescriptor,
+    QgsPreparedMediaBinding, QgsPreparedSourceIdentity, QgsPreparedStreamLayout,
+    QgsPreparedVideoTiming, QgsQncCommandEnvelope, QgsQncEventEnvelope, QgsQncMonitorProjection,
+    QgsQncPassiveView, QgsQncPlayerCommand, QgsQncSessionCommandExecutor, QgsQncTimelineProjection,
+    QgsRuntimeEventEnvelope, QgsRuntimeEventLog, QgsSessionCommandQueueLimits,
+    QgsSessionDuplicateCommandPolicy, QgsSessionQueueRejection, QgsSessionRuntime,
+    QgsSessionRuntimeConfig, QgsTickPreparationEvent, QgsTickPreparationInput, QgsTransportEngine,
+    QgsTransportEvent, QgsVideoPresenterBackendKind, RationalRate, RealTimeClock, TestAudioSink,
     TestPresentationSink,
 };
 use qgs_mp4::{
@@ -156,6 +158,7 @@ const QGS_FILE_PRESENTER_DIAGNOSTIC_ARG: &str = "--qgs-file-presenter-diagnostic
 const QGS_GPU_PAYLOAD_READBACK_DIAGNOSTIC_ARG: &str = "--qgs-gpu-payload-readback-diagnostic";
 const QGS_RUNTIME_SURFACE_E2E_ARG: &str = "--qgs-runtime-surface-e2e";
 const QGS_BROADCAST_PLAYER_CONTROL_CORE_ARG: &str = "--qgs-broadcast-player-control-core";
+const QGS_DEVICE_BACKEND_SELECTION_ARG: &str = "--qgs-device-backend-selection";
 const WRITE_DIAGNOSTIC_WAV_ARG: &str = "--write-diagnostic-wav";
 const AUDIO_AUDIT_START_MS_ARG: &str = "--start-ms";
 const AUDIO_AUDIT_DURATION_MS_ARG: &str = "--duration-ms";
@@ -328,6 +331,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.qgs_broadcast_player_control_core_paths {
         return qgs_broadcast_player_control_core_report(&original, &proxy);
+    }
+    if let Some(policy) = args.qgs_device_backend_selection_policy {
+        return qgs_device_backend_selection_report(policy);
     }
     if let Some(path) = args.linux_audio_device_probe_path {
         return linux_audio_device_probe(&path);
@@ -4138,6 +4144,36 @@ fn qgs_broadcast_player_control_core_report(
     Ok(())
 }
 
+fn qgs_device_backend_selection_report(
+    policy: QgsDeviceSelectionPolicy,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let selection = QgsDeviceBackendSelector::select(policy);
+    println!("QGS Broadcast Player Device Backend Selection");
+    println!("---------------------------------------------");
+    print_device_backend_selection(&selection);
+    println!("Production claims:");
+    println!(
+        "  real display ready: {}",
+        yes_no(selection.real_display_ready)
+    );
+    println!("  visual verified: {}", yes_no(selection.visual_verified));
+    println!(
+        "  realtime verified: {}",
+        yes_no(selection.realtime_verified)
+    );
+    println!(
+        "  audio production verified: {}",
+        yes_no(selection.audio_device_production_verified)
+    );
+    println!(
+        "  A/V sync verified: {}",
+        yes_no(selection.av_sync_verified)
+    );
+    println!("  FramePresented real backend: no");
+    println!("  proxy AAC authoritative: no");
+    Ok(())
+}
+
 fn qgs_qnc_command_label(command: &QgsQncCommandEnvelope) -> String {
     format!(
         "id={} gen={} source={} command={:?} summary={}",
@@ -4348,6 +4384,7 @@ fn print_broadcast_player_snapshot(snapshot: &QgsBroadcastPlayerSnapshot) {
         snapshot.prepared_window.window_policy.max_prepared_frames
     );
     println!("  device status:");
+    print_device_backend_selection(&snapshot.device_status.selection);
     println!(
         "    test presenter boundary available: {}",
         yes_no(snapshot.device_status.test_presenter_boundary_available)
@@ -4363,6 +4400,10 @@ fn print_broadcast_player_snapshot(snapshot: &QgsBroadcastPlayerSnapshot) {
     println!(
         "    real display backend: {}",
         snapshot.device_status.real_display_backend
+    );
+    println!(
+        "    real audio backend: {}",
+        snapshot.device_status.real_audio_backend
     );
     println!(
         "    QNC OS display target: {}",
@@ -4398,6 +4439,92 @@ fn print_broadcast_player_snapshot(snapshot: &QgsBroadcastPlayerSnapshot) {
         "    rejected commands: {}",
         snapshot.event_counters.rejected_commands
     );
+}
+
+fn print_device_backend_selection(selection: &QgsDeviceBackendSelection) {
+    println!("  requested policy: {}", selection.policy.label());
+    println!(
+        "  selected video backend: {} ({})",
+        selection.selected_video_backend.label(),
+        selection.selected_video_availability.label()
+    );
+    println!(
+        "  selected audio backend: {} ({})",
+        selection.selected_audio_backend.label(),
+        selection.selected_audio_availability.label()
+    );
+    println!(
+        "  diagnostic video fallback: {}",
+        qgs_optional_video_backend_label(selection.diagnostic_video_fallback)
+    );
+    println!(
+        "  diagnostic audio fallback: {}",
+        qgs_optional_audio_backend_label(selection.diagnostic_audio_fallback)
+    );
+    println!("  video candidates:");
+    for candidate in &selection.video_candidates {
+        println!(
+            "    - {}: {} ({})",
+            candidate.kind.label(),
+            candidate.availability.label(),
+            candidate.reason
+        );
+    }
+    println!("  audio candidates:");
+    for candidate in &selection.audio_candidates {
+        println!(
+            "    - {}: {} ({})",
+            candidate.kind.label(),
+            candidate.availability.label(),
+            candidate.reason
+        );
+    }
+    println!("  unavailable reasons:");
+    for reason in &selection.unavailable_reasons {
+        println!("    - {reason}");
+    }
+    println!(
+        "  QNC OS display target: {}",
+        selection.qnc_os_display_target
+    );
+    println!("  X11 target: {}", selection.x11_target);
+    println!(
+        "  real display ready: {}",
+        yes_no(selection.real_display_ready)
+    );
+    println!(
+        "  real audio backend ready: {}",
+        yes_no(selection.real_audio_backend_ready)
+    );
+    println!("  visual verified: {}", yes_no(selection.visual_verified));
+    println!(
+        "  realtime verified: {}",
+        yes_no(selection.realtime_verified)
+    );
+    println!(
+        "  audio production verified: {}",
+        yes_no(selection.audio_device_production_verified)
+    );
+    println!(
+        "  A/V sync verified: {}",
+        yes_no(selection.av_sync_verified)
+    );
+    println!(
+        "  private path exposed: {}",
+        yes_no(selection.exposes_private_path())
+    );
+}
+
+fn qgs_optional_video_backend_label(value: Option<QgsVideoPresenterBackendKind>) -> &'static str {
+    value
+        .map(QgsVideoPresenterBackendKind::label)
+        .unwrap_or("none")
+}
+
+fn qgs_optional_audio_backend_label(value: Option<QgsAudioOutputBackendKind>) -> &'static str {
+    value
+        .map(QgsAudioOutputBackendKind::label)
+        .unwrap_or("none")
 }
 
 fn qgs_optional_u64_label(value: Option<u64>) -> String {
@@ -15886,6 +16013,7 @@ struct Args {
     qgs_gpu_payload_readback_diagnostic_paths: Option<(PathBuf, PathBuf)>,
     qgs_runtime_surface_e2e_paths: Option<(PathBuf, PathBuf)>,
     qgs_broadcast_player_control_core_paths: Option<(PathBuf, PathBuf)>,
+    qgs_device_backend_selection_policy: Option<QgsDeviceSelectionPolicy>,
     linux_audio_device_probe_path: Option<PathBuf>,
     pipewire_audio_prototype_path: Option<PathBuf>,
     pipewire_audio_native_prototype_path: Option<PathBuf>,
@@ -15980,6 +16108,7 @@ impl Args {
         let mut qgs_runtime_surface_e2e_paths = None;
         let mut qgs_broadcast_player_control_core_original = None;
         let mut qgs_broadcast_player_control_core_paths = None;
+        let mut qgs_device_backend_selection_policy = None;
         let mut linux_audio_device_probe_path = None;
         let mut pipewire_audio_prototype_path = None;
         let mut pipewire_audio_native_prototype_path = None;
@@ -16065,6 +16194,7 @@ impl Args {
         let mut next_arg_is_qgs_runtime_surface_e2e_proxy = false;
         let mut next_arg_is_qgs_broadcast_player_control_core_original = false;
         let mut next_arg_is_qgs_broadcast_player_control_core_proxy = false;
+        let mut next_arg_is_qgs_device_backend_selection_policy = false;
         let mut next_arg_is_linux_audio_device_probe_path = false;
         let mut next_arg_is_pipewire_audio_prototype_path = false;
         let mut next_arg_is_pipewire_audio_native_prototype_path = false;
@@ -16088,7 +16218,13 @@ impl Args {
         let mut next_arg_is_audio_monitor_track = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_audio_monitor_track {
+            if next_arg_is_qgs_device_backend_selection_policy {
+                qgs_device_backend_selection_policy = Some(
+                    parse_device_selection_policy_arg(&arg)
+                        .unwrap_or_else(|err| panic!("{QGS_DEVICE_BACKEND_SELECTION_ARG}: {err}")),
+                );
+                next_arg_is_qgs_device_backend_selection_policy = false;
+            } else if next_arg_is_audio_monitor_track {
                 audio_monitor_track = Some(
                     parse_monitor_track_arg(&arg)
                         .unwrap_or_else(|err| panic!("{AUDIO_MONITOR_TRACK_ARG}: {err}")),
@@ -16629,6 +16765,8 @@ impl Args {
                 next_arg_is_qgs_runtime_surface_e2e_original = true;
             } else if arg == QGS_BROADCAST_PLAYER_CONTROL_CORE_ARG {
                 next_arg_is_qgs_broadcast_player_control_core_original = true;
+            } else if arg == QGS_DEVICE_BACKEND_SELECTION_ARG {
+                next_arg_is_qgs_device_backend_selection_policy = true;
             } else if arg == LINUX_AUDIO_DEVICE_PROBE_ARG {
                 next_arg_is_linux_audio_device_probe_path = true;
             } else if arg == PIPEWIRE_AUDIO_PROTOTYPE_ARG {
@@ -16707,6 +16845,7 @@ impl Args {
             qgs_gpu_payload_readback_diagnostic_paths,
             qgs_runtime_surface_e2e_paths,
             qgs_broadcast_player_control_core_paths,
+            qgs_device_backend_selection_policy,
             linux_audio_device_probe_path,
             pipewire_audio_prototype_path,
             pipewire_audio_native_prototype_path,
@@ -16749,6 +16888,21 @@ fn parse_monitor_track_arg(value: &std::ffi::OsStr) -> Result<u16, &'static str>
     Ok(track - 1)
 }
 
+fn parse_device_selection_policy_arg(
+    value: &std::ffi::OsStr,
+) -> Result<QgsDeviceSelectionPolicy, &'static str> {
+    match value.to_string_lossy().as_ref() {
+        "diagnostic-only" => Ok(QgsDeviceSelectionPolicy::DiagnosticOnly),
+        "preview-qnc-os" => Ok(QgsDeviceSelectionPolicy::PreviewOnQncOs),
+        "original-qnc-os" => Ok(QgsDeviceSelectionPolicy::OriginalMediaOnQncOs),
+        "headless-ci" => Ok(QgsDeviceSelectionPolicy::HeadlessCi),
+        "future-appliance-direct" => Ok(QgsDeviceSelectionPolicy::FutureApplianceDirect),
+        _ => Err(
+            "expects one of diagnostic-only, preview-qnc-os, original-qnc-os, headless-ci, future-appliance-direct",
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -16763,13 +16917,14 @@ mod tests {
         gpu_payload_readback_image_file_name, gpu_payload_readback_manifest_file_name, json_escape,
         loudest_monitor_pair, manifest_json_contains_private_path,
         mono_monitor_diagnostic_evidence_label, mxf_file_label, original_pcm_blocks_by_channel,
-        original_segment_evidence_label, parse_manual_audible_confirmation,
-        parse_monitor_track_arg, pcm_s24le_sample_to_f32, proxy_presentation_ordinals,
-        public_source_uri_stem, repeated_smoke_test_buffers, rgba_u16_to_ppm_p6_rgb8,
-        rgba_u16_to_rgb8_bytes, runtime_audio_payload_evidence_label, sanitized_source_stem,
-        selected_proxy_ordinals, smoke_test_buffer_count, ManualAudibleConfirmation,
-        SonyXmlSummary,
+        original_segment_evidence_label, parse_device_selection_policy_arg,
+        parse_manual_audible_confirmation, parse_monitor_track_arg, pcm_s24le_sample_to_f32,
+        proxy_presentation_ordinals, public_source_uri_stem, repeated_smoke_test_buffers,
+        rgba_u16_to_ppm_p6_rgb8, rgba_u16_to_rgb8_bytes, runtime_audio_payload_evidence_label,
+        sanitized_source_stem, selected_proxy_ordinals, smoke_test_buffer_count,
+        ManualAudibleConfirmation, SonyXmlSummary,
     };
+    use qgs_media_runtime::QgsDeviceSelectionPolicy;
     use qgs_media_runtime::{
         av_frame_audio_range, bind_broadcast_audio_payload, BroadcastPreparedAudioSlot,
         BroadcastVideoSourceMode, PcmAudioBlock, PcmAudioBlockLayout, PcmEndian, PcmSampleFormat,
@@ -17139,6 +17294,31 @@ mod tests {
         assert_eq!(parse_monitor_track_arg("4".as_ref()).unwrap(), 3);
         assert_eq!(parse_monitor_track_arg("1".as_ref()).unwrap(), 0);
         assert!(parse_monitor_track_arg("0".as_ref()).is_err());
+    }
+
+    #[test]
+    fn device_selection_policy_parser_accepts_block_h_policy_names() {
+        assert_eq!(
+            parse_device_selection_policy_arg("diagnostic-only".as_ref()).unwrap(),
+            QgsDeviceSelectionPolicy::DiagnosticOnly
+        );
+        assert_eq!(
+            parse_device_selection_policy_arg("preview-qnc-os".as_ref()).unwrap(),
+            QgsDeviceSelectionPolicy::PreviewOnQncOs
+        );
+        assert_eq!(
+            parse_device_selection_policy_arg("original-qnc-os".as_ref()).unwrap(),
+            QgsDeviceSelectionPolicy::OriginalMediaOnQncOs
+        );
+        assert_eq!(
+            parse_device_selection_policy_arg("headless-ci".as_ref()).unwrap(),
+            QgsDeviceSelectionPolicy::HeadlessCi
+        );
+        assert_eq!(
+            parse_device_selection_policy_arg("future-appliance-direct".as_ref()).unwrap(),
+            QgsDeviceSelectionPolicy::FutureApplianceDirect
+        );
+        assert!(parse_device_selection_policy_arg("x11".as_ref()).is_err());
     }
 
     #[test]

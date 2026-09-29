@@ -41,6 +41,10 @@ and what remains unimplemented.
   event summaries over already-separated runtime modules. This is not real
   display output, realtime playback, A/V sync, or production audio-device
   verification.
+- `SelectionPolicyEvidence`: backend selection policy is modeled and tested,
+  including candidate availability and conservative non-claims. This is not
+  backend implementation, real display output, realtime playback, A/V sync, or
+  production audio-device verification.
 - `ManualAudibleSignalDetectedContentUnverified`: a human detected a slight
   hum/buzz from a native PipeWire path, but recognizable original audio content
   was not confirmed. This does not verify PCM content correctness, channel
@@ -113,6 +117,7 @@ For Sony FX6 sample 002:
 | broadcast runtime audio payload to PipeWire | `RuntimeAudioPayloadDrainCompleted` | First prepared `ProxyPreview` Broadcast Player Runtime original-audio payload binding submits to native PipeWire and drains; an audible helper path exists but manual confirmation is tracked separately and does not imply full playback, realtime playback, A/V sync, channel certification, or full audio-device verification. |
 | runtime surface end-to-end acceptance | `TestBoundaryEvidence` | Integration Block A session orchestration and Block B test presenter/monitor boundary are wired together as separate backend modules. This is not monolithic runtime ownership; real display output, realtime playback, A/V sync, and visual verification remain unimplemented. |
 | broadcast player control core | `ControlSurfaceEvidence` | Production-shaped Broadcast Player control facade exposes commands, snapshots, readiness, position, prepared-window, device status, and product events over existing Lego modules without claiming real display, realtime playback, A/V sync, or production audio-device verification. |
+| device backend selection | `SelectionPolicyEvidence` | Backend-neutral selection policies identify diagnostic/future video and audio backends truthfully. Wayland/Vulkan is the QNC OS display target but remains `NotImplemented`, X11 is unsupported for QNC OS, and PipeWire prototypes are not production verified. |
 | simulated playback loop | `TestBoundaryEvidence` | Prepared slots flow through test audio/video boundaries deterministically. |
 | real speaker output | `NotImplemented` | No audible speaker output, audio-device clock, or full audio playback path exists; native PipeWire buffer submission is tracked separately. |
 | real display output | `NotImplemented` | No QNC OS Wayland/Vulkan presenter, optional DRM/KMS direct-output presenter, legacy X11 compatibility presenter, swapchain, or real display presenter exists. X11 is not a QNC OS target. |
@@ -158,6 +163,10 @@ The matrix intentionally does not overstate these areas:
 - Broadcast Player control surface evidence proves product-shaped command and
   snapshot orchestration only. It is not real display output, realtime playback,
   A/V sync, visual verification, or production audio-device verification.
+- Device backend selection evidence proves selection policy and reporting only.
+  It is not Wayland/Vulkan presenter implementation, real display output,
+  `FramePresented` from a real backend, `VisualVerified`, realtime playback,
+  A/V sync, `AudioDeviceVerified`, or production PipeWire audio output.
 - The audio content sanity audit is inspection evidence, not audible content
   verification.
 - Haswell CPU-bridge 1080p50 is not marked realtime verified.
