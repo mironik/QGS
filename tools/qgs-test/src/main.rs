@@ -59,10 +59,12 @@ use qgs_media_runtime::{
     QgsPreparedAudioChannel, QgsPreparedAudioLayout, QgsPreparedInputDescriptor,
     QgsPreparedMediaBinding, QgsPreparedSourceIdentity, QgsPreparedStreamLayout,
     QgsPreparedVideoTiming, QgsQncAudioChannelKindLike, QgsQncAudioChannelLike,
-    QgsQncAudioRepresentationLike, QgsQncCommandEnvelope, QgsQncEventEnvelope,
-    QgsQncFrameRangeLike, QgsQncMonitorProjection, QgsQncPassiveView, QgsQncPlaybackInputLike,
-    QgsQncPlayerCommand, QgsQncPreparedInputLike, QgsQncPrivateBindingLike, QgsQncProjectAudioLike,
-    QgsQncRepresentationLike, QgsQncSessionCommandExecutor, QgsQncSourceIdentityLike,
+    QgsQncAudioRepresentationLike, QgsQncCommandEnvelope, QgsQncCommandKind, QgsQncCommandPayload,
+    QgsQncCommandRequestEnvelope, QgsQncControlEventEnvelope, QgsQncControlEventKind,
+    QgsQncControlSurface, QgsQncEventEnvelope, QgsQncFrameRangeLike, QgsQncMonitorProjection,
+    QgsQncPassiveView, QgsQncPlaybackInputLike, QgsQncPlayerCommand, QgsQncPreparedInputLike,
+    QgsQncPrivateBindingLike, QgsQncProjectAudioLike, QgsQncRepresentationLike,
+    QgsQncRuntimeSnapshot, QgsQncSessionCommandExecutor, QgsQncSourceIdentityLike,
     QgsQncStreamLayoutLike, QgsQncTimelineProjection, QgsQncVideoInputLike,
     QgsRuntimeEventEnvelope, QgsRuntimeEventLog, QgsSessionCommandQueueLimits,
     QgsSessionDuplicateCommandPolicy, QgsSessionQueueRejection, QgsSessionRuntime,
@@ -5362,14 +5364,20 @@ struct QgsControlSessionStateKey {
 }
 
 impl QgsControlSessionStateKey {
-    fn from_snapshot(snapshot: &QgsOperationalRuntimeSnapshot) -> Self {
+    fn from_snapshot(snapshot: &QgsQncRuntimeSnapshot) -> Self {
         Self {
-            status: snapshot.operational_status,
-            source_loaded: snapshot.player.readiness.source_loaded,
+            status: snapshot.status,
+            source_loaded: snapshot.source_loaded,
             frame: snapshot.current_frame,
             audio_range: snapshot.current_audio_sample_range,
-            prepared_start: snapshot.buffer_health.prepared_start_frame,
-            prepared_end: snapshot.buffer_health.prepared_end_frame_exclusive,
+            prepared_start: snapshot
+                .prepared_window
+                .as_ref()
+                .and_then(|window| window.start_frame),
+            prepared_end: snapshot
+                .prepared_window
+                .as_ref()
+                .and_then(|window| window.end_frame_exclusive),
         }
     }
 }
@@ -5380,15 +5388,17 @@ fn qgs_broadcast_player_control_session_report(
     script: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let assembly = build_qgs_broadcast_player_assembly(original_path, proxy_path)?;
-    let active_frames = assembly.active_frame_count();
     let commands = QgsControlSessionScriptCommand::parse_script(script)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-    let mut runtime = assembly.new_operational_runtime()?;
+    let mut surface = QgsQncControlSurface::from_assembly(&assembly, "qgs-test-control-session")?;
     let mut accepted_count = 0_usize;
     let mut rejected_count = 0_usize;
+    let mut projected_event_count = 0_usize;
 
-    println!("QGS Broadcast Player Control Session");
+    println!("QGS QNC-Compatible Broadcast Player Control Session");
     println!("assembly: modular broadcast player runtime");
+    println!("control surface: QgsQncControlSurface");
+    println!("session id: {}", surface.session_id().0);
     println!("modules: {}", assembly.module_labels().join(", "));
     println!("mode: ProxyPreview");
     println!("video: proxy MP4");
@@ -5406,175 +5416,76 @@ fn qgs_broadcast_player_control_session_report(
     for (index, command) in commands.iter().enumerate() {
         let ordinal = index + 1;
         let label = command.label();
-        println!("[{ordinal:03}] {label}");
-        match command {
-            QgsControlSessionScriptCommand::Load => {
-                let result = runtime.execute(QgsBroadcastPlayerCommand::LoadPreparedInput);
-                qgs_print_control_command_result(&result.snapshot, result.accepted, result.reason);
-                qgs_count_control_result(result.accepted, &mut accepted_count, &mut rejected_count);
-            }
-            QgsControlSessionScriptCommand::Prepare => {
-                let result = runtime.execute(QgsBroadcastPlayerCommand::Prepare {
-                    active_range: Some((0, active_frames)),
-                });
-                println!(
-                    "accepted={} status={:?} phase=input-ready source={}",
-                    yes_no(result.accepted),
-                    result.snapshot.operational_status,
-                    yes_no(result.snapshot.player.readiness.source_loaded)
-                );
-                qgs_print_rejection_detail_if_needed(
-                    &runtime,
-                    &result.snapshot,
-                    result.accepted,
-                    result.reason,
-                    None,
-                );
-                qgs_count_control_result(result.accepted, &mut accepted_count, &mut rejected_count);
-            }
-            QgsControlSessionScriptCommand::Cue(frame) => {
-                let before = runtime.snapshot();
-                let result = runtime.execute(QgsBroadcastPlayerCommand::Cue { frame: *frame });
-                qgs_print_control_command_result(&result.snapshot, result.accepted, result.reason);
-                qgs_print_rejection_detail_if_needed(
-                    &runtime,
-                    &result.snapshot,
-                    result.accepted,
-                    result.reason,
-                    Some(before),
-                );
-                qgs_count_control_result(result.accepted, &mut accepted_count, &mut rejected_count);
-            }
-            QgsControlSessionScriptCommand::Preroll => {
-                let prepare_after_paused_seek =
-                    runtime.snapshot().operational_status == QgsBroadcastPlayerStatus::Paused;
-                let result = if prepare_after_paused_seek {
-                    let prepare = runtime.execute(QgsBroadcastPlayerCommand::Prepare {
-                        active_range: Some((0, active_frames)),
-                    });
-                    if prepare.accepted {
-                        runtime.execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 })
-                    } else {
-                        prepare
-                    }
-                } else {
-                    runtime.execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 })
-                };
-                println!(
-                    "accepted={} status={:?} window={} video_ready={} audio_ready={}",
-                    yes_no(result.accepted),
-                    result.snapshot.operational_status,
-                    qgs_optional_frame_window_label(
-                        result.snapshot.buffer_health.prepared_start_frame,
-                        result.snapshot.buffer_health.prepared_end_frame_exclusive
-                    ),
-                    yes_no(result.snapshot.player.readiness.video_payload_ready),
-                    yes_no(result.snapshot.player.readiness.audio_payload_ready)
-                );
-                qgs_print_rejection_detail_if_needed(
-                    &runtime,
-                    &result.snapshot,
-                    result.accepted,
-                    result.reason,
-                    None,
-                );
-                qgs_count_control_result(result.accepted, &mut accepted_count, &mut rejected_count);
-            }
-            QgsControlSessionScriptCommand::Play(frames) => {
-                let play_result =
-                    if runtime.snapshot().operational_status == QgsBroadcastPlayerStatus::Playing {
-                        None
-                    } else {
-                        Some(runtime.execute(QgsBroadcastPlayerCommand::Play))
-                    };
-                let accepted = play_result
-                    .as_ref()
-                    .map(|result| result.accepted)
-                    .unwrap_or(true);
-                let status = play_result
-                    .as_ref()
-                    .map(|result| result.snapshot.operational_status)
-                    .unwrap_or_else(|| runtime.snapshot().operational_status);
-                println!("accepted={} status={status:?}", yes_no(accepted));
-                if let Some(result) = &play_result {
-                    qgs_print_rejection_detail_if_needed(
-                        &runtime,
-                        &result.snapshot,
-                        result.accepted,
-                        result.reason,
-                        None,
-                    );
-                }
-                if accepted {
-                    for tick in 0..*frames {
-                        let tick_snapshot = runtime.snapshot();
-                        qgs_print_control_tick(tick, &tick_snapshot);
-                        runtime.execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 });
-                    }
-                }
-                qgs_count_control_result(accepted, &mut accepted_count, &mut rejected_count);
-            }
-            QgsControlSessionScriptCommand::Pause => {
-                let before = runtime.snapshot();
-                let result = runtime.execute(QgsBroadcastPlayerCommand::Pause);
-                qgs_print_control_command_result(&result.snapshot, result.accepted, result.reason);
-                qgs_print_rejection_detail_if_needed(
-                    &runtime,
-                    &result.snapshot,
-                    result.accepted,
-                    result.reason,
-                    Some(before),
-                );
-                qgs_count_control_result(result.accepted, &mut accepted_count, &mut rejected_count);
-            }
-            QgsControlSessionScriptCommand::Seek(frame) => {
-                let before = runtime.snapshot();
-                let result = runtime.execute(QgsBroadcastPlayerCommand::Seek { frame: *frame });
-                qgs_print_control_command_result(&result.snapshot, result.accepted, result.reason);
-                qgs_print_rejection_detail_if_needed(
-                    &runtime,
-                    &result.snapshot,
-                    result.accepted,
-                    result.reason,
-                    Some(before),
-                );
-                qgs_count_control_result(result.accepted, &mut accepted_count, &mut rejected_count);
-            }
-            QgsControlSessionScriptCommand::Stop => {
-                let result = runtime.execute(QgsBroadcastPlayerCommand::Stop);
-                qgs_print_control_command_result(&result.snapshot, result.accepted, result.reason);
-                qgs_count_control_result(result.accepted, &mut accepted_count, &mut rejected_count);
-            }
-            QgsControlSessionScriptCommand::Unload => {
-                let result = runtime.execute(QgsBroadcastPlayerCommand::Unload);
-                qgs_print_control_command_result(&result.snapshot, result.accepted, result.reason);
-                qgs_count_control_result(result.accepted, &mut accepted_count, &mut rejected_count);
-            }
-            QgsControlSessionScriptCommand::Snapshot | QgsControlSessionScriptCommand::Status => {
-                let snapshot = runtime.snapshot();
-                qgs_print_control_command_result(&snapshot, true, None);
-                accepted_count = accepted_count.saturating_add(1);
-            }
-            QgsControlSessionScriptCommand::Tick(frames) => {
-                println!(
-                    "accepted=yes status={:?}",
-                    runtime.snapshot().operational_status
-                );
-                for tick in 0..*frames {
-                    let tick_snapshot = runtime.snapshot();
-                    qgs_print_control_tick(tick, &tick_snapshot);
-                    runtime.execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 });
-                }
-                accepted_count = accepted_count.saturating_add(1);
-            }
+        let request = qgs_control_request_for_script_command(
+            format!("cmd-{ordinal:04}"),
+            surface.generation(),
+            command,
+        );
+        let reply = surface.handle_command(request);
+        println!(
+            "[{ordinal:03}] id={} gen={}->{} {label}",
+            reply.command_id.0, reply.generation_before.0, reply.generation_after.0
+        );
+        qgs_print_control_command_result(&reply.snapshot, reply.accepted, reply.rejection_reason);
+        if !reply.accepted {
+            qgs_print_rejection_detail_if_needed(&reply);
         }
+        for (tick, event) in reply
+            .events
+            .iter()
+            .filter(|event| event.event_kind == QgsQncControlEventKind::Ticked)
+            .enumerate()
+        {
+            qgs_print_control_tick(tick as u64, event);
+        }
+        projected_event_count = projected_event_count.saturating_add(reply.events.len());
+        qgs_count_control_result(reply.accepted, &mut accepted_count, &mut rejected_count);
         println!();
     }
 
-    let final_snapshot = runtime.snapshot();
+    let stale_before = surface.snapshot();
+    let stale_reply = surface.handle_command(
+        QgsQncCommandRequestEnvelope::new("cmd-stale", QgsQncCommandKind::Pause)
+            .with_expected_generation(qgs_media_runtime::QgsQncGeneration(
+                surface.generation().0.saturating_add(999),
+            )),
+    );
+    println!(
+        "STALE id={} gen={}->{} accepted={} reason={} state_mutated={}",
+        stale_reply.command_id.0,
+        stale_reply.generation_before.0,
+        stale_reply.generation_after.0,
+        yes_no(stale_reply.accepted),
+        stale_reply.rejection_reason.unwrap_or("<none>"),
+        yes_no(stale_reply.state_mutated)
+    );
+    println!(
+        "stale snapshot unchanged: {}",
+        yes_no(
+            QgsControlSessionStateKey::from_snapshot(&stale_before)
+                == QgsControlSessionStateKey::from_snapshot(&stale_reply.snapshot)
+        )
+    );
+    projected_event_count = projected_event_count.saturating_add(stale_reply.events.len());
+    qgs_count_control_result(
+        stale_reply.accepted,
+        &mut accepted_count,
+        &mut rejected_count,
+    );
+    println!();
+
+    let final_snapshot = surface.snapshot();
     println!("Final:");
     println!("commands accepted: {accepted_count}");
     println!("commands rejected: {rejected_count}");
+    println!("projected events: {projected_event_count}");
+    println!("generation: {}", surface.generation().0);
+    println!("final status: {:?}", final_snapshot.status);
+    println!("source loaded: {}", yes_no(final_snapshot.source_loaded));
+    println!(
+        "prepared window: {}",
+        qgs_qnc_optional_frame_window_label(final_snapshot.prepared_window.as_ref())
+    );
     println!("run result: completed");
     println!(
         "private path exposed: {}",
@@ -5582,32 +5493,82 @@ fn qgs_broadcast_player_control_session_report(
     );
     println!(
         "real display: {}",
-        final_snapshot.player.device_status.real_display_backend
+        final_snapshot.device_status.real_display_status
     );
     println!(
         "visual verified: {}",
-        yes_no(final_snapshot.player.device_status.visual_verified)
+        yes_no(final_snapshot.device_status.visual_verified)
     );
     println!(
         "realtime verified: {}",
-        yes_no(final_snapshot.player.device_status.realtime_verified)
+        yes_no(final_snapshot.device_status.realtime_verified)
     );
     println!(
         "audio production verified: {}",
-        yes_no(
-            final_snapshot
-                .player
-                .device_status
-                .audio_device_production_verified
-        )
+        yes_no(final_snapshot.device_status.audio_device_verified)
     );
     println!(
         "A/V sync verified: {}",
-        yes_no(final_snapshot.player.device_status.av_sync_verified)
+        yes_no(final_snapshot.device_status.av_sync_verified)
     );
     println!("FramePresented real display claim: no");
 
     Ok(())
+}
+
+fn qgs_control_request_for_script_command(
+    command_id: String,
+    generation: qgs_media_runtime::QgsQncGeneration,
+    command: &QgsControlSessionScriptCommand,
+) -> QgsQncCommandRequestEnvelope {
+    let (kind, payload) = match *command {
+        QgsControlSessionScriptCommand::Load => (
+            QgsQncCommandKind::LoadPreparedInput,
+            QgsQncCommandPayload::Empty,
+        ),
+        QgsControlSessionScriptCommand::Prepare => {
+            (QgsQncCommandKind::Prepare, QgsQncCommandPayload::Empty)
+        }
+        QgsControlSessionScriptCommand::Cue(frame) => (
+            QgsQncCommandKind::Cue,
+            QgsQncCommandPayload::Frame { frame },
+        ),
+        QgsControlSessionScriptCommand::Preroll => (
+            QgsQncCommandKind::Preroll,
+            QgsQncCommandPayload::Preroll { target_frame: None },
+        ),
+        QgsControlSessionScriptCommand::Play(frame_count) => (
+            QgsQncCommandKind::Play,
+            QgsQncCommandPayload::Play {
+                frame_count: Some(frame_count),
+            },
+        ),
+        QgsControlSessionScriptCommand::Pause => {
+            (QgsQncCommandKind::Pause, QgsQncCommandPayload::Empty)
+        }
+        QgsControlSessionScriptCommand::Seek(frame) => (
+            QgsQncCommandKind::Seek,
+            QgsQncCommandPayload::Frame { frame },
+        ),
+        QgsControlSessionScriptCommand::Stop => {
+            (QgsQncCommandKind::Stop, QgsQncCommandPayload::Empty)
+        }
+        QgsControlSessionScriptCommand::Unload => {
+            (QgsQncCommandKind::Unload, QgsQncCommandPayload::Empty)
+        }
+        QgsControlSessionScriptCommand::Snapshot | QgsControlSessionScriptCommand::Status => {
+            (QgsQncCommandKind::Snapshot, QgsQncCommandPayload::Empty)
+        }
+        QgsControlSessionScriptCommand::Tick(frames) => (
+            QgsQncCommandKind::Play,
+            QgsQncCommandPayload::Play {
+                frame_count: Some(frames),
+            },
+        ),
+    };
+    QgsQncCommandRequestEnvelope::new(command_id, kind)
+        .with_expected_generation(generation)
+        .with_payload(payload)
 }
 
 fn qgs_count_control_result(
@@ -5623,66 +5584,65 @@ fn qgs_count_control_result(
 }
 
 fn qgs_print_control_command_result(
-    snapshot: &QgsOperationalRuntimeSnapshot,
+    snapshot: &QgsQncRuntimeSnapshot,
     accepted: bool,
     reason: Option<&'static str>,
 ) {
     println!(
         "accepted={} status={:?} source={} frame={} audio={} window={} video_ready={} audio_ready={}",
         yes_no(accepted),
-        snapshot.operational_status,
-        yes_no(snapshot.player.readiness.source_loaded),
+        snapshot.status,
+        yes_no(snapshot.source_loaded),
         qgs_optional_u64_label(snapshot.current_frame),
         qgs_optional_sample_range_label(snapshot.current_audio_sample_range),
-        qgs_optional_frame_window_label(
-            snapshot.buffer_health.prepared_start_frame,
-            snapshot.buffer_health.prepared_end_frame_exclusive
-        ),
-        yes_no(snapshot.player.readiness.video_payload_ready),
-        yes_no(snapshot.player.readiness.audio_payload_ready)
+        qgs_qnc_optional_frame_window_label(snapshot.prepared_window.as_ref()),
+        yes_no(snapshot.video_payload_ready),
+        yes_no(snapshot.audio_payload_ready)
     );
     if let Some(reason) = reason {
         println!("reason={reason}");
     }
 }
 
-fn qgs_print_rejection_detail_if_needed(
-    runtime: &QgsBroadcastPlayerOperationalRuntime,
-    snapshot: &QgsOperationalRuntimeSnapshot,
-    accepted: bool,
-    reason: Option<&'static str>,
-    before: Option<QgsOperationalRuntimeSnapshot>,
-) {
-    if accepted {
-        return;
+fn qgs_print_rejection_detail_if_needed(reply: &qgs_media_runtime::QgsQncCommandReplyEnvelope) {
+    if let Some(fault) = &reply.fault {
+        println!(
+            "fault={} severity={} scope={} recovery={}",
+            fault.fault_kind, fault.severity, fault.scope, fault.recovery_action
+        );
     }
-    if let Some(reason) = reason {
-        println!("fault={reason}");
-    }
-    let state_mutated = before
-        .map(|before| {
-            QgsControlSessionStateKey::from_snapshot(&before)
-                != QgsControlSessionStateKey::from_snapshot(snapshot)
-        })
-        .unwrap_or(false);
-    println!("state_mutated={}", yes_no(state_mutated));
+    println!("state_mutated={}", yes_no(reply.state_mutated));
     println!(
         "private path exposed: {}",
-        yes_no(runtime.snapshot().exposes_private_path())
+        yes_no(reply.exposes_private_path())
     );
 }
 
-fn qgs_print_control_tick(index: u64, snapshot: &QgsOperationalRuntimeSnapshot) {
+fn qgs_print_control_tick(index: u64, event: &QgsQncControlEventEnvelope) {
     println!(
         "  {index:03} frame={} audio={} window={} buffer={}",
-        qgs_optional_u64_label(snapshot.current_frame),
-        qgs_optional_sample_range_label(snapshot.current_audio_sample_range),
-        qgs_optional_frame_window_label(
-            snapshot.buffer_health.prepared_start_frame,
-            snapshot.buffer_health.prepared_end_frame_exclusive
-        ),
-        qgs_running_buffer_label(snapshot)
+        qgs_optional_u64_label(event.frame),
+        qgs_optional_sample_range_label(event.audio_sample_range),
+        qgs_qnc_optional_frame_window_label(event.prepared_window.as_ref()),
+        if event
+            .prepared_window
+            .as_ref()
+            .is_some_and(|window| window.prepared_frame_count > 0)
+        {
+            "ready"
+        } else {
+            "empty"
+        }
     );
+}
+
+fn qgs_qnc_optional_frame_window_label(
+    window: Option<&qgs_media_runtime::QgsQncPreparedWindowView>,
+) -> String {
+    window.map_or_else(
+        || "<none>".to_string(),
+        |window| qgs_optional_frame_window_label(window.start_frame, window.end_frame_exclusive),
+    )
 }
 
 fn qgs_device_backend_selection_report(

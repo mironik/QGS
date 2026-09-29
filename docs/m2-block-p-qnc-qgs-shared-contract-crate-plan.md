@@ -7,6 +7,12 @@ This is a contract planning block. It does not create the crate, implement IPC,
 change QNC UI, change QGS runtime behavior, add device backends, certify
 realtime playback, or create a monolith.
 
+Update after M2 Block R: QGS now has an in-process
+`QgsQncControlSurface` that implements the QGS-side shape of these command,
+reply, snapshot, event, fault, recovery, generation, privacy, and device-status
+fields. That implementation is intentionally not the shared
+`qnc-qgs-contract` crate, and it does not add IPC or QNC UI integration.
+
 ## Purpose
 
 QNC is the application. It owns UI, forms, DB, workflow, public media identity,

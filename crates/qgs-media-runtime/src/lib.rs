@@ -4610,6 +4610,823 @@ impl QgsBroadcastPlayerCore {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncCommandId(pub String);
+
+impl QgsQncCommandId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncSessionId(pub String);
+
+impl QgsQncSessionId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsQncGeneration(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsQncCommandKind {
+    LoadPreparedInput,
+    Prepare,
+    Cue,
+    Preroll,
+    Play,
+    Pause,
+    Seek,
+    Stop,
+    Unload,
+    Snapshot,
+}
+
+impl QgsQncCommandKind {
+    pub const fn is_mutating(self) -> bool {
+        !matches!(self, Self::Snapshot)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QgsQncCommandPayload {
+    Empty,
+    Frame { frame: u64 },
+    Play { frame_count: Option<u64> },
+    Preroll { target_frame: Option<u64> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncCommandRequestEnvelope {
+    pub command_id: QgsQncCommandId,
+    pub session_id: Option<QgsQncSessionId>,
+    pub expected_generation: Option<QgsQncGeneration>,
+    pub command: QgsQncCommandKind,
+    pub payload: QgsQncCommandPayload,
+    pub client_tag: Option<String>,
+}
+
+impl QgsQncCommandRequestEnvelope {
+    pub fn new(command_id: impl Into<String>, command: QgsQncCommandKind) -> Self {
+        Self {
+            command_id: QgsQncCommandId::new(command_id),
+            session_id: None,
+            expected_generation: None,
+            command,
+            payload: QgsQncCommandPayload::Empty,
+            client_tag: None,
+        }
+    }
+
+    pub fn with_expected_generation(mut self, generation: QgsQncGeneration) -> Self {
+        self.expected_generation = Some(generation);
+        self
+    }
+
+    pub fn with_payload(mut self, payload: QgsQncCommandPayload) -> Self {
+        self.payload = payload;
+        self
+    }
+
+    pub fn exposes_private_path(&self) -> bool {
+        self.client_tag
+            .as_deref()
+            .is_some_and(qgs_projection_text_exposes_private_path)
+            || self
+                .session_id
+                .as_ref()
+                .is_some_and(|session| qgs_projection_text_exposes_private_path(&session.0))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsQncControlEvidenceLevel {
+    NotImplemented,
+    Prepared,
+    PayloadReady,
+    TestBoundaryEvidence,
+    NativePostSubmitEvidence,
+    ControlSurfaceEvidence,
+}
+
+impl QgsQncControlEvidenceLevel {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NotImplemented => "NotImplemented",
+            Self::Prepared => "Prepared",
+            Self::PayloadReady => "PayloadReady",
+            Self::TestBoundaryEvidence => "TestBoundaryEvidence",
+            Self::NativePostSubmitEvidence => "NativePostSubmitEvidence",
+            Self::ControlSurfaceEvidence => "QncControlSurfaceShapeEvidence",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncControlDeviceStatus {
+    pub device_policy: &'static str,
+    pub selected_video_backend: &'static str,
+    pub selected_audio_backend: &'static str,
+    pub qnc_os_display_target: &'static str,
+    pub x11_target_status: &'static str,
+    pub real_display_status: &'static str,
+    pub presenter_evidence_level: QgsQncControlEvidenceLevel,
+    pub audio_device_status: &'static str,
+    pub visual_verified: bool,
+    pub realtime_verified: bool,
+    pub audio_device_verified: bool,
+    pub av_sync_verified: bool,
+}
+
+impl QgsQncControlDeviceStatus {
+    pub fn from_player(status: &QgsBroadcastPlayerDeviceStatus) -> Self {
+        Self {
+            device_policy: status.selection.policy.label(),
+            selected_video_backend: status.selection.selected_video_backend.label(),
+            selected_audio_backend: status.selection.selected_audio_backend.label(),
+            qnc_os_display_target: status.qnc_os_display_target,
+            x11_target_status: status.x11_target,
+            real_display_status: status.real_display_backend,
+            presenter_evidence_level: QgsQncControlEvidenceLevel::NotImplemented,
+            audio_device_status: status.real_audio_backend,
+            visual_verified: status.visual_verified,
+            realtime_verified: status.realtime_verified,
+            audio_device_verified: status.audio_device_production_verified,
+            av_sync_verified: status.av_sync_verified,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncPreparedWindowView {
+    pub start_frame: Option<u64>,
+    pub end_frame_exclusive: Option<u64>,
+    pub selected_frame: Option<u64>,
+    pub prepared_frame_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncFaultRecord {
+    pub fault_kind: &'static str,
+    pub severity: &'static str,
+    pub scope: &'static str,
+    pub recoverable: bool,
+    pub recovery_action: &'static str,
+    pub command_id: Option<QgsQncCommandId>,
+    pub state_mutated: bool,
+    pub qnc_safe_code: &'static str,
+    pub qnc_safe_message: Option<&'static str>,
+    pub private_path_exposed: bool,
+}
+
+impl QgsQncFaultRecord {
+    pub fn from_operational_fault(
+        fault: &QgsOperationalFault,
+        command_id: Option<QgsQncCommandId>,
+        state_mutated: bool,
+    ) -> Self {
+        Self {
+            fault_kind: fault.kind.label(),
+            severity: fault.severity.label(),
+            scope: fault.scope.label(),
+            recoverable: fault.recoverable,
+            recovery_action: fault.recovery_action.label(),
+            command_id,
+            state_mutated,
+            qnc_safe_code: fault.qnc_safe_code,
+            qnc_safe_message: Some(fault.reason),
+            private_path_exposed: fault.exposes_private_path(),
+        }
+    }
+
+    pub fn exposes_private_path(&self) -> bool {
+        self.private_path_exposed
+            || self
+                .qnc_safe_message
+                .is_some_and(qgs_projection_text_exposes_private_path)
+            || self
+                .command_id
+                .as_ref()
+                .is_some_and(|command_id| qgs_projection_text_exposes_private_path(&command_id.0))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncRuntimeSnapshot {
+    pub generation: QgsQncGeneration,
+    pub status: QgsBroadcastPlayerStatus,
+    pub source_loaded: bool,
+    pub public_source_uri: Option<String>,
+    pub source_mode: Option<QgsInputPlanSourceMode>,
+    pub picture_representation: Option<QgsPlaybackRepresentation>,
+    pub authoritative_audio_source: &'static str,
+    pub proxy_aac_authoritative: bool,
+    pub broadcast_audio_model: &'static str,
+    pub active_range: Option<(u64, u64)>,
+    pub current_frame: Option<u64>,
+    pub current_audio_sample_range: Option<(u64, u64)>,
+    pub media_time: Option<Duration>,
+    pub prepared_window: Option<QgsQncPreparedWindowView>,
+    pub video_payload_ready: bool,
+    pub audio_payload_ready: bool,
+    pub buffer_status: &'static str,
+    pub device_status: QgsQncControlDeviceStatus,
+    pub active_faults: Vec<QgsQncFaultRecord>,
+    pub warnings: Vec<&'static str>,
+    pub private_path_exposed: bool,
+}
+
+impl QgsQncRuntimeSnapshot {
+    pub fn exposes_private_path(&self) -> bool {
+        self.private_path_exposed
+            || self
+                .public_source_uri
+                .as_deref()
+                .is_some_and(qgs_projection_text_exposes_private_path)
+            || self
+                .active_faults
+                .iter()
+                .any(QgsQncFaultRecord::exposes_private_path)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsQncControlEventKind {
+    SessionCreated,
+    SourceLoaded,
+    PreparedInputAccepted,
+    Cued,
+    PrerollReady,
+    Started,
+    Ticked,
+    Paused,
+    Seeked,
+    Stopped,
+    Unloaded,
+    CommandRejected,
+    FaultRecorded,
+    RecoverySuggested,
+    SnapshotReported,
+}
+
+impl QgsQncControlEventKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::SessionCreated => "SessionCreated",
+            Self::SourceLoaded => "SourceLoaded",
+            Self::PreparedInputAccepted => "PreparedInputAccepted",
+            Self::Cued => "Cued",
+            Self::PrerollReady => "PrerollReady",
+            Self::Started => "Started",
+            Self::Ticked => "Ticked",
+            Self::Paused => "Paused",
+            Self::Seeked => "Seeked",
+            Self::Stopped => "Stopped",
+            Self::Unloaded => "Unloaded",
+            Self::CommandRejected => "CommandRejected",
+            Self::FaultRecorded => "FaultRecorded",
+            Self::RecoverySuggested => "RecoverySuggested",
+            Self::SnapshotReported => "SnapshotReported",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncControlEventEnvelope {
+    pub sequence: u64,
+    pub generation: QgsQncGeneration,
+    pub event_kind: QgsQncControlEventKind,
+    pub command_id: Option<QgsQncCommandId>,
+    pub status: Option<QgsBroadcastPlayerStatus>,
+    pub frame: Option<u64>,
+    pub audio_sample_range: Option<(u64, u64)>,
+    pub prepared_window: Option<QgsQncPreparedWindowView>,
+    pub fault: Option<QgsQncFaultRecord>,
+    pub recovery_action: Option<&'static str>,
+    pub evidence_level: Option<QgsQncControlEvidenceLevel>,
+    pub private_path_exposed: bool,
+}
+
+impl QgsQncControlEventEnvelope {
+    pub fn exposes_private_path(&self) -> bool {
+        self.private_path_exposed
+            || self
+                .command_id
+                .as_ref()
+                .is_some_and(|command_id| qgs_projection_text_exposes_private_path(&command_id.0))
+            || self
+                .fault
+                .as_ref()
+                .is_some_and(QgsQncFaultRecord::exposes_private_path)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncCommandReplyEnvelope {
+    pub command_id: QgsQncCommandId,
+    pub accepted: bool,
+    pub generation_before: QgsQncGeneration,
+    pub generation_after: QgsQncGeneration,
+    pub status_before: QgsBroadcastPlayerStatus,
+    pub status_after: QgsBroadcastPlayerStatus,
+    pub state_mutated: bool,
+    pub rejection_reason: Option<&'static str>,
+    pub fault: Option<QgsQncFaultRecord>,
+    pub recovery_action: Option<&'static str>,
+    pub snapshot: QgsQncRuntimeSnapshot,
+    pub events: Vec<QgsQncControlEventEnvelope>,
+    pub private_path_exposed: bool,
+}
+
+impl QgsQncCommandReplyEnvelope {
+    pub fn exposes_private_path(&self) -> bool {
+        self.private_path_exposed
+            || qgs_projection_text_exposes_private_path(&self.command_id.0)
+            || self.snapshot.exposes_private_path()
+            || self
+                .events
+                .iter()
+                .any(QgsQncControlEventEnvelope::exposes_private_path)
+            || self
+                .fault
+                .as_ref()
+                .is_some_and(QgsQncFaultRecord::exposes_private_path)
+    }
+}
+
+pub struct QgsQncControlSurface {
+    runtime: QgsBroadcastPlayerOperationalRuntime,
+    session_id: QgsQncSessionId,
+    generation: QgsQncGeneration,
+    next_event_sequence: u64,
+    active_frame_count: u64,
+}
+
+impl QgsQncControlSurface {
+    pub fn from_assembly(
+        assembly: &QgsBroadcastPlayerAssembly,
+        session_id: impl Into<String>,
+    ) -> Result<Self, PlaybackError> {
+        Ok(Self {
+            runtime: assembly.new_operational_runtime()?,
+            session_id: QgsQncSessionId::new(session_id),
+            generation: QgsQncGeneration(0),
+            next_event_sequence: 1,
+            active_frame_count: assembly.active_frame_count(),
+        })
+    }
+
+    pub const fn generation(&self) -> QgsQncGeneration {
+        self.generation
+    }
+
+    pub fn session_id(&self) -> &QgsQncSessionId {
+        &self.session_id
+    }
+
+    pub fn snapshot(&self) -> QgsQncRuntimeSnapshot {
+        self.snapshot_from_operational(&self.runtime.snapshot(), Vec::new())
+    }
+
+    pub fn handle_command(
+        &mut self,
+        request: QgsQncCommandRequestEnvelope,
+    ) -> QgsQncCommandReplyEnvelope {
+        let generation_before = self.generation;
+        let status_before = self.runtime.snapshot().operational_status;
+        if let Some(expected) = request.expected_generation {
+            if expected != self.generation {
+                let fault = QgsOperationalFault::new(
+                    QgsOperationalFaultKind::StaleGeneration,
+                    "expected generation mismatch",
+                );
+                let projected_fault = QgsQncFaultRecord::from_operational_fault(
+                    &fault,
+                    Some(request.command_id.clone()),
+                    false,
+                );
+                let snapshot = self.snapshot_from_operational(
+                    &self.runtime.snapshot(),
+                    vec![projected_fault.clone()],
+                );
+                let event = self.event_from_snapshot(
+                    QgsQncControlEventKind::CommandRejected,
+                    Some(request.command_id.clone()),
+                    &snapshot,
+                    Some(projected_fault.clone()),
+                    Some(QgsQncControlEvidenceLevel::ControlSurfaceEvidence),
+                );
+                let private_path_exposed = snapshot.exposes_private_path()
+                    || event.exposes_private_path()
+                    || request.exposes_private_path();
+                return QgsQncCommandReplyEnvelope {
+                    command_id: request.command_id,
+                    accepted: false,
+                    generation_before,
+                    generation_after: generation_before,
+                    status_before,
+                    status_after: snapshot.status,
+                    state_mutated: false,
+                    rejection_reason: Some("StaleGeneration"),
+                    recovery_action: Some(fault.recovery_action.label()),
+                    fault: Some(projected_fault),
+                    private_path_exposed,
+                    snapshot,
+                    events: vec![event],
+                };
+            }
+        }
+
+        if matches!(request.command, QgsQncCommandKind::Snapshot) {
+            let snapshot = self.snapshot();
+            let event = self.event_from_snapshot(
+                QgsQncControlEventKind::SnapshotReported,
+                Some(request.command_id.clone()),
+                &snapshot,
+                None,
+                Some(QgsQncControlEvidenceLevel::ControlSurfaceEvidence),
+            );
+            let private_path_exposed = snapshot.exposes_private_path()
+                || event.exposes_private_path()
+                || request.exposes_private_path();
+            return QgsQncCommandReplyEnvelope {
+                command_id: request.command_id,
+                accepted: true,
+                generation_before,
+                generation_after: generation_before,
+                status_before,
+                status_after: snapshot.status,
+                state_mutated: false,
+                rejection_reason: None,
+                fault: None,
+                recovery_action: None,
+                private_path_exposed,
+                snapshot,
+                events: vec![event],
+            };
+        }
+
+        let before_public = self.runtime.snapshot();
+        let execution = self.execute_control_command(&request);
+        let accepted = execution.accepted;
+        if accepted && request.command.is_mutating() {
+            self.generation = QgsQncGeneration(self.generation.0.saturating_add(1));
+        }
+        let generation_after = self.generation;
+        let mut faults = Vec::new();
+        let mut projected_fault = None;
+        let mut recovery_action = None;
+        if !accepted {
+            let fault = QgsOperationalFault::new(
+                self.fault_kind_for_rejection(request.command),
+                execution.reason.unwrap_or("command rejected"),
+            );
+            let record = QgsQncFaultRecord::from_operational_fault(
+                &fault,
+                Some(request.command_id.clone()),
+                false,
+            );
+            recovery_action = Some(fault.recovery_action.label());
+            projected_fault = Some(record.clone());
+            faults.push(record);
+        }
+        let snapshot = self.snapshot_from_operational(&self.runtime.snapshot(), faults);
+        let state_mutated = accepted && before_public != self.runtime.snapshot();
+        let mut events = Vec::new();
+        for kind in execution.event_kinds {
+            events.push(self.event_from_snapshot(
+                kind,
+                Some(request.command_id.clone()),
+                &snapshot,
+                None,
+                Some(QgsQncControlEvidenceLevel::ControlSurfaceEvidence),
+            ));
+        }
+        for tick_snapshot in execution.tick_snapshots {
+            events.push(self.event_from_snapshot(
+                QgsQncControlEventKind::Ticked,
+                Some(request.command_id.clone()),
+                &self.snapshot_from_operational(&tick_snapshot, Vec::new()),
+                None,
+                Some(QgsQncControlEvidenceLevel::Prepared),
+            ));
+        }
+        if let Some(fault) = &projected_fault {
+            events.push(self.event_from_snapshot(
+                QgsQncControlEventKind::CommandRejected,
+                Some(request.command_id.clone()),
+                &snapshot,
+                Some(fault.clone()),
+                Some(QgsQncControlEvidenceLevel::ControlSurfaceEvidence),
+            ));
+            events.push(self.event_from_snapshot(
+                QgsQncControlEventKind::FaultRecorded,
+                Some(request.command_id.clone()),
+                &snapshot,
+                Some(fault.clone()),
+                Some(QgsQncControlEvidenceLevel::ControlSurfaceEvidence),
+            ));
+            events.push(self.event_from_snapshot(
+                QgsQncControlEventKind::RecoverySuggested,
+                Some(request.command_id.clone()),
+                &snapshot,
+                Some(fault.clone()),
+                Some(QgsQncControlEvidenceLevel::ControlSurfaceEvidence),
+            ));
+        }
+        let private_path_exposed = request.exposes_private_path()
+            || snapshot.exposes_private_path()
+            || events
+                .iter()
+                .any(QgsQncControlEventEnvelope::exposes_private_path)
+            || projected_fault
+                .as_ref()
+                .is_some_and(QgsQncFaultRecord::exposes_private_path);
+        QgsQncCommandReplyEnvelope {
+            command_id: request.command_id,
+            accepted,
+            generation_before,
+            generation_after,
+            status_before,
+            status_after: snapshot.status,
+            state_mutated,
+            rejection_reason: execution.reason,
+            fault: projected_fault,
+            recovery_action,
+            snapshot,
+            events,
+            private_path_exposed,
+        }
+    }
+
+    fn execute_control_command(
+        &mut self,
+        request: &QgsQncCommandRequestEnvelope,
+    ) -> QgsQncControlExecution {
+        match request.command {
+            QgsQncCommandKind::LoadPreparedInput => self.execute_single(
+                QgsBroadcastPlayerCommand::LoadPreparedInput,
+                QgsQncControlEventKind::SourceLoaded,
+            ),
+            QgsQncCommandKind::Prepare => self.execute_single(
+                QgsBroadcastPlayerCommand::Prepare {
+                    active_range: Some((0, self.active_frame_count)),
+                },
+                QgsQncControlEventKind::PreparedInputAccepted,
+            ),
+            QgsQncCommandKind::Cue => match request.payload {
+                QgsQncCommandPayload::Frame { frame } => self.execute_single(
+                    QgsBroadcastPlayerCommand::Cue { frame },
+                    QgsQncControlEventKind::Cued,
+                ),
+                _ => QgsQncControlExecution::rejected("cue requires frame payload"),
+            },
+            QgsQncCommandKind::Preroll => {
+                let mut execution = QgsQncControlExecution::default();
+                if self.runtime.snapshot().operational_status == QgsBroadcastPlayerStatus::Paused {
+                    let prepare = self.runtime.execute(QgsBroadcastPlayerCommand::Prepare {
+                        active_range: Some((0, self.active_frame_count)),
+                    });
+                    if !prepare.accepted {
+                        return QgsQncControlExecution::from_result(
+                            prepare,
+                            QgsQncControlEventKind::CommandRejected,
+                        );
+                    }
+                }
+                let target = match request.payload {
+                    QgsQncCommandPayload::Preroll { target_frame } => target_frame.unwrap_or(0),
+                    _ => 0,
+                };
+                let tick = self.runtime.execute(QgsBroadcastPlayerCommand::Tick {
+                    carrier_frame: target,
+                });
+                execution.accepted = tick.accepted;
+                execution.reason = tick.reason;
+                execution.event_kinds.push(if tick.accepted {
+                    QgsQncControlEventKind::PrerollReady
+                } else {
+                    QgsQncControlEventKind::CommandRejected
+                });
+                execution
+            }
+            QgsQncCommandKind::Play => {
+                let mut execution = QgsQncControlExecution::default();
+                if self.runtime.snapshot().operational_status != QgsBroadcastPlayerStatus::Playing {
+                    let play = self.runtime.execute(QgsBroadcastPlayerCommand::Play);
+                    if !play.accepted {
+                        return QgsQncControlExecution::from_result(
+                            play,
+                            QgsQncControlEventKind::CommandRejected,
+                        );
+                    }
+                    execution.event_kinds.push(QgsQncControlEventKind::Started);
+                }
+                execution.accepted = true;
+                let frame_count = match request.payload {
+                    QgsQncCommandPayload::Play { frame_count } => frame_count.unwrap_or(0),
+                    _ => 0,
+                };
+                for _ in 0..frame_count {
+                    execution.tick_snapshots.push(self.runtime.snapshot());
+                    let tick = self
+                        .runtime
+                        .execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 });
+                    if !tick.accepted {
+                        execution.accepted = false;
+                        execution.reason = tick.reason;
+                        return execution;
+                    }
+                }
+                execution
+            }
+            QgsQncCommandKind::Pause => self.execute_single(
+                QgsBroadcastPlayerCommand::Pause,
+                QgsQncControlEventKind::Paused,
+            ),
+            QgsQncCommandKind::Seek => match request.payload {
+                QgsQncCommandPayload::Frame { frame } => self.execute_single(
+                    QgsBroadcastPlayerCommand::Seek { frame },
+                    QgsQncControlEventKind::Seeked,
+                ),
+                _ => QgsQncControlExecution::rejected("seek requires frame payload"),
+            },
+            QgsQncCommandKind::Stop => self.execute_single(
+                QgsBroadcastPlayerCommand::Stop,
+                QgsQncControlEventKind::Stopped,
+            ),
+            QgsQncCommandKind::Unload => self.execute_single(
+                QgsBroadcastPlayerCommand::Unload,
+                QgsQncControlEventKind::Unloaded,
+            ),
+            QgsQncCommandKind::Snapshot => unreachable!("snapshot handled before execution"),
+        }
+    }
+
+    fn execute_single(
+        &mut self,
+        command: QgsBroadcastPlayerCommand,
+        kind: QgsQncControlEventKind,
+    ) -> QgsQncControlExecution {
+        let result = self.runtime.execute(command);
+        QgsQncControlExecution::from_result(result, kind)
+    }
+
+    const fn fault_kind_for_rejection(
+        &self,
+        command: QgsQncCommandKind,
+    ) -> QgsOperationalFaultKind {
+        match command {
+            QgsQncCommandKind::Play => QgsOperationalFaultKind::PrepareRequired,
+            QgsQncCommandKind::Cue => QgsOperationalFaultKind::CueOutsideActiveRange,
+            QgsQncCommandKind::Seek => QgsOperationalFaultKind::SeekOutsideActiveRange,
+            QgsQncCommandKind::LoadPreparedInput
+            | QgsQncCommandKind::Prepare
+            | QgsQncCommandKind::Preroll
+            | QgsQncCommandKind::Pause
+            | QgsQncCommandKind::Stop
+            | QgsQncCommandKind::Unload
+            | QgsQncCommandKind::Snapshot => QgsOperationalFaultKind::IllegalCommandForState,
+        }
+    }
+
+    fn event_from_snapshot(
+        &mut self,
+        event_kind: QgsQncControlEventKind,
+        command_id: Option<QgsQncCommandId>,
+        snapshot: &QgsQncRuntimeSnapshot,
+        fault: Option<QgsQncFaultRecord>,
+        evidence_level: Option<QgsQncControlEvidenceLevel>,
+    ) -> QgsQncControlEventEnvelope {
+        let sequence = self.next_event_sequence;
+        self.next_event_sequence = self.next_event_sequence.saturating_add(1);
+        QgsQncControlEventEnvelope {
+            sequence,
+            generation: self.generation,
+            event_kind,
+            command_id,
+            status: Some(snapshot.status),
+            frame: snapshot.current_frame,
+            audio_sample_range: snapshot.current_audio_sample_range,
+            prepared_window: snapshot.prepared_window.clone(),
+            recovery_action: fault.as_ref().map(|fault| fault.recovery_action),
+            private_path_exposed: snapshot.private_path_exposed
+                || fault
+                    .as_ref()
+                    .is_some_and(QgsQncFaultRecord::exposes_private_path),
+            fault,
+            evidence_level,
+        }
+    }
+
+    fn snapshot_from_operational(
+        &self,
+        runtime: &QgsOperationalRuntimeSnapshot,
+        active_faults: Vec<QgsQncFaultRecord>,
+    ) -> QgsQncRuntimeSnapshot {
+        let player = &runtime.player;
+        let prepared_window = player
+            .prepared_window
+            .prepared_start_frame
+            .or(player.prepared_window.prepared_end_frame_exclusive)
+            .or(player.prepared_window.selected_prepared_frame)
+            .map(|_| QgsQncPreparedWindowView {
+                start_frame: player.prepared_window.prepared_start_frame,
+                end_frame_exclusive: player.prepared_window.prepared_end_frame_exclusive,
+                selected_frame: player.prepared_window.selected_prepared_frame,
+                prepared_frame_count: player.prepared_window.prepared_frame_count,
+            });
+        let active_range = player
+            .position
+            .active_range
+            .map(|range| (range.start_frame, range.end_frame));
+        let buffer_status = if player.prepared_window.prepared_frame_count > 0 {
+            "ready"
+        } else {
+            "empty"
+        };
+        let warnings = [
+            (!player.device_status.selection.real_display_ready)
+                .then_some("real display backend not implemented"),
+            (!player.device_status.selection.real_audio_backend_ready)
+                .then_some("production audio backend not verified"),
+            (!player.device_status.visual_verified).then_some("visual verification not claimed"),
+            (!player.device_status.realtime_verified)
+                .then_some("realtime verification not claimed"),
+            (!player.device_status.av_sync_verified).then_some("A/V sync verification not claimed"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let private_path_exposed = player.exposes_private_path()
+            || active_faults
+                .iter()
+                .any(QgsQncFaultRecord::exposes_private_path);
+        QgsQncRuntimeSnapshot {
+            generation: self.generation,
+            status: runtime.operational_status,
+            source_loaded: player.readiness.source_loaded,
+            public_source_uri: player.public_source_uri.clone(),
+            source_mode: Some(player.source_mode),
+            picture_representation: Some(player.selected_representation),
+            authoritative_audio_source: "original MXF",
+            proxy_aac_authoritative: player.readiness.proxy_aac_authoritative,
+            broadcast_audio_model: if player.readiness.discrete_mono_audio {
+                "discrete original MXF mono lanes"
+            } else {
+                "unknown"
+            },
+            active_range,
+            current_frame: runtime.current_frame,
+            current_audio_sample_range: runtime.current_audio_sample_range,
+            media_time: None,
+            prepared_window,
+            video_payload_ready: player.readiness.video_payload_ready,
+            audio_payload_ready: player.readiness.audio_payload_ready,
+            buffer_status,
+            device_status: QgsQncControlDeviceStatus::from_player(&player.device_status),
+            active_faults,
+            warnings,
+            private_path_exposed,
+        }
+    }
+}
+
+#[derive(Default)]
+struct QgsQncControlExecution {
+    accepted: bool,
+    reason: Option<&'static str>,
+    event_kinds: Vec<QgsQncControlEventKind>,
+    tick_snapshots: Vec<QgsOperationalRuntimeSnapshot>,
+}
+
+impl QgsQncControlExecution {
+    fn rejected(reason: &'static str) -> Self {
+        Self {
+            accepted: false,
+            reason: Some(reason),
+            event_kinds: vec![QgsQncControlEventKind::CommandRejected],
+            tick_snapshots: Vec::new(),
+        }
+    }
+
+    fn from_result(result: QgsOperationalTickResult, success_kind: QgsQncControlEventKind) -> Self {
+        Self {
+            accepted: result.accepted,
+            reason: result.reason,
+            event_kinds: vec![if result.accepted {
+                success_kind
+            } else {
+                QgsQncControlEventKind::CommandRejected
+            }],
+            tick_snapshots: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QgsOperationalRuntimeConfig {
     pub tick_frame_step: u64,
@@ -11139,6 +11956,235 @@ mod tests {
             .events()
             .iter()
             .all(|event| !event.exposes_private_path()));
+    }
+
+    fn qgs_test_control_surface() -> QgsQncControlSurface {
+        let assembly =
+            QgsBroadcastPlayerAssembly::from_input_plan(sample_qgs_input_plan()).unwrap();
+        QgsQncControlSurface::from_assembly(&assembly, "test-session").unwrap()
+    }
+
+    fn qgs_control_request(
+        id: &str,
+        surface: &QgsQncControlSurface,
+        command: QgsQncCommandKind,
+        payload: QgsQncCommandPayload,
+    ) -> QgsQncCommandRequestEnvelope {
+        QgsQncCommandRequestEnvelope::new(id, command)
+            .with_expected_generation(surface.generation())
+            .with_payload(payload)
+    }
+
+    #[test]
+    fn qgs_qnc_control_surface_echoes_command_id_and_increments_generation() {
+        let mut surface = qgs_test_control_surface();
+        let request = qgs_control_request(
+            "cmd-0001",
+            &surface,
+            QgsQncCommandKind::LoadPreparedInput,
+            QgsQncCommandPayload::Empty,
+        );
+        let reply = surface.handle_command(request);
+        assert!(reply.accepted);
+        assert_eq!(reply.command_id.0, "cmd-0001");
+        assert_eq!(reply.generation_before, QgsQncGeneration(0));
+        assert_eq!(reply.generation_after, QgsQncGeneration(1));
+        assert_eq!(surface.generation(), QgsQncGeneration(1));
+        assert!(reply.state_mutated);
+        assert!(reply
+            .events
+            .iter()
+            .any(|event| event.event_kind == QgsQncControlEventKind::SourceLoaded));
+        assert!(!reply.exposes_private_path());
+    }
+
+    #[test]
+    fn qgs_qnc_control_surface_snapshot_does_not_increment_generation() {
+        let mut surface = qgs_test_control_surface();
+        let request = qgs_control_request(
+            "cmd-snapshot",
+            &surface,
+            QgsQncCommandKind::Snapshot,
+            QgsQncCommandPayload::Empty,
+        );
+        let reply = surface.handle_command(request);
+        assert!(reply.accepted);
+        assert_eq!(reply.generation_before, QgsQncGeneration(0));
+        assert_eq!(reply.generation_after, QgsQncGeneration(0));
+        assert!(!reply.state_mutated);
+        assert!(reply
+            .events
+            .iter()
+            .any(|event| event.event_kind == QgsQncControlEventKind::SnapshotReported));
+    }
+
+    #[test]
+    fn qgs_qnc_control_surface_rejects_stale_generation_without_mutation() {
+        let mut surface = qgs_test_control_surface();
+        let before = surface.snapshot();
+        let reply = surface.handle_command(
+            QgsQncCommandRequestEnvelope::new("cmd-stale", QgsQncCommandKind::LoadPreparedInput)
+                .with_expected_generation(QgsQncGeneration(99)),
+        );
+        assert!(!reply.accepted);
+        assert_eq!(reply.rejection_reason, Some("StaleGeneration"));
+        assert_eq!(reply.generation_before, QgsQncGeneration(0));
+        assert_eq!(reply.generation_after, QgsQncGeneration(0));
+        assert!(!reply.state_mutated);
+        assert_eq!(reply.snapshot.status, before.status);
+        assert_eq!(reply.snapshot.source_loaded, before.source_loaded);
+        assert_eq!(reply.snapshot.current_frame, before.current_frame);
+        assert!(reply.fault.is_some());
+        assert!(reply
+            .events
+            .iter()
+            .any(|event| event.event_kind == QgsQncControlEventKind::CommandRejected));
+        assert!(!reply.exposes_private_path());
+    }
+
+    #[test]
+    fn qgs_qnc_control_surface_snapshot_preserves_source_and_device_truth() {
+        let mut surface = qgs_test_control_surface();
+        for (id, command, payload) in [
+            (
+                "cmd-load",
+                QgsQncCommandKind::LoadPreparedInput,
+                QgsQncCommandPayload::Empty,
+            ),
+            (
+                "cmd-prepare",
+                QgsQncCommandKind::Prepare,
+                QgsQncCommandPayload::Empty,
+            ),
+            (
+                "cmd-cue",
+                QgsQncCommandKind::Cue,
+                QgsQncCommandPayload::Frame { frame: 0 },
+            ),
+            (
+                "cmd-preroll",
+                QgsQncCommandKind::Preroll,
+                QgsQncCommandPayload::Preroll { target_frame: None },
+            ),
+        ] {
+            let request = qgs_control_request(id, &surface, command, payload);
+            assert!(surface.handle_command(request).accepted);
+        }
+        let snapshot = surface.snapshot();
+        assert_eq!(
+            snapshot.source_mode,
+            Some(QgsInputPlanSourceMode::ProxyPreview)
+        );
+        assert_eq!(
+            snapshot.picture_representation,
+            Some(QgsPlaybackRepresentation::Proxy)
+        );
+        assert_eq!(snapshot.authoritative_audio_source, "original MXF");
+        assert!(!snapshot.proxy_aac_authoritative);
+        assert_eq!(
+            snapshot.broadcast_audio_model,
+            "discrete original MXF mono lanes"
+        );
+        assert_eq!(
+            snapshot.device_status.qnc_os_display_target,
+            "Wayland + Vulkan"
+        );
+        assert_eq!(
+            snapshot.device_status.x11_target_status,
+            "no / legacy non-target"
+        );
+        assert!(!snapshot.device_status.visual_verified);
+        assert!(!snapshot.device_status.realtime_verified);
+        assert!(!snapshot.device_status.audio_device_verified);
+        assert!(!snapshot.device_status.av_sync_verified);
+        assert!(!snapshot.exposes_private_path());
+    }
+
+    #[test]
+    fn qgs_qnc_control_surface_rejected_command_returns_snapshot_and_fault() {
+        let mut surface = qgs_test_control_surface();
+        let request = qgs_control_request(
+            "cmd-play",
+            &surface,
+            QgsQncCommandKind::Play,
+            QgsQncCommandPayload::Play {
+                frame_count: Some(1),
+            },
+        );
+        let reply = surface.handle_command(request);
+        assert!(!reply.accepted);
+        assert_eq!(reply.generation_before, reply.generation_after);
+        assert_eq!(reply.snapshot.status, QgsBroadcastPlayerStatus::Empty);
+        let fault = reply.fault.as_ref().expect("fault record");
+        assert_eq!(fault.fault_kind, "PrepareRequired");
+        assert_eq!(fault.command_id.as_ref().unwrap().0, "cmd-play");
+        assert!(!fault.exposes_private_path());
+        assert!(reply
+            .events
+            .iter()
+            .all(|event| event.event_kind != QgsQncControlEventKind::Started));
+        let debug = format!("{reply:?}");
+        assert!(!debug.contains("FramePresented"));
+        assert!(!debug.contains("AudioDeviceVerified"));
+    }
+
+    #[test]
+    fn qgs_qnc_control_surface_default_sequence_projects_events() {
+        let mut surface = qgs_test_control_surface();
+        let sequence = [
+            (
+                QgsQncCommandKind::LoadPreparedInput,
+                QgsQncCommandPayload::Empty,
+            ),
+            (QgsQncCommandKind::Prepare, QgsQncCommandPayload::Empty),
+            (
+                QgsQncCommandKind::Cue,
+                QgsQncCommandPayload::Frame { frame: 0 },
+            ),
+            (
+                QgsQncCommandKind::Preroll,
+                QgsQncCommandPayload::Preroll { target_frame: None },
+            ),
+            (
+                QgsQncCommandKind::Play,
+                QgsQncCommandPayload::Play {
+                    frame_count: Some(3),
+                },
+            ),
+            (QgsQncCommandKind::Pause, QgsQncCommandPayload::Empty),
+            (
+                QgsQncCommandKind::Seek,
+                QgsQncCommandPayload::Frame { frame: 4 },
+            ),
+            (
+                QgsQncCommandKind::Preroll,
+                QgsQncCommandPayload::Preroll { target_frame: None },
+            ),
+            (
+                QgsQncCommandKind::Play,
+                QgsQncCommandPayload::Play {
+                    frame_count: Some(2),
+                },
+            ),
+            (QgsQncCommandKind::Stop, QgsQncCommandPayload::Empty),
+            (QgsQncCommandKind::Unload, QgsQncCommandPayload::Empty),
+        ];
+        let mut event_sequences = Vec::new();
+        for (index, (command, payload)) in sequence.into_iter().enumerate() {
+            let request =
+                qgs_control_request(&format!("cmd-{index:04}"), &surface, command, payload);
+            let reply = surface.handle_command(request);
+            assert!(reply.accepted, "{reply:?}");
+            event_sequences.extend(reply.events.iter().map(|event| event.sequence));
+            assert!(!reply.private_path_exposed);
+        }
+        assert!(event_sequences
+            .windows(2)
+            .all(|window| window[0] < window[1]));
+        let snapshot = surface.snapshot();
+        assert_eq!(snapshot.status, QgsBroadcastPlayerStatus::Empty);
+        assert!(!snapshot.source_loaded);
+        assert!(!snapshot.private_path_exposed);
     }
 
     #[test]
