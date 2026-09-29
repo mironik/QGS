@@ -2,9 +2,10 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use qgs_audio_pipewire::{
@@ -4795,6 +4796,56 @@ impl Default for QgsBroadcastPlayerLiveOptions {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum QgsBroadcastPlayerLiveInputCommand {
+    Pause,
+    Resume,
+    Seek(u64),
+    Status,
+    Quit,
+    Help,
+    Stop,
+    Unload,
+    Invalid(String),
+    Noop,
+}
+
+impl QgsBroadcastPlayerLiveInputCommand {
+    fn parse(line: &str) -> Self {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Self::Noop;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let Some(command) = parts.next() else {
+            return Self::Noop;
+        };
+        let command = command.to_ascii_lowercase();
+        match command.as_str() {
+            "p" | "pause" => Self::Pause,
+            "r" | "resume" | "play" => Self::Resume,
+            "status" => Self::Status,
+            "q" | "quit" => Self::Quit,
+            "help" | "?" => Self::Help,
+            "stop" => Self::Stop,
+            "unload" => Self::Unload,
+            "s" | "seek" => {
+                let Some(frame) = parts.next() else {
+                    return Self::Invalid("seek requires a frame number".to_string());
+                };
+                if parts.next().is_some() {
+                    return Self::Invalid("seek accepts one frame number".to_string());
+                }
+                match frame.parse::<u64>() {
+                    Ok(frame) => Self::Seek(frame),
+                    Err(_) => Self::Invalid(format!("invalid seek frame: {frame}")),
+                }
+            }
+            _ => Self::Invalid(format!("unknown live control: {trimmed}")),
+        }
+    }
+}
+
 fn qgs_broadcast_player_run_report(
     original_path: &Path,
     proxy_path: &Path,
@@ -5118,6 +5169,8 @@ fn qgs_broadcast_player_live_report(
     let mut rejected = 0_u64;
     let mut projected_events = 0_u64;
     let mut command_ordinal = 0_u64;
+    let input_rx = qgs_live_spawn_input_thread(!options.no_interactive);
+    let interactive_enabled = input_rx.is_some();
 
     match options.view {
         QgsBroadcastPlayerRunView::Compact => {
@@ -5126,6 +5179,9 @@ fn qgs_broadcast_player_live_report(
         QgsBroadcastPlayerRunView::Detailed => {
             print_broadcast_player_live_detailed_header(&assembly, options, run_limit)
         }
+    }
+    if interactive_enabled {
+        print_broadcast_player_live_controls();
     }
 
     let load = qgs_live_send(
@@ -5210,6 +5266,7 @@ fn qgs_broadcast_player_live_report(
         QgsQncCommandPayload::Play { frame_count: None },
     );
     qgs_live_count_reply(&play, &mut accepted, &mut rejected, &mut projected_events);
+    let mut live_ticking = play.accepted;
     match options.view {
         QgsBroadcastPlayerRunView::Compact => {
             println!("PLAY     status={:?}", play.snapshot.status)
@@ -5223,6 +5280,31 @@ fn qgs_broadcast_player_live_report(
     let mut stop_reason = "end-of-range";
     let mut scripted_seek_done = false;
     while processed < run_limit {
+        if let Some(rx) = &input_rx {
+            let mut should_exit = None;
+            while let Ok(line) = rx.try_recv() {
+                if let Some(reason) = qgs_live_process_input_command(
+                    &line,
+                    &mut surface,
+                    source_timebase,
+                    active_frames,
+                    options.view,
+                    &mut live_ticking,
+                    &mut command_ordinal,
+                    &mut accepted,
+                    &mut rejected,
+                    &mut projected_events,
+                ) {
+                    should_exit = Some(reason);
+                    break;
+                }
+            }
+            if let Some(reason) = should_exit {
+                stop_reason = reason;
+                break;
+            }
+        }
+
         let snapshot = surface.snapshot();
         if processed == 0 || processed % status_every == 0 {
             match options.view {
@@ -5237,7 +5319,7 @@ fn qgs_broadcast_player_live_report(
         }
 
         if let Some(seek_frame) = options.seek_frame {
-            if !scripted_seek_done && processed >= status_every {
+            if live_ticking && !scripted_seek_done && processed >= status_every {
                 scripted_seek_done = true;
                 let target = seek_frame.min(active_frames - 1);
                 let pause = qgs_live_send(
@@ -5254,6 +5336,18 @@ fn qgs_broadcast_player_live_report(
                     QgsQncCommandPayload::Frame { frame: target },
                 );
                 qgs_live_count_reply(&seek, &mut accepted, &mut rejected, &mut projected_events);
+                let prepare_after_seek = qgs_live_send(
+                    &mut surface,
+                    &mut command_ordinal,
+                    QgsQncCommandKind::Prepare,
+                    QgsQncCommandPayload::Empty,
+                );
+                qgs_live_count_reply(
+                    &prepare_after_seek,
+                    &mut accepted,
+                    &mut rejected,
+                    &mut projected_events,
+                );
                 let preroll_after_seek = qgs_live_send(
                     &mut surface,
                     &mut command_ordinal,
@@ -5275,6 +5369,7 @@ fn qgs_broadcast_player_live_report(
                     QgsQncCommandPayload::Play { frame_count: None },
                 );
                 qgs_live_count_reply(&resume, &mut accepted, &mut rejected, &mut projected_events);
+                live_ticking = resume.accepted;
                 match options.view {
                     QgsBroadcastPlayerRunView::Compact => {
                         println!(
@@ -5294,11 +5389,17 @@ fn qgs_broadcast_player_live_report(
                     QgsBroadcastPlayerRunView::Detailed => {
                         print_qgs_live_reply("[PAUSE FOR SCRIPTED SEEK]", &pause);
                         print_qgs_live_reply("[SEEK]", &seek);
+                        print_qgs_live_reply("[PREPARE AFTER SCRIPTED SEEK]", &prepare_after_seek);
                         print_qgs_live_reply("[PREROLL AFTER SEEK]", &preroll_after_seek);
                         print_qgs_live_reply("[RESUME]", &resume);
                     }
                 }
             }
+        }
+
+        if !live_ticking {
+            qgs_live_sleep_for_input(options, frame_duration, interactive_enabled);
+            continue;
         }
 
         let tick = qgs_live_send(
@@ -5327,9 +5428,7 @@ fn qgs_broadcast_player_live_report(
             stop_reason = "max-frames";
             break;
         }
-        if options.pace == QgsBroadcastPlayerLivePace::Wall {
-            std::thread::sleep(frame_duration);
-        }
+        qgs_live_sleep_for_input(options, frame_duration, interactive_enabled);
     }
 
     let stop = qgs_live_send(
@@ -5373,7 +5472,7 @@ fn qgs_broadcast_player_live_report(
         "last frame: {}",
         qgs_optional_u64_label(stop.snapshot.current_frame)
     );
-    println!("run result: completed");
+    println!("run result: {}", qgs_live_run_result_label(stop_reason));
     println!("stop reason: {stop_reason}");
     println!("commands accepted: {accepted}");
     println!("commands rejected: {rejected}");
@@ -5405,6 +5504,260 @@ fn qgs_broadcast_player_live_report(
     println!("FramePresented real display claim: no");
 
     Ok(())
+}
+
+fn qgs_live_spawn_input_thread(enabled: bool) -> Option<mpsc::Receiver<String>> {
+    if !enabled {
+        return None;
+    }
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    Some(rx)
+}
+
+fn qgs_live_process_input_command(
+    line: &str,
+    surface: &mut QgsQncControlSurface,
+    source_timebase: RationalRate,
+    active_frames: u64,
+    view: QgsBroadcastPlayerRunView,
+    live_ticking: &mut bool,
+    command_ordinal: &mut u64,
+    accepted: &mut u64,
+    rejected: &mut u64,
+    projected_events: &mut u64,
+) -> Option<&'static str> {
+    let parsed = QgsBroadcastPlayerLiveInputCommand::parse(line);
+    if !matches!(parsed, QgsBroadcastPlayerLiveInputCommand::Noop) {
+        println!("> {}", line.trim());
+    }
+    match parsed {
+        QgsBroadcastPlayerLiveInputCommand::Pause => {
+            let reply = qgs_live_send(
+                surface,
+                command_ordinal,
+                QgsQncCommandKind::Pause,
+                QgsQncCommandPayload::Empty,
+            );
+            qgs_live_count_reply(&reply, accepted, rejected, projected_events);
+            if reply.accepted {
+                *live_ticking = false;
+            }
+            qgs_live_print_control_reply("PAUSE", &reply, view, source_timebase);
+        }
+        QgsBroadcastPlayerLiveInputCommand::Resume => {
+            let reply = qgs_live_send(
+                surface,
+                command_ordinal,
+                QgsQncCommandKind::Play,
+                QgsQncCommandPayload::Play { frame_count: None },
+            );
+            qgs_live_count_reply(&reply, accepted, rejected, projected_events);
+            if reply.accepted {
+                *live_ticking = true;
+            }
+            qgs_live_print_control_reply("PLAY", &reply, view, source_timebase);
+        }
+        QgsBroadcastPlayerLiveInputCommand::Seek(frame) => {
+            let target = frame.min(active_frames.saturating_sub(1));
+            let was_ticking = *live_ticking;
+            let before = surface.snapshot();
+            if was_ticking {
+                let pause = qgs_live_send(
+                    surface,
+                    command_ordinal,
+                    QgsQncCommandKind::Pause,
+                    QgsQncCommandPayload::Empty,
+                );
+                qgs_live_count_reply(&pause, accepted, rejected, projected_events);
+                if view == QgsBroadcastPlayerRunView::Detailed {
+                    print_qgs_live_reply("[PAUSE FOR INTERACTIVE SEEK]", &pause);
+                }
+            }
+            let seek = qgs_live_send(
+                surface,
+                command_ordinal,
+                QgsQncCommandKind::Seek,
+                QgsQncCommandPayload::Frame { frame: target },
+            );
+            qgs_live_count_reply(&seek, accepted, rejected, projected_events);
+            let prepare = qgs_live_send(
+                surface,
+                command_ordinal,
+                QgsQncCommandKind::Prepare,
+                QgsQncCommandPayload::Empty,
+            );
+            qgs_live_count_reply(&prepare, accepted, rejected, projected_events);
+            let preroll = qgs_live_send(
+                surface,
+                command_ordinal,
+                QgsQncCommandKind::Preroll,
+                QgsQncCommandPayload::Preroll {
+                    target_frame: Some(target),
+                },
+            );
+            qgs_live_count_reply(&preroll, accepted, rejected, projected_events);
+            let resume = if was_ticking {
+                let reply = qgs_live_send(
+                    surface,
+                    command_ordinal,
+                    QgsQncCommandKind::Play,
+                    QgsQncCommandPayload::Play { frame_count: None },
+                );
+                qgs_live_count_reply(&reply, accepted, rejected, projected_events);
+                *live_ticking = reply.accepted;
+                Some(reply)
+            } else {
+                *live_ticking = false;
+                None
+            };
+            match view {
+                QgsBroadcastPlayerRunView::Compact => {
+                    println!(
+                        "SEEK     {} -> {} audio={}",
+                        qgs_optional_u64_label(before.current_frame),
+                        qgs_optional_u64_label(seek.snapshot.current_frame),
+                        qgs_optional_sample_range_label(seek.snapshot.current_audio_sample_range)
+                    );
+                    print_broadcast_player_live_compact_preroll("PREROLL", &preroll.snapshot);
+                    if let Some(resume) = &resume {
+                        println!("PLAY     status={:?}", resume.snapshot.status);
+                    } else {
+                        println!("PAUSED   awaiting play/resume");
+                    }
+                }
+                QgsBroadcastPlayerRunView::Detailed => {
+                    print_qgs_live_reply("[SEEK]", &seek);
+                    print_qgs_live_reply("[PREPARE AFTER INTERACTIVE SEEK]", &prepare);
+                    print_qgs_live_reply("[PREROLL AFTER INTERACTIVE SEEK]", &preroll);
+                    if let Some(resume) = &resume {
+                        print_qgs_live_reply("[RESUME AFTER INTERACTIVE SEEK]", resume);
+                    }
+                }
+            }
+        }
+        QgsBroadcastPlayerLiveInputCommand::Status => {
+            let reply = qgs_live_send(
+                surface,
+                command_ordinal,
+                QgsQncCommandKind::Snapshot,
+                QgsQncCommandPayload::Empty,
+            );
+            qgs_live_count_reply(&reply, accepted, rejected, projected_events);
+            qgs_live_print_control_reply("STATUS", &reply, view, source_timebase);
+        }
+        QgsBroadcastPlayerLiveInputCommand::Quit => {
+            println!("QUIT     requested");
+            return Some("user-quit");
+        }
+        QgsBroadcastPlayerLiveInputCommand::Help => print_broadcast_player_live_controls(),
+        QgsBroadcastPlayerLiveInputCommand::Stop => {
+            let reply = qgs_live_send(
+                surface,
+                command_ordinal,
+                QgsQncCommandKind::Stop,
+                QgsQncCommandPayload::Empty,
+            );
+            qgs_live_count_reply(&reply, accepted, rejected, projected_events);
+            if reply.accepted {
+                *live_ticking = false;
+            }
+            qgs_live_print_control_reply("STOP", &reply, view, source_timebase);
+        }
+        QgsBroadcastPlayerLiveInputCommand::Unload => {
+            println!("UNLOAD   requested; exiting for stop/unload cleanup");
+            return Some("user-unload");
+        }
+        QgsBroadcastPlayerLiveInputCommand::Invalid(reason) => {
+            println!("INVALID  {reason}");
+        }
+        QgsBroadcastPlayerLiveInputCommand::Noop => {}
+    }
+    None
+}
+
+fn qgs_live_print_control_reply(
+    label: &str,
+    reply: &qgs_media_runtime::QgsQncCommandReplyEnvelope,
+    view: QgsBroadcastPlayerRunView,
+    source_timebase: RationalRate,
+) {
+    match view {
+        QgsBroadcastPlayerRunView::Compact => {
+            println!(
+                "{label:<8} accepted={} status={:?} frame={} t={} audio={} window={} buffer={}",
+                yes_no(reply.accepted),
+                reply.snapshot.status,
+                qgs_optional_u64_label(reply.snapshot.current_frame),
+                qgs_live_snapshot_media_time_label(&reply.snapshot, source_timebase),
+                qgs_optional_sample_range_label(reply.snapshot.current_audio_sample_range),
+                qgs_qnc_optional_frame_window_label(reply.snapshot.prepared_window.as_ref()),
+                qgs_live_buffer_label(&reply.snapshot)
+            );
+            if let Some(reason) = reply.rejection_reason {
+                println!("{label:<8} reason={reason}");
+            }
+        }
+        QgsBroadcastPlayerRunView::Detailed => print_qgs_live_reply(&format!("[{label}]"), reply),
+    }
+}
+
+fn qgs_live_preroll_ready(snapshot: &QgsQncRuntimeSnapshot) -> bool {
+    snapshot.video_payload_ready
+        && snapshot.audio_payload_ready
+        && snapshot.buffer_status == "ready"
+        && qgs_qnc_prepared_window_covers_current_frame(snapshot)
+}
+
+fn qgs_live_buffer_label(snapshot: &QgsQncRuntimeSnapshot) -> &'static str {
+    if snapshot.buffer_status == "ready" && !qgs_qnc_prepared_window_covers_current_frame(snapshot)
+    {
+        "stale"
+    } else {
+        snapshot.buffer_status
+    }
+}
+
+fn qgs_qnc_prepared_window_covers_current_frame(snapshot: &QgsQncRuntimeSnapshot) -> bool {
+    let Some(frame) = snapshot.current_frame else {
+        return snapshot.prepared_window.is_none();
+    };
+    let Some(window) = snapshot.prepared_window.as_ref() else {
+        return false;
+    };
+    window
+        .start_frame
+        .zip(window.end_frame_exclusive)
+        .is_some_and(|(start, end)| start <= frame && frame < end)
+}
+
+fn qgs_live_sleep_for_input(
+    options: QgsBroadcastPlayerLiveOptions,
+    frame_duration: Duration,
+    interactive_enabled: bool,
+) {
+    if options.pace == QgsBroadcastPlayerLivePace::Wall {
+        std::thread::sleep(frame_duration);
+    } else if interactive_enabled {
+        std::thread::sleep(frame_duration.min(Duration::from_millis(20)));
+    }
+}
+
+fn qgs_live_run_result_label(stop_reason: &str) -> &'static str {
+    match stop_reason {
+        "user-quit" | "user-unload" => "user-stopped",
+        "rejected-command" => "stopped",
+        _ => "completed",
+    }
 }
 
 fn qgs_resolve_run_seek_frame(requested: Option<u64>, active_frames: u64) -> u64 {
@@ -5463,7 +5816,10 @@ fn print_broadcast_player_live_compact_header(
     println!("display: NotImplemented / target Wayland+Vulkan");
     println!("pace: {}", options.pace.label());
     println!("interactive stdin: {}", yes_no(!options.no_interactive));
-    println!("interactive control implemented: no");
+    println!(
+        "interactive control implemented: {}",
+        yes_no(!options.no_interactive)
+    );
     println!("private source path: hidden");
     println!("proxy AAC authoritative: no");
     println!("realtime verified: no");
@@ -5505,12 +5861,25 @@ fn print_broadcast_player_live_detailed_header(
     println!("start frame: {}", options.start_frame);
     println!("status every: {}", options.status_every.max(1));
     println!("interactive stdin: {}", yes_no(!options.no_interactive));
-    println!("interactive control implemented: no");
+    println!(
+        "interactive control implemented: {}",
+        yes_no(!options.no_interactive)
+    );
     println!("visual verified: no");
     println!("realtime verified: no");
     println!("audio production verified: no");
     println!("A/V sync verified: no");
     print_running_runtime_persistent_warnings();
+    println!();
+}
+
+fn print_broadcast_player_live_controls() {
+    println!(
+        "Controls: p/pause, r/resume/play, s <frame>/seek <frame>, status, stop, q/quit, help"
+    );
+    println!(
+        "Interactive control is stdin-only; no IPC, QNC UI, realtime, or device output claim."
+    );
     println!();
 }
 
@@ -5524,13 +5893,10 @@ fn print_broadcast_player_live_compact_command(label: &str, snapshot: &QgsQncRun
 
 fn print_broadcast_player_live_compact_preroll(label: &str, snapshot: &QgsQncRuntimeSnapshot) {
     println!(
-        "{label:<8} ready={} window={}",
-        yes_no(
-            snapshot.video_payload_ready
-                && snapshot.audio_payload_ready
-                && snapshot.buffer_status == "ready"
-        ),
-        qgs_qnc_optional_frame_window_label(snapshot.prepared_window.as_ref())
+        "{label:<8} ready={} window={} covers_current={}",
+        yes_no(qgs_live_preroll_ready(snapshot)),
+        qgs_qnc_optional_frame_window_label(snapshot.prepared_window.as_ref()),
+        yes_no(qgs_qnc_prepared_window_covers_current_frame(snapshot))
     );
 }
 
@@ -5545,7 +5911,7 @@ fn print_broadcast_player_live_compact_tick(
         qgs_live_snapshot_media_time_label(snapshot, source_timebase),
         qgs_optional_sample_range_label(snapshot.current_audio_sample_range),
         qgs_qnc_optional_frame_window_label(snapshot.prepared_window.as_ref()),
-        snapshot.buffer_status
+        qgs_live_buffer_label(snapshot)
     );
 }
 
@@ -19440,8 +19806,9 @@ mod tests {
         qgs_running_runtime_persistent_warning_lines, repeated_smoke_test_buffers,
         rgba_u16_to_ppm_p6_rgb8, rgba_u16_to_rgb8_bytes, runtime_audio_payload_evidence_label,
         sanitized_source_stem, selected_proxy_ordinals, smoke_test_buffer_count,
-        ManualAudibleConfirmation, QgsBroadcastPlayerLiveOptions, QgsBroadcastPlayerLivePace,
-        QgsBroadcastPlayerRunView, QgsControlSessionScriptCommand, SonyXmlSummary,
+        ManualAudibleConfirmation, QgsBroadcastPlayerLiveInputCommand,
+        QgsBroadcastPlayerLiveOptions, QgsBroadcastPlayerLivePace, QgsBroadcastPlayerRunView,
+        QgsControlSessionScriptCommand, SonyXmlSummary,
     };
     use qgs_media_runtime::QgsDeviceSelectionPolicy;
     use qgs_media_runtime::{
@@ -19624,6 +19991,78 @@ mod tests {
         assert_eq!(options.max_frames, Some(500));
         assert_eq!(options.pace, QgsBroadcastPlayerLivePace::Logical);
         assert!(!options.no_interactive);
+    }
+
+    #[test]
+    fn live_runtime_input_parser_accepts_operator_controls() {
+        assert_eq!(
+            QgsBroadcastPlayerLiveInputCommand::parse("p"),
+            QgsBroadcastPlayerLiveInputCommand::Pause
+        );
+        assert_eq!(
+            QgsBroadcastPlayerLiveInputCommand::parse("pause"),
+            QgsBroadcastPlayerLiveInputCommand::Pause
+        );
+        assert_eq!(
+            QgsBroadcastPlayerLiveInputCommand::parse("resume"),
+            QgsBroadcastPlayerLiveInputCommand::Resume
+        );
+        assert_eq!(
+            QgsBroadcastPlayerLiveInputCommand::parse("play"),
+            QgsBroadcastPlayerLiveInputCommand::Resume
+        );
+        assert_eq!(
+            QgsBroadcastPlayerLiveInputCommand::parse("s 250"),
+            QgsBroadcastPlayerLiveInputCommand::Seek(250)
+        );
+        assert_eq!(
+            QgsBroadcastPlayerLiveInputCommand::parse("seek 50"),
+            QgsBroadcastPlayerLiveInputCommand::Seek(50)
+        );
+        assert_eq!(
+            QgsBroadcastPlayerLiveInputCommand::parse("status"),
+            QgsBroadcastPlayerLiveInputCommand::Status
+        );
+        assert_eq!(
+            QgsBroadcastPlayerLiveInputCommand::parse("q"),
+            QgsBroadcastPlayerLiveInputCommand::Quit
+        );
+        assert_eq!(
+            QgsBroadcastPlayerLiveInputCommand::parse("help"),
+            QgsBroadcastPlayerLiveInputCommand::Help
+        );
+        assert_eq!(
+            QgsBroadcastPlayerLiveInputCommand::parse("stop"),
+            QgsBroadcastPlayerLiveInputCommand::Stop
+        );
+        assert_eq!(
+            QgsBroadcastPlayerLiveInputCommand::parse("unload"),
+            QgsBroadcastPlayerLiveInputCommand::Unload
+        );
+        assert_eq!(
+            QgsBroadcastPlayerLiveInputCommand::parse("   "),
+            QgsBroadcastPlayerLiveInputCommand::Noop
+        );
+        assert!(matches!(
+            QgsBroadcastPlayerLiveInputCommand::parse("seek nope"),
+            QgsBroadcastPlayerLiveInputCommand::Invalid(_)
+        ));
+        assert!(matches!(
+            QgsBroadcastPlayerLiveInputCommand::parse("launch"),
+            QgsBroadcastPlayerLiveInputCommand::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn live_runtime_no_interactive_option_preserves_logical_loop_defaults() {
+        let mut options = QgsBroadcastPlayerLiveOptions::default();
+        options.no_interactive = true;
+
+        assert_eq!(options.start_frame, 0);
+        assert_eq!(options.status_every, 10);
+        assert_eq!(options.max_frames, Some(500));
+        assert_eq!(options.pace, QgsBroadcastPlayerLivePace::Logical);
+        assert!(options.no_interactive);
     }
 
     #[test]

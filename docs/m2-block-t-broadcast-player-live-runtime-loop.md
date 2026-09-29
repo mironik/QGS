@@ -72,7 +72,32 @@ Options:
 | `--seek-frame <frame>` | none | Optional scripted seek after the loop has begun. |
 | `--view compact|detailed` | `compact` | Operator compact output or richer diagnostic output. |
 | `--pace logical|wall` | `logical` | Logical loop or approximate wall-clock preview sleep. |
-| `--no-interactive` | false | Records that no stdin control is expected. Interactive control is not implemented in Block T. |
+| `--no-interactive` | false | Disable stdin controls. Block T introduced the live loop; Block U adds interactive stdin control input. |
+
+## Block U Interactive Control Layer
+
+Block U layers simple stdin controls on top of the same live command. The
+runtime chain remains:
+
+```text
+QgsBroadcastPlayerAssembly
+  -> QgsQncControlSurface
+  -> QgsBroadcastPlayerOperationalRuntime
+```
+
+Available controls:
+
+- `p` / `pause`
+- `r` / `resume` / `play`
+- `s <frame>` / `seek <frame>`
+- `status`
+- `stop`
+- `q` / `quit`
+- `help`
+
+`status` requests a non-mutating snapshot through the control surface. Runtime
+mutations still go through QNC-shaped command envelopes; `qgs-test` only parses
+operator input and prints results.
 
 ## Live Loop Behavior
 
@@ -218,6 +243,8 @@ Recommended next milestone:
 ```text
 M2 Block U - Broadcast Player Live Control Input
 ```
+
+Block U is now implemented as the stdin control layer described above.
 
 Goal:
 
