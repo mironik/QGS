@@ -26,15 +26,17 @@ use qgs_media_runtime::{
     broadcast_player_events_from_presentation_evidence, build_broadcast_audio_device_submission,
     build_broadcast_player_event_surface, build_broadcast_video_presenter_submission,
     classify_presentation, duration_abs_delta, duration_from_audio_samples,
-    evaluate_broadcast_preroll, max_video_timestamp_outside_audio_range, project_qnc_events,
-    qgs_frames_for_duration, qgs_qnc_projected_sequence_is_monotonic,
-    simulate_broadcast_player_runtime_loop, summarize_broadcast_device_boundary,
+    evaluate_broadcast_preroll, max_video_timestamp_outside_audio_range,
+    project_qgs_monitor_update_from_presenter_result, project_qnc_events, qgs_frames_for_duration,
+    qgs_qnc_projected_sequence_is_monotonic, simulate_broadcast_player_runtime_loop,
+    submit_qgs_presenter_payload_to_test_boundary, summarize_broadcast_device_boundary,
     summarize_broadcast_payload_bindings, summarize_broadcast_player_runtime_events,
     summarize_broadcast_prepared_slots, summarize_broadcast_runtime_contract, AudioFormat,
     AudioSampleFormat, AudioTimeline, AudioTimingPacket, AvFrameAudioRange, BoundedQueue,
     BroadcastDevicePayloadStatus, BroadcastDeviceStatus, BroadcastMediaSourceRole,
     BroadcastPreparedAudioSlot, BroadcastPreparedPresentationSlot, BroadcastPreparedVideoSlot,
     BroadcastPreparedVideoSlotStatus, BroadcastPrerollConfig, BroadcastPrerollPlan,
+    BroadcastPresentationPayloadBinding, BroadcastPresentationPayloadReadiness,
     BroadcastPreviewProfile, BroadcastRuntimeCapabilities, BroadcastRuntimePrepareFacts,
     BroadcastRuntimeQueueLimits, BroadcastRuntimeSessionDescription, BroadcastRuntimeStateMachine,
     BroadcastRuntimeVerificationMatrix, BroadcastTestAudioSink, BroadcastTestAudioSinkConfig,
@@ -146,6 +148,7 @@ const QGS_RUNTIME_LIFECYCLE_EVENTS_ARG: &str = "--qgs-runtime-lifecycle-events";
 const QGS_QNC_EVENT_PROJECTION_ARG: &str = "--qgs-qnc-event-projection";
 const QGS_SESSION_COMMAND_BOUNDARY_ARG: &str = "--qgs-session-command-boundary";
 const QGS_SESSION_RUNTIME_CONTROL_ARG: &str = "--qgs-session-runtime-control";
+const QGS_PRESENTER_MONITOR_BOUNDARY_ARG: &str = "--qgs-presenter-monitor-boundary";
 const WRITE_DIAGNOSTIC_WAV_ARG: &str = "--write-diagnostic-wav";
 const AUDIO_AUDIT_START_MS_ARG: &str = "--start-ms";
 const AUDIO_AUDIT_DURATION_MS_ARG: &str = "--duration-ms";
@@ -295,6 +298,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.qgs_session_runtime_control_paths {
         return qgs_session_runtime_control_report(&original, &proxy);
+    }
+    if let Some((original, proxy)) = args.qgs_presenter_monitor_boundary_paths {
+        return qgs_presenter_monitor_boundary_report(&original, &proxy);
     }
     if let Some(path) = args.linux_audio_device_probe_path {
         return linux_audio_device_probe(&path);
@@ -3131,6 +3137,206 @@ fn qgs_test_public_command(
         command,
         summary,
     )
+}
+
+fn qgs_presenter_monitor_boundary_report(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let descriptor = build_qnc_prepared_input_descriptor(original_path, proxy_path)?;
+    descriptor.validate()?;
+    let input_plan =
+        QgsInputPlan::from_descriptor(&descriptor, default_qgs_input_plan_queue_requirements())?;
+    let active_duration = Duration::from_millis(1_000);
+    let active_frames = qgs_frames_for_duration(active_duration, input_plan.video_source.timebase)?;
+    let source_uri = input_plan.video_source.media_uri.clone();
+
+    let mut runtime = QgsSessionRuntime::new(input_plan, QgsSessionRuntimeConfig::default())?;
+    let setup_commands = qgs_session_command_sequence(&source_uri, active_frames);
+    for command in setup_commands.iter().take(8) {
+        runtime.enqueue(command.clone()).map_err(|err| {
+            format!(
+                "presenter monitor session setup enqueue failed for id {}: {err:?}",
+                command.command_id
+            )
+        })?;
+    }
+    let setup_report = runtime.drain_queue();
+    let setup_snapshot = runtime.snapshot();
+
+    let proxy = Mp4Source::open(proxy_path)?;
+    let proxy_video = proxy
+        .video
+        .as_ref()
+        .ok_or("proxy has no H.264 video track")?;
+    let proxy_h264 = classify_video_track(proxy_video)?;
+    let selected = selected_journalist_preview_frames(proxy_video)?;
+    let selected_frame = selected
+        .first()
+        .ok_or("proxy has no selected journalist preview frame")?;
+    let frame_duration = ProxyPlaybackProfile::Journalist50iPreview
+        .presentation_rate(RationalRate::new(
+            u64::from(proxy_video.frame_rate.numerator),
+            u64::from(proxy_video.frame_rate.denominator),
+        )?)?
+        .frame_duration()?;
+    let video_slot = BroadcastPreparedVideoSlot {
+        slot_index: 0,
+        source_mode: BroadcastVideoSourceMode::ProxyPreview,
+        video_source_role: BroadcastMediaSourceRole::ProxyPreviewVideo,
+        source_frame_index: Some(selected_frame.source_presentation_index),
+        selected_preview_frame_index: Some(selected_frame.preview_index),
+        presentation_time: selected_frame.start_time,
+        duration: frame_duration,
+        status: BroadcastPreparedVideoSlotStatus::Prepared,
+    };
+    let proxy_payload_proof = bind_proxy_preview_video_payloads(
+        proxy_video,
+        &proxy_h264,
+        std::slice::from_ref(&video_slot),
+    )?;
+    let video_binding = proxy_payload_proof
+        .bindings
+        .first()
+        .cloned()
+        .ok_or("proxy payload proof did not produce a binding")?;
+    let presentation_binding = BroadcastPresentationPayloadBinding {
+        presentation_slot_index: 0,
+        video_binding_index: video_binding.video_slot_index,
+        audio_binding_index: 0,
+        presentation_time: selected_frame.start_time,
+        duration: frame_duration,
+        ready: true,
+        readiness: BroadcastPresentationPayloadReadiness::PayloadReady,
+    };
+    let payload = video_binding
+        .payload
+        .as_ref()
+        .ok_or("presenter boundary missing proxy video payload")?;
+    let mut presenter = BroadcastTestVideoPresenter::new(BroadcastTestVideoPresenterConfig {
+        accepted_kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+        accepted_format: BroadcastVideoPayloadFormat::RgbaU16,
+        visible_width: proxy_h264.width,
+        visible_height: proxy_h264.height,
+        coded_width: proxy_h264.coded_width,
+        coded_height: proxy_h264.coded_height,
+    })?;
+    let presenter_result = submit_qgs_presenter_payload_to_test_boundary(
+        descriptor
+            .binding
+            .proxy_media_uri
+            .as_deref()
+            .unwrap_or(&source_uri),
+        &presentation_binding,
+        &video_binding,
+        &mut presenter,
+    )?;
+    let monitor_update = project_qgs_monitor_update_from_presenter_result(&presenter_result);
+    let monitor_projection = QgsQncMonitorProjection::from_presenter_update(&monitor_update);
+    let private_path_exposed = monitor_projection.private_path_exposed
+        || setup_snapshot.private_path_exposed
+        || setup_report.transcript.exposes_private_path();
+    let presenter_evidence_kind = monitor_update
+        .presenter_evidence_kind
+        .map(|kind| format!("{kind:?}"))
+        .unwrap_or_else(|| "none".to_string());
+    let frame_presented_claim = if monitor_update.frame_presented_test_boundary {
+        "test-boundary evidence only; no real display claim"
+    } else {
+        "no"
+    };
+
+    println!("QGS Presenter / Monitor Boundary");
+    println!("--------------------------------");
+    println!(
+        "Public source URI: {}",
+        descriptor
+            .binding
+            .proxy_media_uri
+            .as_deref()
+            .unwrap_or(&source_uri)
+    );
+    println!(
+        "Selected frame: {}",
+        selected_frame.source_presentation_index
+    );
+    println!("Payload kind: {:?}", payload.kind);
+    println!("Payload format: {:?}", payload.format);
+    println!("Payload backend: {:?}", payload.backend_path);
+    println!(
+        "Payload dimensions: visible={}x{} coded={}x{}",
+        payload.visible_width, payload.visible_height, payload.coded_width, payload.coded_height
+    );
+    println!("Presenter kind: TestPresenter");
+    println!(
+        "Submitted to presenter: {}",
+        yes_no(monitor_update.submitted_to_presenter)
+    );
+    println!(
+        "Test presenter accepted: {}",
+        yes_no(presenter.accepted_count() == 1 && presenter.rejected_count() == 0)
+    );
+    println!("Presenter evidence kind: {presenter_evidence_kind}");
+    println!("Evidence level: {:?}", presenter_result.evidence_level);
+    println!("FramePresented claim: {frame_presented_claim}");
+    println!("Monitor projection:");
+    println!(
+        "  prepared descriptor present: {}",
+        yes_no(monitor_projection.prepared_descriptor_present)
+    );
+    println!(
+        "  submitted to presenter: {}",
+        yes_no(monitor_projection.submitted_to_presenter)
+    );
+    println!(
+        "  source frame: {}",
+        qgs_optional_u64_label(monitor_projection.source_frame)
+    );
+    println!("  payload status: {:?}", monitor_projection.payload_status);
+    println!(
+        "  test-boundary presented: {}",
+        yes_no(monitor_projection.frame_presented_test_boundary)
+    );
+    println!(
+        "  presented as real display: {}",
+        yes_no(monitor_projection.frame_presented_real_backend)
+    );
+    println!(
+        "  real display evidence: {}",
+        if monitor_projection.real_display_evidence_present {
+            "present"
+        } else {
+            "none"
+        }
+    );
+    println!(
+        "  visual verified: {}",
+        yes_no(monitor_projection.visual_verified)
+    );
+    println!(
+        "Session setup: commands_executed={} accepted={} rejected={} final_state={:?}",
+        setup_report.executed,
+        setup_report.accepted,
+        setup_report.rejected,
+        setup_snapshot.passive_view.transport.state
+    );
+    println!(
+        "Presenter accepted={} rejected={}",
+        presenter.accepted_count(),
+        presenter.rejected_count()
+    );
+    println!("Realtime playback: no");
+    println!("A/V sync: no");
+    println!("Device verified: no");
+    println!("FramePresented real display claim: no");
+    println!(
+        "FramePresented test boundary evidence: {}",
+        yes_no(monitor_projection.frame_presented_test_boundary)
+    );
+    println!("VisualVerified: no");
+    println!("Private path exposed: {}", yes_no(private_path_exposed));
+
+    Ok(())
 }
 
 fn qgs_qnc_command_label(command: &QgsQncCommandEnvelope) -> String {
@@ -14316,6 +14522,7 @@ struct Args {
     qgs_qnc_event_projection_paths: Option<(PathBuf, PathBuf)>,
     qgs_session_command_boundary_paths: Option<(PathBuf, PathBuf)>,
     qgs_session_runtime_control_paths: Option<(PathBuf, PathBuf)>,
+    qgs_presenter_monitor_boundary_paths: Option<(PathBuf, PathBuf)>,
     linux_audio_device_probe_path: Option<PathBuf>,
     pipewire_audio_prototype_path: Option<PathBuf>,
     pipewire_audio_native_prototype_path: Option<PathBuf>,
@@ -14400,6 +14607,8 @@ impl Args {
         let mut qgs_session_command_boundary_paths = None;
         let mut qgs_session_runtime_control_original = None;
         let mut qgs_session_runtime_control_paths = None;
+        let mut qgs_presenter_monitor_boundary_original = None;
+        let mut qgs_presenter_monitor_boundary_paths = None;
         let mut linux_audio_device_probe_path = None;
         let mut pipewire_audio_prototype_path = None;
         let mut pipewire_audio_native_prototype_path = None;
@@ -14475,6 +14684,8 @@ impl Args {
         let mut next_arg_is_qgs_session_command_boundary_proxy = false;
         let mut next_arg_is_qgs_session_runtime_control_original = false;
         let mut next_arg_is_qgs_session_runtime_control_proxy = false;
+        let mut next_arg_is_qgs_presenter_monitor_boundary_original = false;
+        let mut next_arg_is_qgs_presenter_monitor_boundary_proxy = false;
         let mut next_arg_is_linux_audio_device_probe_path = false;
         let mut next_arg_is_pipewire_audio_prototype_path = false;
         let mut next_arg_is_pipewire_audio_native_prototype_path = false;
@@ -14591,6 +14802,17 @@ impl Args {
             } else if next_arg_is_pipewire_audio_prototype_path {
                 pipewire_audio_prototype_path = Some(PathBuf::from(arg));
                 next_arg_is_pipewire_audio_prototype_path = false;
+            } else if next_arg_is_qgs_presenter_monitor_boundary_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = qgs_presenter_monitor_boundary_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                qgs_presenter_monitor_boundary_paths = Some((original, proxy));
+                next_arg_is_qgs_presenter_monitor_boundary_proxy = false;
+            } else if next_arg_is_qgs_presenter_monitor_boundary_original {
+                qgs_presenter_monitor_boundary_original = Some(PathBuf::from(arg));
+                next_arg_is_qgs_presenter_monitor_boundary_original = false;
+                next_arg_is_qgs_presenter_monitor_boundary_proxy = true;
             } else if next_arg_is_qgs_session_runtime_control_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = qgs_session_runtime_control_original
@@ -14974,6 +15196,8 @@ impl Args {
                 next_arg_is_qgs_session_command_boundary_original = true;
             } else if arg == QGS_SESSION_RUNTIME_CONTROL_ARG {
                 next_arg_is_qgs_session_runtime_control_original = true;
+            } else if arg == QGS_PRESENTER_MONITOR_BOUNDARY_ARG {
+                next_arg_is_qgs_presenter_monitor_boundary_original = true;
             } else if arg == LINUX_AUDIO_DEVICE_PROBE_ARG {
                 next_arg_is_linux_audio_device_probe_path = true;
             } else if arg == PIPEWIRE_AUDIO_PROTOTYPE_ARG {
@@ -15047,6 +15271,7 @@ impl Args {
             qgs_qnc_event_projection_paths,
             qgs_session_command_boundary_paths,
             qgs_session_runtime_control_paths,
+            qgs_presenter_monitor_boundary_paths,
             linux_audio_device_probe_path,
             pipewire_audio_prototype_path,
             pipewire_audio_native_prototype_path,

@@ -88,6 +88,7 @@ For Sony FX6 sample 002:
 | event surface | `UnitTested` | Deterministic backend-neutral runtime event accounting is covered. |
 | device boundary contract | `UnitTested` | `PayloadReady` and `DevicePayloadReady` remain distinct. |
 | test video presenter evidence | `TestBoundaryEvidence` | Test presenter evidence gates `FramePresented`; this is not real display output. |
+| presenter/monitor boundary | `TestBoundaryEvidence` | Prepared video payload descriptors can be submitted to the test presenter boundary and projected into monitor facts. Real display output and visual verification remain unimplemented. |
 | test audio sink evidence | `TestBoundaryEvidence` | Test audio sink evidence accepts original PCM; this is not real speaker output. |
 | native PipeWire buffer submission | `NativePostSubmitEvidence` | A 20 ms original-audio-derived f32 buffer was queued to a native PipeWire stream and a drain callback was observed; audible output and full playback are not claimed. |
 | native PipeWire audible smoke test | `ManualContentAudibilityPartiallyObserved` | Bounded original-audio-derived PipeWire smoke-test buffers submitted and drained; later listening found voice-like content rather than only hum/buzz, but routing/gain and production output remain unverified. |
@@ -108,6 +109,8 @@ For Sony FX6 sample 002:
 The matrix intentionally does not overstate these areas:
 
 - Test presenter evidence is not real display output.
+- Presenter/monitor boundary evidence from the test presenter is not real
+  display output and is not visual verification.
 - Test audio sink evidence is not real speaker output.
 - Native PipeWire buffer submission/drain evidence is not audible playback or
   `AudioDeviceVerified`.
