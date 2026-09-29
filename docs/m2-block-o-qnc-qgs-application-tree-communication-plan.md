@@ -563,6 +563,17 @@ M2 Block P - QNC PreparedInput to QGS Descriptor Mapping
 The shared contract plan is slightly safer first because it prevents another
 round of ad-hoc bridge fields before QNC and QGS start talking.
 
+## Block P Follow-Up
+
+M2 Block P defines the field-level shared contract plan for this communication
+boundary. It names the future `qnc-qgs-contract` scope, proposed version fields,
+source identity and private binding records, prepared input descriptor fields,
+command/reply/snapshot/event/fault surfaces, evidence levels, ownership rules,
+and mapping tables against current QNC and QGS concepts.
+
+Block O remains the application-tree and ownership plan. Block P is the
+contract-field plan that should guide the next bridge implementation work.
+
 ## Non-Claims
 
 Block O does not implement:
