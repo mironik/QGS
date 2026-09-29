@@ -172,8 +172,14 @@ const QGS_BROADCAST_PLAYER_OPERATIONAL_RUNTIME_ARG: &str =
     "--qgs-broadcast-player-operational-runtime";
 const QGS_BROADCAST_PLAYER_FAULT_RECOVERY_ARG: &str = "--qgs-broadcast-player-fault-recovery";
 const QGS_BROADCAST_PLAYER_RUN_ARG: &str = "--qgs-broadcast-player-run";
+const QGS_BROADCAST_PLAYER_LIVE_ARG: &str = "--qgs-broadcast-player-live";
 const QGS_BROADCAST_PLAYER_CONTROL_SESSION_ARG: &str = "--qgs-broadcast-player-control-session";
 const QGS_BROADCAST_PLAYER_RUN_FRAMES_ARG: &str = "--frames";
+const QGS_BROADCAST_PLAYER_LIVE_START_FRAME_ARG: &str = "--start-frame";
+const QGS_BROADCAST_PLAYER_LIVE_STATUS_EVERY_ARG: &str = "--status-every";
+const QGS_BROADCAST_PLAYER_LIVE_MAX_FRAMES_ARG: &str = "--max-frames";
+const QGS_BROADCAST_PLAYER_LIVE_PACE_ARG: &str = "--pace";
+const QGS_BROADCAST_PLAYER_LIVE_NO_INTERACTIVE_ARG: &str = "--no-interactive";
 const QGS_BROADCAST_PLAYER_RUN_SEEK_FRAME_ARG: &str = "--seek-frame";
 const QGS_BROADCAST_PLAYER_RUN_VIEW_ARG: &str = "--view";
 const QGS_BROADCAST_PLAYER_CONTROL_SCRIPT_ARG: &str = "--script";
@@ -358,6 +364,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.qgs_broadcast_player_fault_recovery_paths {
         return qgs_broadcast_player_fault_recovery_report(&original, &proxy);
+    }
+    if let Some((original, proxy)) = args.qgs_broadcast_player_live_paths {
+        return qgs_broadcast_player_live_report(
+            &original,
+            &proxy,
+            args.qgs_broadcast_player_live_options,
+        );
     }
     if let Some((original, proxy)) = args.qgs_broadcast_player_run_paths {
         return qgs_broadcast_player_run_report(
@@ -4734,6 +4747,54 @@ impl Default for QgsBroadcastPlayerRunOptions {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QgsBroadcastPlayerLivePace {
+    Logical,
+    Wall,
+}
+
+impl QgsBroadcastPlayerLivePace {
+    fn parse(value: &std::ffi::OsStr) -> Result<Self, &'static str> {
+        match value.to_string_lossy().as_ref() {
+            "logical" => Ok(Self::Logical),
+            "wall" => Ok(Self::Wall),
+            _ => Err("expects logical or wall"),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Logical => "logical",
+            Self::Wall => "wall",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QgsBroadcastPlayerLiveOptions {
+    start_frame: u64,
+    status_every: u64,
+    max_frames: Option<u64>,
+    seek_frame: Option<u64>,
+    view: QgsBroadcastPlayerRunView,
+    pace: QgsBroadcastPlayerLivePace,
+    no_interactive: bool,
+}
+
+impl Default for QgsBroadcastPlayerLiveOptions {
+    fn default() -> Self {
+        Self {
+            start_frame: 0,
+            status_every: 10,
+            max_frames: Some(500),
+            seek_frame: None,
+            view: QgsBroadcastPlayerRunView::Compact,
+            pace: QgsBroadcastPlayerLivePace::Logical,
+            no_interactive: false,
+        }
+    }
+}
+
 fn qgs_broadcast_player_run_report(
     original_path: &Path,
     proxy_path: &Path,
@@ -5032,6 +5093,320 @@ fn qgs_broadcast_player_run_report(
     Ok(())
 }
 
+fn qgs_broadcast_player_live_report(
+    original_path: &Path,
+    proxy_path: &Path,
+    options: QgsBroadcastPlayerLiveOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let assembly = build_qgs_broadcast_player_assembly(original_path, proxy_path)?;
+    let active_frames = assembly.active_frame_count();
+    if active_frames == 0 {
+        return Err("live runtime requires at least one active frame".into());
+    }
+    let start_frame = options.start_frame.min(active_frames - 1);
+    let status_every = options.status_every.max(1);
+    let source_timebase = assembly.input_plan().video_source.timebase;
+    let frame_duration = source_timebase.frame_duration()?;
+    let remaining_frames = active_frames.saturating_sub(start_frame).max(1);
+    let run_limit = options
+        .max_frames
+        .unwrap_or(remaining_frames)
+        .max(1)
+        .min(remaining_frames);
+    let mut surface = QgsQncControlSurface::from_assembly(&assembly, "qgs-test-live-runtime-loop")?;
+    let mut accepted = 0_u64;
+    let mut rejected = 0_u64;
+    let mut projected_events = 0_u64;
+    let mut command_ordinal = 0_u64;
+
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => {
+            print_broadcast_player_live_compact_header(&assembly, options)
+        }
+        QgsBroadcastPlayerRunView::Detailed => {
+            print_broadcast_player_live_detailed_header(&assembly, options, run_limit)
+        }
+    }
+
+    let load = qgs_live_send(
+        &mut surface,
+        &mut command_ordinal,
+        QgsQncCommandKind::LoadPreparedInput,
+        QgsQncCommandPayload::Empty,
+    );
+    qgs_live_count_reply(&load, &mut accepted, &mut rejected, &mut projected_events);
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => {
+            print_broadcast_player_live_compact_command("LOAD", &load.snapshot)
+        }
+        QgsBroadcastPlayerRunView::Detailed => {
+            print_qgs_live_reply("[LOAD]", &load);
+        }
+    }
+
+    let prepare = qgs_live_send(
+        &mut surface,
+        &mut command_ordinal,
+        QgsQncCommandKind::Prepare,
+        QgsQncCommandPayload::Empty,
+    );
+    qgs_live_count_reply(
+        &prepare,
+        &mut accepted,
+        &mut rejected,
+        &mut projected_events,
+    );
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => {
+            println!(
+                "PREPARE  status={:?} phase=input-ready",
+                prepare.snapshot.status
+            );
+        }
+        QgsBroadcastPlayerRunView::Detailed => print_qgs_live_reply("[PREPARE]", &prepare),
+    }
+
+    let cue = qgs_live_send(
+        &mut surface,
+        &mut command_ordinal,
+        QgsQncCommandKind::Cue,
+        QgsQncCommandPayload::Frame { frame: start_frame },
+    );
+    qgs_live_count_reply(&cue, &mut accepted, &mut rejected, &mut projected_events);
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => println!(
+            "CUE      frame={} audio={}",
+            qgs_optional_u64_label(cue.snapshot.current_frame),
+            qgs_optional_sample_range_label(cue.snapshot.current_audio_sample_range)
+        ),
+        QgsBroadcastPlayerRunView::Detailed => print_qgs_live_reply("[CUE]", &cue),
+    }
+
+    let preroll = qgs_live_send(
+        &mut surface,
+        &mut command_ordinal,
+        QgsQncCommandKind::Preroll,
+        QgsQncCommandPayload::Preroll {
+            target_frame: Some(start_frame),
+        },
+    );
+    qgs_live_count_reply(
+        &preroll,
+        &mut accepted,
+        &mut rejected,
+        &mut projected_events,
+    );
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => {
+            print_broadcast_player_live_compact_preroll("PREROLL", &preroll.snapshot)
+        }
+        QgsBroadcastPlayerRunView::Detailed => print_qgs_live_reply("[PREROLL]", &preroll),
+    }
+
+    let play = qgs_live_send(
+        &mut surface,
+        &mut command_ordinal,
+        QgsQncCommandKind::Play,
+        QgsQncCommandPayload::Play { frame_count: None },
+    );
+    qgs_live_count_reply(&play, &mut accepted, &mut rejected, &mut projected_events);
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => {
+            println!("PLAY     status={:?}", play.snapshot.status)
+        }
+        QgsBroadcastPlayerRunView::Detailed => print_qgs_live_reply("[PLAY]", &play),
+    }
+
+    println!();
+    println!("LIVE");
+    let mut processed = 0_u64;
+    let mut stop_reason = "end-of-range";
+    let mut scripted_seek_done = false;
+    while processed < run_limit {
+        let snapshot = surface.snapshot();
+        if processed == 0 || processed % status_every == 0 {
+            match options.view {
+                QgsBroadcastPlayerRunView::Compact => {
+                    print_broadcast_player_live_compact_tick(processed, &snapshot, source_timebase)
+                }
+                QgsBroadcastPlayerRunView::Detailed => {
+                    print_broadcast_player_live_detailed_tick(processed, &snapshot, source_timebase)
+                }
+            }
+            io::stdout().flush()?;
+        }
+
+        if let Some(seek_frame) = options.seek_frame {
+            if !scripted_seek_done && processed >= status_every {
+                scripted_seek_done = true;
+                let target = seek_frame.min(active_frames - 1);
+                let pause = qgs_live_send(
+                    &mut surface,
+                    &mut command_ordinal,
+                    QgsQncCommandKind::Pause,
+                    QgsQncCommandPayload::Empty,
+                );
+                qgs_live_count_reply(&pause, &mut accepted, &mut rejected, &mut projected_events);
+                let seek = qgs_live_send(
+                    &mut surface,
+                    &mut command_ordinal,
+                    QgsQncCommandKind::Seek,
+                    QgsQncCommandPayload::Frame { frame: target },
+                );
+                qgs_live_count_reply(&seek, &mut accepted, &mut rejected, &mut projected_events);
+                let preroll_after_seek = qgs_live_send(
+                    &mut surface,
+                    &mut command_ordinal,
+                    QgsQncCommandKind::Preroll,
+                    QgsQncCommandPayload::Preroll {
+                        target_frame: Some(target),
+                    },
+                );
+                qgs_live_count_reply(
+                    &preroll_after_seek,
+                    &mut accepted,
+                    &mut rejected,
+                    &mut projected_events,
+                );
+                let resume = qgs_live_send(
+                    &mut surface,
+                    &mut command_ordinal,
+                    QgsQncCommandKind::Play,
+                    QgsQncCommandPayload::Play { frame_count: None },
+                );
+                qgs_live_count_reply(&resume, &mut accepted, &mut rejected, &mut projected_events);
+                match options.view {
+                    QgsBroadcastPlayerRunView::Compact => {
+                        println!(
+                            "SEEK     {} -> {} audio={}",
+                            qgs_optional_u64_label(snapshot.current_frame),
+                            qgs_optional_u64_label(seek.snapshot.current_frame),
+                            qgs_optional_sample_range_label(
+                                seek.snapshot.current_audio_sample_range
+                            )
+                        );
+                        print_broadcast_player_live_compact_preroll(
+                            "PREROLL",
+                            &preroll_after_seek.snapshot,
+                        );
+                        println!("PLAY     status={:?}", resume.snapshot.status);
+                    }
+                    QgsBroadcastPlayerRunView::Detailed => {
+                        print_qgs_live_reply("[PAUSE FOR SCRIPTED SEEK]", &pause);
+                        print_qgs_live_reply("[SEEK]", &seek);
+                        print_qgs_live_reply("[PREROLL AFTER SEEK]", &preroll_after_seek);
+                        print_qgs_live_reply("[RESUME]", &resume);
+                    }
+                }
+            }
+        }
+
+        let tick = qgs_live_send(
+            &mut surface,
+            &mut command_ordinal,
+            QgsQncCommandKind::Play,
+            QgsQncCommandPayload::Play {
+                frame_count: Some(1),
+            },
+        );
+        qgs_live_count_reply(&tick, &mut accepted, &mut rejected, &mut projected_events);
+        if !tick.accepted {
+            stop_reason = "rejected-command";
+            break;
+        }
+        processed = processed.saturating_add(1);
+        if tick
+            .snapshot
+            .current_frame
+            .is_some_and(|frame| frame >= active_frames.saturating_sub(1))
+        {
+            stop_reason = "end-of-range";
+            break;
+        }
+        if processed >= run_limit {
+            stop_reason = "max-frames";
+            break;
+        }
+        if options.pace == QgsBroadcastPlayerLivePace::Wall {
+            std::thread::sleep(frame_duration);
+        }
+    }
+
+    let stop = qgs_live_send(
+        &mut surface,
+        &mut command_ordinal,
+        QgsQncCommandKind::Stop,
+        QgsQncCommandPayload::Empty,
+    );
+    qgs_live_count_reply(&stop, &mut accepted, &mut rejected, &mut projected_events);
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => {
+            println!();
+            println!("STOP     reason={stop_reason}");
+            print_broadcast_player_live_compact_command("STOP", &stop.snapshot);
+        }
+        QgsBroadcastPlayerRunView::Detailed => {
+            println!("[STOP] reason={stop_reason}");
+            print_qgs_live_reply("[STOP RESULT]", &stop);
+        }
+    }
+
+    let unload = qgs_live_send(
+        &mut surface,
+        &mut command_ordinal,
+        QgsQncCommandKind::Unload,
+        QgsQncCommandPayload::Empty,
+    );
+    qgs_live_count_reply(&unload, &mut accepted, &mut rejected, &mut projected_events);
+    match options.view {
+        QgsBroadcastPlayerRunView::Compact => {
+            print_broadcast_player_live_compact_command("UNLOAD", &unload.snapshot)
+        }
+        QgsBroadcastPlayerRunView::Detailed => print_qgs_live_reply("[UNLOAD]", &unload),
+    }
+
+    let final_snapshot = surface.snapshot();
+    println!();
+    println!("Final:");
+    println!("frames processed: {processed}");
+    println!(
+        "last frame: {}",
+        qgs_optional_u64_label(stop.snapshot.current_frame)
+    );
+    println!("run result: completed");
+    println!("stop reason: {stop_reason}");
+    println!("commands accepted: {accepted}");
+    println!("commands rejected: {rejected}");
+    println!("projected events: {projected_events}");
+    println!(
+        "private path exposed: {}",
+        yes_no(final_snapshot.exposes_private_path())
+    );
+    println!(
+        "real display: {}",
+        final_snapshot.device_status.real_display_status
+    );
+    println!(
+        "visual verified: {}",
+        yes_no(final_snapshot.device_status.visual_verified)
+    );
+    println!(
+        "realtime verified: {}",
+        yes_no(final_snapshot.device_status.realtime_verified)
+    );
+    println!(
+        "audio production verified: {}",
+        yes_no(final_snapshot.device_status.audio_device_verified)
+    );
+    println!(
+        "A/V sync verified: {}",
+        yes_no(final_snapshot.device_status.av_sync_verified)
+    );
+    println!("FramePresented real display claim: no");
+
+    Ok(())
+}
+
 fn qgs_resolve_run_seek_frame(requested: Option<u64>, active_frames: u64) -> u64 {
     if active_frames <= 1 {
         return 0;
@@ -5047,6 +5422,233 @@ fn qgs_resolve_run_seek_frame(requested: Option<u64>, active_frames: u64) -> u64
             .max(1)
             .min(active_frames - 1)
     }
+}
+
+fn qgs_live_send(
+    surface: &mut QgsQncControlSurface,
+    ordinal: &mut u64,
+    command: QgsQncCommandKind,
+    payload: QgsQncCommandPayload,
+) -> qgs_media_runtime::QgsQncCommandReplyEnvelope {
+    *ordinal = ordinal.saturating_add(1);
+    let request = QgsQncCommandRequestEnvelope::new(format!("live-{ordinal:06}"), command)
+        .with_expected_generation(surface.generation())
+        .with_payload(payload);
+    surface.handle_command(request)
+}
+
+fn qgs_live_count_reply(
+    reply: &qgs_media_runtime::QgsQncCommandReplyEnvelope,
+    accepted: &mut u64,
+    rejected: &mut u64,
+    projected_events: &mut u64,
+) {
+    if reply.accepted {
+        *accepted = accepted.saturating_add(1);
+    } else {
+        *rejected = rejected.saturating_add(1);
+    }
+    *projected_events = projected_events.saturating_add(reply.events.len() as u64);
+}
+
+fn print_broadcast_player_live_compact_header(
+    assembly: &QgsBroadcastPlayerAssembly,
+    options: QgsBroadcastPlayerLiveOptions,
+) {
+    println!("QGS Broadcast Player Live");
+    println!("mode: ProxyPreview");
+    println!("video: proxy MP4");
+    println!("audio: original MXF mono lanes");
+    println!("device: preview-qnc-os");
+    println!("display: NotImplemented / target Wayland+Vulkan");
+    println!("pace: {}", options.pace.label());
+    println!("interactive stdin: {}", yes_no(!options.no_interactive));
+    println!("interactive control implemented: no");
+    println!("private source path: hidden");
+    println!("proxy AAC authoritative: no");
+    println!("realtime verified: no");
+    println!("A/V sync verified: no");
+    println!(
+        "source frames: {} @ {} fps",
+        assembly.active_frame_count(),
+        qgs_rate_label(assembly.input_plan().video_source.timebase)
+    );
+    println!();
+}
+
+fn print_broadcast_player_live_detailed_header(
+    assembly: &QgsBroadcastPlayerAssembly,
+    options: QgsBroadcastPlayerLiveOptions,
+    run_limit: u64,
+) {
+    println!("QGS Broadcast Player Live");
+    println!("-------------------------");
+    println!("Runtime surface: live logical backend loop");
+    println!("control layer: QgsQncControlSurface");
+    println!("assembly: modular broadcast player runtime");
+    println!("modules: {}", assembly.module_labels().join(", "));
+    println!("mode: ProxyPreview");
+    println!("video: proxy MP4");
+    println!("audio: original MXF discrete mono lanes");
+    println!("original MXF audio authoritative: yes");
+    println!("proxy AAC authoritative: no");
+    println!("device policy: preview-qnc-os");
+    println!("real display: NotImplemented");
+    println!("display target: Wayland + Vulkan");
+    println!("x11: legacy/non-target");
+    println!("pace: {}", options.pace.label());
+    println!(
+        "wall-paced preview loop: {}",
+        yes_no(options.pace == QgsBroadcastPlayerLivePace::Wall)
+    );
+    println!("run frame cap: {run_limit}");
+    println!("start frame: {}", options.start_frame);
+    println!("status every: {}", options.status_every.max(1));
+    println!("interactive stdin: {}", yes_no(!options.no_interactive));
+    println!("interactive control implemented: no");
+    println!("visual verified: no");
+    println!("realtime verified: no");
+    println!("audio production verified: no");
+    println!("A/V sync verified: no");
+    print_running_runtime_persistent_warnings();
+    println!();
+}
+
+fn print_broadcast_player_live_compact_command(label: &str, snapshot: &QgsQncRuntimeSnapshot) {
+    println!(
+        "{label:<8} status={:?} source={}",
+        snapshot.status,
+        yes_no(snapshot.source_loaded)
+    );
+}
+
+fn print_broadcast_player_live_compact_preroll(label: &str, snapshot: &QgsQncRuntimeSnapshot) {
+    println!(
+        "{label:<8} ready={} window={}",
+        yes_no(
+            snapshot.video_payload_ready
+                && snapshot.audio_payload_ready
+                && snapshot.buffer_status == "ready"
+        ),
+        qgs_qnc_optional_frame_window_label(snapshot.prepared_window.as_ref())
+    );
+}
+
+fn print_broadcast_player_live_compact_tick(
+    tick: u64,
+    snapshot: &QgsQncRuntimeSnapshot,
+    source_timebase: RationalRate,
+) {
+    println!(
+        "tick={tick:06} frame={:<4} t={} audio={:<18} window={:<9} buffer={}",
+        qgs_optional_u64_label(snapshot.current_frame),
+        qgs_live_snapshot_media_time_label(snapshot, source_timebase),
+        qgs_optional_sample_range_label(snapshot.current_audio_sample_range),
+        qgs_qnc_optional_frame_window_label(snapshot.prepared_window.as_ref()),
+        snapshot.buffer_status
+    );
+}
+
+fn print_broadcast_player_live_detailed_tick(
+    tick: u64,
+    snapshot: &QgsQncRuntimeSnapshot,
+    source_timebase: RationalRate,
+) {
+    println!("[LIVE TICK {tick:06}]");
+    println!("status: {:?}", snapshot.status);
+    println!("frame: {}", qgs_optional_u64_label(snapshot.current_frame));
+    println!(
+        "media time: {}",
+        qgs_live_snapshot_media_time_label(snapshot, source_timebase)
+    );
+    println!(
+        "audio samples: {}",
+        qgs_optional_sample_range_label(snapshot.current_audio_sample_range)
+    );
+    println!(
+        "prepared window: {}",
+        qgs_qnc_optional_frame_window_label(snapshot.prepared_window.as_ref())
+    );
+    println!("buffer: {}", snapshot.buffer_status);
+    println!(
+        "video payload ready: {}",
+        yes_no(snapshot.video_payload_ready)
+    );
+    println!(
+        "audio payload ready: {}",
+        yes_no(snapshot.audio_payload_ready)
+    );
+    println!(
+        "private path exposed: {}",
+        yes_no(snapshot.exposes_private_path())
+    );
+    println!();
+}
+
+fn print_qgs_live_reply(label: &str, reply: &qgs_media_runtime::QgsQncCommandReplyEnvelope) {
+    println!("{label}");
+    println!("accepted: {}", yes_no(reply.accepted));
+    println!(
+        "generation: {} -> {}",
+        reply.generation_before.0, reply.generation_after.0
+    );
+    println!("status: {:?}", reply.snapshot.status);
+    println!(
+        "frame: {}",
+        qgs_optional_u64_label(reply.snapshot.current_frame)
+    );
+    println!(
+        "media time: {}",
+        qgs_media_time_label(reply.snapshot.media_time)
+    );
+    println!(
+        "audio samples: {}",
+        qgs_optional_sample_range_label(reply.snapshot.current_audio_sample_range)
+    );
+    println!(
+        "prepared window: {}",
+        qgs_qnc_optional_frame_window_label(reply.snapshot.prepared_window.as_ref())
+    );
+    println!("buffer: {}", reply.snapshot.buffer_status);
+    println!("events: {}", reply.events.len());
+    println!(
+        "private path exposed: {}",
+        yes_no(reply.exposes_private_path())
+    );
+    if let Some(reason) = reply.rejection_reason {
+        println!("reason: {reason}");
+    }
+    println!();
+}
+
+fn qgs_media_time_label(value: Option<Duration>) -> String {
+    value
+        .map(qgs_format_media_time)
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn qgs_live_snapshot_media_time_label(
+    snapshot: &QgsQncRuntimeSnapshot,
+    source_timebase: RationalRate,
+) -> String {
+    snapshot
+        .media_time
+        .or_else(|| {
+            snapshot
+                .current_frame
+                .and_then(|frame| source_timebase.frame_offset(frame).ok())
+        })
+        .map(qgs_format_media_time)
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn qgs_format_media_time(duration: Duration) -> String {
+    let total_millis = duration.as_millis();
+    let hours = total_millis / 3_600_000;
+    let minutes = (total_millis / 60_000) % 60;
+    let seconds = (total_millis / 1_000) % 60;
+    let millis = total_millis % 1_000;
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
 }
 
 fn print_running_runtime_compact_header(assembly: &QgsBroadcastPlayerAssembly) {
@@ -17748,6 +18350,8 @@ struct Args {
     qgs_broadcast_player_fault_recovery_paths: Option<(PathBuf, PathBuf)>,
     qgs_broadcast_player_run_paths: Option<(PathBuf, PathBuf)>,
     qgs_broadcast_player_run_options: QgsBroadcastPlayerRunOptions,
+    qgs_broadcast_player_live_paths: Option<(PathBuf, PathBuf)>,
+    qgs_broadcast_player_live_options: QgsBroadcastPlayerLiveOptions,
     qgs_broadcast_player_control_session_paths: Option<(PathBuf, PathBuf)>,
     qgs_broadcast_player_control_session_script: String,
     qgs_device_backend_selection_policy: Option<QgsDeviceSelectionPolicy>,
@@ -17854,6 +18458,9 @@ impl Args {
         let mut qgs_broadcast_player_run_original = None;
         let mut qgs_broadcast_player_run_paths = None;
         let mut qgs_broadcast_player_run_options = QgsBroadcastPlayerRunOptions::default();
+        let mut qgs_broadcast_player_live_original = None;
+        let mut qgs_broadcast_player_live_paths = None;
+        let mut qgs_broadcast_player_live_options = QgsBroadcastPlayerLiveOptions::default();
         let mut qgs_broadcast_player_control_session_original = None;
         let mut qgs_broadcast_player_control_session_paths = None;
         let mut qgs_broadcast_player_control_session_script =
@@ -17952,7 +18559,13 @@ impl Args {
         let mut next_arg_is_qgs_broadcast_player_fault_recovery_proxy = false;
         let mut next_arg_is_qgs_broadcast_player_run_original = false;
         let mut next_arg_is_qgs_broadcast_player_run_proxy = false;
+        let mut next_arg_is_qgs_broadcast_player_live_original = false;
+        let mut next_arg_is_qgs_broadcast_player_live_proxy = false;
         let mut next_arg_is_qgs_broadcast_player_run_frames = false;
+        let mut next_arg_is_qgs_broadcast_player_live_start_frame = false;
+        let mut next_arg_is_qgs_broadcast_player_live_status_every = false;
+        let mut next_arg_is_qgs_broadcast_player_live_max_frames = false;
+        let mut next_arg_is_qgs_broadcast_player_live_pace = false;
         let mut next_arg_is_qgs_broadcast_player_run_seek_frame = false;
         let mut next_arg_is_qgs_broadcast_player_run_view = false;
         let mut next_arg_is_qgs_broadcast_player_control_session_original = false;
@@ -17986,15 +18599,32 @@ impl Args {
                 qgs_broadcast_player_run_options.frames =
                     parse_u64_os_arg(&arg, QGS_BROADCAST_PLAYER_RUN_FRAMES_ARG).max(1);
                 next_arg_is_qgs_broadcast_player_run_frames = false;
+            } else if next_arg_is_qgs_broadcast_player_live_start_frame {
+                qgs_broadcast_player_live_options.start_frame =
+                    parse_u64_os_arg(&arg, QGS_BROADCAST_PLAYER_LIVE_START_FRAME_ARG);
+                next_arg_is_qgs_broadcast_player_live_start_frame = false;
+            } else if next_arg_is_qgs_broadcast_player_live_status_every {
+                qgs_broadcast_player_live_options.status_every =
+                    parse_u64_os_arg(&arg, QGS_BROADCAST_PLAYER_LIVE_STATUS_EVERY_ARG).max(1);
+                next_arg_is_qgs_broadcast_player_live_status_every = false;
+            } else if next_arg_is_qgs_broadcast_player_live_max_frames {
+                qgs_broadcast_player_live_options.max_frames =
+                    Some(parse_u64_os_arg(&arg, QGS_BROADCAST_PLAYER_LIVE_MAX_FRAMES_ARG).max(1));
+                next_arg_is_qgs_broadcast_player_live_max_frames = false;
+            } else if next_arg_is_qgs_broadcast_player_live_pace {
+                qgs_broadcast_player_live_options.pace = QgsBroadcastPlayerLivePace::parse(&arg)
+                    .unwrap_or_else(|err| panic!("{QGS_BROADCAST_PLAYER_LIVE_PACE_ARG}: {err}"));
+                next_arg_is_qgs_broadcast_player_live_pace = false;
             } else if next_arg_is_qgs_broadcast_player_run_seek_frame {
-                qgs_broadcast_player_run_options.seek_frame = Some(parse_u64_os_arg(
-                    &arg,
-                    QGS_BROADCAST_PLAYER_RUN_SEEK_FRAME_ARG,
-                ));
+                let seek_frame = parse_u64_os_arg(&arg, QGS_BROADCAST_PLAYER_RUN_SEEK_FRAME_ARG);
+                qgs_broadcast_player_run_options.seek_frame = Some(seek_frame);
+                qgs_broadcast_player_live_options.seek_frame = Some(seek_frame);
                 next_arg_is_qgs_broadcast_player_run_seek_frame = false;
             } else if next_arg_is_qgs_broadcast_player_run_view {
-                qgs_broadcast_player_run_options.view = QgsBroadcastPlayerRunView::parse(&arg)
+                let view = QgsBroadcastPlayerRunView::parse(&arg)
                     .unwrap_or_else(|err| panic!("{QGS_BROADCAST_PLAYER_RUN_VIEW_ARG}: {err}"));
+                qgs_broadcast_player_run_options.view = view;
+                qgs_broadcast_player_live_options.view = view;
                 next_arg_is_qgs_broadcast_player_run_view = false;
             } else if next_arg_is_qgs_broadcast_player_control_session_script {
                 qgs_broadcast_player_control_session_script = arg.to_string_lossy().to_string();
@@ -18010,6 +18640,17 @@ impl Args {
                 qgs_broadcast_player_control_session_original = Some(PathBuf::from(arg));
                 next_arg_is_qgs_broadcast_player_control_session_original = false;
                 next_arg_is_qgs_broadcast_player_control_session_proxy = true;
+            } else if next_arg_is_qgs_broadcast_player_live_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = qgs_broadcast_player_live_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                qgs_broadcast_player_live_paths = Some((original, proxy));
+                next_arg_is_qgs_broadcast_player_live_proxy = false;
+            } else if next_arg_is_qgs_broadcast_player_live_original {
+                qgs_broadcast_player_live_original = Some(PathBuf::from(arg));
+                next_arg_is_qgs_broadcast_player_live_original = false;
+                next_arg_is_qgs_broadcast_player_live_proxy = true;
             } else if next_arg_is_qgs_broadcast_player_run_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = qgs_broadcast_player_run_original
@@ -18607,12 +19248,24 @@ impl Args {
                 next_arg_is_qgs_broadcast_player_operational_runtime_original = true;
             } else if arg == QGS_BROADCAST_PLAYER_FAULT_RECOVERY_ARG {
                 next_arg_is_qgs_broadcast_player_fault_recovery_original = true;
+            } else if arg == QGS_BROADCAST_PLAYER_LIVE_ARG {
+                next_arg_is_qgs_broadcast_player_live_original = true;
             } else if arg == QGS_BROADCAST_PLAYER_RUN_ARG {
                 next_arg_is_qgs_broadcast_player_run_original = true;
             } else if arg == QGS_BROADCAST_PLAYER_CONTROL_SESSION_ARG {
                 next_arg_is_qgs_broadcast_player_control_session_original = true;
             } else if arg == QGS_BROADCAST_PLAYER_RUN_FRAMES_ARG {
                 next_arg_is_qgs_broadcast_player_run_frames = true;
+            } else if arg == QGS_BROADCAST_PLAYER_LIVE_START_FRAME_ARG {
+                next_arg_is_qgs_broadcast_player_live_start_frame = true;
+            } else if arg == QGS_BROADCAST_PLAYER_LIVE_STATUS_EVERY_ARG {
+                next_arg_is_qgs_broadcast_player_live_status_every = true;
+            } else if arg == QGS_BROADCAST_PLAYER_LIVE_MAX_FRAMES_ARG {
+                next_arg_is_qgs_broadcast_player_live_max_frames = true;
+            } else if arg == QGS_BROADCAST_PLAYER_LIVE_PACE_ARG {
+                next_arg_is_qgs_broadcast_player_live_pace = true;
+            } else if arg == QGS_BROADCAST_PLAYER_LIVE_NO_INTERACTIVE_ARG {
+                qgs_broadcast_player_live_options.no_interactive = true;
             } else if arg == QGS_BROADCAST_PLAYER_RUN_SEEK_FRAME_ARG {
                 next_arg_is_qgs_broadcast_player_run_seek_frame = true;
             } else if arg == QGS_BROADCAST_PLAYER_RUN_VIEW_ARG {
@@ -18704,6 +19357,8 @@ impl Args {
             qgs_broadcast_player_fault_recovery_paths,
             qgs_broadcast_player_run_paths,
             qgs_broadcast_player_run_options,
+            qgs_broadcast_player_live_paths,
+            qgs_broadcast_player_live_options,
             qgs_broadcast_player_control_session_paths,
             qgs_broadcast_player_control_session_script,
             qgs_device_backend_selection_policy,
@@ -18780,13 +19435,13 @@ mod tests {
         mono_monitor_diagnostic_evidence_label, mxf_file_label, original_pcm_blocks_by_channel,
         original_segment_evidence_label, parse_device_selection_policy_arg,
         parse_manual_audible_confirmation, parse_monitor_track_arg, pcm_s24le_sample_to_f32,
-        proxy_presentation_ordinals, public_source_uri_stem, qgs_resolve_run_seek_frame,
-        qgs_running_prepare_input_meaning, qgs_running_preroll_meaning,
+        proxy_presentation_ordinals, public_source_uri_stem, qgs_format_media_time,
+        qgs_resolve_run_seek_frame, qgs_running_prepare_input_meaning, qgs_running_preroll_meaning,
         qgs_running_runtime_persistent_warning_lines, repeated_smoke_test_buffers,
         rgba_u16_to_ppm_p6_rgb8, rgba_u16_to_rgb8_bytes, runtime_audio_payload_evidence_label,
         sanitized_source_stem, selected_proxy_ordinals, smoke_test_buffer_count,
-        ManualAudibleConfirmation, QgsBroadcastPlayerRunView, QgsControlSessionScriptCommand,
-        SonyXmlSummary,
+        ManualAudibleConfirmation, QgsBroadcastPlayerLiveOptions, QgsBroadcastPlayerLivePace,
+        QgsBroadcastPlayerRunView, QgsControlSessionScriptCommand, SonyXmlSummary,
     };
     use qgs_media_runtime::QgsDeviceSelectionPolicy;
     use qgs_media_runtime::{
@@ -18949,6 +19604,46 @@ mod tests {
         assert_eq!(qgs_resolve_run_seek_frame(Some(50), 106), 50);
         assert_eq!(qgs_resolve_run_seek_frame(Some(999), 106), 105);
         assert_eq!(qgs_resolve_run_seek_frame(None, 20), 10);
+    }
+
+    #[test]
+    fn live_runtime_options_parse_pace_and_use_safe_defaults() {
+        assert_eq!(
+            QgsBroadcastPlayerLivePace::parse(std::ffi::OsStr::new("logical")),
+            Ok(QgsBroadcastPlayerLivePace::Logical)
+        );
+        assert_eq!(
+            QgsBroadcastPlayerLivePace::parse(std::ffi::OsStr::new("wall")),
+            Ok(QgsBroadcastPlayerLivePace::Wall)
+        );
+        assert!(QgsBroadcastPlayerLivePace::parse(std::ffi::OsStr::new("realtime")).is_err());
+
+        let options = QgsBroadcastPlayerLiveOptions::default();
+        assert_eq!(options.start_frame, 0);
+        assert_eq!(options.status_every, 10);
+        assert_eq!(options.max_frames, Some(500));
+        assert_eq!(options.pace, QgsBroadcastPlayerLivePace::Logical);
+        assert!(!options.no_interactive);
+    }
+
+    #[test]
+    fn live_runtime_media_time_format_is_operator_readable() {
+        assert_eq!(
+            qgs_format_media_time(Duration::from_millis(0)),
+            "00:00:00.000"
+        );
+        assert_eq!(
+            qgs_format_media_time(Duration::from_millis(200)),
+            "00:00:00.200"
+        );
+        assert_eq!(
+            qgs_format_media_time(Duration::from_millis(5_000)),
+            "00:00:05.000"
+        );
+        assert_eq!(
+            qgs_format_media_time(Duration::from_millis(3_661_234)),
+            "01:01:01.234"
+        );
     }
 
     #[test]
