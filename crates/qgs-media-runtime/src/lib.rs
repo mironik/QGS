@@ -2435,6 +2435,278 @@ pub fn qgs_qnc_projected_sequence_is_monotonic(events: &[QgsQncEventEnvelope]) -
         .all(|(index, event)| event.sequence == u64::try_from(index).unwrap_or(u64::MAX))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncSessionCommandResult {
+    pub outcome: QgsQncCommandOutcome,
+    pub projected_events: Vec<QgsQncEventEnvelope>,
+    pub passive_view: QgsQncPassiveView,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncSessionCommandExecutor {
+    plan: QgsInputPlan,
+    engine: QgsTransportEngine,
+    event_log: QgsRuntimeEventLog,
+    active_handle: Option<QgsTransportSourceHandle>,
+    buffer: Option<QgsPlayoutBufferState>,
+    last_seen_transport_events: usize,
+    last_seen_buffer_events: usize,
+    latest_discarded_frame_count: usize,
+}
+
+impl QgsQncSessionCommandExecutor {
+    pub fn new(plan: QgsInputPlan) -> Result<Self, PlaybackError> {
+        plan.validate()?;
+        Ok(Self {
+            plan,
+            engine: QgsTransportEngine::new(),
+            event_log: QgsRuntimeEventLog::new(),
+            active_handle: None,
+            buffer: None,
+            last_seen_transport_events: 0,
+            last_seen_buffer_events: 0,
+            latest_discarded_frame_count: 0,
+        })
+    }
+
+    pub fn current_generation(&self) -> QgsRuntimeEventGeneration {
+        self.event_log.generation
+    }
+
+    pub fn passive_view(&self) -> QgsQncPassiveView {
+        let slots = self
+            .buffer
+            .as_ref()
+            .map_or_else(Vec::new, |buffer| buffer.slots());
+        QgsQncPassiveView::from_parts(
+            self.event_log.generation,
+            &self.engine.snapshot(),
+            &slots,
+            self.latest_discarded_frame_count,
+        )
+    }
+
+    pub fn execute(&mut self, command: &QgsQncCommandEnvelope) -> QgsQncSessionCommandResult {
+        if command.exposes_private_path() {
+            return self.rejected_command(command.command_id, "command exposes private path");
+        }
+        if command
+            .expected_generation
+            .is_some_and(|expected| expected != self.event_log.generation)
+        {
+            return self.rejected_command(command.command_id, "runtime generation mismatch");
+        }
+
+        let before_log_len = self.event_log.envelopes().len();
+        let result = match command.command {
+            QgsQncPlayerCommand::LoadPreparedInput => self.command_load_prepared_input(),
+            QgsQncPlayerCommand::PreloadSource => self.command_preload_source(),
+            QgsQncPlayerCommand::SetActiveSource => self.command_set_active_source(),
+            QgsQncPlayerCommand::SetActiveRange {
+                start_frame,
+                end_frame,
+            } => self.command_set_active_range(start_frame, end_frame),
+            QgsQncPlayerCommand::Cue { frame } => self.command_cue(frame),
+            QgsQncPlayerCommand::PrepareAnchor => self.command_prepare_anchor(),
+            QgsQncPlayerCommand::Play => self.command_play(),
+            QgsQncPlayerCommand::Pause => self.command_pause(),
+            QgsQncPlayerCommand::Stop => self.command_stop(),
+            QgsQncPlayerCommand::TickPrepare { carrier_frame } => {
+                self.command_tick_prepare(carrier_frame)
+            }
+            QgsQncPlayerCommand::CloseActiveSource => self.command_close_active_source(),
+            QgsQncPlayerCommand::UnloadSource => self.command_unload_source(),
+        };
+
+        let accepted = result.is_ok();
+        let reason = result.err();
+        self.push_new_runtime_events();
+        let projected_events = project_qnc_events(&self.event_log.envelopes()[before_log_len..]);
+        QgsQncSessionCommandResult {
+            outcome: QgsQncCommandOutcome {
+                command_id: command.command_id,
+                accepted,
+                reason,
+            },
+            projected_events,
+            passive_view: self.passive_view(),
+        }
+    }
+
+    fn rejected_command(
+        &self,
+        command_id: u64,
+        reason: &'static str,
+    ) -> QgsQncSessionCommandResult {
+        QgsQncSessionCommandResult {
+            outcome: QgsQncCommandOutcome {
+                command_id,
+                accepted: false,
+                reason: Some(reason),
+            },
+            projected_events: Vec::new(),
+            passive_view: self.passive_view(),
+        }
+    }
+
+    fn command_load_prepared_input(&mut self) -> Result<(), &'static str> {
+        if self.active_handle.is_some() || self.engine.snapshot().loaded_source_count != 0 {
+            return Err("source already loaded");
+        }
+        let handle = self
+            .engine
+            .load_source(&self.plan)
+            .map_err(|_| "load source failed")?;
+        self.active_handle = Some(handle);
+        Ok(())
+    }
+
+    fn command_preload_source(&mut self) -> Result<(), &'static str> {
+        let handle = self.active_handle.clone().ok_or("no source loaded")?;
+        self.engine
+            .preload_source(&handle)
+            .map_err(|_| "preload source failed")
+    }
+
+    fn command_set_active_source(&mut self) -> Result<(), &'static str> {
+        let handle = self.active_handle.clone().ok_or("no source loaded")?;
+        self.engine
+            .set_active_source(&handle)
+            .map_err(|_| "set active source failed")
+    }
+
+    fn command_set_active_range(
+        &mut self,
+        start_frame: u64,
+        end_frame: u64,
+    ) -> Result<(), &'static str> {
+        self.engine
+            .set_active_range_frames(start_frame, end_frame)
+            .map(|_| ())
+            .map_err(|_| "set active range failed")
+    }
+
+    fn command_cue(&mut self, frame: u64) -> Result<(), &'static str> {
+        self.engine
+            .cue_frame(frame)
+            .map(|_| ())
+            .map_err(|_| "cue failed")
+    }
+
+    fn command_prepare_anchor(&mut self) -> Result<(), &'static str> {
+        self.engine
+            .prepare_anchor()
+            .map(|_| ())
+            .map_err(|_| "prepare anchor failed")
+    }
+
+    fn command_play(&mut self) -> Result<(), &'static str> {
+        if !self.engine.snapshot().play_ready {
+            return Err("not ready");
+        }
+        self.engine.play().map_err(|_| "play failed")
+    }
+
+    fn command_pause(&mut self) -> Result<(), &'static str> {
+        self.engine.pause().map_err(|_| "pause failed")
+    }
+
+    fn command_stop(&mut self) -> Result<(), &'static str> {
+        self.engine.stop().map_err(|_| "stop failed")
+    }
+
+    fn command_tick_prepare(&mut self, carrier_frame: u64) -> Result<(), &'static str> {
+        let snapshot = self.engine.snapshot();
+        let handle = snapshot.active_source.ok_or("no active source")?;
+        let range = snapshot.active_range.ok_or("no active range")?;
+        let active_range = QgsActiveRangeTiming::new(
+            handle.duration_frames,
+            handle.timebase,
+            handle.audio_sample_rate,
+            range.start_frame,
+            range.end_frame,
+        )
+        .map_err(|_| "active range timing failed")?;
+        let limits = QgsPlayoutBufferLimits::default_transport_window();
+        if self.buffer.is_none() {
+            self.buffer = Some(
+                QgsPlayoutBufferState::new(
+                    active_range,
+                    handle.revision,
+                    handle.source_mode,
+                    self.plan.audio_source.lanes.clone(),
+                    limits,
+                )
+                .map_err(|_| "playout buffer create failed")?,
+            );
+            self.last_seen_buffer_events = 0;
+        }
+        let buffer = self.buffer.as_mut().ok_or("playout buffer missing")?;
+        buffer
+            .tick_prepare(
+                QgsFrameClock::forward(active_range).map_err(|_| "frame clock create failed")?,
+                QgsTickPreparationInput {
+                    carrier_frame,
+                    elapsed: Duration::ZERO,
+                    max_due_frames: limits.max_prepared_frames,
+                },
+            )
+            .map(|_| ())
+            .map_err(|_| "tick prepare failed")
+    }
+
+    fn command_close_active_source(&mut self) -> Result<(), &'static str> {
+        self.event_log.increment_generation();
+        self.discard_buffer(QgsBufferDiscardReason::SourceClosed);
+        self.engine
+            .close_active_source()
+            .map(|_| ())
+            .map_err(|_| "close active source failed")
+    }
+
+    fn command_unload_source(&mut self) -> Result<(), &'static str> {
+        let handle = self.active_handle.clone().ok_or("no source loaded")?;
+        self.event_log.increment_generation();
+        self.discard_buffer(QgsBufferDiscardReason::SourceUnloaded);
+        let result = self.engine.unload_source(&handle);
+        if result.unloaded {
+            self.active_handle = None;
+            Ok(())
+        } else {
+            Err("unload source failed")
+        }
+    }
+
+    fn discard_buffer(&mut self, reason: QgsBufferDiscardReason) {
+        if let Some(buffer) = self.buffer.as_mut() {
+            let frames = buffer.discard_all(reason);
+            self.latest_discarded_frame_count = frames.len();
+            self.engine.record_prepared_state_discarded(frames.len());
+            self.push_new_buffer_events();
+            self.buffer = None;
+            self.last_seen_buffer_events = 0;
+        }
+    }
+
+    fn push_new_runtime_events(&mut self) {
+        let snapshot = self.engine.snapshot();
+        for event in snapshot.events.iter().skip(self.last_seen_transport_events) {
+            self.event_log.push_transport_event(event);
+        }
+        self.last_seen_transport_events = snapshot.events.len();
+        self.push_new_buffer_events();
+    }
+
+    fn push_new_buffer_events(&mut self) {
+        if let Some(buffer) = &self.buffer {
+            for event in buffer.events().iter().skip(self.last_seen_buffer_events) {
+                self.event_log.push_tick_event(event);
+            }
+            self.last_seen_buffer_events = buffer.events().len();
+        }
+    }
+}
+
 fn qgs_projection_text_exposes_private_path(value: &str) -> bool {
     value.starts_with('/') || value.starts_with("file:") || value.contains("file:")
 }
@@ -6801,6 +7073,144 @@ mod tests {
         assert!(!evidence.frame_presented);
         assert!(!evidence.audio_device_verified);
         assert!(!evidence.realtime_verified);
+    }
+
+    fn qgs_test_command(
+        command_id: u64,
+        generation: u64,
+        command: QgsQncPlayerCommand,
+    ) -> QgsQncCommandEnvelope {
+        QgsQncCommandEnvelope::new(
+            command_id,
+            Some(QgsRuntimeEventGeneration(generation)),
+            Some("qnc://local/media/proxy/sample".to_string()),
+            command,
+            "test command",
+        )
+    }
+
+    #[test]
+    fn qgs_session_command_accepts_correct_generation() {
+        let mut session = QgsQncSessionCommandExecutor::new(sample_qgs_input_plan()).unwrap();
+        let result = session.execute(&qgs_test_command(
+            1,
+            0,
+            QgsQncPlayerCommand::LoadPreparedInput,
+        ));
+        assert!(result.outcome.accepted);
+        assert_eq!(result.passive_view.loaded_source_count, 1);
+        assert!(result
+            .projected_events
+            .iter()
+            .any(|event| event.event.kind == QgsQncProjectedEventKind::SourceLoaded));
+    }
+
+    #[test]
+    fn qgs_session_command_rejects_wrong_generation_without_mutating() {
+        let mut session = QgsQncSessionCommandExecutor::new(sample_qgs_input_plan()).unwrap();
+        let before = session.passive_view();
+        let result = session.execute(&qgs_test_command(
+            1,
+            9,
+            QgsQncPlayerCommand::LoadPreparedInput,
+        ));
+        assert!(!result.outcome.accepted);
+        assert_eq!(result.outcome.reason, Some("runtime generation mismatch"));
+        assert!(result.projected_events.is_empty());
+        assert_eq!(session.passive_view(), before);
+    }
+
+    #[test]
+    fn qgs_session_rejected_play_before_ready_does_not_mutate_state() {
+        let mut session = QgsQncSessionCommandExecutor::new(sample_qgs_input_plan()).unwrap();
+        session.execute(&qgs_test_command(
+            1,
+            0,
+            QgsQncPlayerCommand::LoadPreparedInput,
+        ));
+        let before = session.passive_view();
+        let result = session.execute(&qgs_test_command(2, 0, QgsQncPlayerCommand::Play));
+        assert!(!result.outcome.accepted);
+        assert_eq!(result.outcome.reason, Some("not ready"));
+        assert!(result.projected_events.is_empty());
+        assert_eq!(session.passive_view(), before);
+    }
+
+    #[test]
+    fn qgs_session_projected_events_and_passive_view_follow_commands() {
+        let mut session = QgsQncSessionCommandExecutor::new(sample_qgs_input_plan()).unwrap();
+        let commands = [
+            QgsQncPlayerCommand::LoadPreparedInput,
+            QgsQncPlayerCommand::PreloadSource,
+            QgsQncPlayerCommand::SetActiveSource,
+            QgsQncPlayerCommand::SetActiveRange {
+                start_frame: 0,
+                end_frame: 50,
+            },
+            QgsQncPlayerCommand::Cue { frame: 0 },
+            QgsQncPlayerCommand::PrepareAnchor,
+        ];
+        let mut projected_count = 0;
+        for (index, command) in commands.into_iter().enumerate() {
+            let result = session.execute(&qgs_test_command(index as u64, 0, command));
+            assert!(result.outcome.accepted);
+            projected_count += result.projected_events.len();
+        }
+        let view = session.passive_view();
+        assert!(view.readiness.play_ready);
+        assert_eq!(view.loaded_source_count, 1);
+        assert!(projected_count > 0);
+        assert!(!view.private_path_exposed);
+    }
+
+    #[test]
+    fn qgs_session_tick_prepare_is_prepared_not_realtime_or_presented() {
+        let mut session = QgsQncSessionCommandExecutor::new(sample_qgs_input_plan()).unwrap();
+        for (index, command) in [
+            QgsQncPlayerCommand::LoadPreparedInput,
+            QgsQncPlayerCommand::PreloadSource,
+            QgsQncPlayerCommand::SetActiveSource,
+            QgsQncPlayerCommand::SetActiveRange {
+                start_frame: 0,
+                end_frame: 50,
+            },
+            QgsQncPlayerCommand::Cue { frame: 0 },
+            QgsQncPlayerCommand::PrepareAnchor,
+            QgsQncPlayerCommand::Play,
+            QgsQncPlayerCommand::TickPrepare { carrier_frame: 0 },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let result = session.execute(&qgs_test_command(index as u64, 0, command));
+            assert!(result.outcome.accepted, "{:?}", result.outcome);
+        }
+        let view = session.passive_view();
+        assert_eq!(view.prepared_buffer.prepared_frame_count, 6);
+        assert_eq!(
+            view.prepared_buffer.payload_evidence,
+            QgsQncEvidenceStatus::Prepared
+        );
+        assert!(!view.evidence.realtime_verified);
+        assert!(!view.evidence.frame_presented);
+        assert!(!view.evidence.audio_device_verified);
+    }
+
+    #[test]
+    fn qgs_session_private_path_command_is_rejected_without_exposure() {
+        let mut session = QgsQncSessionCommandExecutor::new(sample_qgs_input_plan()).unwrap();
+        let command = QgsQncCommandEnvelope::new(
+            1,
+            Some(QgsRuntimeEventGeneration(0)),
+            Some("file:///tmp/private.MXF".to_string()),
+            QgsQncPlayerCommand::LoadPreparedInput,
+            "private path attempt",
+        );
+        let result = session.execute(&command);
+        assert!(!result.outcome.accepted);
+        assert_eq!(result.outcome.reason, Some("command exposes private path"));
+        assert!(result.projected_events.is_empty());
+        assert!(!result.passive_view.private_path_exposed);
     }
 
     #[test]
