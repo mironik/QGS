@@ -174,10 +174,11 @@ It does not prove:
 - QNC UI integration
 - IPC or process-launcher behavior
 
-## Recommended Next Block
+## Presenter Backend Follow-Up
 
-M2 Integration Block D should be a real display presenter backend audit or
-adapter-boundary spike.
+M2 Integration Block D is the real display presenter backend audit. It preserves
+the same Lego shape and recommends a staged path: first a screenshot/file
+presenter visual diagnostic, then a minimal Wayland/Vulkan presenter prototype.
 
 It should preserve the Lego shape:
 

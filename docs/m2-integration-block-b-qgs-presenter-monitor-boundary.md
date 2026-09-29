@@ -160,7 +160,7 @@ evidence remains test-boundary evidence only.
 
 ## Next Integration Block
 
-The next useful block is a real display-backend audit or adapter boundary. It
-should choose the first viable Linux display path, define evidence required for
-real display presentation, and still keep `VisualVerified` separate from merely
-submitting a frame to a presenter.
+Integration Block D audits real display presenter backend options. It keeps the
+presenter boundary independent, recommends a screenshot/file visual diagnostic
+before a minimal Wayland/Vulkan presenter prototype, and still keeps
+`VisualVerified` separate from merely submitting a frame to a presenter.
