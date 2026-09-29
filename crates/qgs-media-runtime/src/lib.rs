@@ -2047,6 +2047,399 @@ pub struct QgsRuntimeCommandOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QgsQncPlayerCommand {
+    LoadPreparedInput,
+    PreloadSource,
+    SetActiveSource,
+    SetActiveRange { start_frame: u64, end_frame: u64 },
+    Cue { frame: u64 },
+    PrepareAnchor,
+    Play,
+    Pause,
+    Stop,
+    TickPrepare { carrier_frame: u64 },
+    CloseActiveSource,
+    UnloadSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncCommandEnvelope {
+    pub command_id: u64,
+    pub expected_generation: Option<QgsRuntimeEventGeneration>,
+    pub public_source_uri: Option<String>,
+    pub command: QgsQncPlayerCommand,
+    pub payload_summary: String,
+}
+
+impl QgsQncCommandEnvelope {
+    pub fn new(
+        command_id: u64,
+        expected_generation: Option<QgsRuntimeEventGeneration>,
+        public_source_uri: Option<String>,
+        command: QgsQncPlayerCommand,
+        payload_summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            command_id,
+            expected_generation,
+            public_source_uri,
+            command,
+            payload_summary: payload_summary.into(),
+        }
+    }
+
+    pub fn exposes_private_path(&self) -> bool {
+        self.public_source_uri
+            .as_deref()
+            .is_some_and(qgs_projection_text_exposes_private_path)
+            || qgs_projection_text_exposes_private_path(&self.payload_summary)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncCommandOutcome {
+    pub command_id: u64,
+    pub accepted: bool,
+    pub reason: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsQncProjectedEventKind {
+    SourceLoaded,
+    SourcePreloaded,
+    ActiveSourceChanged,
+    ActiveRangeChanged,
+    CueChanged,
+    PreparedAnchorChanged,
+    PlaybackReadinessChanged,
+    TransportStateChanged,
+    TickPrepared,
+    PreparedBufferChanged,
+    SourceClosed,
+    SourceUnloaded,
+    CommandRejected,
+    RuntimeGenerationChanged,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncProjectedEvent {
+    pub kind: QgsQncProjectedEventKind,
+    pub public_payload_summary: String,
+    pub evidence_status: QgsQncEvidenceStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncEventEnvelope {
+    pub sequence: u64,
+    pub generation: u64,
+    pub public_source_uri: Option<String>,
+    pub event: QgsQncProjectedEvent,
+}
+
+impl QgsQncEventEnvelope {
+    pub fn from_runtime_event(event: &QgsRuntimeEventEnvelope) -> Self {
+        let kind = match event.kind {
+            QgsRuntimeEventKind::RuntimeEngineCreated => {
+                QgsQncProjectedEventKind::TransportStateChanged
+            }
+            QgsRuntimeEventKind::SourceLoaded => QgsQncProjectedEventKind::SourceLoaded,
+            QgsRuntimeEventKind::SourcePreloaded => QgsQncProjectedEventKind::SourcePreloaded,
+            QgsRuntimeEventKind::ActiveSourceChanged => {
+                QgsQncProjectedEventKind::ActiveSourceChanged
+            }
+            QgsRuntimeEventKind::ActiveRangeSet => QgsQncProjectedEventKind::ActiveRangeChanged,
+            QgsRuntimeEventKind::CueCompleted => QgsQncProjectedEventKind::CueChanged,
+            QgsRuntimeEventKind::PreparedAnchorReady => {
+                QgsQncProjectedEventKind::PreparedAnchorChanged
+            }
+            QgsRuntimeEventKind::PlayReadinessChanged => {
+                QgsQncProjectedEventKind::PlaybackReadinessChanged
+            }
+            QgsRuntimeEventKind::TransportStarted
+            | QgsRuntimeEventKind::TransportPaused
+            | QgsRuntimeEventKind::TransportStopped => {
+                QgsQncProjectedEventKind::TransportStateChanged
+            }
+            QgsRuntimeEventKind::TickPreparationCompleted => QgsQncProjectedEventKind::TickPrepared,
+            QgsRuntimeEventKind::PreparedStateDiscarded => {
+                QgsQncProjectedEventKind::PreparedBufferChanged
+            }
+            QgsRuntimeEventKind::ActiveSourceCleared => QgsQncProjectedEventKind::SourceClosed,
+            QgsRuntimeEventKind::SourceRevisionInvalidated => {
+                QgsQncProjectedEventKind::RuntimeGenerationChanged
+            }
+            QgsRuntimeEventKind::SourceUnloaded => QgsQncProjectedEventKind::SourceUnloaded,
+            QgsRuntimeEventKind::TransportCommandRejected => {
+                QgsQncProjectedEventKind::CommandRejected
+            }
+        };
+        let evidence_status = match event.kind {
+            QgsRuntimeEventKind::TickPreparationCompleted
+            | QgsRuntimeEventKind::PreparedStateDiscarded => QgsQncEvidenceStatus::Prepared,
+            _ => QgsQncEvidenceStatus::NotImplemented,
+        };
+        Self {
+            sequence: event.sequence.0,
+            generation: event.generation.0,
+            public_source_uri: event.source.as_ref().map(|source| source.source_id.clone()),
+            event: QgsQncProjectedEvent {
+                kind,
+                public_payload_summary: event.payload.summary.clone(),
+                evidence_status,
+            },
+        }
+    }
+
+    pub fn exposes_private_path(&self) -> bool {
+        self.public_source_uri
+            .as_deref()
+            .is_some_and(qgs_projection_text_exposes_private_path)
+            || qgs_projection_text_exposes_private_path(&self.event.public_payload_summary)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsQncEvidenceStatus {
+    NotImplemented,
+    Prepared,
+    SubmittedToDevice,
+    Presented,
+    Verified,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncEvidenceView {
+    pub prepared: QgsQncEvidenceStatus,
+    pub submitted_to_device: QgsQncEvidenceStatus,
+    pub presented: QgsQncEvidenceStatus,
+    pub verified: QgsQncEvidenceStatus,
+    pub realtime_verified: bool,
+    pub audio_device_verified: bool,
+    pub frame_presented: bool,
+}
+
+impl QgsQncEvidenceView {
+    pub fn prepared_only() -> Self {
+        Self {
+            prepared: QgsQncEvidenceStatus::Prepared,
+            submitted_to_device: QgsQncEvidenceStatus::NotImplemented,
+            presented: QgsQncEvidenceStatus::NotImplemented,
+            verified: QgsQncEvidenceStatus::NotImplemented,
+            realtime_verified: false,
+            audio_device_verified: false,
+            frame_presented: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncSourceView {
+    pub public_source_uri: Option<String>,
+    pub public_video_uri: Option<String>,
+    pub public_audio_uri: Option<String>,
+    pub source_mode: Option<QgsInputPlanSourceMode>,
+    pub revision: Option<QgsTransportSourceRevision>,
+}
+
+impl QgsQncSourceView {
+    pub fn exposes_private_path(&self) -> bool {
+        self.public_source_uri
+            .as_deref()
+            .is_some_and(qgs_projection_text_exposes_private_path)
+            || self
+                .public_video_uri
+                .as_deref()
+                .is_some_and(qgs_projection_text_exposes_private_path)
+            || self
+                .public_audio_uri
+                .as_deref()
+                .is_some_and(qgs_projection_text_exposes_private_path)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncReadinessView {
+    pub play_ready: bool,
+    pub prepared_anchor_ready: bool,
+    pub active_source_ready: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncTransportView {
+    pub state: QgsTransportStatus,
+    pub active_range: Option<QgsTransportActiveRange>,
+    pub cue: Option<QgsTransportCuePoint>,
+    pub prepared_anchor: Option<QgsTransportPreparedAnchor>,
+    pub carrier_frame: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncPreparedBufferView {
+    pub prepared_frame_count: usize,
+    pub prepared_start_frame: Option<u64>,
+    pub prepared_end_frame_exclusive: Option<u64>,
+    pub latest_discarded_frame_count: usize,
+    pub payload_evidence: QgsQncEvidenceStatus,
+}
+
+impl QgsQncPreparedBufferView {
+    pub fn from_slots(slots: &[QgsPreparedFrameSlot], latest_discarded_frame_count: usize) -> Self {
+        let prepared_start_frame = slots.iter().map(|slot| slot.key.frame).min();
+        let prepared_end_frame_exclusive = slots
+            .iter()
+            .filter_map(|slot| slot.key.frame.checked_add(1))
+            .max();
+        Self {
+            prepared_frame_count: slots.len(),
+            prepared_start_frame,
+            prepared_end_frame_exclusive,
+            latest_discarded_frame_count,
+            payload_evidence: if slots.is_empty() {
+                QgsQncEvidenceStatus::NotImplemented
+            } else {
+                QgsQncEvidenceStatus::Prepared
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncPassiveView {
+    pub generation: QgsRuntimeEventGeneration,
+    pub source: QgsQncSourceView,
+    pub transport: QgsQncTransportView,
+    pub readiness: QgsQncReadinessView,
+    pub loaded_source_count: usize,
+    pub prepared_buffer: QgsQncPreparedBufferView,
+    pub evidence: QgsQncEvidenceView,
+    pub private_path_exposed: bool,
+}
+
+impl QgsQncPassiveView {
+    pub fn from_parts(
+        generation: QgsRuntimeEventGeneration,
+        snapshot: &QgsTransportSnapshot,
+        slots: &[QgsPreparedFrameSlot],
+        latest_discarded_frame_count: usize,
+    ) -> Self {
+        let source = snapshot.active_source.as_ref().map_or(
+            QgsQncSourceView {
+                public_source_uri: None,
+                public_video_uri: None,
+                public_audio_uri: None,
+                source_mode: None,
+                revision: None,
+            },
+            |handle| QgsQncSourceView {
+                public_source_uri: Some(handle.source_id.clone()),
+                public_video_uri: Some(handle.video_uri.clone()),
+                public_audio_uri: Some(handle.audio_uri.clone()),
+                source_mode: Some(handle.source_mode),
+                revision: Some(handle.revision),
+            },
+        );
+        let transport = QgsQncTransportView {
+            state: snapshot.status,
+            active_range: snapshot.active_range,
+            cue: snapshot.cue,
+            prepared_anchor: snapshot.prepared_anchor,
+            carrier_frame: snapshot.cue.map(|cue| cue.frame),
+        };
+        let prepared_buffer =
+            QgsQncPreparedBufferView::from_slots(slots, latest_discarded_frame_count);
+        let private_path_exposed = source.exposes_private_path();
+        Self {
+            generation,
+            source,
+            transport,
+            readiness: QgsQncReadinessView {
+                play_ready: snapshot.play_ready,
+                prepared_anchor_ready: snapshot.prepared_anchor.is_some(),
+                active_source_ready: snapshot.active_source.is_some(),
+            },
+            loaded_source_count: snapshot.loaded_source_count,
+            prepared_buffer,
+            evidence: QgsQncEvidenceView::prepared_only(),
+            private_path_exposed,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncTimelineProjection {
+    pub active_range: Option<QgsTransportActiveRange>,
+    pub carrier_frame: Option<u64>,
+    pub cue_frame: Option<u64>,
+    pub prepared_start_frame: Option<u64>,
+    pub prepared_end_frame_exclusive: Option<u64>,
+    pub frame_rate: Option<RationalRate>,
+    pub audio_sample_rate: Option<u32>,
+    pub presented_frame_claimed: bool,
+}
+
+impl QgsQncTimelineProjection {
+    pub fn from_parts(snapshot: &QgsTransportSnapshot, slots: &[QgsPreparedFrameSlot]) -> Self {
+        let handle = snapshot.active_source.as_ref();
+        Self {
+            active_range: snapshot.active_range,
+            carrier_frame: snapshot.cue.map(|cue| cue.frame),
+            cue_frame: snapshot.cue.map(|cue| cue.frame),
+            prepared_start_frame: slots.iter().map(|slot| slot.key.frame).min(),
+            prepared_end_frame_exclusive: slots
+                .iter()
+                .filter_map(|slot| slot.key.frame.checked_add(1))
+                .max(),
+            frame_rate: handle.map(|handle| handle.timebase),
+            audio_sample_rate: handle.map(|handle| handle.audio_sample_rate),
+            presented_frame_claimed: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsQncMonitorProjection {
+    pub prepared_descriptor_present: bool,
+    pub source_frame: Option<u64>,
+    pub payload_status: QgsQncEvidenceStatus,
+    pub presented: bool,
+    pub real_display_evidence: Option<&'static str>,
+}
+
+impl QgsQncMonitorProjection {
+    pub fn from_slots(slots: &[QgsPreparedFrameSlot]) -> Self {
+        Self {
+            prepared_descriptor_present: !slots.is_empty(),
+            source_frame: slots.first().map(|slot| slot.key.frame),
+            payload_status: if slots.is_empty() {
+                QgsQncEvidenceStatus::NotImplemented
+            } else {
+                QgsQncEvidenceStatus::Prepared
+            },
+            presented: false,
+            real_display_evidence: None,
+        }
+    }
+}
+
+pub fn project_qnc_events(events: &[QgsRuntimeEventEnvelope]) -> Vec<QgsQncEventEnvelope> {
+    events
+        .iter()
+        .map(QgsQncEventEnvelope::from_runtime_event)
+        .collect()
+}
+
+pub fn qgs_qnc_projected_sequence_is_monotonic(events: &[QgsQncEventEnvelope]) -> bool {
+    events
+        .iter()
+        .enumerate()
+        .all(|(index, event)| event.sequence == u64::try_from(index).unwrap_or(u64::MAX))
+}
+
+fn qgs_projection_text_exposes_private_path(value: &str) -> bool {
+    value.starts_with('/') || value.starts_with("file:") || value.contains("file:")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QgsTransportSnapshot {
     pub status: QgsTransportStatus,
     pub active_source: Option<QgsTransportSourceHandle>,
@@ -2054,6 +2447,7 @@ pub struct QgsTransportSnapshot {
     pub cue: Option<QgsTransportCuePoint>,
     pub prepared_anchor: Option<QgsTransportPreparedAnchor>,
     pub play_ready: bool,
+    pub loaded_source_count: usize,
     pub no_work_on_play: QgsTransportNoWorkOnPlayCounters,
     pub events: Vec<QgsTransportEvent>,
 }
@@ -2457,6 +2851,7 @@ impl QgsTransportEngine {
             cue: self.cue,
             prepared_anchor: self.prepared_anchor,
             play_ready: self.play_ready,
+            loaded_source_count: self.sources.len(),
             no_work_on_play: self.no_work_on_play,
             events: self.events.clone(),
         }
@@ -6252,6 +6647,160 @@ mod tests {
         assert!(!transcript.contains("FramePresented"));
         assert!(!transcript.contains("RealtimeVerified"));
         assert!(!transcript.contains("AudioDeviceVerified"));
+    }
+
+    #[test]
+    fn qgs_qnc_command_envelope_contains_no_private_path() {
+        let command = QgsQncCommandEnvelope::new(
+            7,
+            Some(QgsRuntimeEventGeneration(1)),
+            Some("qnc://local/media/proxy/Mironik-1560".to_string()),
+            QgsQncPlayerCommand::SetActiveSource,
+            "set active source by public uri",
+        );
+        assert!(!command.exposes_private_path());
+        let private = QgsQncCommandEnvelope::new(
+            8,
+            None,
+            Some("/home/miro/private.MXF".to_string()),
+            QgsQncPlayerCommand::LoadPreparedInput,
+            "bad private source",
+        );
+        assert!(private.exposes_private_path());
+    }
+
+    #[test]
+    fn qgs_qnc_event_projection_preserves_generation_and_monotonic_sequence() {
+        let (mut engine, handle) = sample_ready_transport_engine();
+        let mut log = QgsRuntimeEventLog::new();
+        let ready_snapshot = engine.snapshot();
+        for event in &ready_snapshot.events {
+            log.push_transport_event(event);
+        }
+        log.increment_generation();
+        engine.unload_source(&handle);
+        for event in engine
+            .snapshot()
+            .events
+            .iter()
+            .skip(ready_snapshot.events.len())
+        {
+            log.push_transport_event(event);
+        }
+        let projected = project_qnc_events(log.envelopes());
+        assert!(qgs_qnc_projected_sequence_is_monotonic(&projected));
+        assert!(projected.iter().all(|event| !event.exposes_private_path()));
+        assert!(projected
+            .iter()
+            .any(|event| event.event.kind == QgsQncProjectedEventKind::SourceUnloaded));
+        assert!(projected.iter().any(|event| event.generation == 1));
+    }
+
+    #[test]
+    fn qgs_qnc_passive_view_reflects_ready_transport_state() {
+        let (engine, _handle) = sample_ready_transport_engine();
+        let (mut buffer, clock) = sample_qgs_playout_buffer();
+        buffer
+            .tick_prepare(
+                clock,
+                QgsTickPreparationInput {
+                    carrier_frame: 0,
+                    elapsed: Duration::ZERO,
+                    max_due_frames: 8,
+                },
+            )
+            .unwrap();
+        let view = QgsQncPassiveView::from_parts(
+            QgsRuntimeEventGeneration(0),
+            &engine.snapshot(),
+            &buffer.slots(),
+            0,
+        );
+        assert_eq!(view.loaded_source_count, 1);
+        assert!(view.readiness.play_ready);
+        assert!(view.readiness.prepared_anchor_ready);
+        assert_eq!(view.prepared_buffer.prepared_frame_count, 6);
+        assert_eq!(
+            view.prepared_buffer.payload_evidence,
+            QgsQncEvidenceStatus::Prepared
+        );
+        assert!(!view.private_path_exposed);
+        assert!(!view.evidence.frame_presented);
+        assert!(!view.evidence.audio_device_verified);
+        assert!(!view.evidence.realtime_verified);
+    }
+
+    #[test]
+    fn qgs_qnc_passive_view_after_unload_reflects_cleared_source() {
+        let (mut engine, handle) = sample_ready_transport_engine();
+        engine.unload_source(&handle);
+        let view =
+            QgsQncPassiveView::from_parts(QgsRuntimeEventGeneration(1), &engine.snapshot(), &[], 6);
+        assert_eq!(view.loaded_source_count, 0);
+        assert!(view.source.public_source_uri.is_none());
+        assert!(!view.readiness.play_ready);
+        assert!(!view.readiness.active_source_ready);
+        assert_eq!(view.prepared_buffer.latest_discarded_frame_count, 6);
+        assert!(!view.private_path_exposed);
+    }
+
+    #[test]
+    fn qgs_qnc_timeline_projection_uses_active_range_without_presented_claim() {
+        let (engine, _handle) = sample_ready_transport_engine();
+        let (mut buffer, clock) = sample_qgs_playout_buffer();
+        buffer
+            .tick_prepare(
+                clock,
+                QgsTickPreparationInput {
+                    carrier_frame: 0,
+                    elapsed: Duration::ZERO,
+                    max_due_frames: 8,
+                },
+            )
+            .unwrap();
+        let timeline = QgsQncTimelineProjection::from_parts(&engine.snapshot(), &buffer.slots());
+        assert_eq!(timeline.active_range.unwrap().start_frame, 0);
+        assert_eq!(timeline.active_range.unwrap().end_frame, 50);
+        assert_eq!(timeline.prepared_start_frame, Some(0));
+        assert_eq!(timeline.prepared_end_frame_exclusive, Some(6));
+        assert_eq!(timeline.audio_sample_rate, Some(48_000));
+        assert!(!timeline.presented_frame_claimed);
+    }
+
+    #[test]
+    fn qgs_qnc_monitor_projection_does_not_claim_real_display_evidence() {
+        let (mut buffer, clock) = sample_qgs_playout_buffer();
+        buffer
+            .tick_prepare(
+                clock,
+                QgsTickPreparationInput {
+                    carrier_frame: 0,
+                    elapsed: Duration::ZERO,
+                    max_due_frames: 8,
+                },
+            )
+            .unwrap();
+        let monitor = QgsQncMonitorProjection::from_slots(&buffer.slots());
+        assert!(monitor.prepared_descriptor_present);
+        assert_eq!(monitor.source_frame, Some(0));
+        assert_eq!(monitor.payload_status, QgsQncEvidenceStatus::Prepared);
+        assert!(!monitor.presented);
+        assert!(monitor.real_display_evidence.is_none());
+    }
+
+    #[test]
+    fn qgs_qnc_evidence_view_keeps_prepared_distinct_from_verified() {
+        let evidence = QgsQncEvidenceView::prepared_only();
+        assert_eq!(evidence.prepared, QgsQncEvidenceStatus::Prepared);
+        assert_eq!(
+            evidence.submitted_to_device,
+            QgsQncEvidenceStatus::NotImplemented
+        );
+        assert_eq!(evidence.presented, QgsQncEvidenceStatus::NotImplemented);
+        assert_eq!(evidence.verified, QgsQncEvidenceStatus::NotImplemented);
+        assert!(!evidence.frame_presented);
+        assert!(!evidence.audio_device_verified);
+        assert!(!evidence.realtime_verified);
     }
 
     #[test]

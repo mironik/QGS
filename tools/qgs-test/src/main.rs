@@ -26,7 +26,8 @@ use qgs_media_runtime::{
     broadcast_player_events_from_presentation_evidence, build_broadcast_audio_device_submission,
     build_broadcast_player_event_surface, build_broadcast_video_presenter_submission,
     classify_presentation, duration_abs_delta, duration_from_audio_samples,
-    evaluate_broadcast_preroll, max_video_timestamp_outside_audio_range, qgs_frames_for_duration,
+    evaluate_broadcast_preroll, max_video_timestamp_outside_audio_range, project_qnc_events,
+    qgs_frames_for_duration, qgs_qnc_projected_sequence_is_monotonic,
     simulate_broadcast_player_runtime_loop, summarize_broadcast_device_boundary,
     summarize_broadcast_payload_bindings, summarize_broadcast_player_runtime_events,
     summarize_broadcast_prepared_slots, summarize_broadcast_runtime_contract, AudioFormat,
@@ -48,9 +49,11 @@ use qgs_media_runtime::{
     QgsOriginalProxyAssociationStatus, QgsPlaybackRepresentation, QgsPlayoutBufferLimits,
     QgsPlayoutBufferState, QgsPreparedAudioChannel, QgsPreparedAudioLayout,
     QgsPreparedInputDescriptor, QgsPreparedMediaBinding, QgsPreparedSourceIdentity,
-    QgsPreparedStreamLayout, QgsPreparedVideoTiming, QgsRuntimeEventEnvelope, QgsRuntimeEventLog,
-    QgsTickPreparationEvent, QgsTickPreparationInput, QgsTransportEngine, QgsTransportEvent,
-    RationalRate, RealTimeClock, TestAudioSink, TestPresentationSink,
+    QgsPreparedStreamLayout, QgsPreparedVideoTiming, QgsQncCommandEnvelope, QgsQncEventEnvelope,
+    QgsQncMonitorProjection, QgsQncPassiveView, QgsQncPlayerCommand, QgsQncTimelineProjection,
+    QgsRuntimeEventEnvelope, QgsRuntimeEventLog, QgsTickPreparationEvent, QgsTickPreparationInput,
+    QgsTransportEngine, QgsTransportEvent, RationalRate, RealTimeClock, TestAudioSink,
+    TestPresentationSink,
 };
 use qgs_mp4::{
     classify_video_track, nearest_random_access_before, MediaHealth, Mp4Source, Mp4TrackKind,
@@ -138,6 +141,7 @@ const QGS_TRANSPORT_ENGINE_PARITY_ARG: &str = "--qgs-transport-engine-parity";
 const QGS_FRAME_CLOCK_PARITY_ARG: &str = "--qgs-frame-clock-parity";
 const QGS_PLAYOUT_BUFFER_TICK_ARG: &str = "--qgs-playout-buffer-tick";
 const QGS_RUNTIME_LIFECYCLE_EVENTS_ARG: &str = "--qgs-runtime-lifecycle-events";
+const QGS_QNC_EVENT_PROJECTION_ARG: &str = "--qgs-qnc-event-projection";
 const WRITE_DIAGNOSTIC_WAV_ARG: &str = "--write-diagnostic-wav";
 const AUDIO_AUDIT_START_MS_ARG: &str = "--start-ms";
 const AUDIO_AUDIT_DURATION_MS_ARG: &str = "--duration-ms";
@@ -278,6 +282,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.qgs_runtime_lifecycle_events_paths {
         return qgs_runtime_lifecycle_events_report(&original, &proxy);
+    }
+    if let Some((original, proxy)) = args.qgs_qnc_event_projection_paths {
+        return qgs_qnc_event_projection_report(&original, &proxy);
     }
     if let Some(path) = args.linux_audio_device_probe_path {
         return linux_audio_device_probe(&path);
@@ -2451,6 +2458,371 @@ fn qgs_runtime_event_label(event: &QgsRuntimeEventEnvelope) -> String {
             .unwrap_or_else(|| "<none>".to_string()),
         event.payload.summary
     )
+}
+
+fn qgs_qnc_event_projection_report(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let descriptor = build_qnc_prepared_input_descriptor(original_path, proxy_path)?;
+    descriptor.validate()?;
+    let plan =
+        QgsInputPlan::from_descriptor(&descriptor, default_qgs_input_plan_queue_requirements())?;
+    let active_duration = Duration::from_millis(1_000);
+    let active_frames = qgs_frames_for_duration(active_duration, plan.video_source.timebase)?;
+
+    let mut engine = QgsTransportEngine::new();
+    let handle = engine.load_source(&plan)?;
+    let command_examples = qgs_qnc_command_examples(&handle.source_id, active_frames);
+    engine.preload_source(&handle)?;
+    engine.set_active_source(&handle)?;
+    let transport_range = engine.set_active_range_frames(0, active_frames)?;
+    engine.cue_frame(0)?;
+    engine.prepare_anchor()?;
+    engine.evaluate_play_ready();
+    let ready_snapshot = engine.snapshot();
+
+    let active_range = QgsActiveRangeTiming::new(
+        handle.duration_frames,
+        handle.timebase,
+        handle.audio_sample_rate,
+        transport_range.start_frame,
+        transport_range.end_frame,
+    )?;
+    let limits = QgsPlayoutBufferLimits::default_transport_window();
+    let mut buffer = QgsPlayoutBufferState::new(
+        active_range,
+        handle.revision,
+        plan.source_mode,
+        plan.audio_source.lanes.clone(),
+        limits,
+    )?;
+    let tick_result = buffer.tick_prepare(
+        QgsFrameClock::forward(active_range)?,
+        QgsTickPreparationInput {
+            carrier_frame: 0,
+            elapsed: Duration::ZERO,
+            max_due_frames: limits.max_prepared_frames,
+        },
+    )?;
+    let prepared_slots = buffer.slots();
+
+    let mut event_log = QgsRuntimeEventLog::new();
+    for event in &ready_snapshot.events {
+        event_log.push_transport_event(event);
+    }
+    for event in &tick_result.events {
+        event_log.push_tick_event(event);
+    }
+    let ready_passive_view =
+        QgsQncPassiveView::from_parts(event_log.generation, &ready_snapshot, &prepared_slots, 0);
+    let timeline_projection =
+        QgsQncTimelineProjection::from_parts(&ready_snapshot, &prepared_slots);
+    let monitor_projection = QgsQncMonitorProjection::from_slots(&prepared_slots);
+
+    let previous_transport_event_count = ready_snapshot.events.len();
+    let discarded_frames = buffer.discard_all(QgsBufferDiscardReason::SourceUnloaded);
+    engine.record_prepared_state_discarded(discarded_frames.len());
+    event_log.increment_generation();
+    engine.unload_source(&handle);
+    let stale_command_rejected = engine.set_active_source(&handle).is_err();
+    let final_snapshot = engine.snapshot();
+    for event in final_snapshot
+        .events
+        .iter()
+        .skip(previous_transport_event_count)
+    {
+        event_log.push_transport_event(event);
+    }
+    for event in buffer.events().iter().skip(tick_result.events.len() + 1) {
+        event_log.push_tick_event(event);
+    }
+
+    let projected_events = project_qnc_events(event_log.envelopes());
+    let final_passive_view = QgsQncPassiveView::from_parts(
+        event_log.generation,
+        &final_snapshot,
+        &buffer.slots(),
+        discarded_frames.len(),
+    );
+    let private_path_exposed = command_examples
+        .iter()
+        .any(QgsQncCommandEnvelope::exposes_private_path)
+        || projected_events
+            .iter()
+            .any(QgsQncEventEnvelope::exposes_private_path)
+        || ready_passive_view.private_path_exposed
+        || final_passive_view.private_path_exposed;
+
+    println!("QGS QNC-Compatible Command/Event Projection");
+    println!("-------------------------------------------");
+    println!(
+        "Public original URI: {}",
+        descriptor.binding.original_media_uri
+    );
+    println!(
+        "Public proxy URI: {}",
+        descriptor
+            .binding
+            .proxy_media_uri
+            .as_deref()
+            .unwrap_or("<none>")
+    );
+    println!("Private path exposed: {}", yes_no(private_path_exposed));
+    println!("Projection only: yes");
+    println!("IPC implemented: no");
+    println!("QNC UI implemented: no");
+    println!("Command envelope examples:");
+    for command in &command_examples {
+        println!("  {}", qgs_qnc_command_label(command));
+    }
+    println!("Projected event count: {}", projected_events.len());
+    println!(
+        "Event sequence monotonic: {}",
+        yes_no(qgs_qnc_projected_sequence_is_monotonic(&projected_events))
+    );
+    println!("Projected event transcript:");
+    for event in &projected_events {
+        println!("  {}", qgs_qnc_projected_event_label(event));
+    }
+    println!("Passive view before unload:");
+    print_qgs_qnc_passive_view(&ready_passive_view);
+    println!("Passive view after unload:");
+    print_qgs_qnc_passive_view(&final_passive_view);
+    println!("Timeline projection:");
+    println!(
+        "  active_range: {}",
+        ready_passive_view
+            .transport
+            .active_range
+            .map(qgs_transport_range_label)
+            .unwrap_or_else(|| "<none>".to_string())
+    );
+    println!(
+        "  prepared_frame_window: {}",
+        qgs_optional_frame_window_label(
+            timeline_projection.prepared_start_frame,
+            timeline_projection.prepared_end_frame_exclusive
+        )
+    );
+    println!(
+        "  cue_frame: {}",
+        qgs_optional_u64_label(timeline_projection.cue_frame)
+    );
+    println!(
+        "  carrier_frame: {}",
+        qgs_optional_u64_label(timeline_projection.carrier_frame)
+    );
+    println!(
+        "  frame_rate: {}",
+        timeline_projection
+            .frame_rate
+            .map(qgs_rate_label)
+            .unwrap_or_else(|| "<none>".to_string())
+    );
+    println!(
+        "  audio_sample_rate: {}",
+        timeline_projection
+            .audio_sample_rate
+            .map(|rate| format!("{rate} Hz"))
+            .unwrap_or_else(|| "<none>".to_string())
+    );
+    println!(
+        "  presented_frame_claimed: {}",
+        yes_no(timeline_projection.presented_frame_claimed)
+    );
+    println!("Monitor projection:");
+    println!(
+        "  prepared_descriptor_present: {}",
+        yes_no(monitor_projection.prepared_descriptor_present)
+    );
+    println!(
+        "  source_frame: {}",
+        qgs_optional_u64_label(monitor_projection.source_frame)
+    );
+    println!("  payload_status: {:?}", monitor_projection.payload_status);
+    println!("  presented: {}", yes_no(monitor_projection.presented));
+    println!(
+        "  real_display_evidence: {}",
+        monitor_projection.real_display_evidence.unwrap_or("none")
+    );
+    println!("Evidence summary:");
+    println!("  prepared: {:?}", ready_passive_view.evidence.prepared);
+    println!(
+        "  submitted_to_device: {:?}",
+        ready_passive_view.evidence.submitted_to_device
+    );
+    println!("  presented: {:?}", ready_passive_view.evidence.presented);
+    println!("  verified: {:?}", ready_passive_view.evidence.verified);
+    println!(
+        "  stale command rejected: {}",
+        yes_no(stale_command_rejected)
+    );
+    println!("  realtime: no");
+    println!("  A/V sync: no");
+    println!("  FramePresented: no");
+    println!("  AudioDeviceVerified: no");
+
+    Ok(())
+}
+
+fn qgs_qnc_command_examples(source_uri: &str, active_frames: u64) -> Vec<QgsQncCommandEnvelope> {
+    vec![
+        QgsQncCommandEnvelope::new(
+            0,
+            Some(qgs_media_runtime::QgsRuntimeEventGeneration(0)),
+            Some(source_uri.to_string()),
+            QgsQncPlayerCommand::LoadPreparedInput,
+            "load prepared input by public qnc uri",
+        ),
+        QgsQncCommandEnvelope::new(
+            1,
+            Some(qgs_media_runtime::QgsRuntimeEventGeneration(0)),
+            Some(source_uri.to_string()),
+            QgsQncPlayerCommand::PreloadSource,
+            "preload source handle",
+        ),
+        QgsQncCommandEnvelope::new(
+            2,
+            Some(qgs_media_runtime::QgsRuntimeEventGeneration(0)),
+            Some(source_uri.to_string()),
+            QgsQncPlayerCommand::SetActiveSource,
+            "set active source",
+        ),
+        QgsQncCommandEnvelope::new(
+            3,
+            Some(qgs_media_runtime::QgsRuntimeEventGeneration(0)),
+            Some(source_uri.to_string()),
+            QgsQncPlayerCommand::SetActiveRange {
+                start_frame: 0,
+                end_frame: active_frames,
+            },
+            format!("set active range frames=[0..{active_frames})"),
+        ),
+        QgsQncCommandEnvelope::new(
+            4,
+            Some(qgs_media_runtime::QgsRuntimeEventGeneration(0)),
+            Some(source_uri.to_string()),
+            QgsQncPlayerCommand::Cue { frame: 0 },
+            "cue frame 0",
+        ),
+        QgsQncCommandEnvelope::new(
+            5,
+            Some(qgs_media_runtime::QgsRuntimeEventGeneration(0)),
+            Some(source_uri.to_string()),
+            QgsQncPlayerCommand::PrepareAnchor,
+            "prepare anchor before play",
+        ),
+        QgsQncCommandEnvelope::new(
+            6,
+            Some(qgs_media_runtime::QgsRuntimeEventGeneration(0)),
+            Some(source_uri.to_string()),
+            QgsQncPlayerCommand::TickPrepare { carrier_frame: 0 },
+            "prepare bounded buffer around carrier frame",
+        ),
+        QgsQncCommandEnvelope::new(
+            7,
+            Some(qgs_media_runtime::QgsRuntimeEventGeneration(1)),
+            Some(source_uri.to_string()),
+            QgsQncPlayerCommand::UnloadSource,
+            "unload source and invalidate revision",
+        ),
+    ]
+}
+
+fn qgs_qnc_command_label(command: &QgsQncCommandEnvelope) -> String {
+    format!(
+        "id={} gen={} source={} command={:?} summary={}",
+        command.command_id,
+        command
+            .expected_generation
+            .map(|generation| generation.0.to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
+        command.public_source_uri.as_deref().unwrap_or("<none>"),
+        command.command,
+        command.payload_summary
+    )
+}
+
+fn qgs_qnc_projected_event_label(event: &QgsQncEventEnvelope) -> String {
+    format!(
+        "#{:02} gen={} kind={:?} source={} evidence={:?} summary={}",
+        event.sequence,
+        event.generation,
+        event.event.kind,
+        event.public_source_uri.as_deref().unwrap_or("<none>"),
+        event.event.evidence_status,
+        event.event.public_payload_summary
+    )
+}
+
+fn print_qgs_qnc_passive_view(view: &QgsQncPassiveView) {
+    println!("  generation: {}", view.generation.0);
+    println!("  transport_state: {:?}", view.transport.state);
+    println!(
+        "  current_public_source: {}",
+        view.source.public_source_uri.as_deref().unwrap_or("<none>")
+    );
+    println!(
+        "  active_range: {}",
+        view.transport
+            .active_range
+            .map(qgs_transport_range_label)
+            .unwrap_or_else(|| "<none>".to_string())
+    );
+    println!(
+        "  cue_frame: {}",
+        view.transport
+            .cue
+            .map(|cue| cue.frame.to_string())
+            .unwrap_or_else(|| "<none>".to_string())
+    );
+    println!(
+        "  prepared_anchor: {}",
+        view.transport
+            .prepared_anchor
+            .map(|anchor| format!("frame={} revision={}", anchor.frame, anchor.revision.0))
+            .unwrap_or_else(|| "<none>".to_string())
+    );
+    println!("  play_ready: {}", yes_no(view.readiness.play_ready));
+    println!("  loaded_source_count: {}", view.loaded_source_count);
+    println!(
+        "  prepared_buffer: count={} window={} latest_discarded={}",
+        view.prepared_buffer.prepared_frame_count,
+        qgs_optional_frame_window_label(
+            view.prepared_buffer.prepared_start_frame,
+            view.prepared_buffer.prepared_end_frame_exclusive
+        ),
+        view.prepared_buffer.latest_discarded_frame_count
+    );
+    println!(
+        "  private_path_exposed: {}",
+        yes_no(view.private_path_exposed)
+    );
+}
+
+fn qgs_optional_u64_label(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "<none>".to_string())
+}
+
+fn qgs_optional_frame_window_label(start: Option<u64>, end: Option<u64>) -> String {
+    match (start, end) {
+        (Some(start), Some(end)) => format!("[{start}..{end})"),
+        _ => "<none>".to_string(),
+    }
+}
+
+fn qgs_transport_range_label(range: qgs_media_runtime::QgsTransportActiveRange) -> String {
+    format!(
+        "frames=[{}..{}) samples=[{}..{})",
+        range.start_frame, range.end_frame, range.start_sample, range.end_sample
+    )
+}
+
+fn qgs_rate_label(rate: RationalRate) -> String {
+    format!("{}/{}", rate.numerator(), rate.denominator())
 }
 
 fn result_label<T>(
@@ -13536,6 +13908,7 @@ struct Args {
     qgs_frame_clock_parity_paths: Option<(PathBuf, PathBuf)>,
     qgs_playout_buffer_tick_paths: Option<(PathBuf, PathBuf)>,
     qgs_runtime_lifecycle_events_paths: Option<(PathBuf, PathBuf)>,
+    qgs_qnc_event_projection_paths: Option<(PathBuf, PathBuf)>,
     linux_audio_device_probe_path: Option<PathBuf>,
     pipewire_audio_prototype_path: Option<PathBuf>,
     pipewire_audio_native_prototype_path: Option<PathBuf>,
@@ -13614,6 +13987,8 @@ impl Args {
         let mut qgs_playout_buffer_tick_paths = None;
         let mut qgs_runtime_lifecycle_events_original = None;
         let mut qgs_runtime_lifecycle_events_paths = None;
+        let mut qgs_qnc_event_projection_original = None;
+        let mut qgs_qnc_event_projection_paths = None;
         let mut linux_audio_device_probe_path = None;
         let mut pipewire_audio_prototype_path = None;
         let mut pipewire_audio_native_prototype_path = None;
@@ -13683,6 +14058,8 @@ impl Args {
         let mut next_arg_is_qgs_playout_buffer_tick_proxy = false;
         let mut next_arg_is_qgs_runtime_lifecycle_events_original = false;
         let mut next_arg_is_qgs_runtime_lifecycle_events_proxy = false;
+        let mut next_arg_is_qgs_qnc_event_projection_original = false;
+        let mut next_arg_is_qgs_qnc_event_projection_proxy = false;
         let mut next_arg_is_linux_audio_device_probe_path = false;
         let mut next_arg_is_pipewire_audio_prototype_path = false;
         let mut next_arg_is_pipewire_audio_native_prototype_path = false;
@@ -13854,6 +14231,17 @@ impl Args {
                 qgs_runtime_lifecycle_events_original = Some(PathBuf::from(arg));
                 next_arg_is_qgs_runtime_lifecycle_events_original = false;
                 next_arg_is_qgs_runtime_lifecycle_events_proxy = true;
+            } else if next_arg_is_qgs_qnc_event_projection_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = qgs_qnc_event_projection_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                qgs_qnc_event_projection_paths = Some((original, proxy));
+                next_arg_is_qgs_qnc_event_projection_proxy = false;
+            } else if next_arg_is_qgs_qnc_event_projection_original {
+                qgs_qnc_event_projection_original = Some(PathBuf::from(arg));
+                next_arg_is_qgs_qnc_event_projection_original = false;
+                next_arg_is_qgs_qnc_event_projection_proxy = true;
             } else if next_arg_is_qnc_prepared_input_descriptor_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = qnc_prepared_input_descriptor_original
@@ -14143,6 +14531,8 @@ impl Args {
                 next_arg_is_qgs_playout_buffer_tick_original = true;
             } else if arg == QGS_RUNTIME_LIFECYCLE_EVENTS_ARG {
                 next_arg_is_qgs_runtime_lifecycle_events_original = true;
+            } else if arg == QGS_QNC_EVENT_PROJECTION_ARG {
+                next_arg_is_qgs_qnc_event_projection_original = true;
             } else if arg == LINUX_AUDIO_DEVICE_PROBE_ARG {
                 next_arg_is_linux_audio_device_probe_path = true;
             } else if arg == PIPEWIRE_AUDIO_PROTOTYPE_ARG {
@@ -14213,6 +14603,7 @@ impl Args {
             qgs_frame_clock_parity_paths,
             qgs_playout_buffer_tick_paths,
             qgs_runtime_lifecycle_events_paths,
+            qgs_qnc_event_projection_paths,
             linux_audio_device_probe_path,
             pipewire_audio_prototype_path,
             pipewire_audio_native_prototype_path,
