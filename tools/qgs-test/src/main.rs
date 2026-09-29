@@ -161,6 +161,7 @@ const QGS_BROADCAST_PLAYER_CONTROL_CORE_ARG: &str = "--qgs-broadcast-player-cont
 const QGS_DEVICE_BACKEND_SELECTION_ARG: &str = "--qgs-device-backend-selection";
 const QGS_BROADCAST_PLAYER_OPERATIONAL_RUNTIME_ARG: &str =
     "--qgs-broadcast-player-operational-runtime";
+const QGS_BROADCAST_PLAYER_FAULT_RECOVERY_ARG: &str = "--qgs-broadcast-player-fault-recovery";
 const WRITE_DIAGNOSTIC_WAV_ARG: &str = "--write-diagnostic-wav";
 const AUDIO_AUDIT_START_MS_ARG: &str = "--start-ms";
 const AUDIO_AUDIT_DURATION_MS_ARG: &str = "--duration-ms";
@@ -336,6 +337,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.qgs_broadcast_player_operational_runtime_paths {
         return qgs_broadcast_player_operational_runtime_report(&original, &proxy);
+    }
+    if let Some((original, proxy)) = args.qgs_broadcast_player_fault_recovery_paths {
+        return qgs_broadcast_player_fault_recovery_report(&original, &proxy);
     }
     if let Some(policy) = args.qgs_device_backend_selection_policy {
         return qgs_device_backend_selection_report(policy);
@@ -4304,6 +4308,231 @@ fn qgs_broadcast_player_operational_runtime_report(
     Ok(())
 }
 
+fn qgs_broadcast_player_fault_recovery_report(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let descriptor = build_qnc_prepared_input_descriptor(original_path, proxy_path)?;
+    descriptor.validate()?;
+    let plan =
+        QgsInputPlan::from_descriptor(&descriptor, default_qgs_input_plan_queue_requirements())?;
+    let active_duration = Duration::from_millis(1_000);
+    let active_frames = qgs_frames_for_duration(active_duration, plan.video_source.timebase)?;
+    let outside_frame = active_frames.saturating_add(50);
+    let mut runtime =
+        QgsBroadcastPlayerOperationalRuntime::new(plan, QgsOperationalRuntimeConfig::default())?;
+    let commands = vec![
+        QgsBroadcastPlayerCommand::Play,
+        QgsBroadcastPlayerCommand::Seek { frame: 0 },
+        QgsBroadcastPlayerCommand::LoadPreparedInput,
+        QgsBroadcastPlayerCommand::Cue {
+            frame: outside_frame,
+        },
+        QgsBroadcastPlayerCommand::Prepare {
+            active_range: Some((0, active_frames)),
+        },
+        QgsBroadcastPlayerCommand::Play,
+        QgsBroadcastPlayerCommand::Cue { frame: 0 },
+        QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 },
+        QgsBroadcastPlayerCommand::Play,
+        QgsBroadcastPlayerCommand::Seek {
+            frame: outside_frame,
+        },
+        QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 },
+        QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 },
+        QgsBroadcastPlayerCommand::Stop,
+        QgsBroadcastPlayerCommand::Unload,
+        QgsBroadcastPlayerCommand::Seek { frame: 0 },
+    ];
+
+    let mut results = Vec::new();
+    let mut rejected_state_mutations = 0usize;
+    let mut rejected_source_loaded_after = Vec::new();
+    for command in commands {
+        let before = runtime.snapshot();
+        let result = runtime.execute(command);
+        if !result.accepted {
+            let state_mutated = before.operational_status != result.snapshot.operational_status
+                || before.current_frame != result.snapshot.current_frame
+                || before.player.readiness.source_loaded
+                    != result.snapshot.player.readiness.source_loaded
+                || before.player.position.active_range
+                    != result.snapshot.player.position.active_range;
+            if state_mutated {
+                rejected_state_mutations = rejected_state_mutations.saturating_add(1);
+            }
+            rejected_source_loaded_after.push(result.snapshot.player.readiness.source_loaded);
+        }
+        results.push(result);
+    }
+    let snapshot = runtime.snapshot();
+    let accepted_count = results.iter().filter(|result| result.accepted).count();
+    let rejected_count = results.len().saturating_sub(accepted_count);
+    let private_path_exposed = snapshot.exposes_private_path()
+        || results
+            .iter()
+            .any(|result| result.snapshot.exposes_private_path());
+    let status_transitions = results
+        .iter()
+        .map(|result| format!("{:?}", result.snapshot.operational_status))
+        .collect::<Vec<_>>()
+        .join(" -> ");
+
+    println!("QGS Broadcast Player Fault And Recovery Rules");
+    println!("---------------------------------------------");
+    println!("Runtime surface: production-shaped fault/recovery policy");
+    println!("Video source mode: ProxyPreview");
+    println!("Video source: proxy MP4");
+    println!("Audio source: original MXF");
+    println!("Original MXF audio authoritative: yes");
+    println!("Proxy AAC: not used / not authoritative");
+    println!("Broadcast audio model: discrete original mono lanes");
+    println!("Real display output: no");
+    println!("Realtime playback: no");
+    println!("A/V sync: no");
+    println!("Command sequence:");
+    for (index, result) in results.iter().enumerate() {
+        let last_fault = result.snapshot.fault_snapshot.last_fault.as_ref();
+        println!(
+            "  {:02}. {:?}: accepted={} status={:?} frame={} reason={} last_fault={} recovery={}",
+            index + 1,
+            result.command,
+            yes_no(result.accepted),
+            result.snapshot.operational_status,
+            qgs_optional_u64_label(result.snapshot.current_frame),
+            result.reason.unwrap_or("n/a"),
+            last_fault.map(|fault| fault.kind.label()).unwrap_or("none"),
+            last_fault
+                .map(|fault| fault.recovery_action.label())
+                .unwrap_or("none")
+        );
+        for event in &result.events {
+            println!(
+                "      event #{:02} {:?} status={:?} frame={} summary={}",
+                event.sequence,
+                event.kind,
+                event.status,
+                qgs_optional_u64_label(event.frame),
+                event.summary
+            );
+        }
+    }
+    println!("Command count: {}", results.len());
+    println!("Accepted commands: {accepted_count}");
+    println!("Rejected commands: {rejected_count}");
+    println!(
+        "Faults recorded: {}",
+        snapshot.fault_snapshot.active_faults.len()
+    );
+    println!(
+        "Recoverable fault count: {}",
+        snapshot.fault_snapshot.recoverable_fault_count
+    );
+    println!(
+        "Fatal fault count: {}",
+        snapshot.fault_snapshot.fatal_fault_count
+    );
+    println!(
+        "Last fault kind: {}",
+        snapshot
+            .fault_snapshot
+            .last_fault
+            .as_ref()
+            .map(|fault| fault.kind.label())
+            .unwrap_or("none")
+    );
+    println!(
+        "Last fault severity: {}",
+        snapshot
+            .fault_snapshot
+            .last_fault
+            .as_ref()
+            .map(|fault| fault.severity.label())
+            .unwrap_or("none")
+    );
+    println!(
+        "Last fault scope: {}",
+        snapshot
+            .fault_snapshot
+            .last_fault
+            .as_ref()
+            .map(|fault| fault.scope.label())
+            .unwrap_or("none")
+    );
+    println!(
+        "Last fault recoverable: {}",
+        snapshot
+            .fault_snapshot
+            .last_fault
+            .as_ref()
+            .map(|fault| yes_no(fault.recoverable))
+            .unwrap_or("n/a")
+    );
+    println!(
+        "Recommended recovery action: {}",
+        snapshot
+            .fault_snapshot
+            .recommended_recovery_action
+            .map(|action| action.label())
+            .unwrap_or("none")
+    );
+    println!(
+        "State mutated by rejected command: {}",
+        yes_no(rejected_state_mutations > 0)
+    );
+    println!(
+        "Rejected command state mutation count: {}",
+        rejected_state_mutations
+    );
+    println!(
+        "Source loaded after rejected commands: {}",
+        rejected_source_loaded_after
+            .iter()
+            .map(|value| yes_no(*value))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!("Status transitions: {status_transitions}");
+    println!("Final operational snapshot:");
+    print_operational_runtime_snapshot(&snapshot);
+    println!("Private path exposed: {}", yes_no(private_path_exposed));
+    println!(
+        "Real display: {}",
+        snapshot.player.device_status.real_display_backend
+    );
+    println!(
+        "Visual verified: {}",
+        yes_no(snapshot.player.device_status.visual_verified)
+    );
+    println!(
+        "Realtime verified: {}",
+        yes_no(snapshot.player.device_status.realtime_verified)
+    );
+    println!(
+        "Audio device production verified: {}",
+        yes_no(
+            snapshot
+                .player
+                .device_status
+                .audio_device_production_verified
+        )
+    );
+    println!(
+        "A/V sync verified: {}",
+        yes_no(snapshot.player.device_status.av_sync_verified)
+    );
+    println!(
+        "QNC OS display target: {}",
+        snapshot.player.device_status.qnc_os_display_target
+    );
+    println!("X11 target: {}", snapshot.player.device_status.x11_target);
+    println!("QNC UI integration: no");
+    println!("Device output: no");
+    println!("FramePresented real display claim: no");
+
+    Ok(())
+}
+
 fn qgs_device_backend_selection_report(
     policy: QgsDeviceSelectionPolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4748,9 +4977,61 @@ fn print_operational_runtime_snapshot(snapshot: &QgsOperationalRuntimeSnapshot) 
         println!("    none");
     } else {
         for fault in &snapshot.faults {
-            println!("    - {}: {}", fault.kind.label(), fault.reason);
+            println!(
+                "    - {} severity={} scope={} recoverable={} recovery={} status={} code={} reason={}",
+                fault.kind.label(),
+                fault.severity.label(),
+                fault.scope.label(),
+                yes_no(fault.recoverable),
+                fault.recovery_action.label(),
+                fault.recovery_status.label(),
+                fault.qnc_safe_code,
+                fault.reason
+            );
         }
     }
+    println!("  fault snapshot:");
+    println!(
+        "    active faults: {}",
+        snapshot.fault_snapshot.active_faults.len()
+    );
+    println!(
+        "    recoverable faults: {}",
+        snapshot.fault_snapshot.recoverable_fault_count
+    );
+    println!(
+        "    fatal faults: {}",
+        snapshot.fault_snapshot.fatal_fault_count
+    );
+    println!(
+        "    last fault: {}",
+        snapshot
+            .fault_snapshot
+            .last_fault
+            .as_ref()
+            .map(|fault| fault.kind.label())
+            .unwrap_or("none")
+    );
+    println!(
+        "    recommended recovery: {}",
+        snapshot
+            .fault_snapshot
+            .recommended_recovery_action
+            .map(|action| action.label())
+            .unwrap_or("none")
+    );
+    println!("    fault counters:");
+    if snapshot.fault_snapshot.fault_counters.is_empty() {
+        println!("      none");
+    } else {
+        for counter in &snapshot.fault_snapshot.fault_counters {
+            println!("      {}: {}", counter.kind.label(), counter.count);
+        }
+    }
+    println!(
+        "    backend/device warnings: {}",
+        snapshot.fault_snapshot.backend_device_warnings.len()
+    );
     println!("  device selection:");
     print_device_backend_selection(&snapshot.player.device_status.selection);
     println!(
@@ -16264,6 +16545,7 @@ struct Args {
     qgs_runtime_surface_e2e_paths: Option<(PathBuf, PathBuf)>,
     qgs_broadcast_player_control_core_paths: Option<(PathBuf, PathBuf)>,
     qgs_broadcast_player_operational_runtime_paths: Option<(PathBuf, PathBuf)>,
+    qgs_broadcast_player_fault_recovery_paths: Option<(PathBuf, PathBuf)>,
     qgs_device_backend_selection_policy: Option<QgsDeviceSelectionPolicy>,
     linux_audio_device_probe_path: Option<PathBuf>,
     pipewire_audio_prototype_path: Option<PathBuf>,
@@ -16361,6 +16643,8 @@ impl Args {
         let mut qgs_broadcast_player_control_core_paths = None;
         let mut qgs_broadcast_player_operational_runtime_original = None;
         let mut qgs_broadcast_player_operational_runtime_paths = None;
+        let mut qgs_broadcast_player_fault_recovery_original = None;
+        let mut qgs_broadcast_player_fault_recovery_paths = None;
         let mut qgs_device_backend_selection_policy = None;
         let mut linux_audio_device_probe_path = None;
         let mut pipewire_audio_prototype_path = None;
@@ -16449,6 +16733,8 @@ impl Args {
         let mut next_arg_is_qgs_broadcast_player_control_core_proxy = false;
         let mut next_arg_is_qgs_broadcast_player_operational_runtime_original = false;
         let mut next_arg_is_qgs_broadcast_player_operational_runtime_proxy = false;
+        let mut next_arg_is_qgs_broadcast_player_fault_recovery_original = false;
+        let mut next_arg_is_qgs_broadcast_player_fault_recovery_proxy = false;
         let mut next_arg_is_qgs_device_backend_selection_policy = false;
         let mut next_arg_is_linux_audio_device_probe_path = false;
         let mut next_arg_is_pipewire_audio_prototype_path = false;
@@ -16473,7 +16759,18 @@ impl Args {
         let mut next_arg_is_audio_monitor_track = false;
 
         for arg in std::env::args_os().skip(1) {
-            if next_arg_is_qgs_device_backend_selection_policy {
+            if next_arg_is_qgs_broadcast_player_fault_recovery_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = qgs_broadcast_player_fault_recovery_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                qgs_broadcast_player_fault_recovery_paths = Some((original, proxy));
+                next_arg_is_qgs_broadcast_player_fault_recovery_proxy = false;
+            } else if next_arg_is_qgs_broadcast_player_fault_recovery_original {
+                qgs_broadcast_player_fault_recovery_original = Some(PathBuf::from(arg));
+                next_arg_is_qgs_broadcast_player_fault_recovery_original = false;
+                next_arg_is_qgs_broadcast_player_fault_recovery_proxy = true;
+            } else if next_arg_is_qgs_device_backend_selection_policy {
                 qgs_device_backend_selection_policy = Some(
                     parse_device_selection_policy_arg(&arg)
                         .unwrap_or_else(|err| panic!("{QGS_DEVICE_BACKEND_SELECTION_ARG}: {err}")),
@@ -17033,6 +17330,8 @@ impl Args {
                 next_arg_is_qgs_broadcast_player_control_core_original = true;
             } else if arg == QGS_BROADCAST_PLAYER_OPERATIONAL_RUNTIME_ARG {
                 next_arg_is_qgs_broadcast_player_operational_runtime_original = true;
+            } else if arg == QGS_BROADCAST_PLAYER_FAULT_RECOVERY_ARG {
+                next_arg_is_qgs_broadcast_player_fault_recovery_original = true;
             } else if arg == QGS_DEVICE_BACKEND_SELECTION_ARG {
                 next_arg_is_qgs_device_backend_selection_policy = true;
             } else if arg == LINUX_AUDIO_DEVICE_PROBE_ARG {
@@ -17114,6 +17413,7 @@ impl Args {
             qgs_runtime_surface_e2e_paths,
             qgs_broadcast_player_control_core_paths,
             qgs_broadcast_player_operational_runtime_paths,
+            qgs_broadcast_player_fault_recovery_paths,
             qgs_device_backend_selection_policy,
             linux_audio_device_probe_path,
             pipewire_audio_prototype_path,

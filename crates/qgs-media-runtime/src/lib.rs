@@ -3471,6 +3471,12 @@ pub enum QgsBroadcastPlayerEventKind {
     PlayerUnloaded,
     PlayerFailed,
     PlayerTicked,
+    PlayerCommandRejected,
+    PlayerFaultRecorded,
+    PlayerRecoverySuggested,
+    PlayerEnteredFailed,
+    PlayerRecovered,
+    PlayerWarningRecorded,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4318,16 +4324,29 @@ impl QgsOperationalRuntimeConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum QgsOperationalFaultKind {
     BackendNotImplemented,
     RealDisplayUnavailable,
     AudioOutputNotProductionVerified,
+    VisualVerificationUnavailable,
+    RealtimeVerificationUnavailable,
+    AvSyncNotVerified,
     PreparedWindowUnderrun,
+    PreparedWindowEmpty,
     IllegalCommandForState,
     SourceNotLoaded,
+    SourceAlreadyLoaded,
+    StaleSourceHandle,
+    StaleGeneration,
     CueOutsideActiveRange,
+    SeekOutsideActiveRange,
+    PrepareRequired,
+    PrepareFailed,
     EndOfRangeReached,
+    PrivatePathExposureBlocked,
+    UnsupportedQncOsBackend,
+    ProxyAudioNotAuthoritative,
 }
 
 impl QgsOperationalFaultKind {
@@ -4336,11 +4355,368 @@ impl QgsOperationalFaultKind {
             Self::BackendNotImplemented => "BackendNotImplemented",
             Self::RealDisplayUnavailable => "RealDisplayUnavailable",
             Self::AudioOutputNotProductionVerified => "AudioOutputNotProductionVerified",
+            Self::VisualVerificationUnavailable => "VisualVerificationUnavailable",
+            Self::RealtimeVerificationUnavailable => "RealtimeVerificationUnavailable",
+            Self::AvSyncNotVerified => "AvSyncNotVerified",
             Self::PreparedWindowUnderrun => "PreparedWindowUnderrun",
+            Self::PreparedWindowEmpty => "PreparedWindowEmpty",
             Self::IllegalCommandForState => "IllegalCommandForState",
             Self::SourceNotLoaded => "SourceNotLoaded",
+            Self::SourceAlreadyLoaded => "SourceAlreadyLoaded",
+            Self::StaleSourceHandle => "StaleSourceHandle",
+            Self::StaleGeneration => "StaleGeneration",
             Self::CueOutsideActiveRange => "CueOutsideActiveRange",
+            Self::SeekOutsideActiveRange => "SeekOutsideActiveRange",
+            Self::PrepareRequired => "PrepareRequired",
+            Self::PrepareFailed => "PrepareFailed",
             Self::EndOfRangeReached => "EndOfRangeReached",
+            Self::PrivatePathExposureBlocked => "PrivatePathExposureBlocked",
+            Self::UnsupportedQncOsBackend => "UnsupportedQncOsBackend",
+            Self::ProxyAudioNotAuthoritative => "ProxyAudioNotAuthoritative",
+        }
+    }
+
+    pub const fn policy(self) -> QgsBroadcastPlayerRecoveryPolicy {
+        use QgsBroadcastPlayerFaultScope as Scope;
+        use QgsBroadcastPlayerFaultSeverity as Severity;
+        use QgsBroadcastPlayerRecoveryAction as Action;
+        match self {
+            Self::IllegalCommandForState => QgsBroadcastPlayerRecoveryPolicy::new(
+                Severity::Warning,
+                Scope::Command,
+                Action::RetryCommandAfterPrepare,
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+            ),
+            Self::SourceNotLoaded => QgsBroadcastPlayerRecoveryPolicy::new(
+                Severity::Recoverable,
+                Scope::Source,
+                Action::UnloadAndReload,
+                true,
+                false,
+                true,
+                false,
+                true,
+                false,
+            ),
+            Self::SourceAlreadyLoaded => QgsBroadcastPlayerRecoveryPolicy::new(
+                Severity::Warning,
+                Scope::Source,
+                Action::NoActionRequired,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+            ),
+            Self::StaleSourceHandle | Self::StaleGeneration => {
+                QgsBroadcastPlayerRecoveryPolicy::new(
+                    Severity::Recoverable,
+                    Scope::Session,
+                    Action::UnloadAndReload,
+                    true,
+                    false,
+                    true,
+                    true,
+                    true,
+                    false,
+                )
+            }
+            Self::CueOutsideActiveRange => QgsBroadcastPlayerRecoveryPolicy::new(
+                Severity::Recoverable,
+                Scope::Timing,
+                Action::ReCue,
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+            ),
+            Self::SeekOutsideActiveRange => QgsBroadcastPlayerRecoveryPolicy::new(
+                Severity::Recoverable,
+                Scope::Timing,
+                Action::SeekToValidRange,
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+            ),
+            Self::PrepareRequired => QgsBroadcastPlayerRecoveryPolicy::new(
+                Severity::Recoverable,
+                Scope::Prepare,
+                Action::PrepareAgain,
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+            ),
+            Self::PrepareFailed => QgsBroadcastPlayerRecoveryPolicy::new(
+                Severity::Recoverable,
+                Scope::Prepare,
+                Action::PrepareAgain,
+                true,
+                false,
+                true,
+                true,
+                true,
+                false,
+            ),
+            Self::PreparedWindowUnderrun | Self::PreparedWindowEmpty => {
+                QgsBroadcastPlayerRecoveryPolicy::new(
+                    Severity::Recoverable,
+                    Scope::Buffer,
+                    Action::PrepareAgain,
+                    true,
+                    false,
+                    true,
+                    true,
+                    true,
+                    false,
+                )
+            }
+            Self::EndOfRangeReached => QgsBroadcastPlayerRecoveryPolicy::new(
+                Severity::Info,
+                Scope::Playback,
+                Action::NoActionRequired,
+                true,
+                true,
+                false,
+                true,
+                false,
+                false,
+            ),
+            Self::BackendNotImplemented => QgsBroadcastPlayerRecoveryPolicy::new(
+                Severity::Warning,
+                Scope::Device,
+                Action::WaitForBackendImplementation,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+            ),
+            Self::RealDisplayUnavailable
+            | Self::VisualVerificationUnavailable
+            | Self::RealtimeVerificationUnavailable
+            | Self::AvSyncNotVerified => QgsBroadcastPlayerRecoveryPolicy::new(
+                Severity::Warning,
+                Scope::Device,
+                Action::UseDiagnosticBackendOnly,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+            ),
+            Self::AudioOutputNotProductionVerified => QgsBroadcastPlayerRecoveryPolicy::new(
+                Severity::Warning,
+                Scope::Device,
+                Action::UseDiagnosticBackendOnly,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+            ),
+            Self::PrivatePathExposureBlocked => QgsBroadcastPlayerRecoveryPolicy::new(
+                Severity::Recoverable,
+                Scope::Session,
+                Action::NoActionRequired,
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+            ),
+            Self::UnsupportedQncOsBackend => QgsBroadcastPlayerRecoveryPolicy::new(
+                Severity::Warning,
+                Scope::Device,
+                Action::SelectDifferentDevicePolicy,
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+            ),
+            Self::ProxyAudioNotAuthoritative => QgsBroadcastPlayerRecoveryPolicy::new(
+                Severity::Fatal,
+                Scope::Source,
+                Action::FatalRequiresNewSession,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsBroadcastPlayerFaultSeverity {
+    Info,
+    Warning,
+    Recoverable,
+    Fatal,
+}
+
+impl QgsBroadcastPlayerFaultSeverity {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Info => "Info",
+            Self::Warning => "Warning",
+            Self::Recoverable => "Recoverable",
+            Self::Fatal => "Fatal",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsBroadcastPlayerFaultScope {
+    Command,
+    Source,
+    Prepare,
+    Playback,
+    Buffer,
+    Device,
+    Timing,
+    Session,
+}
+
+impl QgsBroadcastPlayerFaultScope {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Command => "Command",
+            Self::Source => "Source",
+            Self::Prepare => "Prepare",
+            Self::Playback => "Playback",
+            Self::Buffer => "Buffer",
+            Self::Device => "Device",
+            Self::Timing => "Timing",
+            Self::Session => "Session",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsBroadcastPlayerRecoveryAction {
+    NoActionRequired,
+    RetryCommandAfterPrepare,
+    PrepareAgain,
+    ReCue,
+    SeekToValidRange,
+    StopThenUnload,
+    UnloadAndReload,
+    SelectDifferentDevicePolicy,
+    UseDiagnosticBackendOnly,
+    WaitForBackendImplementation,
+    FatalRequiresNewSession,
+}
+
+impl QgsBroadcastPlayerRecoveryAction {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NoActionRequired => "NoActionRequired",
+            Self::RetryCommandAfterPrepare => "RetryCommandAfterPrepare",
+            Self::PrepareAgain => "PrepareAgain",
+            Self::ReCue => "ReCue",
+            Self::SeekToValidRange => "SeekToValidRange",
+            Self::StopThenUnload => "StopThenUnload",
+            Self::UnloadAndReload => "UnloadAndReload",
+            Self::SelectDifferentDevicePolicy => "SelectDifferentDevicePolicy",
+            Self::UseDiagnosticBackendOnly => "UseDiagnosticBackendOnly",
+            Self::WaitForBackendImplementation => "WaitForBackendImplementation",
+            Self::FatalRequiresNewSession => "FatalRequiresNewSession",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsBroadcastPlayerRecoveryStatus {
+    Suggested,
+    NotRequired,
+    NotAttempted,
+    FailedRequiresNewSession,
+}
+
+impl QgsBroadcastPlayerRecoveryStatus {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Suggested => "Suggested",
+            Self::NotRequired => "NotRequired",
+            Self::NotAttempted => "NotAttempted",
+            Self::FailedRequiresNewSession => "FailedRequiresNewSession",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsBroadcastPlayerRecoveryPolicy {
+    pub severity: QgsBroadcastPlayerFaultSeverity,
+    pub scope: QgsBroadcastPlayerFaultScope,
+    pub action: QgsBroadcastPlayerRecoveryAction,
+    pub recoverable: bool,
+    pub state_mutates: bool,
+    pub qnc_may_retry: bool,
+    pub source_remains_loaded: bool,
+    pub prepared_window_invalidated: bool,
+    pub moves_to_failed: bool,
+}
+
+impl QgsBroadcastPlayerRecoveryPolicy {
+    pub const fn new(
+        severity: QgsBroadcastPlayerFaultSeverity,
+        scope: QgsBroadcastPlayerFaultScope,
+        action: QgsBroadcastPlayerRecoveryAction,
+        recoverable: bool,
+        state_mutates: bool,
+        qnc_may_retry: bool,
+        source_remains_loaded: bool,
+        prepared_window_invalidated: bool,
+        moves_to_failed: bool,
+    ) -> Self {
+        Self {
+            severity,
+            scope,
+            action,
+            recoverable,
+            state_mutates,
+            qnc_may_retry,
+            source_remains_loaded,
+            prepared_window_invalidated,
+            moves_to_failed,
+        }
+    }
+
+    pub const fn status(self) -> QgsBroadcastPlayerRecoveryStatus {
+        if matches!(
+            self.action,
+            QgsBroadcastPlayerRecoveryAction::FatalRequiresNewSession
+        ) {
+            QgsBroadcastPlayerRecoveryStatus::FailedRequiresNewSession
+        } else if matches!(
+            self.action,
+            QgsBroadcastPlayerRecoveryAction::NoActionRequired
+        ) {
+            QgsBroadcastPlayerRecoveryStatus::NotRequired
+        } else {
+            QgsBroadcastPlayerRecoveryStatus::Suggested
         }
     }
 }
@@ -4348,16 +4724,95 @@ impl QgsOperationalFaultKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QgsOperationalFault {
     pub kind: QgsOperationalFaultKind,
+    pub severity: QgsBroadcastPlayerFaultSeverity,
+    pub scope: QgsBroadcastPlayerFaultScope,
+    pub recoverable: bool,
+    pub recovery_action: QgsBroadcastPlayerRecoveryAction,
+    pub recovery_status: QgsBroadcastPlayerRecoveryStatus,
+    pub qnc_safe_code: &'static str,
     pub reason: &'static str,
 }
 
 impl QgsOperationalFault {
-    pub const fn new(kind: QgsOperationalFaultKind, reason: &'static str) -> Self {
-        Self { kind, reason }
+    pub fn new(kind: QgsOperationalFaultKind, reason: &'static str) -> Self {
+        let policy = kind.policy();
+        Self {
+            kind,
+            severity: policy.severity,
+            scope: policy.scope,
+            recoverable: policy.recoverable,
+            recovery_action: policy.action,
+            recovery_status: policy.status(),
+            qnc_safe_code: kind.label(),
+            reason,
+        }
     }
 
     pub fn exposes_private_path(&self) -> bool {
         qgs_projection_text_exposes_private_path(self.reason)
+    }
+}
+
+pub type QgsBroadcastPlayerFault = QgsOperationalFault;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsBroadcastPlayerFaultCounter {
+    pub kind: QgsOperationalFaultKind,
+    pub count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsBroadcastPlayerFaultSnapshot {
+    pub active_faults: Vec<QgsOperationalFault>,
+    pub last_fault: Option<QgsOperationalFault>,
+    pub fault_counters: Vec<QgsBroadcastPlayerFaultCounter>,
+    pub recoverable_fault_count: usize,
+    pub fatal_fault_count: usize,
+    pub recommended_recovery_action: Option<QgsBroadcastPlayerRecoveryAction>,
+    pub backend_device_warnings: Vec<QgsOperationalFault>,
+    pub private_path_exposed: bool,
+}
+
+impl QgsBroadcastPlayerFaultSnapshot {
+    pub fn from_faults(faults: Vec<QgsOperationalFault>) -> Self {
+        let mut counters = Vec::<QgsBroadcastPlayerFaultCounter>::new();
+        for fault in &faults {
+            if let Some(counter) = counters
+                .iter_mut()
+                .find(|counter| counter.kind == fault.kind)
+            {
+                counter.count = counter.count.saturating_add(1);
+            } else {
+                counters.push(QgsBroadcastPlayerFaultCounter {
+                    kind: fault.kind,
+                    count: 1,
+                });
+            }
+        }
+        counters.sort_by_key(|counter| counter.kind);
+        let recoverable_fault_count = faults.iter().filter(|fault| fault.recoverable).count();
+        let fatal_fault_count = faults
+            .iter()
+            .filter(|fault| fault.severity == QgsBroadcastPlayerFaultSeverity::Fatal)
+            .count();
+        let last_fault = faults.last().cloned();
+        let recommended_recovery_action = last_fault.as_ref().map(|fault| fault.recovery_action);
+        let backend_device_warnings = faults
+            .iter()
+            .filter(|fault| fault.scope == QgsBroadcastPlayerFaultScope::Device)
+            .cloned()
+            .collect();
+        let private_path_exposed = faults.iter().any(QgsOperationalFault::exposes_private_path);
+        Self {
+            active_faults: faults,
+            last_fault,
+            fault_counters: counters,
+            recoverable_fault_count,
+            fatal_fault_count,
+            recommended_recovery_action,
+            backend_device_warnings,
+            private_path_exposed,
+        }
     }
 }
 
@@ -4382,6 +4837,7 @@ pub struct QgsOperationalRuntimeSnapshot {
     pub current_audio_sample_range: Option<(u64, u64)>,
     pub buffer_health: QgsOperationalBufferHealth,
     pub faults: Vec<QgsOperationalFault>,
+    pub fault_snapshot: QgsBroadcastPlayerFaultSnapshot,
     pub accepted_commands: usize,
     pub rejected_commands: usize,
     pub completed: bool,
@@ -4409,6 +4865,12 @@ pub enum QgsOperationalRuntimeEventKind {
     Completed,
     Unloaded,
     WarningRaised,
+    PlayerCommandRejected,
+    PlayerFaultRecorded,
+    PlayerRecoverySuggested,
+    PlayerEnteredFailed,
+    PlayerRecovered,
+    PlayerWarningRecorded,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4463,7 +4925,7 @@ impl QgsBroadcastPlayerOperationalRuntime {
         let legality = self.command_legality(&command);
         if let Err(reason) = legality {
             self.rejected_commands = self.rejected_commands.saturating_add(1);
-            self.push_fault(QgsOperationalFaultKind::IllegalCommandForState, reason);
+            self.push_fault(self.rejected_fault_kind(&command, Some(reason)), reason);
             self.push_event(
                 QgsOperationalRuntimeEventKind::CommandRejected,
                 self.operational_status(),
@@ -4489,7 +4951,7 @@ impl QgsBroadcastPlayerOperationalRuntime {
         } else {
             self.rejected_commands = self.rejected_commands.saturating_add(1);
             self.push_fault(
-                QgsOperationalFaultKind::IllegalCommandForState,
+                self.rejected_fault_kind(&operational_command, result.reason),
                 result.reason.unwrap_or("command rejected"),
             );
             self.push_event(
@@ -4517,8 +4979,9 @@ impl QgsBroadcastPlayerOperationalRuntime {
         let buffer_health = self.buffer_health(&player, current_frame);
         let mut faults = self.state_faults(&player, &buffer_health);
         faults.extend(self.faults.clone());
-        let private_path_exposed = player.exposes_private_path()
-            || faults.iter().any(QgsOperationalFault::exposes_private_path);
+        let fault_snapshot = QgsBroadcastPlayerFaultSnapshot::from_faults(faults.clone());
+        let private_path_exposed =
+            player.exposes_private_path() || fault_snapshot.private_path_exposed;
         QgsOperationalRuntimeSnapshot {
             player,
             operational_status: self.operational_status(),
@@ -4526,6 +4989,7 @@ impl QgsBroadcastPlayerOperationalRuntime {
             current_audio_sample_range,
             buffer_health,
             faults,
+            fault_snapshot,
             accepted_commands: self.accepted_commands,
             rejected_commands: self.rejected_commands,
             completed: self.completed,
@@ -4622,6 +5086,34 @@ impl QgsBroadcastPlayerOperationalRuntime {
         }
     }
 
+    fn rejected_fault_kind(
+        &self,
+        command: &QgsBroadcastPlayerCommand,
+        reason: Option<&'static str>,
+    ) -> QgsOperationalFaultKind {
+        match command {
+            QgsBroadcastPlayerCommand::Play
+                if self.operational_status() == QgsBroadcastPlayerStatus::Empty =>
+            {
+                QgsOperationalFaultKind::SourceNotLoaded
+            }
+            QgsBroadcastPlayerCommand::Play if reason == Some("play requires Ready") => {
+                QgsOperationalFaultKind::PrepareRequired
+            }
+            QgsBroadcastPlayerCommand::LoadPreparedInput
+                if reason == Some("source already loaded") =>
+            {
+                QgsOperationalFaultKind::SourceAlreadyLoaded
+            }
+            QgsBroadcastPlayerCommand::Cue { .. } => QgsOperationalFaultKind::CueOutsideActiveRange,
+            QgsBroadcastPlayerCommand::Seek { .. } => {
+                QgsOperationalFaultKind::SeekOutsideActiveRange
+            }
+            QgsBroadcastPlayerCommand::Prepare { .. } => QgsOperationalFaultKind::PrepareFailed,
+            _ => QgsOperationalFaultKind::IllegalCommandForState,
+        }
+    }
+
     fn operational_command(&self, command: QgsBroadcastPlayerCommand) -> QgsBroadcastPlayerCommand {
         match command {
             QgsBroadcastPlayerCommand::Tick { .. } => QgsBroadcastPlayerCommand::Tick {
@@ -4657,7 +5149,6 @@ impl QgsBroadcastPlayerOperationalRuntime {
             QgsBroadcastPlayerCommand::Unload => {
                 self.completed = false;
                 self.current_frame = None;
-                self.faults.clear();
             }
         }
     }
@@ -4793,10 +5284,48 @@ impl QgsBroadcastPlayerOperationalRuntime {
                 "real display is unavailable",
             ));
         }
+        if !player.readiness.visual_verified {
+            faults.push(QgsOperationalFault::new(
+                QgsOperationalFaultKind::VisualVerificationUnavailable,
+                "visual verification is unavailable",
+            ));
+        }
+        if !player.readiness.realtime_verified {
+            faults.push(QgsOperationalFault::new(
+                QgsOperationalFaultKind::RealtimeVerificationUnavailable,
+                "realtime verification is unavailable",
+            ));
+        }
+        if !player.readiness.av_sync_verified {
+            faults.push(QgsOperationalFault::new(
+                QgsOperationalFaultKind::AvSyncNotVerified,
+                "A/V sync is not verified",
+            ));
+        }
         if !player.device_status.audio_device_production_verified {
             faults.push(QgsOperationalFault::new(
                 QgsOperationalFaultKind::AudioOutputNotProductionVerified,
                 "audio output is not production verified",
+            ));
+        }
+        if player.device_status.selection.selected_video_backend
+            == QgsVideoPresenterBackendKind::X11LegacyNonTarget
+        {
+            faults.push(QgsOperationalFault::new(
+                QgsOperationalFaultKind::UnsupportedQncOsBackend,
+                "X11 is legacy/non-target for QNC OS",
+            ));
+        }
+        if player.readiness.proxy_aac_authoritative {
+            faults.push(QgsOperationalFault::new(
+                QgsOperationalFaultKind::ProxyAudioNotAuthoritative,
+                "proxy AAC cannot be authoritative runtime audio",
+            ));
+        }
+        if buffer_health.preparation_pending {
+            faults.push(QgsOperationalFault::new(
+                QgsOperationalFaultKind::PreparedWindowEmpty,
+                "prepared window is empty while source is loaded",
             ));
         }
         if buffer_health.underrun {
@@ -4811,10 +5340,36 @@ impl QgsBroadcastPlayerOperationalRuntime {
     fn push_fault(&mut self, kind: QgsOperationalFaultKind, reason: &'static str) {
         let fault = QgsOperationalFault::new(kind, reason);
         if !self.faults.contains(&fault) {
-            self.faults.push(fault);
+            self.faults.push(fault.clone());
         }
         self.push_event(
-            QgsOperationalRuntimeEventKind::WarningRaised,
+            QgsOperationalRuntimeEventKind::PlayerFaultRecorded,
+            self.operational_status(),
+            self.current_frame,
+            reason,
+        );
+        if fault.recoverable {
+            self.push_event(
+                QgsOperationalRuntimeEventKind::PlayerRecoverySuggested,
+                self.operational_status(),
+                self.current_frame,
+                fault.recovery_action.label(),
+            );
+        }
+        if fault.severity == QgsBroadcastPlayerFaultSeverity::Fatal {
+            self.push_event(
+                QgsOperationalRuntimeEventKind::PlayerEnteredFailed,
+                QgsBroadcastPlayerStatus::Failed,
+                self.current_frame,
+                reason,
+            );
+        }
+        self.push_event(
+            if fault.scope == QgsBroadcastPlayerFaultScope::Device {
+                QgsOperationalRuntimeEventKind::PlayerWarningRecorded
+            } else {
+                QgsOperationalRuntimeEventKind::WarningRaised
+            },
             self.operational_status(),
             self.current_frame,
             reason,
@@ -5339,6 +5894,7 @@ pub enum BroadcastRuntimeVerificationLevel {
     ControlSurfaceEvidence,
     SelectionPolicyEvidence,
     OperationalStateEvidence,
+    FaultRecoveryPolicyEvidence,
     MediaInspected,
     PayloadExtracted,
     PayloadBound,
@@ -5370,6 +5926,7 @@ impl BroadcastRuntimeVerificationLevel {
             Self::ControlSurfaceEvidence => "ControlSurfaceEvidence",
             Self::SelectionPolicyEvidence => "SelectionPolicyEvidence",
             Self::OperationalStateEvidence => "OperationalStateEvidence",
+            Self::FaultRecoveryPolicyEvidence => "FaultRecoveryPolicyEvidence",
             Self::MediaInspected => "MediaInspected",
             Self::PayloadExtracted => "PayloadExtracted",
             Self::PayloadBound => "PayloadBound",
@@ -5434,6 +5991,7 @@ pub enum BroadcastRuntimeVerifiedSubsystem {
     BroadcastPlayerControlCore,
     DeviceBackendSelection,
     BroadcastPlayerOperationalRuntime,
+    BroadcastPlayerFaultRecoveryRules,
     SimulatedPlaybackLoop,
     RealSpeakerOutput,
     RealDisplayOutput,
@@ -5484,6 +6042,7 @@ impl BroadcastRuntimeVerifiedSubsystem {
             Self::BroadcastPlayerControlCore => "broadcast player control core",
             Self::DeviceBackendSelection => "device backend selection",
             Self::BroadcastPlayerOperationalRuntime => "broadcast player operational runtime",
+            Self::BroadcastPlayerFaultRecoveryRules => "broadcast player fault and recovery rules",
             Self::SimulatedPlaybackLoop => "simulated playback loop",
             Self::RealSpeakerOutput => "real speaker output",
             Self::RealDisplayOutput => "real display output",
@@ -5670,6 +6229,11 @@ impl BroadcastRuntimeVerificationMatrix {
                     subsystem: Subsystem::BroadcastPlayerOperationalRuntime,
                     level: Level::OperationalStateEvidence,
                     summary: "deterministic Broadcast Player operational runtime enforces command legality, advances logical position on playing ticks, models seek/stop/completion, reports buffer health and warnings, and keeps real display, realtime, A/V sync, and production audio-device claims false",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::BroadcastPlayerFaultRecoveryRules,
+                    level: Level::FaultRecoveryPolicyEvidence,
+                    summary: "production-shaped fault severity, scope, recovery action, snapshot counters, backend warnings, and rejected-command no-mutation rules are modeled and tested; real display, realtime, A/V sync, and production audio-device claims remain false",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::SimulatedPlaybackLoop,
@@ -9931,7 +10495,22 @@ mod tests {
             .snapshot
             .faults
             .iter()
-            .any(|fault| fault.kind == QgsOperationalFaultKind::IllegalCommandForState));
+            .any(|fault| fault.kind == QgsOperationalFaultKind::SourceNotLoaded));
+        let last_fault = result
+            .snapshot
+            .fault_snapshot
+            .last_fault
+            .as_ref()
+            .expect("last fault");
+        assert_eq!(last_fault.kind, QgsOperationalFaultKind::SourceNotLoaded);
+        assert_eq!(
+            last_fault.severity,
+            QgsBroadcastPlayerFaultSeverity::Recoverable
+        );
+        assert_eq!(
+            last_fault.recovery_action,
+            QgsBroadcastPlayerRecoveryAction::UnloadAndReload
+        );
         assert!(!result.snapshot.exposes_private_path());
     }
 
@@ -9953,6 +10532,17 @@ mod tests {
         assert_eq!(
             result.snapshot.operational_status,
             QgsBroadcastPlayerStatus::Loaded
+        );
+        let last_fault = result
+            .snapshot
+            .fault_snapshot
+            .last_fault
+            .as_ref()
+            .expect("last fault");
+        assert_eq!(last_fault.kind, QgsOperationalFaultKind::PrepareRequired);
+        assert_eq!(
+            last_fault.recovery_action,
+            QgsBroadcastPlayerRecoveryAction::PrepareAgain
         );
     }
 
@@ -10066,7 +10656,11 @@ mod tests {
             .snapshot
             .faults
             .iter()
-            .any(|fault| fault.kind == QgsOperationalFaultKind::IllegalCommandForState));
+            .any(|fault| fault.kind == QgsOperationalFaultKind::SeekOutsideActiveRange));
+        assert_eq!(
+            result.snapshot.fault_snapshot.recommended_recovery_action,
+            Some(QgsBroadcastPlayerRecoveryAction::SeekToValidRange)
+        );
     }
 
     #[test]
@@ -10110,7 +10704,94 @@ mod tests {
             .faults
             .iter()
             .any(|fault| fault.kind == QgsOperationalFaultKind::AudioOutputNotProductionVerified));
+        assert!(snapshot
+            .faults
+            .iter()
+            .any(|fault| fault.kind == QgsOperationalFaultKind::VisualVerificationUnavailable));
+        assert!(snapshot
+            .faults
+            .iter()
+            .any(|fault| fault.kind == QgsOperationalFaultKind::RealtimeVerificationUnavailable));
+        assert!(snapshot
+            .faults
+            .iter()
+            .any(|fault| fault.kind == QgsOperationalFaultKind::AvSyncNotVerified));
+        assert_eq!(snapshot.fault_snapshot.fatal_fault_count, 0);
+        assert!(snapshot.fault_snapshot.recoverable_fault_count > 0);
         assert!(!snapshot.exposes_private_path());
+    }
+
+    #[test]
+    fn qgs_fault_snapshot_counts_last_fault_and_recovery_action() {
+        let mut runtime = qgs_operational_runtime_ready((0, 10));
+        let before = runtime.snapshot();
+        let result = runtime.execute(QgsBroadcastPlayerCommand::Seek { frame: 99 });
+        assert!(!result.accepted);
+        assert_eq!(
+            result.snapshot.operational_status,
+            before.operational_status
+        );
+        assert_eq!(result.snapshot.current_frame, before.current_frame);
+        assert_eq!(
+            result.snapshot.player.readiness.source_loaded,
+            before.player.readiness.source_loaded
+        );
+
+        let fault_snapshot = &result.snapshot.fault_snapshot;
+        assert!(fault_snapshot
+            .fault_counters
+            .iter()
+            .any(
+                |counter| counter.kind == QgsOperationalFaultKind::SeekOutsideActiveRange
+                    && counter.count == 1
+            ));
+        assert_eq!(fault_snapshot.fatal_fault_count, 0);
+        assert!(fault_snapshot.recoverable_fault_count > 0);
+        assert_eq!(
+            fault_snapshot.recommended_recovery_action,
+            Some(QgsBroadcastPlayerRecoveryAction::SeekToValidRange)
+        );
+        assert!(!fault_snapshot.private_path_exposed);
+    }
+
+    #[test]
+    fn qgs_fault_policy_keeps_backend_warnings_non_fatal() {
+        let runtime = qgs_operational_runtime_ready((0, 50));
+        let snapshot = runtime.snapshot();
+        assert!(snapshot
+            .fault_snapshot
+            .backend_device_warnings
+            .iter()
+            .any(
+                |fault| fault.kind == QgsOperationalFaultKind::BackendNotImplemented
+                    && fault.severity == QgsBroadcastPlayerFaultSeverity::Warning
+                    && fault.recovery_action
+                        == QgsBroadcastPlayerRecoveryAction::WaitForBackendImplementation
+            ));
+        assert!(snapshot
+            .fault_snapshot
+            .backend_device_warnings
+            .iter()
+            .any(
+                |fault| fault.kind == QgsOperationalFaultKind::AudioOutputNotProductionVerified
+                    && fault.recovery_action
+                        == QgsBroadcastPlayerRecoveryAction::UseDiagnosticBackendOnly
+            ));
+        assert_eq!(snapshot.fault_snapshot.fatal_fault_count, 0);
+        assert_ne!(
+            snapshot
+                .player
+                .device_status
+                .selection
+                .selected_video_backend,
+            QgsVideoPresenterBackendKind::X11LegacyNonTarget
+        );
+        assert!(!snapshot.player.readiness.proxy_aac_authoritative);
+        assert!(snapshot.player.readiness.discrete_mono_audio);
+        assert!(!snapshot.player.readiness.visual_verified);
+        assert!(!snapshot.player.readiness.realtime_verified);
+        assert!(!snapshot.player.readiness.audio_device_verified);
+        assert!(!snapshot.player.readiness.av_sync_verified);
     }
 
     #[test]
@@ -11451,6 +12132,18 @@ mod tests {
         );
         assert!(
             BroadcastRuntimeVerificationLevel::OperationalStateEvidence
+                < BroadcastRuntimeVerificationLevel::RealtimeVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::FaultRecoveryPolicyEvidence
+                < BroadcastRuntimeVerificationLevel::VisualVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::FaultRecoveryPolicyEvidence
+                < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::FaultRecoveryPolicyEvidence
                 < BroadcastRuntimeVerificationLevel::RealtimeVerified
         );
         assert!(
