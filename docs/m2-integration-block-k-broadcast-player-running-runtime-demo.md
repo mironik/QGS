@@ -182,6 +182,21 @@ not add a backend, real display output, realtime certification, A/V sync
 certification, production audio output, QNC UI integration, export/render, or a
 real backend `FramePresented` claim.
 
+## QNC Control Session
+
+M2 Block L adds a related command:
+
+```text
+cargo run -q -p qgs-test -- --qgs-broadcast-player-control-session <original-mxf> <proxy-mp4>
+```
+
+Fixed run mode shows the backend player behavior through one operator scenario.
+Control session mode shows QNC-style command control: qgs-test sends explicit
+commands such as `load`, `prepare`, `cue:0`, `play:10`, `pause`, `seek:50`,
+`stop`, and `unload`, then prints the resulting runtime snapshot after each
+command. Both modes use the same operational runtime and preserve the same
+truth boundaries.
+
 ## Sony FX6 Sample 002 Result
 
 For sample 002, the run reaches:

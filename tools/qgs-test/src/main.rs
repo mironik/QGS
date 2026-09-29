@@ -50,11 +50,12 @@ use qgs_media_runtime::{
     PlaybackConfig, PlaybackState, PresentationDecision, QgsActiveRangeTiming,
     QgsAudioOutputBackendKind, QgsAudioRepresentation, QgsBroadcastPlayerCommand,
     QgsBroadcastPlayerCore, QgsBroadcastPlayerOperationalRuntime, QgsBroadcastPlayerSnapshot,
-    QgsBufferDiscardReason, QgsDeviceBackendSelection, QgsDeviceBackendSelector,
-    QgsDeviceSelectionPolicy, QgsFilePresenterSubmissionResult, QgsFrameClock, QgsFrameClockMode,
-    QgsFrameClockRate, QgsInputPlan, QgsInputPlanQueueRequirements, QgsOperationalRuntimeConfig,
-    QgsOperationalRuntimeSnapshot, QgsOriginalProxyAssociationStatus, QgsPlaybackRepresentation,
-    QgsPlayoutBufferLimits, QgsPlayoutBufferState, QgsPreparedAudioChannel, QgsPreparedAudioLayout,
+    QgsBroadcastPlayerStatus, QgsBufferDiscardReason, QgsDeviceBackendSelection,
+    QgsDeviceBackendSelector, QgsDeviceSelectionPolicy, QgsFilePresenterSubmissionResult,
+    QgsFrameClock, QgsFrameClockMode, QgsFrameClockRate, QgsInputPlan,
+    QgsInputPlanQueueRequirements, QgsOperationalRuntimeConfig, QgsOperationalRuntimeSnapshot,
+    QgsOriginalProxyAssociationStatus, QgsPlaybackRepresentation, QgsPlayoutBufferLimits,
+    QgsPlayoutBufferState, QgsPreparedAudioChannel, QgsPreparedAudioLayout,
     QgsPreparedInputDescriptor, QgsPreparedMediaBinding, QgsPreparedSourceIdentity,
     QgsPreparedStreamLayout, QgsPreparedVideoTiming, QgsQncCommandEnvelope, QgsQncEventEnvelope,
     QgsQncMonitorProjection, QgsQncPassiveView, QgsQncPlayerCommand, QgsQncSessionCommandExecutor,
@@ -163,9 +164,11 @@ const QGS_BROADCAST_PLAYER_OPERATIONAL_RUNTIME_ARG: &str =
     "--qgs-broadcast-player-operational-runtime";
 const QGS_BROADCAST_PLAYER_FAULT_RECOVERY_ARG: &str = "--qgs-broadcast-player-fault-recovery";
 const QGS_BROADCAST_PLAYER_RUN_ARG: &str = "--qgs-broadcast-player-run";
+const QGS_BROADCAST_PLAYER_CONTROL_SESSION_ARG: &str = "--qgs-broadcast-player-control-session";
 const QGS_BROADCAST_PLAYER_RUN_FRAMES_ARG: &str = "--frames";
 const QGS_BROADCAST_PLAYER_RUN_SEEK_FRAME_ARG: &str = "--seek-frame";
 const QGS_BROADCAST_PLAYER_RUN_VIEW_ARG: &str = "--view";
+const QGS_BROADCAST_PLAYER_CONTROL_SCRIPT_ARG: &str = "--script";
 const WRITE_DIAGNOSTIC_WAV_ARG: &str = "--write-diagnostic-wav";
 const AUDIO_AUDIT_START_MS_ARG: &str = "--start-ms";
 const AUDIO_AUDIT_DURATION_MS_ARG: &str = "--duration-ms";
@@ -350,6 +353,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &original,
             &proxy,
             args.qgs_broadcast_player_run_options,
+        );
+    }
+    if let Some((original, proxy)) = args.qgs_broadcast_player_control_session_paths {
+        return qgs_broadcast_player_control_session_report(
+            &original,
+            &proxy,
+            &args.qgs_broadcast_player_control_session_script,
         );
     }
     if let Some(policy) = args.qgs_device_backend_selection_policy {
@@ -5107,6 +5117,429 @@ fn qgs_running_is_persistent_warning_kind(
             | qgs_media_runtime::QgsOperationalFaultKind::RealtimeVerificationUnavailable
             | qgs_media_runtime::QgsOperationalFaultKind::AvSyncNotVerified
     )
+}
+
+const QGS_BROADCAST_PLAYER_CONTROL_SESSION_DEFAULT_SCRIPT: &str =
+    "load,prepare,cue:0,preroll,play:10,pause,seek:50,preroll,play:10,stop,unload";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum QgsControlSessionScriptCommand {
+    Load,
+    Prepare,
+    Cue(u64),
+    Preroll,
+    Play(u64),
+    Pause,
+    Seek(u64),
+    Stop,
+    Unload,
+    Snapshot,
+    Tick(u64),
+    Status,
+}
+
+impl QgsControlSessionScriptCommand {
+    fn parse_script(script: &str) -> Result<Vec<Self>, String> {
+        script
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(Self::parse_one)
+            .collect()
+    }
+
+    fn parse_one(part: &str) -> Result<Self, String> {
+        if part == "load" {
+            Ok(Self::Load)
+        } else if part == "prepare" {
+            Ok(Self::Prepare)
+        } else if part == "preroll" {
+            Ok(Self::Preroll)
+        } else if part == "pause" {
+            Ok(Self::Pause)
+        } else if part == "stop" {
+            Ok(Self::Stop)
+        } else if part == "unload" {
+            Ok(Self::Unload)
+        } else if part == "snapshot" {
+            Ok(Self::Snapshot)
+        } else if part == "status" {
+            Ok(Self::Status)
+        } else if let Some(value) = part.strip_prefix("cue:") {
+            Ok(Self::Cue(qgs_parse_control_script_u64(part, value)?))
+        } else if let Some(value) = part.strip_prefix("seek:") {
+            Ok(Self::Seek(qgs_parse_control_script_u64(part, value)?))
+        } else if let Some(value) = part.strip_prefix("play:") {
+            Ok(Self::Play(
+                qgs_parse_control_script_u64(part, value)?.max(1),
+            ))
+        } else if let Some(value) = part.strip_prefix("tick:") {
+            Ok(Self::Tick(
+                qgs_parse_control_script_u64(part, value)?.max(1),
+            ))
+        } else {
+            Err(format!("unsupported control script command: {part}"))
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::Load => "load".to_string(),
+            Self::Prepare => "prepare".to_string(),
+            Self::Cue(frame) => format!("cue:{frame}"),
+            Self::Preroll => "preroll".to_string(),
+            Self::Play(frames) => format!("play:{frames}"),
+            Self::Pause => "pause".to_string(),
+            Self::Seek(frame) => format!("seek:{frame}"),
+            Self::Stop => "stop".to_string(),
+            Self::Unload => "unload".to_string(),
+            Self::Snapshot => "snapshot".to_string(),
+            Self::Tick(frames) => format!("tick:{frames}"),
+            Self::Status => "status".to_string(),
+        }
+    }
+}
+
+fn qgs_parse_control_script_u64(part: &str, value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("{part} expects an unsigned integer argument"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QgsControlSessionStateKey {
+    status: QgsBroadcastPlayerStatus,
+    source_loaded: bool,
+    frame: Option<u64>,
+    audio_range: Option<(u64, u64)>,
+    prepared_start: Option<u64>,
+    prepared_end: Option<u64>,
+}
+
+impl QgsControlSessionStateKey {
+    fn from_snapshot(snapshot: &QgsOperationalRuntimeSnapshot) -> Self {
+        Self {
+            status: snapshot.operational_status,
+            source_loaded: snapshot.player.readiness.source_loaded,
+            frame: snapshot.current_frame,
+            audio_range: snapshot.current_audio_sample_range,
+            prepared_start: snapshot.buffer_health.prepared_start_frame,
+            prepared_end: snapshot.buffer_health.prepared_end_frame_exclusive,
+        }
+    }
+}
+
+fn qgs_broadcast_player_control_session_report(
+    original_path: &Path,
+    proxy_path: &Path,
+    script: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let descriptor = build_qnc_prepared_input_descriptor(original_path, proxy_path)?;
+    descriptor.validate()?;
+    let plan =
+        QgsInputPlan::from_descriptor(&descriptor, default_qgs_input_plan_queue_requirements())?;
+    let active_frames = plan.video_source.duration_frames;
+    let commands = QgsControlSessionScriptCommand::parse_script(script)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    let mut runtime =
+        QgsBroadcastPlayerOperationalRuntime::new(plan, QgsOperationalRuntimeConfig::default())?;
+    let mut accepted_count = 0_usize;
+    let mut rejected_count = 0_usize;
+
+    println!("QGS Broadcast Player Control Session");
+    println!("mode: ProxyPreview");
+    println!("video: proxy MP4");
+    println!("audio: original MXF mono lanes");
+    println!("device: preview-qnc-os");
+    println!("display: NotImplemented / target Wayland+Vulkan");
+    println!("x11: legacy/non-target");
+    println!("private source path: hidden");
+    println!("proxy AAC authoritative: no");
+    println!();
+    println!("SCRIPT");
+    println!("{script}");
+    println!();
+
+    for (index, command) in commands.iter().enumerate() {
+        let ordinal = index + 1;
+        let label = command.label();
+        println!("[{ordinal:03}] {label}");
+        match command {
+            QgsControlSessionScriptCommand::Load => {
+                let result = runtime.execute(QgsBroadcastPlayerCommand::LoadPreparedInput);
+                qgs_print_control_command_result(&result.snapshot, result.accepted, result.reason);
+                qgs_count_control_result(result.accepted, &mut accepted_count, &mut rejected_count);
+            }
+            QgsControlSessionScriptCommand::Prepare => {
+                let result = runtime.execute(QgsBroadcastPlayerCommand::Prepare {
+                    active_range: Some((0, active_frames)),
+                });
+                println!(
+                    "accepted={} status={:?} phase=input-ready source={}",
+                    yes_no(result.accepted),
+                    result.snapshot.operational_status,
+                    yes_no(result.snapshot.player.readiness.source_loaded)
+                );
+                qgs_print_rejection_detail_if_needed(
+                    &runtime,
+                    &result.snapshot,
+                    result.accepted,
+                    result.reason,
+                    None,
+                );
+                qgs_count_control_result(result.accepted, &mut accepted_count, &mut rejected_count);
+            }
+            QgsControlSessionScriptCommand::Cue(frame) => {
+                let before = runtime.snapshot();
+                let result = runtime.execute(QgsBroadcastPlayerCommand::Cue { frame: *frame });
+                qgs_print_control_command_result(&result.snapshot, result.accepted, result.reason);
+                qgs_print_rejection_detail_if_needed(
+                    &runtime,
+                    &result.snapshot,
+                    result.accepted,
+                    result.reason,
+                    Some(before),
+                );
+                qgs_count_control_result(result.accepted, &mut accepted_count, &mut rejected_count);
+            }
+            QgsControlSessionScriptCommand::Preroll => {
+                let prepare_after_paused_seek =
+                    runtime.snapshot().operational_status == QgsBroadcastPlayerStatus::Paused;
+                let result = if prepare_after_paused_seek {
+                    let prepare = runtime.execute(QgsBroadcastPlayerCommand::Prepare {
+                        active_range: Some((0, active_frames)),
+                    });
+                    if prepare.accepted {
+                        runtime.execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 })
+                    } else {
+                        prepare
+                    }
+                } else {
+                    runtime.execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 })
+                };
+                println!(
+                    "accepted={} status={:?} window={} video_ready={} audio_ready={}",
+                    yes_no(result.accepted),
+                    result.snapshot.operational_status,
+                    qgs_optional_frame_window_label(
+                        result.snapshot.buffer_health.prepared_start_frame,
+                        result.snapshot.buffer_health.prepared_end_frame_exclusive
+                    ),
+                    yes_no(result.snapshot.player.readiness.video_payload_ready),
+                    yes_no(result.snapshot.player.readiness.audio_payload_ready)
+                );
+                qgs_print_rejection_detail_if_needed(
+                    &runtime,
+                    &result.snapshot,
+                    result.accepted,
+                    result.reason,
+                    None,
+                );
+                qgs_count_control_result(result.accepted, &mut accepted_count, &mut rejected_count);
+            }
+            QgsControlSessionScriptCommand::Play(frames) => {
+                let play_result =
+                    if runtime.snapshot().operational_status == QgsBroadcastPlayerStatus::Playing {
+                        None
+                    } else {
+                        Some(runtime.execute(QgsBroadcastPlayerCommand::Play))
+                    };
+                let accepted = play_result
+                    .as_ref()
+                    .map(|result| result.accepted)
+                    .unwrap_or(true);
+                let status = play_result
+                    .as_ref()
+                    .map(|result| result.snapshot.operational_status)
+                    .unwrap_or_else(|| runtime.snapshot().operational_status);
+                println!("accepted={} status={status:?}", yes_no(accepted));
+                if let Some(result) = &play_result {
+                    qgs_print_rejection_detail_if_needed(
+                        &runtime,
+                        &result.snapshot,
+                        result.accepted,
+                        result.reason,
+                        None,
+                    );
+                }
+                if accepted {
+                    for tick in 0..*frames {
+                        let tick_snapshot = runtime.snapshot();
+                        qgs_print_control_tick(tick, &tick_snapshot);
+                        runtime.execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 });
+                    }
+                }
+                qgs_count_control_result(accepted, &mut accepted_count, &mut rejected_count);
+            }
+            QgsControlSessionScriptCommand::Pause => {
+                let before = runtime.snapshot();
+                let result = runtime.execute(QgsBroadcastPlayerCommand::Pause);
+                qgs_print_control_command_result(&result.snapshot, result.accepted, result.reason);
+                qgs_print_rejection_detail_if_needed(
+                    &runtime,
+                    &result.snapshot,
+                    result.accepted,
+                    result.reason,
+                    Some(before),
+                );
+                qgs_count_control_result(result.accepted, &mut accepted_count, &mut rejected_count);
+            }
+            QgsControlSessionScriptCommand::Seek(frame) => {
+                let before = runtime.snapshot();
+                let result = runtime.execute(QgsBroadcastPlayerCommand::Seek { frame: *frame });
+                qgs_print_control_command_result(&result.snapshot, result.accepted, result.reason);
+                qgs_print_rejection_detail_if_needed(
+                    &runtime,
+                    &result.snapshot,
+                    result.accepted,
+                    result.reason,
+                    Some(before),
+                );
+                qgs_count_control_result(result.accepted, &mut accepted_count, &mut rejected_count);
+            }
+            QgsControlSessionScriptCommand::Stop => {
+                let result = runtime.execute(QgsBroadcastPlayerCommand::Stop);
+                qgs_print_control_command_result(&result.snapshot, result.accepted, result.reason);
+                qgs_count_control_result(result.accepted, &mut accepted_count, &mut rejected_count);
+            }
+            QgsControlSessionScriptCommand::Unload => {
+                let result = runtime.execute(QgsBroadcastPlayerCommand::Unload);
+                qgs_print_control_command_result(&result.snapshot, result.accepted, result.reason);
+                qgs_count_control_result(result.accepted, &mut accepted_count, &mut rejected_count);
+            }
+            QgsControlSessionScriptCommand::Snapshot | QgsControlSessionScriptCommand::Status => {
+                let snapshot = runtime.snapshot();
+                qgs_print_control_command_result(&snapshot, true, None);
+                accepted_count = accepted_count.saturating_add(1);
+            }
+            QgsControlSessionScriptCommand::Tick(frames) => {
+                println!(
+                    "accepted=yes status={:?}",
+                    runtime.snapshot().operational_status
+                );
+                for tick in 0..*frames {
+                    let tick_snapshot = runtime.snapshot();
+                    qgs_print_control_tick(tick, &tick_snapshot);
+                    runtime.execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 });
+                }
+                accepted_count = accepted_count.saturating_add(1);
+            }
+        }
+        println!();
+    }
+
+    let final_snapshot = runtime.snapshot();
+    println!("Final:");
+    println!("commands accepted: {accepted_count}");
+    println!("commands rejected: {rejected_count}");
+    println!("run result: completed");
+    println!(
+        "private path exposed: {}",
+        yes_no(final_snapshot.exposes_private_path())
+    );
+    println!(
+        "real display: {}",
+        final_snapshot.player.device_status.real_display_backend
+    );
+    println!(
+        "visual verified: {}",
+        yes_no(final_snapshot.player.device_status.visual_verified)
+    );
+    println!(
+        "realtime verified: {}",
+        yes_no(final_snapshot.player.device_status.realtime_verified)
+    );
+    println!(
+        "audio production verified: {}",
+        yes_no(
+            final_snapshot
+                .player
+                .device_status
+                .audio_device_production_verified
+        )
+    );
+    println!(
+        "A/V sync verified: {}",
+        yes_no(final_snapshot.player.device_status.av_sync_verified)
+    );
+    println!("FramePresented real display claim: no");
+
+    Ok(())
+}
+
+fn qgs_count_control_result(
+    accepted: bool,
+    accepted_count: &mut usize,
+    rejected_count: &mut usize,
+) {
+    if accepted {
+        *accepted_count = accepted_count.saturating_add(1);
+    } else {
+        *rejected_count = rejected_count.saturating_add(1);
+    }
+}
+
+fn qgs_print_control_command_result(
+    snapshot: &QgsOperationalRuntimeSnapshot,
+    accepted: bool,
+    reason: Option<&'static str>,
+) {
+    println!(
+        "accepted={} status={:?} source={} frame={} audio={} window={} video_ready={} audio_ready={}",
+        yes_no(accepted),
+        snapshot.operational_status,
+        yes_no(snapshot.player.readiness.source_loaded),
+        qgs_optional_u64_label(snapshot.current_frame),
+        qgs_optional_sample_range_label(snapshot.current_audio_sample_range),
+        qgs_optional_frame_window_label(
+            snapshot.buffer_health.prepared_start_frame,
+            snapshot.buffer_health.prepared_end_frame_exclusive
+        ),
+        yes_no(snapshot.player.readiness.video_payload_ready),
+        yes_no(snapshot.player.readiness.audio_payload_ready)
+    );
+    if let Some(reason) = reason {
+        println!("reason={reason}");
+    }
+}
+
+fn qgs_print_rejection_detail_if_needed(
+    runtime: &QgsBroadcastPlayerOperationalRuntime,
+    snapshot: &QgsOperationalRuntimeSnapshot,
+    accepted: bool,
+    reason: Option<&'static str>,
+    before: Option<QgsOperationalRuntimeSnapshot>,
+) {
+    if accepted {
+        return;
+    }
+    if let Some(reason) = reason {
+        println!("fault={reason}");
+    }
+    let state_mutated = before
+        .map(|before| {
+            QgsControlSessionStateKey::from_snapshot(&before)
+                != QgsControlSessionStateKey::from_snapshot(snapshot)
+        })
+        .unwrap_or(false);
+    println!("state_mutated={}", yes_no(state_mutated));
+    println!(
+        "private path exposed: {}",
+        yes_no(runtime.snapshot().exposes_private_path())
+    );
+}
+
+fn qgs_print_control_tick(index: u64, snapshot: &QgsOperationalRuntimeSnapshot) {
+    println!(
+        "  {index:03} frame={} audio={} window={} buffer={}",
+        qgs_optional_u64_label(snapshot.current_frame),
+        qgs_optional_sample_range_label(snapshot.current_audio_sample_range),
+        qgs_optional_frame_window_label(
+            snapshot.buffer_health.prepared_start_frame,
+            snapshot.buffer_health.prepared_end_frame_exclusive
+        ),
+        qgs_running_buffer_label(snapshot)
+    );
 }
 
 fn qgs_device_backend_selection_report(
@@ -17124,6 +17557,8 @@ struct Args {
     qgs_broadcast_player_fault_recovery_paths: Option<(PathBuf, PathBuf)>,
     qgs_broadcast_player_run_paths: Option<(PathBuf, PathBuf)>,
     qgs_broadcast_player_run_options: QgsBroadcastPlayerRunOptions,
+    qgs_broadcast_player_control_session_paths: Option<(PathBuf, PathBuf)>,
+    qgs_broadcast_player_control_session_script: String,
     qgs_device_backend_selection_policy: Option<QgsDeviceSelectionPolicy>,
     linux_audio_device_probe_path: Option<PathBuf>,
     pipewire_audio_prototype_path: Option<PathBuf>,
@@ -17226,6 +17661,10 @@ impl Args {
         let mut qgs_broadcast_player_run_original = None;
         let mut qgs_broadcast_player_run_paths = None;
         let mut qgs_broadcast_player_run_options = QgsBroadcastPlayerRunOptions::default();
+        let mut qgs_broadcast_player_control_session_original = None;
+        let mut qgs_broadcast_player_control_session_paths = None;
+        let mut qgs_broadcast_player_control_session_script =
+            QGS_BROADCAST_PLAYER_CONTROL_SESSION_DEFAULT_SCRIPT.to_string();
         let mut qgs_device_backend_selection_policy = None;
         let mut linux_audio_device_probe_path = None;
         let mut pipewire_audio_prototype_path = None;
@@ -17321,6 +17760,9 @@ impl Args {
         let mut next_arg_is_qgs_broadcast_player_run_frames = false;
         let mut next_arg_is_qgs_broadcast_player_run_seek_frame = false;
         let mut next_arg_is_qgs_broadcast_player_run_view = false;
+        let mut next_arg_is_qgs_broadcast_player_control_session_original = false;
+        let mut next_arg_is_qgs_broadcast_player_control_session_proxy = false;
+        let mut next_arg_is_qgs_broadcast_player_control_session_script = false;
         let mut next_arg_is_qgs_device_backend_selection_policy = false;
         let mut next_arg_is_linux_audio_device_probe_path = false;
         let mut next_arg_is_pipewire_audio_prototype_path = false;
@@ -17359,6 +17801,20 @@ impl Args {
                 qgs_broadcast_player_run_options.view = QgsBroadcastPlayerRunView::parse(&arg)
                     .unwrap_or_else(|err| panic!("{QGS_BROADCAST_PLAYER_RUN_VIEW_ARG}: {err}"));
                 next_arg_is_qgs_broadcast_player_run_view = false;
+            } else if next_arg_is_qgs_broadcast_player_control_session_script {
+                qgs_broadcast_player_control_session_script = arg.to_string_lossy().to_string();
+                next_arg_is_qgs_broadcast_player_control_session_script = false;
+            } else if next_arg_is_qgs_broadcast_player_control_session_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = qgs_broadcast_player_control_session_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                qgs_broadcast_player_control_session_paths = Some((original, proxy));
+                next_arg_is_qgs_broadcast_player_control_session_proxy = false;
+            } else if next_arg_is_qgs_broadcast_player_control_session_original {
+                qgs_broadcast_player_control_session_original = Some(PathBuf::from(arg));
+                next_arg_is_qgs_broadcast_player_control_session_original = false;
+                next_arg_is_qgs_broadcast_player_control_session_proxy = true;
             } else if next_arg_is_qgs_broadcast_player_run_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = qgs_broadcast_player_run_original
@@ -17945,12 +18401,16 @@ impl Args {
                 next_arg_is_qgs_broadcast_player_fault_recovery_original = true;
             } else if arg == QGS_BROADCAST_PLAYER_RUN_ARG {
                 next_arg_is_qgs_broadcast_player_run_original = true;
+            } else if arg == QGS_BROADCAST_PLAYER_CONTROL_SESSION_ARG {
+                next_arg_is_qgs_broadcast_player_control_session_original = true;
             } else if arg == QGS_BROADCAST_PLAYER_RUN_FRAMES_ARG {
                 next_arg_is_qgs_broadcast_player_run_frames = true;
             } else if arg == QGS_BROADCAST_PLAYER_RUN_SEEK_FRAME_ARG {
                 next_arg_is_qgs_broadcast_player_run_seek_frame = true;
             } else if arg == QGS_BROADCAST_PLAYER_RUN_VIEW_ARG {
                 next_arg_is_qgs_broadcast_player_run_view = true;
+            } else if arg == QGS_BROADCAST_PLAYER_CONTROL_SCRIPT_ARG {
+                next_arg_is_qgs_broadcast_player_control_session_script = true;
             } else if arg == QGS_DEVICE_BACKEND_SELECTION_ARG {
                 next_arg_is_qgs_device_backend_selection_policy = true;
             } else if arg == LINUX_AUDIO_DEVICE_PROBE_ARG {
@@ -18035,6 +18495,8 @@ impl Args {
             qgs_broadcast_player_fault_recovery_paths,
             qgs_broadcast_player_run_paths,
             qgs_broadcast_player_run_options,
+            qgs_broadcast_player_control_session_paths,
+            qgs_broadcast_player_control_session_script,
             qgs_device_backend_selection_policy,
             linux_audio_device_probe_path,
             pipewire_audio_prototype_path,
@@ -18114,7 +18576,8 @@ mod tests {
         qgs_running_runtime_persistent_warning_lines, repeated_smoke_test_buffers,
         rgba_u16_to_ppm_p6_rgb8, rgba_u16_to_rgb8_bytes, runtime_audio_payload_evidence_label,
         sanitized_source_stem, selected_proxy_ordinals, smoke_test_buffer_count,
-        ManualAudibleConfirmation, QgsBroadcastPlayerRunView, SonyXmlSummary,
+        ManualAudibleConfirmation, QgsBroadcastPlayerRunView, QgsControlSessionScriptCommand,
+        SonyXmlSummary,
     };
     use qgs_media_runtime::QgsDeviceSelectionPolicy;
     use qgs_media_runtime::{
@@ -18277,6 +18740,22 @@ mod tests {
         assert_eq!(qgs_resolve_run_seek_frame(Some(50), 106), 50);
         assert_eq!(qgs_resolve_run_seek_frame(Some(999), 106), 105);
         assert_eq!(qgs_resolve_run_seek_frame(None, 20), 10);
+    }
+
+    #[test]
+    fn control_session_script_parser_accepts_qnc_style_commands() {
+        let commands = QgsControlSessionScriptCommand::parse_script(
+            "load,prepare,cue:0,preroll,play:5,pause,seek:50,stop,unload,snapshot",
+        )
+        .unwrap();
+
+        assert_eq!(commands.len(), 10);
+        assert_eq!(commands[0], QgsControlSessionScriptCommand::Load);
+        assert_eq!(commands[2], QgsControlSessionScriptCommand::Cue(0));
+        assert_eq!(commands[4], QgsControlSessionScriptCommand::Play(5));
+        assert_eq!(commands[6], QgsControlSessionScriptCommand::Seek(50));
+        assert!(QgsControlSessionScriptCommand::parse_script("play:not-a-number").is_err());
+        assert!(QgsControlSessionScriptCommand::parse_script("launch").is_err());
     }
 
     #[test]
