@@ -17,6 +17,12 @@ and what remains unimplemented.
 - `PayloadBound`: runtime slots bind to concrete backend payload references.
 - `TestBoundaryEvidence`: a test-only sink/presenter accepted payloads and
   returned explicit evidence.
+- `FilePresenterManifestWritten`: a file presenter diagnostic wrote a
+  deterministic public-safe descriptor manifest for a prepared video payload.
+  This is not a real display backend and does not verify visual pixels.
+- `FilePresenterImageWritten`: a file presenter diagnostic wrote a still-image
+  artifact from real frame pixels. This remains below `VisualVerified` unless
+  comparison or display evidence is added.
 - `NativeBufferSubmissionVerified`: a tiny bounded payload was queued to a
   native device boundary, without claiming audible/visible output.
 - `NativePostSubmitEvidence`: a native device boundary accepted a tiny bounded
@@ -89,6 +95,7 @@ For Sony FX6 sample 002:
 | device boundary contract | `UnitTested` | `PayloadReady` and `DevicePayloadReady` remain distinct. |
 | test video presenter evidence | `TestBoundaryEvidence` | Test presenter evidence gates `FramePresented`; this is not real display output. |
 | presenter/monitor boundary | `TestBoundaryEvidence` | Prepared video payload descriptors can be submitted to the test presenter boundary and projected into monitor facts. Real display output and visual verification remain unimplemented. |
+| file presenter visual diagnostic | `FilePresenterManifestWritten` | A deterministic public-safe descriptor manifest can be written for a prepared proxy video payload. Current runtime payload binding exposes a processed GPU frame token/descriptor, not CPU-readable pixels, so no image artifact, real display output, or visual verification is claimed. |
 | test audio sink evidence | `TestBoundaryEvidence` | Test audio sink evidence accepts original PCM; this is not real speaker output. |
 | native PipeWire buffer submission | `NativePostSubmitEvidence` | A 20 ms original-audio-derived f32 buffer was queued to a native PipeWire stream and a drain callback was observed; audible output and full playback are not claimed. |
 | native PipeWire audible smoke test | `ManualContentAudibilityPartiallyObserved` | Bounded original-audio-derived PipeWire smoke-test buffers submitted and drained; later listening found voice-like content rather than only hum/buzz, but routing/gain and production output remain unverified. |
@@ -112,6 +119,9 @@ The matrix intentionally does not overstate these areas:
 - Test presenter evidence is not real display output.
 - Presenter/monitor boundary evidence from the test presenter is not real
   display output and is not visual verification.
+- File presenter visual diagnostics are not real display output. A descriptor
+  manifest is not visual verification, and an image artifact would still require
+  comparison or display evidence before `VisualVerified`.
 - Runtime surface end-to-end acceptance combines session commands with
   test-presenter monitor evidence through separate Lego modules; it is not
   monolithic runtime ownership, realtime playback, A/V sync, real display

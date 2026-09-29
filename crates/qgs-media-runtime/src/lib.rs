@@ -2462,6 +2462,7 @@ impl QgsQncMonitorProjection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QgsPresenterDeviceKind {
     TestPresenter,
+    FilePresenter,
     RealDisplayPresenter,
 }
 
@@ -2470,6 +2471,8 @@ pub enum QgsPresenterCapability {
     AcceptsProcessedGpuFrame,
     AcceptsRgbaU16,
     ProvidesTestBoundaryEvidence,
+    WritesDescriptorManifest,
+    WritesImageFile,
     ProvidesRealDisplayEvidence,
 }
 
@@ -2487,6 +2490,8 @@ pub enum QgsPresenterBoundaryStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QgsPresenterEvidenceKind {
     TestPresenterAccepted,
+    FilePresenterManifestWritten,
+    FilePresenterImageWritten,
     RealPresenterEvidence,
 }
 
@@ -2494,6 +2499,8 @@ pub enum QgsPresenterEvidenceKind {
 pub enum QgsVideoPresentationEvidenceLevel {
     PreparedPayload,
     SubmittedToPresenter,
+    FilePresenterManifestWritten,
+    FilePresenterImageWritten,
     PresentationEvidenceReceived,
     FramePresentedTestBoundary,
     FramePresentedRealBackend,
@@ -2503,6 +2510,8 @@ pub enum QgsVideoPresentationEvidenceLevel {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QgsPresenterPayloadDescriptor {
     pub public_source_uri: String,
+    pub source_mode: BroadcastVideoSourceMode,
+    pub video_source_role: BroadcastMediaSourceRole,
     pub source_frame: u64,
     pub selected_preview_frame: Option<u64>,
     pub payload_id: u64,
@@ -2534,6 +2543,8 @@ impl QgsPresenterPayloadDescriptor {
         Ok(Self {
             private_path_exposed: qgs_projection_text_exposes_private_path(&public_source_uri),
             public_source_uri,
+            source_mode: binding.source_mode,
+            video_source_role: binding.video_source_role,
             source_frame: payload.source_frame_index,
             selected_preview_frame: payload.selected_preview_frame_index,
             payload_id: payload.payload_id,
@@ -2674,6 +2685,116 @@ pub fn project_qgs_monitor_update_from_presenter_result(
         real_display_evidence_present: result.real_display_evidence_present,
         visual_verified: result.visual_verified,
         evidence_level: result.evidence_level,
+        private_path_exposed,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsFilePresenterArtifactKind {
+    ImageFile,
+    DescriptorManifest,
+    PlaceholderManifest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsVisualDiagnosticStatus {
+    ImageFileWritten,
+    ManifestWritten,
+    PlaceholderWritten,
+    VisualVerified,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsFilePresenterArtifact {
+    pub kind: QgsFilePresenterArtifactKind,
+    pub public_artifact_path: String,
+    pub image_written: bool,
+    pub manifest_written: bool,
+    pub reason: Option<&'static str>,
+}
+
+impl QgsFilePresenterArtifact {
+    pub fn exposes_private_path(&self) -> bool {
+        qgs_projection_text_exposes_private_path(&self.public_artifact_path)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsFilePresenterSubmissionResult {
+    pub submission: QgsPresenterSubmission,
+    pub artifact: QgsFilePresenterArtifact,
+    pub evidence: QgsPresenterEvidence,
+    pub visual_status: QgsVisualDiagnosticStatus,
+    pub real_display_evidence_present: bool,
+    pub visual_verified: bool,
+}
+
+pub fn submit_qgs_file_presenter_manifest(
+    public_source_uri: impl Into<String>,
+    video_binding: &BroadcastVideoPayloadBinding,
+    public_artifact_path: impl Into<String>,
+) -> Result<QgsFilePresenterSubmissionResult, PlaybackError> {
+    let descriptor =
+        QgsPresenterPayloadDescriptor::from_video_binding(public_source_uri, video_binding)?;
+    let artifact = QgsFilePresenterArtifact {
+        kind: QgsFilePresenterArtifactKind::DescriptorManifest,
+        public_artifact_path: public_artifact_path.into(),
+        image_written: false,
+        manifest_written: true,
+        reason: Some("prepared payload descriptor does not expose CPU-readable frame pixels"),
+    };
+    if artifact.exposes_private_path() {
+        return Err(PlaybackError::InvalidRuntimeTransition);
+    }
+    let submission = QgsPresenterSubmission {
+        presenter_kind: QgsPresenterDeviceKind::FilePresenter,
+        payload: descriptor,
+        status: QgsPresenterBoundaryStatus::SubmittedToPresenter,
+        submitted_to_presenter: true,
+    };
+    let evidence = QgsPresenterEvidence {
+        presentation_slot_index: 0,
+        video_binding_index: video_binding.video_slot_index,
+        media_time: submission.payload.presentation_time,
+        payload_id: submission.payload.payload_id,
+        evidence_kind: QgsPresenterEvidenceKind::FilePresenterManifestWritten,
+        presenter_kind: QgsPresenterDeviceKind::FilePresenter,
+        evidence_level: QgsVideoPresentationEvidenceLevel::FilePresenterManifestWritten,
+    };
+    Ok(QgsFilePresenterSubmissionResult {
+        submission,
+        artifact,
+        evidence,
+        visual_status: QgsVisualDiagnosticStatus::ManifestWritten,
+        real_display_evidence_present: false,
+        visual_verified: false,
+    })
+}
+
+pub fn project_qgs_monitor_update_from_file_presenter_result(
+    result: &QgsFilePresenterSubmissionResult,
+) -> QgsMonitorProjectionUpdate {
+    let frame = QgsMonitorFrameDescriptor {
+        source_public_uri: result.submission.payload.public_source_uri.clone(),
+        source_frame: result.submission.payload.source_frame,
+        selected_preview_frame: result.submission.payload.selected_preview_frame,
+        prepared_payload_present: true,
+        payload_kind: result.submission.payload.payload_kind,
+        payload_format: result.submission.payload.payload_format,
+        private_path_exposed: result.submission.payload.private_path_exposed
+            || result.artifact.exposes_private_path(),
+    };
+    let private_path_exposed = frame.private_path_exposed;
+    QgsMonitorProjectionUpdate {
+        frame,
+        submitted_to_presenter: result.submission.submitted_to_presenter,
+        presenter_evidence_kind: Some(result.evidence.evidence_kind),
+        payload_status: QgsQncEvidenceStatus::SubmittedToDevice,
+        frame_presented_test_boundary: false,
+        frame_presented_real_backend: false,
+        real_display_evidence_present: result.real_display_evidence_present,
+        visual_verified: result.visual_verified,
+        evidence_level: result.evidence.evidence_level,
         private_path_exposed,
     }
 }
@@ -3771,6 +3892,8 @@ pub enum BroadcastRuntimeVerificationLevel {
     PayloadExtracted,
     PayloadBound,
     TestBoundaryEvidence,
+    FilePresenterManifestWritten,
+    FilePresenterImageWritten,
     NativeBufferSubmissionVerified,
     NativePostSubmitEvidence,
     RuntimeAudioPayloadDrainCompleted,
@@ -3797,6 +3920,8 @@ impl BroadcastRuntimeVerificationLevel {
             Self::PayloadExtracted => "PayloadExtracted",
             Self::PayloadBound => "PayloadBound",
             Self::TestBoundaryEvidence => "TestBoundaryEvidence",
+            Self::FilePresenterManifestWritten => "FilePresenterManifestWritten",
+            Self::FilePresenterImageWritten => "FilePresenterImageWritten",
             Self::NativeBufferSubmissionVerified => "NativeBufferSubmissionVerified",
             Self::NativePostSubmitEvidence => "NativePostSubmitEvidence",
             Self::RuntimeAudioPayloadDrainCompleted => "RuntimeAudioPayloadDrainCompleted",
@@ -3840,6 +3965,7 @@ pub enum BroadcastRuntimeVerifiedSubsystem {
     DeviceBoundaryContract,
     TestVideoPresenterEvidence,
     PresenterMonitorBoundary,
+    FilePresenterVisualDiagnostic,
     TestAudioSinkEvidence,
     NativePipeWireBufferSubmission,
     NativePipeWireAudibleSmokeTest,
@@ -3877,6 +4003,7 @@ impl BroadcastRuntimeVerifiedSubsystem {
             Self::DeviceBoundaryContract => "device boundary contract",
             Self::TestVideoPresenterEvidence => "test video presenter evidence",
             Self::PresenterMonitorBoundary => "presenter/monitor boundary",
+            Self::FilePresenterVisualDiagnostic => "file presenter visual diagnostic",
             Self::TestAudioSinkEvidence => "test audio sink evidence",
             Self::NativePipeWireBufferSubmission => "native PipeWire buffer submission",
             Self::NativePipeWireAudibleSmokeTest => "native PipeWire audible smoke test",
@@ -4006,6 +4133,11 @@ impl BroadcastRuntimeVerificationMatrix {
                     subsystem: Subsystem::PresenterMonitorBoundary,
                     level: Level::TestBoundaryEvidence,
                     summary: "prepared video payload descriptor submits through the test presenter boundary and updates monitor projection facts; real display and visual verification remain unimplemented",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::FilePresenterVisualDiagnostic,
+                    level: Level::FilePresenterManifestWritten,
+                    summary: "file presenter writes a deterministic public-safe descriptor manifest for a prepared video payload; no frame pixels, real display, or visual verification are claimed",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::TestAudioSinkEvidence,
@@ -9107,6 +9239,106 @@ mod tests {
     }
 
     #[test]
+    fn file_presenter_manifest_uses_public_identity_without_real_display_claim() {
+        let video_slot = &test_prepared_video_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
+        let video_binding = bind_broadcast_video_payload_ready(
+            video_slot,
+            BroadcastVideoPayloadReference {
+                payload_id: 505,
+                kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+                format: BroadcastVideoPayloadFormat::RgbaU16,
+                backend_path: BroadcastVideoPayloadBackendPath::VaapiCpuNv12Vulkan,
+                source_frame_index: video_slot.source_frame_index.unwrap(),
+                selected_preview_frame_index: video_slot.selected_preview_frame_index,
+                presentation_time: video_slot.presentation_time,
+                duration: video_slot.duration,
+                coded_width: 1920,
+                coded_height: 1088,
+                visible_width: 1920,
+                visible_height: 1080,
+                bounded_slot_index: video_slot.slot_index,
+                session_index: 0,
+            },
+        )
+        .unwrap();
+
+        let result = submit_qgs_file_presenter_manifest(
+            "qnc://local/media/proxy/test",
+            &video_binding,
+            "target/qgs-visual-diagnostics/test-frame000000-manifest.json",
+        )
+        .unwrap();
+        let update = project_qgs_monitor_update_from_file_presenter_result(&result);
+        let projection = QgsQncMonitorProjection::from_presenter_update(&update);
+
+        assert_eq!(
+            result.submission.presenter_kind,
+            QgsPresenterDeviceKind::FilePresenter
+        );
+        assert_eq!(
+            result.artifact.kind,
+            QgsFilePresenterArtifactKind::DescriptorManifest
+        );
+        assert!(result.artifact.manifest_written);
+        assert!(!result.artifact.image_written);
+        assert_eq!(
+            result.evidence.evidence_kind,
+            QgsPresenterEvidenceKind::FilePresenterManifestWritten
+        );
+        assert_eq!(
+            result.evidence.evidence_level,
+            QgsVideoPresentationEvidenceLevel::FilePresenterManifestWritten
+        );
+        assert_eq!(
+            result.visual_status,
+            QgsVisualDiagnosticStatus::ManifestWritten
+        );
+        assert!(!result.real_display_evidence_present);
+        assert!(!result.visual_verified);
+        assert!(projection.prepared_descriptor_present);
+        assert!(projection.submitted_to_presenter);
+        assert!(!projection.frame_presented_test_boundary);
+        assert!(!projection.frame_presented_real_backend);
+        assert!(!projection.real_display_evidence_present);
+        assert!(!projection.visual_verified);
+        assert!(!projection.private_path_exposed);
+    }
+
+    #[test]
+    fn file_presenter_manifest_rejects_private_artifact_paths() {
+        let video_slot = &test_prepared_video_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
+        let video_binding = bind_broadcast_video_payload_ready(
+            video_slot,
+            BroadcastVideoPayloadReference {
+                payload_id: 506,
+                kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+                format: BroadcastVideoPayloadFormat::RgbaU16,
+                backend_path: BroadcastVideoPayloadBackendPath::VaapiCpuNv12Vulkan,
+                source_frame_index: video_slot.source_frame_index.unwrap(),
+                selected_preview_frame_index: video_slot.selected_preview_frame_index,
+                presentation_time: video_slot.presentation_time,
+                duration: video_slot.duration,
+                coded_width: 1920,
+                coded_height: 1088,
+                visible_width: 1920,
+                visible_height: 1080,
+                bounded_slot_index: video_slot.slot_index,
+                session_index: 0,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            submit_qgs_file_presenter_manifest(
+                "qnc://local/media/proxy/test",
+                &video_binding,
+                "/tmp/private-frame-manifest.json",
+            ),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+    }
+
+    #[test]
     fn monitor_projection_flags_private_public_identity() {
         let video_slot = &test_prepared_video_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
         let binding = bind_broadcast_video_payload_ready(
@@ -9144,6 +9376,14 @@ mod tests {
         );
         assert!(
             BroadcastRuntimeVerificationLevel::TestBoundaryEvidence
+                < BroadcastRuntimeVerificationLevel::VisualVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::FilePresenterManifestWritten
+                < BroadcastRuntimeVerificationLevel::VisualVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::FilePresenterImageWritten
                 < BroadcastRuntimeVerificationLevel::VisualVerified
         );
         assert!(

@@ -27,14 +27,16 @@ use qgs_media_runtime::{
     build_broadcast_player_event_surface, build_broadcast_video_presenter_submission,
     classify_presentation, duration_abs_delta, duration_from_audio_samples,
     evaluate_broadcast_preroll, max_video_timestamp_outside_audio_range,
+    project_qgs_monitor_update_from_file_presenter_result,
     project_qgs_monitor_update_from_presenter_result, project_qnc_events, qgs_frames_for_duration,
     qgs_qnc_projected_sequence_is_monotonic, simulate_broadcast_player_runtime_loop,
-    submit_qgs_presenter_payload_to_test_boundary, summarize_broadcast_device_boundary,
-    summarize_broadcast_payload_bindings, summarize_broadcast_player_runtime_events,
-    summarize_broadcast_prepared_slots, summarize_broadcast_runtime_contract, AudioFormat,
-    AudioSampleFormat, AudioTimeline, AudioTimingPacket, AvFrameAudioRange, BoundedQueue,
-    BroadcastDevicePayloadStatus, BroadcastDeviceStatus, BroadcastMediaSourceRole,
-    BroadcastPreparedAudioSlot, BroadcastPreparedPresentationSlot, BroadcastPreparedVideoSlot,
+    submit_qgs_file_presenter_manifest, submit_qgs_presenter_payload_to_test_boundary,
+    summarize_broadcast_device_boundary, summarize_broadcast_payload_bindings,
+    summarize_broadcast_player_runtime_events, summarize_broadcast_prepared_slots,
+    summarize_broadcast_runtime_contract, AudioFormat, AudioSampleFormat, AudioTimeline,
+    AudioTimingPacket, AvFrameAudioRange, BoundedQueue, BroadcastDevicePayloadStatus,
+    BroadcastDeviceStatus, BroadcastMediaSourceRole, BroadcastPreparedAudioSlot,
+    BroadcastPreparedPresentationSlot, BroadcastPreparedVideoSlot,
     BroadcastPreparedVideoSlotStatus, BroadcastPrerollConfig, BroadcastPrerollPlan,
     BroadcastPresentationPayloadBinding, BroadcastPresentationPayloadReadiness,
     BroadcastPreviewProfile, BroadcastRuntimeCapabilities, BroadcastRuntimePrepareFacts,
@@ -46,10 +48,10 @@ use qgs_media_runtime::{
     BroadcastVideoSourceMode, FrameIdentity as PlaybackFrameIdentity, OriginalAudioTrack,
     PcmAudioBlock, PcmAudioBlockLayout, PcmAudioPacket, PcmEndian, PcmSampleFormat, PlaybackClock,
     PlaybackConfig, PlaybackState, PresentationDecision, QgsActiveRangeTiming,
-    QgsAudioRepresentation, QgsBufferDiscardReason, QgsFrameClock, QgsFrameClockMode,
-    QgsFrameClockRate, QgsInputPlan, QgsInputPlanQueueRequirements,
-    QgsOriginalProxyAssociationStatus, QgsPlaybackRepresentation, QgsPlayoutBufferLimits,
-    QgsPlayoutBufferState, QgsPreparedAudioChannel, QgsPreparedAudioLayout,
+    QgsAudioRepresentation, QgsBufferDiscardReason, QgsFilePresenterSubmissionResult,
+    QgsFrameClock, QgsFrameClockMode, QgsFrameClockRate, QgsInputPlan,
+    QgsInputPlanQueueRequirements, QgsOriginalProxyAssociationStatus, QgsPlaybackRepresentation,
+    QgsPlayoutBufferLimits, QgsPlayoutBufferState, QgsPreparedAudioChannel, QgsPreparedAudioLayout,
     QgsPreparedInputDescriptor, QgsPreparedMediaBinding, QgsPreparedSourceIdentity,
     QgsPreparedStreamLayout, QgsPreparedVideoTiming, QgsQncCommandEnvelope, QgsQncEventEnvelope,
     QgsQncMonitorProjection, QgsQncPassiveView, QgsQncPlayerCommand, QgsQncSessionCommandExecutor,
@@ -149,6 +151,7 @@ const QGS_QNC_EVENT_PROJECTION_ARG: &str = "--qgs-qnc-event-projection";
 const QGS_SESSION_COMMAND_BOUNDARY_ARG: &str = "--qgs-session-command-boundary";
 const QGS_SESSION_RUNTIME_CONTROL_ARG: &str = "--qgs-session-runtime-control";
 const QGS_PRESENTER_MONITOR_BOUNDARY_ARG: &str = "--qgs-presenter-monitor-boundary";
+const QGS_FILE_PRESENTER_DIAGNOSTIC_ARG: &str = "--qgs-file-presenter-diagnostic";
 const QGS_RUNTIME_SURFACE_E2E_ARG: &str = "--qgs-runtime-surface-e2e";
 const WRITE_DIAGNOSTIC_WAV_ARG: &str = "--write-diagnostic-wav";
 const AUDIO_AUDIT_START_MS_ARG: &str = "--start-ms";
@@ -302,6 +305,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.qgs_presenter_monitor_boundary_paths {
         return qgs_presenter_monitor_boundary_report(&original, &proxy);
+    }
+    if let Some((original, proxy)) = args.qgs_file_presenter_diagnostic_paths {
+        return qgs_file_presenter_diagnostic_report(
+            &original,
+            &proxy,
+            args.audio_content_audit_output_dir.as_deref(),
+        );
     }
     if let Some((original, proxy)) = args.qgs_runtime_surface_e2e_paths {
         return qgs_runtime_surface_e2e_report(&original, &proxy);
@@ -3338,6 +3348,201 @@ fn qgs_presenter_monitor_boundary_report(
         yes_no(monitor_projection.frame_presented_test_boundary)
     );
     println!("VisualVerified: no");
+    println!("Private path exposed: {}", yes_no(private_path_exposed));
+
+    Ok(())
+}
+
+fn qgs_file_presenter_diagnostic_report(
+    original_path: &Path,
+    proxy_path: &Path,
+    output_dir: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let descriptor = build_qnc_prepared_input_descriptor(original_path, proxy_path)?;
+    descriptor.validate()?;
+    let input_plan =
+        QgsInputPlan::from_descriptor(&descriptor, default_qgs_input_plan_queue_requirements())?;
+    let active_duration = Duration::from_millis(1_000);
+    let active_frames = qgs_frames_for_duration(active_duration, input_plan.video_source.timebase)?;
+    let source_uri = input_plan.video_source.media_uri.clone();
+    let public_source_uri = descriptor
+        .binding
+        .proxy_media_uri
+        .as_deref()
+        .unwrap_or(&source_uri)
+        .to_string();
+
+    let mut runtime = QgsSessionRuntime::new(input_plan, QgsSessionRuntimeConfig::default())?;
+    let setup_commands = qgs_session_command_sequence(&source_uri, active_frames);
+    for command in setup_commands.iter().take(8) {
+        runtime.enqueue(command.clone()).map_err(|err| {
+            format!(
+                "file presenter diagnostic setup enqueue failed for id {}: {err:?}",
+                command.command_id
+            )
+        })?;
+    }
+    let setup_report = runtime.drain_queue();
+    let setup_snapshot = runtime.snapshot();
+
+    let proxy = Mp4Source::open(proxy_path)?;
+    let proxy_video = proxy
+        .video
+        .as_ref()
+        .ok_or("proxy has no H.264 video track")?;
+    let proxy_h264 = classify_video_track(proxy_video)?;
+    let selected = selected_journalist_preview_frames(proxy_video)?;
+    let selected_frame = selected
+        .first()
+        .ok_or("proxy has no selected journalist preview frame")?;
+    let frame_duration = ProxyPlaybackProfile::Journalist50iPreview
+        .presentation_rate(RationalRate::new(
+            u64::from(proxy_video.frame_rate.numerator),
+            u64::from(proxy_video.frame_rate.denominator),
+        )?)?
+        .frame_duration()?;
+    let video_slot = BroadcastPreparedVideoSlot {
+        slot_index: 0,
+        source_mode: BroadcastVideoSourceMode::ProxyPreview,
+        video_source_role: BroadcastMediaSourceRole::ProxyPreviewVideo,
+        source_frame_index: Some(selected_frame.source_presentation_index),
+        selected_preview_frame_index: Some(selected_frame.preview_index),
+        presentation_time: selected_frame.start_time,
+        duration: frame_duration,
+        status: BroadcastPreparedVideoSlotStatus::Prepared,
+    };
+    let proxy_payload_proof = bind_proxy_preview_video_payloads(
+        proxy_video,
+        &proxy_h264,
+        std::slice::from_ref(&video_slot),
+    )?;
+    let video_binding = proxy_payload_proof
+        .bindings
+        .first()
+        .cloned()
+        .ok_or("proxy payload proof did not produce a binding")?;
+    let payload = video_binding
+        .payload
+        .as_ref()
+        .ok_or("file presenter diagnostic missing proxy video payload")?;
+
+    let output_dir = output_dir.unwrap_or_else(|| Path::new("target/qgs-visual-diagnostics"));
+    std::fs::create_dir_all(output_dir)?;
+    let artifact_file_name = file_presenter_manifest_file_name(
+        &public_source_uri,
+        selected_frame.source_presentation_index,
+    );
+    let artifact_path = output_dir.join(&artifact_file_name);
+    let public_artifact_path = format!("qgs-visual-diagnostics/{artifact_file_name}");
+
+    let file_result = submit_qgs_file_presenter_manifest(
+        public_source_uri.clone(),
+        &video_binding,
+        public_artifact_path,
+    )?;
+    let monitor_update = project_qgs_monitor_update_from_file_presenter_result(&file_result);
+    let monitor_projection = QgsQncMonitorProjection::from_presenter_update(&monitor_update);
+    let manifest_json = qgs_file_presenter_manifest_json(
+        &file_result,
+        &monitor_projection,
+        setup_report.executed,
+        setup_report.accepted,
+        setup_report.rejected,
+        &format!("{:?}", setup_snapshot.passive_view.transport.state),
+    );
+    File::create(&artifact_path)?.write_all(manifest_json.as_bytes())?;
+
+    let private_path_exposed = monitor_projection.private_path_exposed
+        || setup_snapshot.private_path_exposed
+        || setup_report.transcript.exposes_private_path()
+        || manifest_json_contains_private_path(&manifest_json);
+    let artifact_kind = format!("{:?}", file_result.artifact.kind);
+    let evidence_level = format!("{:?}", file_result.evidence.evidence_level);
+    let reason = file_result.artifact.reason.unwrap_or("n/a");
+
+    println!("QGS File Presenter Visual Diagnostic");
+    println!("------------------------------------");
+    println!("Audio source: original MXF");
+    println!("Video source: proxy MP4");
+    println!("Proxy AAC: not used");
+    println!("Presenter kind: FilePresenter");
+    println!("Preview profile: journalist-50i-preview");
+    println!("Public source URI: {public_source_uri}");
+    println!(
+        "Selected frame: {}",
+        selected_frame.source_presentation_index
+    );
+    println!("Selected preview frame: {}", selected_frame.preview_index);
+    println!("Payload kind: {:?}", payload.kind);
+    println!("Payload format: {:?}", payload.format);
+    println!("Payload backend: {:?}", payload.backend_path);
+    println!(
+        "Payload dimensions: visible={}x{} coded={}x{}",
+        payload.visible_width, payload.visible_height, payload.coded_width, payload.coded_height
+    );
+    println!("Artifact kind: {artifact_kind}");
+    println!("Artifact path: {}", artifact_path.display());
+    println!(
+        "Artifact public path: {}",
+        file_result.artifact.public_artifact_path
+    );
+    println!(
+        "Image artifact available: {}",
+        yes_no(file_result.artifact.image_written)
+    );
+    println!(
+        "Manifest written: {}",
+        yes_no(file_result.artifact.manifest_written)
+    );
+    println!("Image unavailable reason: {reason}");
+    println!("Evidence level: {evidence_level}");
+    println!("Monitor projection:");
+    println!(
+        "  prepared descriptor present: {}",
+        yes_no(monitor_projection.prepared_descriptor_present)
+    );
+    println!(
+        "  submitted to file presenter: {}",
+        yes_no(monitor_projection.submitted_to_presenter)
+    );
+    println!(
+        "  source frame: {}",
+        qgs_optional_u64_label(monitor_projection.source_frame)
+    );
+    println!("  payload status: {:?}", monitor_projection.payload_status);
+    println!(
+        "  frame presented test boundary: {}",
+        yes_no(monitor_projection.frame_presented_test_boundary)
+    );
+    println!(
+        "  frame presented real display: {}",
+        yes_no(monitor_projection.frame_presented_real_backend)
+    );
+    println!(
+        "  real display evidence: {}",
+        if monitor_projection.real_display_evidence_present {
+            "present"
+        } else {
+            "none"
+        }
+    );
+    println!(
+        "  visual verified: {}",
+        yes_no(monitor_projection.visual_verified)
+    );
+    println!(
+        "Session setup: commands_executed={} accepted={} rejected={} final_state={:?}",
+        setup_report.executed,
+        setup_report.accepted,
+        setup_report.rejected,
+        setup_snapshot.passive_view.transport.state
+    );
+    println!("Real display output: no");
+    println!("VisualVerified: no");
+    println!("Realtime playback: no");
+    println!("A/V sync: no");
+    println!("Device output: no");
+    println!("FramePresented real display claim: no");
     println!("Private path exposed: {}", yes_no(private_path_exposed));
 
     Ok(())
@@ -7051,6 +7256,161 @@ fn sanitized_source_stem(path: &Path) -> String {
     } else {
         out
     }
+}
+
+fn public_source_uri_stem(public_source_uri: &str) -> String {
+    let raw = public_source_uri
+        .rsplit('/')
+        .next()
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("qgs-video");
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "qgs-video".to_string()
+    } else {
+        out
+    }
+}
+
+fn file_presenter_manifest_file_name(public_source_uri: &str, source_frame_index: u64) -> String {
+    format!(
+        "{}-frame{source_frame_index:06}-proxy-preview-manifest.json",
+        public_source_uri_stem(public_source_uri)
+    )
+}
+
+fn json_escape(value: &str) -> String {
+    let mut escaped = String::new();
+    for ch in value.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => escaped.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn manifest_json_contains_private_path(manifest_json: &str) -> bool {
+    manifest_json.contains("/home/")
+        || manifest_json.contains("/tmp/")
+        || manifest_json.contains("/mnt/")
+        || manifest_json.contains("file://")
+}
+
+fn qgs_file_presenter_manifest_json(
+    result: &QgsFilePresenterSubmissionResult,
+    monitor_projection: &QgsQncMonitorProjection,
+    setup_commands_executed: usize,
+    setup_commands_accepted: usize,
+    setup_commands_rejected: usize,
+    final_setup_state: &str,
+) -> String {
+    let payload = &result.submission.payload;
+    let reason = result.artifact.reason.unwrap_or("n/a");
+    format!(
+        concat!(
+            "{{\n",
+            "  \"schema\": \"qgs.file-presenter-diagnostic.v1\",\n",
+            "  \"presenter_kind\": \"FilePresenter\",\n",
+            "  \"source_mode\": \"{:?}\",\n",
+            "  \"video_source\": \"proxy MP4\",\n",
+            "  \"audio_source\": \"original MXF\",\n",
+            "  \"proxy_aac\": \"not used\",\n",
+            "  \"public_source_uri\": \"{}\",\n",
+            "  \"private_path_exposed\": {},\n",
+            "  \"source_frame_index\": {},\n",
+            "  \"selected_preview_frame_index\": {},\n",
+            "  \"presentation_time_ms\": {:.3},\n",
+            "  \"duration_ms\": {:.3},\n",
+            "  \"payload_kind\": \"{:?}\",\n",
+            "  \"payload_format\": \"{:?}\",\n",
+            "  \"backend_path\": \"{:?}\",\n",
+            "  \"payload_id\": {},\n",
+            "  \"visible_width\": {},\n",
+            "  \"visible_height\": {},\n",
+            "  \"coded_width\": {},\n",
+            "  \"coded_height\": {},\n",
+            "  \"artifact_kind\": \"{:?}\",\n",
+            "  \"artifact_public_path\": \"{}\",\n",
+            "  \"image_artifact_available\": {},\n",
+            "  \"manifest_written\": {},\n",
+            "  \"image_unavailable_reason\": \"{}\",\n",
+            "  \"evidence_kind\": \"{:?}\",\n",
+            "  \"evidence_level\": \"{:?}\",\n",
+            "  \"monitor_projection\": {{\n",
+            "    \"prepared_descriptor_present\": {},\n",
+            "    \"submitted_to_presenter\": {},\n",
+            "    \"frame_presented_test_boundary\": {},\n",
+            "    \"frame_presented_real_backend\": {},\n",
+            "    \"real_display_evidence_present\": {},\n",
+            "    \"visual_verified\": {}\n",
+            "  }},\n",
+            "  \"session_setup\": {{\n",
+            "    \"commands_executed\": {},\n",
+            "    \"commands_accepted\": {},\n",
+            "    \"commands_rejected\": {},\n",
+            "    \"final_state\": \"{}\"\n",
+            "  }},\n",
+            "  \"real_display_output\": false,\n",
+            "  \"visual_verified\": false,\n",
+            "  \"realtime_playback\": false,\n",
+            "  \"av_sync\": false,\n",
+            "  \"device_output\": false,\n",
+            "  \"frame_presented_real_display_claim\": false\n",
+            "}}\n"
+        ),
+        payload.source_mode,
+        json_escape(&payload.public_source_uri),
+        payload.private_path_exposed || result.artifact.exposes_private_path(),
+        payload.source_frame,
+        payload
+            .selected_preview_frame
+            .map(|frame| frame.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        duration_ms(payload.presentation_time),
+        duration_ms(payload.duration),
+        payload.payload_kind,
+        payload.payload_format,
+        payload.backend_path,
+        payload.payload_id,
+        payload.visible_width,
+        payload.visible_height,
+        payload.coded_width,
+        payload.coded_height,
+        result.artifact.kind,
+        json_escape(&result.artifact.public_artifact_path),
+        result.artifact.image_written,
+        result.artifact.manifest_written,
+        json_escape(reason),
+        result.evidence.evidence_kind,
+        result.evidence.evidence_level,
+        monitor_projection.prepared_descriptor_present,
+        monitor_projection.submitted_to_presenter,
+        monitor_projection.frame_presented_test_boundary,
+        monitor_projection.frame_presented_real_backend,
+        monitor_projection.real_display_evidence_present,
+        monitor_projection.visual_verified,
+        setup_commands_executed,
+        setup_commands_accepted,
+        setup_commands_rejected,
+        json_escape(final_setup_state),
+    )
 }
 
 fn audio_audit_range_label(start_ms: u64, duration_ms: u64) -> String {
@@ -14766,6 +15126,7 @@ struct Args {
     qgs_session_command_boundary_paths: Option<(PathBuf, PathBuf)>,
     qgs_session_runtime_control_paths: Option<(PathBuf, PathBuf)>,
     qgs_presenter_monitor_boundary_paths: Option<(PathBuf, PathBuf)>,
+    qgs_file_presenter_diagnostic_paths: Option<(PathBuf, PathBuf)>,
     qgs_runtime_surface_e2e_paths: Option<(PathBuf, PathBuf)>,
     linux_audio_device_probe_path: Option<PathBuf>,
     pipewire_audio_prototype_path: Option<PathBuf>,
@@ -14853,6 +15214,8 @@ impl Args {
         let mut qgs_session_runtime_control_paths = None;
         let mut qgs_presenter_monitor_boundary_original = None;
         let mut qgs_presenter_monitor_boundary_paths = None;
+        let mut qgs_file_presenter_diagnostic_original = None;
+        let mut qgs_file_presenter_diagnostic_paths = None;
         let mut qgs_runtime_surface_e2e_original = None;
         let mut qgs_runtime_surface_e2e_paths = None;
         let mut linux_audio_device_probe_path = None;
@@ -14932,6 +15295,8 @@ impl Args {
         let mut next_arg_is_qgs_session_runtime_control_proxy = false;
         let mut next_arg_is_qgs_presenter_monitor_boundary_original = false;
         let mut next_arg_is_qgs_presenter_monitor_boundary_proxy = false;
+        let mut next_arg_is_qgs_file_presenter_diagnostic_original = false;
+        let mut next_arg_is_qgs_file_presenter_diagnostic_proxy = false;
         let mut next_arg_is_qgs_runtime_surface_e2e_original = false;
         let mut next_arg_is_qgs_runtime_surface_e2e_proxy = false;
         let mut next_arg_is_linux_audio_device_probe_path = false;
@@ -15061,6 +15426,17 @@ impl Args {
                 qgs_runtime_surface_e2e_original = Some(PathBuf::from(arg));
                 next_arg_is_qgs_runtime_surface_e2e_original = false;
                 next_arg_is_qgs_runtime_surface_e2e_proxy = true;
+            } else if next_arg_is_qgs_file_presenter_diagnostic_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = qgs_file_presenter_diagnostic_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                qgs_file_presenter_diagnostic_paths = Some((original, proxy));
+                next_arg_is_qgs_file_presenter_diagnostic_proxy = false;
+            } else if next_arg_is_qgs_file_presenter_diagnostic_original {
+                qgs_file_presenter_diagnostic_original = Some(PathBuf::from(arg));
+                next_arg_is_qgs_file_presenter_diagnostic_original = false;
+                next_arg_is_qgs_file_presenter_diagnostic_proxy = true;
             } else if next_arg_is_qgs_presenter_monitor_boundary_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = qgs_presenter_monitor_boundary_original
@@ -15457,6 +15833,8 @@ impl Args {
                 next_arg_is_qgs_session_runtime_control_original = true;
             } else if arg == QGS_PRESENTER_MONITOR_BOUNDARY_ARG {
                 next_arg_is_qgs_presenter_monitor_boundary_original = true;
+            } else if arg == QGS_FILE_PRESENTER_DIAGNOSTIC_ARG {
+                next_arg_is_qgs_file_presenter_diagnostic_original = true;
             } else if arg == QGS_RUNTIME_SURFACE_E2E_ARG {
                 next_arg_is_qgs_runtime_surface_e2e_original = true;
             } else if arg == LINUX_AUDIO_DEVICE_PROBE_ARG {
@@ -15533,6 +15911,7 @@ impl Args {
             qgs_session_command_boundary_paths,
             qgs_session_runtime_control_paths,
             qgs_presenter_monitor_boundary_paths,
+            qgs_file_presenter_diagnostic_paths,
             qgs_runtime_surface_e2e_paths,
             linux_audio_device_probe_path,
             pipewire_audio_prototype_path,
@@ -15586,13 +15965,14 @@ mod tests {
         build_runtime_audio_payload_pipewire_buffer,
         build_sequential_original_audio_segment_for_duration, decode_s24be_i32, decode_s24le_i32,
         decode_u24le, default_qgs_input_plan_queue_requirements, discrete_4mono_evidence_label,
-        duration_samples_to_frames, f32_buffer_stats, loudest_monitor_pair,
+        duration_samples_to_frames, f32_buffer_stats, file_presenter_manifest_file_name,
+        json_escape, loudest_monitor_pair, manifest_json_contains_private_path,
         mono_monitor_diagnostic_evidence_label, mxf_file_label, original_pcm_blocks_by_channel,
         original_segment_evidence_label, parse_manual_audible_confirmation,
         parse_monitor_track_arg, pcm_s24le_sample_to_f32, proxy_presentation_ordinals,
-        repeated_smoke_test_buffers, runtime_audio_payload_evidence_label, sanitized_source_stem,
-        selected_proxy_ordinals, smoke_test_buffer_count, ManualAudibleConfirmation,
-        SonyXmlSummary,
+        public_source_uri_stem, repeated_smoke_test_buffers, runtime_audio_payload_evidence_label,
+        sanitized_source_stem, selected_proxy_ordinals, smoke_test_buffer_count,
+        ManualAudibleConfirmation, SonyXmlSummary,
     };
     use qgs_media_runtime::{
         av_frame_audio_range, bind_broadcast_audio_payload, BroadcastPreparedAudioSlot,
@@ -16025,6 +16405,36 @@ mod tests {
             sanitized_source_stem(&PathBuf::from("/tmp/%%%")),
             "original-audio"
         );
+    }
+
+    #[test]
+    fn file_presenter_manifest_filename_is_deterministic_and_public_safe() {
+        assert_eq!(
+            public_source_uri_stem("qnc://local/media/proxy/Mironik-1560"),
+            "Mironik-1560"
+        );
+        assert_eq!(
+            file_presenter_manifest_file_name("qnc://local/media/proxy/Mironik 1560", 4),
+            "Mironik-1560-frame000004-proxy-preview-manifest.json"
+        );
+        assert_eq!(
+            file_presenter_manifest_file_name("qnc://local/media/proxy/%%%/", 0),
+            "qgs-video-frame000000-proxy-preview-manifest.json"
+        );
+    }
+
+    #[test]
+    fn file_presenter_manifest_helpers_escape_and_detect_private_paths() {
+        assert_eq!(json_escape("a\"b\\c\n"), "a\\\"b\\\\c\\n");
+        assert!(!manifest_json_contains_private_path(
+            "qgs-visual-diagnostics/Mironik-1560-frame000000-proxy-preview-manifest.json"
+        ));
+        assert!(manifest_json_contains_private_path(
+            "/home/miro/private/frame.json"
+        ));
+        assert!(manifest_json_contains_private_path(
+            "file:///tmp/frame.json"
+        ));
     }
 
     #[test]
