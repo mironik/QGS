@@ -61,6 +61,10 @@ and what remains unimplemented.
   root wires existing LEGO modules and creates operational runtimes without
   becoming a monolithic player. This is not realtime playback, real display
   output, A/V sync, or production audio-device verification.
+- `ArchitectureAuditEvidence`: architecture, ownership, reuse/parity, and
+  remaining gaps were audited against QNC/QGS modules. This is not runtime
+  implementation evidence, realtime playback, real display output, A/V sync, or
+  production audio-device verification.
 - `ManualAudibleSignalDetectedContentUnverified`: a human detected a slight
   hum/buzz from a native PipeWire path, but recognizable original audio content
   was not confirmed. This does not verify PCM content correctness, channel
@@ -138,6 +142,7 @@ For Sony FX6 sample 002:
 | broadcast player fault and recovery rules | `FaultRecoveryPolicyEvidence` | Structured fault severity, scope, recovery action, snapshot counters, backend warnings, and rejected-command no-mutation rules are modeled and tested. Real display, realtime playback, A/V sync, and production audio-device claims remain false. |
 | broadcast player running runtime demo | `RuntimeBehaviorEvidence` | Running operational demo streams step-by-step backend player state, frame/audio progression, pause freeze, seek/reprepare/replay, stop, unload, buffer health, and non-claims using the operational runtime. Real display, realtime playback, A/V sync, and production audio-device claims remain false. |
 | broadcast player modular runtime assembly | `AssemblySurfaceEvidence` | `QgsBroadcastPlayerAssembly` is a composition root over input planning, transport, frame-clock facts, preroll, payload providers, device selection, fault/recovery, events, snapshots, and session/control surfaces. It creates existing operational runtimes without duplicating player logic or claiming real display, realtime playback, A/V sync, or production audio-device verification. |
+| QNC broadcast engine reuse/parity audit | `ArchitectureAuditEvidence` | QNC broadcast/player contracts, behavior, backend responsibilities, UI/DB/workflow ownership, QGS equivalents, reusable concepts, non-reusable implementation areas, and remaining QGS gaps were audited after Block M. No runtime feature or device claim was added. |
 | simulated playback loop | `TestBoundaryEvidence` | Prepared slots flow through test audio/video boundaries deterministically. |
 | real speaker output | `NotImplemented` | No audible speaker output, audio-device clock, or full audio playback path exists; native PipeWire buffer submission is tracked separately. |
 | real display output | `NotImplemented` | No QNC OS Wayland/Vulkan presenter, optional DRM/KMS direct-output presenter, legacy X11 compatibility presenter, swapchain, or real display presenter exists. X11 is not a QNC OS target. |
@@ -205,6 +210,10 @@ The matrix intentionally does not overstate these areas:
   module ownership clarity only. It is not a monolithic player implementation,
   realtime scheduler, real display output, visual verification, A/V sync,
   production audio output, or full playback acceptance.
+- QNC broadcast engine reuse/parity audit evidence proves architectural mapping
+  only. It is not runtime behavior, device output, visual verification,
+  realtime playback, A/V sync, production audio output, or a completed backend
+  replacement.
 - The audio content sanity audit is inspection evidence, not audible content
   verification.
 - Haswell CPU-bridge 1080p50 is not marked realtime verified.
