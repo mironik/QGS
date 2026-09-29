@@ -216,7 +216,12 @@ Block H does not claim:
 
 ## Next Recommended Block
 
-M2 Integration Block I — Wayland + Vulkan Presenter Boundary Prototype.
+M2 Integration Block I — Broadcast Player Operational Runtime.
+
+The device-selection policy exists so the Broadcast Player can keep moving as a
+production-shaped runtime surface without jumping directly into Wayland/Vulkan
+implementation. Real Wayland/Vulkan presenter work should wait until the
+operational runtime and fault/recovery rules are stable.
 
 That should happen only after this selection model exists. Wayland/Vulkan is the
 first real QNC OS display target. X11 must not be implemented as a QNC OS

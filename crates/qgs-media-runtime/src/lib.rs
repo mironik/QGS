@@ -4293,6 +4293,551 @@ impl QgsBroadcastPlayerCore {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsOperationalRuntimeConfig {
+    pub tick_frame_step: u64,
+    pub low_water_prepared_frames: usize,
+}
+
+impl Default for QgsOperationalRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            tick_frame_step: 1,
+            low_water_prepared_frames: 3,
+        }
+    }
+}
+
+impl QgsOperationalRuntimeConfig {
+    pub fn validate(self) -> Result<Self, PlaybackError> {
+        if self.tick_frame_step == 0 {
+            Err(PlaybackError::InvalidCapacity)
+        } else {
+            Ok(self)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsOperationalFaultKind {
+    BackendNotImplemented,
+    RealDisplayUnavailable,
+    AudioOutputNotProductionVerified,
+    PreparedWindowUnderrun,
+    IllegalCommandForState,
+    SourceNotLoaded,
+    CueOutsideActiveRange,
+    EndOfRangeReached,
+}
+
+impl QgsOperationalFaultKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::BackendNotImplemented => "BackendNotImplemented",
+            Self::RealDisplayUnavailable => "RealDisplayUnavailable",
+            Self::AudioOutputNotProductionVerified => "AudioOutputNotProductionVerified",
+            Self::PreparedWindowUnderrun => "PreparedWindowUnderrun",
+            Self::IllegalCommandForState => "IllegalCommandForState",
+            Self::SourceNotLoaded => "SourceNotLoaded",
+            Self::CueOutsideActiveRange => "CueOutsideActiveRange",
+            Self::EndOfRangeReached => "EndOfRangeReached",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsOperationalFault {
+    pub kind: QgsOperationalFaultKind,
+    pub reason: &'static str,
+}
+
+impl QgsOperationalFault {
+    pub const fn new(kind: QgsOperationalFaultKind, reason: &'static str) -> Self {
+        Self { kind, reason }
+    }
+
+    pub fn exposes_private_path(&self) -> bool {
+        qgs_projection_text_exposes_private_path(self.reason)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsOperationalBufferHealth {
+    pub prepared_start_frame: Option<u64>,
+    pub prepared_end_frame_exclusive: Option<u64>,
+    pub selected_prepared_frame: Option<u64>,
+    pub prepared_frame_count: usize,
+    pub low_water: bool,
+    pub underrun: bool,
+    pub discarded_count: usize,
+    pub last_prepared_frame: Option<u64>,
+    pub preparation_pending: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsOperationalRuntimeSnapshot {
+    pub player: QgsBroadcastPlayerSnapshot,
+    pub operational_status: QgsBroadcastPlayerStatus,
+    pub current_frame: Option<u64>,
+    pub current_audio_sample_range: Option<(u64, u64)>,
+    pub buffer_health: QgsOperationalBufferHealth,
+    pub faults: Vec<QgsOperationalFault>,
+    pub accepted_commands: usize,
+    pub rejected_commands: usize,
+    pub completed: bool,
+    pub private_path_exposed: bool,
+}
+
+impl QgsOperationalRuntimeSnapshot {
+    pub fn exposes_private_path(&self) -> bool {
+        self.private_path_exposed
+            || self.player.exposes_private_path()
+            || self
+                .faults
+                .iter()
+                .any(QgsOperationalFault::exposes_private_path)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsOperationalRuntimeEventKind {
+    CommandAccepted,
+    CommandRejected,
+    PositionAdvanced,
+    Seeked,
+    Stopped,
+    Completed,
+    Unloaded,
+    WarningRaised,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsOperationalRuntimeEvent {
+    pub sequence: u64,
+    pub kind: QgsOperationalRuntimeEventKind,
+    pub status: QgsBroadcastPlayerStatus,
+    pub frame: Option<u64>,
+    pub summary: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsOperationalTickResult {
+    pub command: QgsBroadcastPlayerCommand,
+    pub accepted: bool,
+    pub reason: Option<&'static str>,
+    pub command_result: Option<QgsBroadcastPlayerCommandResult>,
+    pub events: Vec<QgsOperationalRuntimeEvent>,
+    pub snapshot: QgsOperationalRuntimeSnapshot,
+}
+
+pub struct QgsBroadcastPlayerOperationalRuntime {
+    core: QgsBroadcastPlayerCore,
+    config: QgsOperationalRuntimeConfig,
+    current_frame: Option<u64>,
+    completed: bool,
+    faults: Vec<QgsOperationalFault>,
+    events: Vec<QgsOperationalRuntimeEvent>,
+    accepted_commands: usize,
+    rejected_commands: usize,
+}
+
+impl QgsBroadcastPlayerOperationalRuntime {
+    pub fn new(
+        plan: QgsInputPlan,
+        config: QgsOperationalRuntimeConfig,
+    ) -> Result<Self, PlaybackError> {
+        Ok(Self {
+            core: QgsBroadcastPlayerCore::new(plan)?,
+            config: config.validate()?,
+            current_frame: None,
+            completed: false,
+            faults: Vec::new(),
+            events: Vec::new(),
+            accepted_commands: 0,
+            rejected_commands: 0,
+        })
+    }
+
+    pub fn execute(&mut self, command: QgsBroadcastPlayerCommand) -> QgsOperationalTickResult {
+        let before_events = self.events.len();
+        let legality = self.command_legality(&command);
+        if let Err(reason) = legality {
+            self.rejected_commands = self.rejected_commands.saturating_add(1);
+            self.push_fault(QgsOperationalFaultKind::IllegalCommandForState, reason);
+            self.push_event(
+                QgsOperationalRuntimeEventKind::CommandRejected,
+                self.operational_status(),
+                self.current_frame,
+                reason,
+            );
+            return QgsOperationalTickResult {
+                command,
+                accepted: false,
+                reason: Some(reason),
+                command_result: None,
+                events: self.events[before_events..].to_vec(),
+                snapshot: self.snapshot(),
+            };
+        }
+
+        let operational_command = self.operational_command(command.clone());
+        let result = self.core.execute(operational_command.clone());
+        if result.accepted {
+            self.accepted_commands = self.accepted_commands.saturating_add(1);
+            self.apply_accepted_command(&operational_command);
+            self.push_event_for_accepted_command(&operational_command);
+        } else {
+            self.rejected_commands = self.rejected_commands.saturating_add(1);
+            self.push_fault(
+                QgsOperationalFaultKind::IllegalCommandForState,
+                result.reason.unwrap_or("command rejected"),
+            );
+            self.push_event(
+                QgsOperationalRuntimeEventKind::CommandRejected,
+                self.operational_status(),
+                self.current_frame,
+                result.reason.unwrap_or("command rejected"),
+            );
+        }
+        QgsOperationalTickResult {
+            command,
+            accepted: result.accepted,
+            reason: result.reason,
+            command_result: Some(result),
+            events: self.events[before_events..].to_vec(),
+            snapshot: self.snapshot(),
+        }
+    }
+
+    pub fn snapshot(&self) -> QgsOperationalRuntimeSnapshot {
+        let player = self.core.snapshot();
+        let current_frame = self.current_frame.or(player.position.current_frame);
+        let current_audio_sample_range =
+            current_frame.and_then(|frame| self.frame_audio_sample_range(frame, &player));
+        let buffer_health = self.buffer_health(&player, current_frame);
+        let mut faults = self.state_faults(&player, &buffer_health);
+        faults.extend(self.faults.clone());
+        let private_path_exposed = player.exposes_private_path()
+            || faults.iter().any(QgsOperationalFault::exposes_private_path);
+        QgsOperationalRuntimeSnapshot {
+            player,
+            operational_status: self.operational_status(),
+            current_frame,
+            current_audio_sample_range,
+            buffer_health,
+            faults,
+            accepted_commands: self.accepted_commands,
+            rejected_commands: self.rejected_commands,
+            completed: self.completed,
+            private_path_exposed,
+        }
+    }
+
+    pub fn events(&self) -> &[QgsOperationalRuntimeEvent] {
+        &self.events
+    }
+
+    fn command_legality(&self, command: &QgsBroadcastPlayerCommand) -> Result<(), &'static str> {
+        let status = self.operational_status();
+        match status {
+            QgsBroadcastPlayerStatus::Empty => match command {
+                QgsBroadcastPlayerCommand::LoadPreparedInput => Ok(()),
+                _ => Err("command is illegal while player is Empty"),
+            },
+            QgsBroadcastPlayerStatus::Loaded | QgsBroadcastPlayerStatus::Preparing => match command
+            {
+                QgsBroadcastPlayerCommand::Prepare { .. }
+                | QgsBroadcastPlayerCommand::Cue { .. }
+                | QgsBroadcastPlayerCommand::Stop
+                | QgsBroadcastPlayerCommand::Unload
+                | QgsBroadcastPlayerCommand::Tick { .. } => Ok(()),
+                QgsBroadcastPlayerCommand::Play => Err("play requires Ready"),
+                QgsBroadcastPlayerCommand::LoadPreparedInput => Err("source already loaded"),
+                QgsBroadcastPlayerCommand::Pause => Err("pause requires Playing"),
+                QgsBroadcastPlayerCommand::Seek { .. } => Err("seek requires active range"),
+            },
+            QgsBroadcastPlayerStatus::Ready => match command {
+                QgsBroadcastPlayerCommand::Play
+                | QgsBroadcastPlayerCommand::Seek { .. }
+                | QgsBroadcastPlayerCommand::Stop
+                | QgsBroadcastPlayerCommand::Unload
+                | QgsBroadcastPlayerCommand::Tick { .. }
+                | QgsBroadcastPlayerCommand::Prepare { .. }
+                | QgsBroadcastPlayerCommand::Cue { .. } => Ok(()),
+                QgsBroadcastPlayerCommand::LoadPreparedInput => Err("source already loaded"),
+                QgsBroadcastPlayerCommand::Pause => Err("pause requires Playing"),
+            },
+            QgsBroadcastPlayerStatus::Playing => match command {
+                QgsBroadcastPlayerCommand::Tick { .. }
+                | QgsBroadcastPlayerCommand::Pause
+                | QgsBroadcastPlayerCommand::Stop
+                | QgsBroadcastPlayerCommand::Seek { .. } => Ok(()),
+                QgsBroadcastPlayerCommand::LoadPreparedInput => Err("source already loaded"),
+                QgsBroadcastPlayerCommand::Play => Err("already playing"),
+                QgsBroadcastPlayerCommand::Prepare { .. }
+                | QgsBroadcastPlayerCommand::Cue { .. } => {
+                    Err("prepare/cue requires non-playing state")
+                }
+                QgsBroadcastPlayerCommand::Unload => Err("unload requires stopped or paused state"),
+            },
+            QgsBroadcastPlayerStatus::Paused => match command {
+                QgsBroadcastPlayerCommand::Play
+                | QgsBroadcastPlayerCommand::Seek { .. }
+                | QgsBroadcastPlayerCommand::Stop
+                | QgsBroadcastPlayerCommand::Unload
+                | QgsBroadcastPlayerCommand::Tick { .. }
+                | QgsBroadcastPlayerCommand::Prepare { .. }
+                | QgsBroadcastPlayerCommand::Cue { .. } => Ok(()),
+                QgsBroadcastPlayerCommand::Pause => Err("already paused"),
+                QgsBroadcastPlayerCommand::LoadPreparedInput => Err("source already loaded"),
+            },
+            QgsBroadcastPlayerStatus::Stopped => match command {
+                QgsBroadcastPlayerCommand::Cue { .. }
+                | QgsBroadcastPlayerCommand::Seek { .. }
+                | QgsBroadcastPlayerCommand::Prepare { .. }
+                | QgsBroadcastPlayerCommand::Unload
+                | QgsBroadcastPlayerCommand::Tick { .. } => Ok(()),
+                QgsBroadcastPlayerCommand::Pause => Err("pause requires Playing"),
+                QgsBroadcastPlayerCommand::Play => Err("play requires Ready"),
+                QgsBroadcastPlayerCommand::LoadPreparedInput => Err("source already loaded"),
+                QgsBroadcastPlayerCommand::Stop => Err("already stopped"),
+            },
+            QgsBroadcastPlayerStatus::Completed => match command {
+                QgsBroadcastPlayerCommand::Seek { .. }
+                | QgsBroadcastPlayerCommand::Cue { .. }
+                | QgsBroadcastPlayerCommand::Prepare { .. }
+                | QgsBroadcastPlayerCommand::Unload => Ok(()),
+                QgsBroadcastPlayerCommand::Play => {
+                    Err("completed range requires seek/prepare before play")
+                }
+                QgsBroadcastPlayerCommand::Tick { .. } => Err("completed range cannot tick"),
+                QgsBroadcastPlayerCommand::LoadPreparedInput => Err("source already loaded"),
+                QgsBroadcastPlayerCommand::Pause => Err("pause requires Playing"),
+                QgsBroadcastPlayerCommand::Stop => Err("already completed"),
+            },
+            QgsBroadcastPlayerStatus::Failed => match command {
+                QgsBroadcastPlayerCommand::Unload => Ok(()),
+                _ => Err("failed runtime requires unload"),
+            },
+        }
+    }
+
+    fn operational_command(&self, command: QgsBroadcastPlayerCommand) -> QgsBroadcastPlayerCommand {
+        match command {
+            QgsBroadcastPlayerCommand::Tick { .. } => QgsBroadcastPlayerCommand::Tick {
+                carrier_frame: self.current_frame.unwrap_or(0),
+            },
+            other => other,
+        }
+    }
+
+    fn apply_accepted_command(&mut self, command: &QgsBroadcastPlayerCommand) {
+        match *command {
+            QgsBroadcastPlayerCommand::LoadPreparedInput => {
+                self.completed = false;
+            }
+            QgsBroadcastPlayerCommand::Prepare { .. } => {
+                self.completed = false;
+            }
+            QgsBroadcastPlayerCommand::Cue { frame }
+            | QgsBroadcastPlayerCommand::Seek { frame } => {
+                self.completed = false;
+                self.current_frame = Some(frame);
+            }
+            QgsBroadcastPlayerCommand::Play => {
+                self.completed = false;
+            }
+            QgsBroadcastPlayerCommand::Tick { .. } => {
+                if self.core.snapshot().status == QgsBroadcastPlayerStatus::Playing {
+                    self.advance_playing_position();
+                }
+            }
+            QgsBroadcastPlayerCommand::Stop => {}
+            QgsBroadcastPlayerCommand::Pause => {}
+            QgsBroadcastPlayerCommand::Unload => {
+                self.completed = false;
+                self.current_frame = None;
+                self.faults.clear();
+            }
+        }
+    }
+
+    fn advance_playing_position(&mut self) {
+        let snapshot = self.core.snapshot();
+        let Some(range) = snapshot.position.active_range else {
+            return;
+        };
+        let current = self
+            .current_frame
+            .or(snapshot.position.current_frame)
+            .unwrap_or(range.start_frame);
+        let next = current.saturating_add(self.config.tick_frame_step);
+        if next >= range.end_frame {
+            self.current_frame = Some(range.end_frame.saturating_sub(1));
+            self.completed = true;
+            self.push_fault(
+                QgsOperationalFaultKind::EndOfRangeReached,
+                "active range end reached",
+            );
+            self.push_event(
+                QgsOperationalRuntimeEventKind::Completed,
+                QgsBroadcastPlayerStatus::Completed,
+                self.current_frame,
+                "active range end reached",
+            );
+        } else {
+            self.current_frame = Some(next);
+            self.push_event(
+                QgsOperationalRuntimeEventKind::PositionAdvanced,
+                QgsBroadcastPlayerStatus::Playing,
+                self.current_frame,
+                "logical frame advanced",
+            );
+        }
+    }
+
+    fn push_event_for_accepted_command(&mut self, command: &QgsBroadcastPlayerCommand) {
+        let (kind, summary) = match command {
+            QgsBroadcastPlayerCommand::Seek { .. } => {
+                (QgsOperationalRuntimeEventKind::Seeked, "seek accepted")
+            }
+            QgsBroadcastPlayerCommand::Stop => {
+                (QgsOperationalRuntimeEventKind::Stopped, "stop accepted")
+            }
+            QgsBroadcastPlayerCommand::Unload => {
+                (QgsOperationalRuntimeEventKind::Unloaded, "unload accepted")
+            }
+            _ => (
+                QgsOperationalRuntimeEventKind::CommandAccepted,
+                "command accepted",
+            ),
+        };
+        self.push_event(kind, self.operational_status(), self.current_frame, summary);
+    }
+
+    fn operational_status(&self) -> QgsBroadcastPlayerStatus {
+        if self.completed {
+            QgsBroadcastPlayerStatus::Completed
+        } else {
+            self.core.snapshot().status
+        }
+    }
+
+    fn frame_audio_sample_range(
+        &self,
+        frame: u64,
+        player: &QgsBroadcastPlayerSnapshot,
+    ) -> Option<(u64, u64)> {
+        player
+            .position
+            .frame_rate
+            .frame_duration()
+            .ok()
+            .and_then(|duration| {
+                audio_samples_for_duration(duration, player.position.audio_sample_rate).ok()
+            })
+            .map(|samples_per_frame| {
+                let start = frame.saturating_mul(samples_per_frame);
+                (start, start.saturating_add(samples_per_frame))
+            })
+    }
+
+    fn buffer_health(
+        &self,
+        player: &QgsBroadcastPlayerSnapshot,
+        current_frame: Option<u64>,
+    ) -> QgsOperationalBufferHealth {
+        let prepared_start = player.prepared_window.prepared_start_frame;
+        let prepared_end = player.prepared_window.prepared_end_frame_exclusive;
+        let prepared_count = player.prepared_window.prepared_frame_count;
+        let last_prepared_frame = prepared_end.and_then(|end| end.checked_sub(1));
+        let current_prepared = match (current_frame, prepared_start, prepared_end) {
+            (Some(frame), Some(start), Some(end)) => frame >= start && frame < end,
+            _ => false,
+        };
+        let source_loaded = player.readiness.source_loaded;
+        QgsOperationalBufferHealth {
+            prepared_start_frame: prepared_start,
+            prepared_end_frame_exclusive: prepared_end,
+            selected_prepared_frame: player.prepared_window.selected_prepared_frame,
+            prepared_frame_count: prepared_count,
+            low_water: prepared_count > 0
+                && prepared_count <= self.config.low_water_prepared_frames,
+            underrun: source_loaded
+                && current_frame.is_some()
+                && prepared_count > 0
+                && !current_prepared,
+            discarded_count: player.prepared_window.latest_discarded_frame_count,
+            last_prepared_frame,
+            preparation_pending: source_loaded && prepared_count == 0,
+        }
+    }
+
+    fn state_faults(
+        &self,
+        player: &QgsBroadcastPlayerSnapshot,
+        buffer_health: &QgsOperationalBufferHealth,
+    ) -> Vec<QgsOperationalFault> {
+        let mut faults = Vec::new();
+        if player.device_status.real_display_backend
+            == QgsDeviceBackendAvailability::NotImplemented.label()
+        {
+            faults.push(QgsOperationalFault::new(
+                QgsOperationalFaultKind::BackendNotImplemented,
+                "real display backend is NotImplemented",
+            ));
+        }
+        if !player.readiness.real_display_ready {
+            faults.push(QgsOperationalFault::new(
+                QgsOperationalFaultKind::RealDisplayUnavailable,
+                "real display is unavailable",
+            ));
+        }
+        if !player.device_status.audio_device_production_verified {
+            faults.push(QgsOperationalFault::new(
+                QgsOperationalFaultKind::AudioOutputNotProductionVerified,
+                "audio output is not production verified",
+            ));
+        }
+        if buffer_health.underrun {
+            faults.push(QgsOperationalFault::new(
+                QgsOperationalFaultKind::PreparedWindowUnderrun,
+                "current frame is outside prepared window",
+            ));
+        }
+        faults
+    }
+
+    fn push_fault(&mut self, kind: QgsOperationalFaultKind, reason: &'static str) {
+        let fault = QgsOperationalFault::new(kind, reason);
+        if !self.faults.contains(&fault) {
+            self.faults.push(fault);
+        }
+        self.push_event(
+            QgsOperationalRuntimeEventKind::WarningRaised,
+            self.operational_status(),
+            self.current_frame,
+            reason,
+        );
+    }
+
+    fn push_event(
+        &mut self,
+        kind: QgsOperationalRuntimeEventKind,
+        status: QgsBroadcastPlayerStatus,
+        frame: Option<u64>,
+        summary: &'static str,
+    ) {
+        self.events.push(QgsOperationalRuntimeEvent {
+            sequence: u64::try_from(self.events.len() + 1).unwrap_or(u64::MAX),
+            kind,
+            status,
+            frame,
+            summary,
+        });
+    }
+}
+
 fn qgs_projection_text_exposes_private_path(value: &str) -> bool {
     value.starts_with('/') || value.starts_with("file:") || value.contains("file:")
 }
@@ -4793,6 +5338,7 @@ pub enum BroadcastRuntimeVerificationLevel {
     UnitTested,
     ControlSurfaceEvidence,
     SelectionPolicyEvidence,
+    OperationalStateEvidence,
     MediaInspected,
     PayloadExtracted,
     PayloadBound,
@@ -4823,6 +5369,7 @@ impl BroadcastRuntimeVerificationLevel {
             Self::UnitTested => "UnitTested",
             Self::ControlSurfaceEvidence => "ControlSurfaceEvidence",
             Self::SelectionPolicyEvidence => "SelectionPolicyEvidence",
+            Self::OperationalStateEvidence => "OperationalStateEvidence",
             Self::MediaInspected => "MediaInspected",
             Self::PayloadExtracted => "PayloadExtracted",
             Self::PayloadBound => "PayloadBound",
@@ -4886,6 +5433,7 @@ pub enum BroadcastRuntimeVerifiedSubsystem {
     RuntimeSurfaceE2eAcceptance,
     BroadcastPlayerControlCore,
     DeviceBackendSelection,
+    BroadcastPlayerOperationalRuntime,
     SimulatedPlaybackLoop,
     RealSpeakerOutput,
     RealDisplayOutput,
@@ -4935,6 +5483,7 @@ impl BroadcastRuntimeVerifiedSubsystem {
             Self::RuntimeSurfaceE2eAcceptance => "runtime surface end-to-end acceptance",
             Self::BroadcastPlayerControlCore => "broadcast player control core",
             Self::DeviceBackendSelection => "device backend selection",
+            Self::BroadcastPlayerOperationalRuntime => "broadcast player operational runtime",
             Self::SimulatedPlaybackLoop => "simulated playback loop",
             Self::RealSpeakerOutput => "real speaker output",
             Self::RealDisplayOutput => "real display output",
@@ -5116,6 +5665,11 @@ impl BroadcastRuntimeVerificationMatrix {
                     subsystem: Subsystem::DeviceBackendSelection,
                     level: Level::SelectionPolicyEvidence,
                     summary: "backend-neutral device selection policies choose diagnostic/future display and audio candidates truthfully; Wayland/Vulkan remains the QNC OS target but NotImplemented, X11 is unsupported for QNC OS, and PipeWire prototypes are not production verified",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::BroadcastPlayerOperationalRuntime,
+                    level: Level::OperationalStateEvidence,
+                    summary: "deterministic Broadcast Player operational runtime enforces command legality, advances logical position on playing ticks, models seek/stop/completion, reports buffer health and warnings, and keeps real display, realtime, A/V sync, and production audio-device claims false",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::SimulatedPlaybackLoop,
@@ -9328,6 +9882,237 @@ mod tests {
         assert!(!selection.audio_device_production_verified);
     }
 
+    fn qgs_operational_runtime_ready(range: (u64, u64)) -> QgsBroadcastPlayerOperationalRuntime {
+        let mut runtime = QgsBroadcastPlayerOperationalRuntime::new(
+            sample_qgs_input_plan(),
+            QgsOperationalRuntimeConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            runtime
+                .execute(QgsBroadcastPlayerCommand::LoadPreparedInput)
+                .accepted
+        );
+        assert!(
+            runtime
+                .execute(QgsBroadcastPlayerCommand::Prepare {
+                    active_range: Some(range),
+                })
+                .accepted
+        );
+        assert!(
+            runtime
+                .execute(QgsBroadcastPlayerCommand::Cue { frame: range.0 })
+                .accepted
+        );
+        assert!(
+            runtime
+                .execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 })
+                .accepted
+        );
+        runtime
+    }
+
+    #[test]
+    fn qgs_operational_runtime_rejects_illegal_play_while_empty() {
+        let mut runtime = QgsBroadcastPlayerOperationalRuntime::new(
+            sample_qgs_input_plan(),
+            QgsOperationalRuntimeConfig::default(),
+        )
+        .unwrap();
+        let result = runtime.execute(QgsBroadcastPlayerCommand::Play);
+        assert!(!result.accepted);
+        assert_eq!(
+            result.reason,
+            Some("command is illegal while player is Empty")
+        );
+        assert_eq!(result.snapshot.rejected_commands, 1);
+        assert!(result
+            .snapshot
+            .faults
+            .iter()
+            .any(|fault| fault.kind == QgsOperationalFaultKind::IllegalCommandForState));
+        assert!(!result.snapshot.exposes_private_path());
+    }
+
+    #[test]
+    fn qgs_operational_runtime_rejects_play_before_ready() {
+        let mut runtime = QgsBroadcastPlayerOperationalRuntime::new(
+            sample_qgs_input_plan(),
+            QgsOperationalRuntimeConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            runtime
+                .execute(QgsBroadcastPlayerCommand::LoadPreparedInput)
+                .accepted
+        );
+        let result = runtime.execute(QgsBroadcastPlayerCommand::Play);
+        assert!(!result.accepted);
+        assert_eq!(result.reason, Some("play requires Ready"));
+        assert_eq!(
+            result.snapshot.operational_status,
+            QgsBroadcastPlayerStatus::Loaded
+        );
+    }
+
+    #[test]
+    fn qgs_operational_runtime_tick_advances_only_while_playing() {
+        let mut runtime = qgs_operational_runtime_ready((0, 50));
+        assert_eq!(runtime.snapshot().current_frame, Some(0));
+        assert!(runtime.execute(QgsBroadcastPlayerCommand::Play).accepted);
+        assert!(
+            runtime
+                .execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 })
+                .accepted
+        );
+        assert_eq!(runtime.snapshot().current_frame, Some(1));
+        assert_eq!(
+            runtime.snapshot().current_audio_sample_range,
+            Some((960, 1_920))
+        );
+        assert!(runtime.execute(QgsBroadcastPlayerCommand::Pause).accepted);
+        assert!(
+            runtime
+                .execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 })
+                .accepted
+        );
+        assert_eq!(runtime.snapshot().current_frame, Some(1));
+        assert!(runtime.execute(QgsBroadcastPlayerCommand::Stop).accepted);
+        assert!(
+            runtime
+                .execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 })
+                .accepted
+        );
+        assert_eq!(runtime.snapshot().current_frame, Some(1));
+    }
+
+    #[test]
+    fn qgs_operational_runtime_seek_stop_unload_sequence_preserves_source_policy() {
+        let mut runtime = qgs_operational_runtime_ready((0, 50));
+        assert!(runtime.execute(QgsBroadcastPlayerCommand::Play).accepted);
+        assert!(runtime.execute(QgsBroadcastPlayerCommand::Pause).accepted);
+        assert!(
+            runtime
+                .execute(QgsBroadcastPlayerCommand::Seek { frame: 4 })
+                .accepted
+        );
+        assert_eq!(runtime.snapshot().current_frame, Some(4));
+        assert_eq!(
+            runtime.snapshot().current_audio_sample_range,
+            Some((3_840, 4_800))
+        );
+        assert!(
+            runtime
+                .execute(QgsBroadcastPlayerCommand::Prepare {
+                    active_range: Some((0, 50)),
+                })
+                .accepted
+        );
+        assert!(runtime.execute(QgsBroadcastPlayerCommand::Stop).accepted);
+        assert_eq!(
+            runtime.snapshot().operational_status,
+            QgsBroadcastPlayerStatus::Stopped
+        );
+        assert!(runtime.snapshot().player.readiness.source_loaded);
+        assert!(runtime.execute(QgsBroadcastPlayerCommand::Unload).accepted);
+        assert_eq!(
+            runtime.snapshot().operational_status,
+            QgsBroadcastPlayerStatus::Empty
+        );
+        assert!(!runtime.snapshot().player.readiness.source_loaded);
+    }
+
+    #[test]
+    fn qgs_operational_runtime_completion_occurs_at_active_range_end() {
+        let mut runtime = qgs_operational_runtime_ready((0, 2));
+        assert!(runtime.execute(QgsBroadcastPlayerCommand::Play).accepted);
+        assert!(
+            runtime
+                .execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 })
+                .accepted
+        );
+        assert_eq!(
+            runtime.snapshot().operational_status,
+            QgsBroadcastPlayerStatus::Playing
+        );
+        assert!(
+            runtime
+                .execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 })
+                .accepted
+        );
+        let snapshot = runtime.snapshot();
+        assert_eq!(
+            snapshot.operational_status,
+            QgsBroadcastPlayerStatus::Completed
+        );
+        assert!(snapshot.completed);
+        assert_eq!(snapshot.current_frame, Some(1));
+        assert!(snapshot
+            .faults
+            .iter()
+            .any(|fault| fault.kind == QgsOperationalFaultKind::EndOfRangeReached));
+        assert!(snapshot.player.readiness.source_loaded);
+    }
+
+    #[test]
+    fn qgs_operational_runtime_seek_outside_active_range_is_rejected() {
+        let mut runtime = qgs_operational_runtime_ready((0, 10));
+        let result = runtime.execute(QgsBroadcastPlayerCommand::Seek { frame: 99 });
+        assert!(!result.accepted);
+        assert_eq!(result.reason, Some("cue failed"));
+        assert_eq!(result.snapshot.current_frame, Some(0));
+        assert!(result
+            .snapshot
+            .faults
+            .iter()
+            .any(|fault| fault.kind == QgsOperationalFaultKind::IllegalCommandForState));
+    }
+
+    #[test]
+    fn qgs_operational_runtime_snapshot_preserves_non_claims_and_media_policy() {
+        let runtime = qgs_operational_runtime_ready((0, 50));
+        let snapshot = runtime.snapshot();
+        assert_eq!(
+            snapshot.player.source_mode,
+            QgsInputPlanSourceMode::ProxyPreview
+        );
+        assert!(!snapshot.player.readiness.proxy_aac_authoritative);
+        assert!(snapshot.player.readiness.discrete_mono_audio);
+        assert_eq!(
+            snapshot
+                .player
+                .device_status
+                .selection
+                .selected_video_backend,
+            QgsVideoPresenterBackendKind::WaylandVulkanPresenter
+        );
+        assert_ne!(
+            snapshot
+                .player
+                .device_status
+                .selection
+                .selected_video_backend,
+            QgsVideoPresenterBackendKind::X11LegacyNonTarget
+        );
+        assert!(!snapshot.player.readiness.real_display_ready);
+        assert!(!snapshot.player.readiness.audio_device_verified);
+        assert!(!snapshot.player.readiness.visual_verified);
+        assert!(!snapshot.player.readiness.realtime_verified);
+        assert!(!snapshot.player.readiness.av_sync_verified);
+        assert!(!snapshot.buffer_health.underrun);
+        assert!(snapshot.buffer_health.prepared_frame_count > 0);
+        assert!(snapshot
+            .faults
+            .iter()
+            .any(|fault| fault.kind == QgsOperationalFaultKind::BackendNotImplemented));
+        assert!(snapshot
+            .faults
+            .iter()
+            .any(|fault| fault.kind == QgsOperationalFaultKind::AudioOutputNotProductionVerified));
+        assert!(!snapshot.exposes_private_path());
+    }
+
     #[test]
     fn exact_integer_rates_use_integer_timing() {
         let rate = RationalRate::new(50, 1).expect("rate");
@@ -10654,6 +11439,18 @@ mod tests {
         );
         assert!(
             BroadcastRuntimeVerificationLevel::SelectionPolicyEvidence
+                < BroadcastRuntimeVerificationLevel::RealtimeVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::OperationalStateEvidence
+                < BroadcastRuntimeVerificationLevel::VisualVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::OperationalStateEvidence
+                < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::OperationalStateEvidence
                 < BroadcastRuntimeVerificationLevel::RealtimeVerified
         );
         assert!(
