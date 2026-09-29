@@ -2771,6 +2771,48 @@ pub fn submit_qgs_file_presenter_manifest(
     })
 }
 
+pub fn submit_qgs_file_presenter_image(
+    public_source_uri: impl Into<String>,
+    video_binding: &BroadcastVideoPayloadBinding,
+    public_artifact_path: impl Into<String>,
+) -> Result<QgsFilePresenterSubmissionResult, PlaybackError> {
+    let descriptor =
+        QgsPresenterPayloadDescriptor::from_video_binding(public_source_uri, video_binding)?;
+    let artifact = QgsFilePresenterArtifact {
+        kind: QgsFilePresenterArtifactKind::ImageFile,
+        public_artifact_path: public_artifact_path.into(),
+        image_written: true,
+        manifest_written: false,
+        reason: None,
+    };
+    if artifact.exposes_private_path() {
+        return Err(PlaybackError::InvalidRuntimeTransition);
+    }
+    let submission = QgsPresenterSubmission {
+        presenter_kind: QgsPresenterDeviceKind::FilePresenter,
+        payload: descriptor,
+        status: QgsPresenterBoundaryStatus::SubmittedToPresenter,
+        submitted_to_presenter: true,
+    };
+    let evidence = QgsPresenterEvidence {
+        presentation_slot_index: 0,
+        video_binding_index: video_binding.video_slot_index,
+        media_time: submission.payload.presentation_time,
+        payload_id: submission.payload.payload_id,
+        evidence_kind: QgsPresenterEvidenceKind::FilePresenterImageWritten,
+        presenter_kind: QgsPresenterDeviceKind::FilePresenter,
+        evidence_level: QgsVideoPresentationEvidenceLevel::FilePresenterImageWritten,
+    };
+    Ok(QgsFilePresenterSubmissionResult {
+        submission,
+        artifact,
+        evidence,
+        visual_status: QgsVisualDiagnosticStatus::ImageFileWritten,
+        real_display_evidence_present: false,
+        visual_verified: false,
+    })
+}
+
 pub fn project_qgs_monitor_update_from_file_presenter_result(
     result: &QgsFilePresenterSubmissionResult,
 ) -> QgsMonitorProjectionUpdate {
@@ -3966,6 +4008,7 @@ pub enum BroadcastRuntimeVerifiedSubsystem {
     TestVideoPresenterEvidence,
     PresenterMonitorBoundary,
     FilePresenterVisualDiagnostic,
+    GpuPayloadReadbackVisualDiagnostic,
     TestAudioSinkEvidence,
     NativePipeWireBufferSubmission,
     NativePipeWireAudibleSmokeTest,
@@ -4004,6 +4047,7 @@ impl BroadcastRuntimeVerifiedSubsystem {
             Self::TestVideoPresenterEvidence => "test video presenter evidence",
             Self::PresenterMonitorBoundary => "presenter/monitor boundary",
             Self::FilePresenterVisualDiagnostic => "file presenter visual diagnostic",
+            Self::GpuPayloadReadbackVisualDiagnostic => "GPU payload readback visual diagnostic",
             Self::TestAudioSinkEvidence => "test audio sink evidence",
             Self::NativePipeWireBufferSubmission => "native PipeWire buffer submission",
             Self::NativePipeWireAudibleSmokeTest => "native PipeWire audible smoke test",
@@ -4138,6 +4182,11 @@ impl BroadcastRuntimeVerificationMatrix {
                     subsystem: Subsystem::FilePresenterVisualDiagnostic,
                     level: Level::FilePresenterManifestWritten,
                     summary: "file presenter writes a deterministic public-safe descriptor manifest for a prepared video payload; no frame pixels, real display, or visual verification are claimed",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::GpuPayloadReadbackVisualDiagnostic,
+                    level: Level::FilePresenterImageWritten,
+                    summary: "diagnostic validation readback writes a bounded PPM image from real prepared proxy GPU payload pixels; this is not real display output or visual verification",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::TestAudioSinkEvidence,
@@ -9336,6 +9385,63 @@ mod tests {
             ),
             Err(PlaybackError::InvalidRuntimeTransition)
         );
+    }
+
+    #[test]
+    fn file_presenter_image_evidence_stays_below_real_display_and_visual_verified() {
+        let video_slot = &test_prepared_video_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
+        let video_binding = bind_broadcast_video_payload_ready(
+            video_slot,
+            BroadcastVideoPayloadReference {
+                payload_id: 507,
+                kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+                format: BroadcastVideoPayloadFormat::RgbaU16,
+                backend_path: BroadcastVideoPayloadBackendPath::VaapiCpuNv12Vulkan,
+                source_frame_index: video_slot.source_frame_index.unwrap(),
+                selected_preview_frame_index: video_slot.selected_preview_frame_index,
+                presentation_time: video_slot.presentation_time,
+                duration: video_slot.duration,
+                coded_width: 1920,
+                coded_height: 1088,
+                visible_width: 1920,
+                visible_height: 1080,
+                bounded_slot_index: video_slot.slot_index,
+                session_index: 0,
+            },
+        )
+        .unwrap();
+
+        let result = submit_qgs_file_presenter_image(
+            "qnc://local/media/proxy/test",
+            &video_binding,
+            "qgs-visual-diagnostics/test-frame000000-readback.ppm",
+        )
+        .unwrap();
+        let update = project_qgs_monitor_update_from_file_presenter_result(&result);
+        let projection = QgsQncMonitorProjection::from_presenter_update(&update);
+
+        assert_eq!(
+            result.artifact.kind,
+            QgsFilePresenterArtifactKind::ImageFile
+        );
+        assert!(result.artifact.image_written);
+        assert_eq!(
+            result.evidence.evidence_kind,
+            QgsPresenterEvidenceKind::FilePresenterImageWritten
+        );
+        assert_eq!(
+            result.evidence.evidence_level,
+            QgsVideoPresentationEvidenceLevel::FilePresenterImageWritten
+        );
+        assert_eq!(
+            result.visual_status,
+            QgsVisualDiagnosticStatus::ImageFileWritten
+        );
+        assert!(projection.submitted_to_presenter);
+        assert!(!projection.frame_presented_real_backend);
+        assert!(!projection.real_display_evidence_present);
+        assert!(!projection.visual_verified);
+        assert!(!projection.private_path_exposed);
     }
 
     #[test]

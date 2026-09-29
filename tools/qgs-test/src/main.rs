@@ -30,13 +30,13 @@ use qgs_media_runtime::{
     project_qgs_monitor_update_from_file_presenter_result,
     project_qgs_monitor_update_from_presenter_result, project_qnc_events, qgs_frames_for_duration,
     qgs_qnc_projected_sequence_is_monotonic, simulate_broadcast_player_runtime_loop,
-    submit_qgs_file_presenter_manifest, submit_qgs_presenter_payload_to_test_boundary,
-    summarize_broadcast_device_boundary, summarize_broadcast_payload_bindings,
-    summarize_broadcast_player_runtime_events, summarize_broadcast_prepared_slots,
-    summarize_broadcast_runtime_contract, AudioFormat, AudioSampleFormat, AudioTimeline,
-    AudioTimingPacket, AvFrameAudioRange, BoundedQueue, BroadcastDevicePayloadStatus,
-    BroadcastDeviceStatus, BroadcastMediaSourceRole, BroadcastPreparedAudioSlot,
-    BroadcastPreparedPresentationSlot, BroadcastPreparedVideoSlot,
+    submit_qgs_file_presenter_image, submit_qgs_file_presenter_manifest,
+    submit_qgs_presenter_payload_to_test_boundary, summarize_broadcast_device_boundary,
+    summarize_broadcast_payload_bindings, summarize_broadcast_player_runtime_events,
+    summarize_broadcast_prepared_slots, summarize_broadcast_runtime_contract, AudioFormat,
+    AudioSampleFormat, AudioTimeline, AudioTimingPacket, AvFrameAudioRange, BoundedQueue,
+    BroadcastDevicePayloadStatus, BroadcastDeviceStatus, BroadcastMediaSourceRole,
+    BroadcastPreparedAudioSlot, BroadcastPreparedPresentationSlot, BroadcastPreparedVideoSlot,
     BroadcastPreparedVideoSlotStatus, BroadcastPrerollConfig, BroadcastPrerollPlan,
     BroadcastPresentationPayloadBinding, BroadcastPresentationPayloadReadiness,
     BroadcastPreviewProfile, BroadcastRuntimeCapabilities, BroadcastRuntimePrepareFacts,
@@ -152,6 +152,7 @@ const QGS_SESSION_COMMAND_BOUNDARY_ARG: &str = "--qgs-session-command-boundary";
 const QGS_SESSION_RUNTIME_CONTROL_ARG: &str = "--qgs-session-runtime-control";
 const QGS_PRESENTER_MONITOR_BOUNDARY_ARG: &str = "--qgs-presenter-monitor-boundary";
 const QGS_FILE_PRESENTER_DIAGNOSTIC_ARG: &str = "--qgs-file-presenter-diagnostic";
+const QGS_GPU_PAYLOAD_READBACK_DIAGNOSTIC_ARG: &str = "--qgs-gpu-payload-readback-diagnostic";
 const QGS_RUNTIME_SURFACE_E2E_ARG: &str = "--qgs-runtime-surface-e2e";
 const WRITE_DIAGNOSTIC_WAV_ARG: &str = "--write-diagnostic-wav";
 const AUDIO_AUDIT_START_MS_ARG: &str = "--start-ms";
@@ -308,6 +309,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.qgs_file_presenter_diagnostic_paths {
         return qgs_file_presenter_diagnostic_report(
+            &original,
+            &proxy,
+            args.audio_content_audit_output_dir.as_deref(),
+        );
+    }
+    if let Some((original, proxy)) = args.qgs_gpu_payload_readback_diagnostic_paths {
+        return qgs_gpu_payload_readback_diagnostic_report(
             &original,
             &proxy,
             args.audio_content_audit_output_dir.as_deref(),
@@ -3536,6 +3544,207 @@ fn qgs_file_presenter_diagnostic_report(
         setup_report.accepted,
         setup_report.rejected,
         setup_snapshot.passive_view.transport.state
+    );
+    println!("Real display output: no");
+    println!("VisualVerified: no");
+    println!("Realtime playback: no");
+    println!("A/V sync: no");
+    println!("Device output: no");
+    println!("FramePresented real display claim: no");
+    println!("Private path exposed: {}", yes_no(private_path_exposed));
+
+    Ok(())
+}
+
+fn qgs_gpu_payload_readback_diagnostic_report(
+    original_path: &Path,
+    proxy_path: &Path,
+    output_dir: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let descriptor = build_qnc_prepared_input_descriptor(original_path, proxy_path)?;
+    descriptor.validate()?;
+    let input_plan =
+        QgsInputPlan::from_descriptor(&descriptor, default_qgs_input_plan_queue_requirements())?;
+    let active_duration = Duration::from_millis(1_000);
+    let active_frames = qgs_frames_for_duration(active_duration, input_plan.video_source.timebase)?;
+    let source_uri = input_plan.video_source.media_uri.clone();
+    let public_source_uri = descriptor
+        .binding
+        .proxy_media_uri
+        .as_deref()
+        .unwrap_or(&source_uri)
+        .to_string();
+
+    let mut runtime = QgsSessionRuntime::new(input_plan, QgsSessionRuntimeConfig::default())?;
+    let setup_commands = qgs_session_command_sequence(&source_uri, active_frames);
+    for command in setup_commands.iter().take(8) {
+        runtime.enqueue(command.clone()).map_err(|err| {
+            format!(
+                "GPU payload readback diagnostic setup enqueue failed for id {}: {err:?}",
+                command.command_id
+            )
+        })?;
+    }
+    let setup_report = runtime.drain_queue();
+    let setup_snapshot = runtime.snapshot();
+
+    let proxy = Mp4Source::open(proxy_path)?;
+    let proxy_video = proxy
+        .video
+        .as_ref()
+        .ok_or("proxy has no H.264 video track")?;
+    let proxy_h264 = classify_video_track(proxy_video)?;
+    let selected = selected_journalist_preview_frames(proxy_video)?;
+    let selected_frame = selected
+        .first()
+        .ok_or("proxy has no selected journalist preview frame")?;
+    let frame_duration = ProxyPlaybackProfile::Journalist50iPreview
+        .presentation_rate(RationalRate::new(
+            u64::from(proxy_video.frame_rate.numerator),
+            u64::from(proxy_video.frame_rate.denominator),
+        )?)?
+        .frame_duration()?;
+    let video_slot = BroadcastPreparedVideoSlot {
+        slot_index: 0,
+        source_mode: BroadcastVideoSourceMode::ProxyPreview,
+        video_source_role: BroadcastMediaSourceRole::ProxyPreviewVideo,
+        source_frame_index: Some(selected_frame.source_presentation_index),
+        selected_preview_frame_index: Some(selected_frame.preview_index),
+        presentation_time: selected_frame.start_time,
+        duration: frame_duration,
+        status: BroadcastPreparedVideoSlotStatus::Prepared,
+    };
+    let proxy_payload_proof = bind_proxy_preview_video_payloads_with_readback(
+        proxy_video,
+        &proxy_h264,
+        std::slice::from_ref(&video_slot),
+        true,
+    )?;
+    let video_binding = proxy_payload_proof
+        .bindings
+        .first()
+        .cloned()
+        .ok_or("proxy payload proof did not produce a binding")?;
+    let payload = video_binding
+        .payload
+        .as_ref()
+        .ok_or("GPU payload readback diagnostic missing proxy video payload")?;
+    let readback = proxy_payload_proof
+        .readback_outputs
+        .get(&selected_frame.source_presentation_index)
+        .ok_or("GPU payload readback diagnostic did not receive CPU-readable pixels")?;
+
+    let output_dir = output_dir.unwrap_or_else(|| Path::new("target/qgs-visual-diagnostics"));
+    std::fs::create_dir_all(output_dir)?;
+    let image_file_name = gpu_payload_readback_image_file_name(
+        &public_source_uri,
+        selected_frame.source_presentation_index,
+    );
+    let manifest_file_name = gpu_payload_readback_manifest_file_name(
+        &public_source_uri,
+        selected_frame.source_presentation_index,
+    );
+    let image_path = output_dir.join(&image_file_name);
+    let manifest_path = output_dir.join(&manifest_file_name);
+    let public_image_path = format!("qgs-visual-diagnostics/{image_file_name}");
+    let public_manifest_path = format!("qgs-visual-diagnostics/{manifest_file_name}");
+
+    let ppm_bytes = rgba_u16_to_ppm_p6_rgb8(&readback.rgba_u16, readback.width, readback.height)?;
+    File::create(&image_path)?.write_all(&ppm_bytes)?;
+
+    let file_result = submit_qgs_file_presenter_image(
+        public_source_uri.clone(),
+        &video_binding,
+        public_image_path,
+    )?;
+    let monitor_update = project_qgs_monitor_update_from_file_presenter_result(&file_result);
+    let monitor_projection = QgsQncMonitorProjection::from_presenter_update(&monitor_update);
+    let manifest_json = qgs_gpu_payload_readback_manifest_json(
+        &file_result,
+        &monitor_projection,
+        &public_manifest_path,
+        ppm_bytes.len(),
+        readback.checksum,
+        readback.output_bytes,
+        setup_report.executed,
+        setup_report.accepted,
+        setup_report.rejected,
+        &format!("{:?}", setup_snapshot.passive_view.transport.state),
+    );
+    File::create(&manifest_path)?.write_all(manifest_json.as_bytes())?;
+
+    let private_path_exposed = monitor_projection.private_path_exposed
+        || setup_snapshot.private_path_exposed
+        || setup_report.transcript.exposes_private_path()
+        || manifest_json_contains_private_path(&manifest_json);
+
+    println!("QGS GPU Payload Readback Visual Diagnostic");
+    println!("------------------------------------------");
+    println!("Audio source: original MXF");
+    println!("Video source: proxy MP4");
+    println!("Proxy AAC: not used");
+    println!("Presenter kind: FilePresenter");
+    println!("Preview profile: journalist-50i-preview");
+    println!("Public source URI: {public_source_uri}");
+    println!(
+        "Selected frame: {}",
+        selected_frame.source_presentation_index
+    );
+    println!("Selected preview frame: {}", selected_frame.preview_index);
+    println!("Payload kind: {:?}", payload.kind);
+    println!("Payload format: {:?}", payload.format);
+    println!("Payload backend: {:?}", payload.backend_path);
+    println!(
+        "Payload dimensions: visible={}x{} coded={}x{}",
+        payload.visible_width, payload.visible_height, payload.coded_width, payload.coded_height
+    );
+    println!("Readback attempted: yes");
+    println!("Readback available: yes");
+    println!("Readback format: RgbaU16");
+    println!("Output artifact format: PPM P6 RGB8");
+    println!("Conversion: RgbaU16 high byte -> RGB8; alpha discarded");
+    println!("Image width: {}", readback.width);
+    println!("Image height: {}", readback.height);
+    println!("Artifact kind: image");
+    println!("Image artifact path: {}", image_path.display());
+    println!("Manifest artifact path: {}", manifest_path.display());
+    println!("Image bytes written: {}", ppm_bytes.len());
+    println!("GPU readback payload bytes: {}", readback.output_bytes);
+    println!("GPU readback checksum: 0x{:016x}", readback.checksum);
+    println!("Evidence level: {:?}", file_result.evidence.evidence_level);
+    println!("Monitor projection:");
+    println!(
+        "  prepared descriptor present: {}",
+        yes_no(monitor_projection.prepared_descriptor_present)
+    );
+    println!(
+        "  submitted to file presenter: {}",
+        yes_no(monitor_projection.submitted_to_presenter)
+    );
+    println!(
+        "  source frame: {}",
+        qgs_optional_u64_label(monitor_projection.source_frame)
+    );
+    println!("  payload status: {:?}", monitor_projection.payload_status);
+    println!(
+        "  frame presented test boundary: {}",
+        yes_no(monitor_projection.frame_presented_test_boundary)
+    );
+    println!(
+        "  frame presented real display: {}",
+        yes_no(monitor_projection.frame_presented_real_backend)
+    );
+    println!(
+        "  real display evidence: {}",
+        if monitor_projection.real_display_evidence_present {
+            "present"
+        } else {
+            "none"
+        }
+    );
+    println!(
+        "  visual verified: {}",
+        yes_no(monitor_projection.visual_verified)
     );
     println!("Real display output: no");
     println!("VisualVerified: no");
@@ -7290,6 +7499,68 @@ fn file_presenter_manifest_file_name(public_source_uri: &str, source_frame_index
     )
 }
 
+fn gpu_payload_readback_image_file_name(
+    public_source_uri: &str,
+    source_frame_index: u64,
+) -> String {
+    format!(
+        "{}-frame{source_frame_index:06}-proxy-preview-readback.ppm",
+        public_source_uri_stem(public_source_uri)
+    )
+}
+
+fn gpu_payload_readback_manifest_file_name(
+    public_source_uri: &str,
+    source_frame_index: u64,
+) -> String {
+    format!(
+        "{}-frame{source_frame_index:06}-proxy-preview-readback-manifest.json",
+        public_source_uri_stem(public_source_uri)
+    )
+}
+
+fn rgba_u16_to_rgb8_bytes(
+    rgba_u16: &[u16],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let pixel_count = usize::try_from(width)?
+        .checked_mul(usize::try_from(height)?)
+        .ok_or("readback image dimensions overflow")?;
+    let expected_samples = pixel_count
+        .checked_mul(4)
+        .ok_or("readback RGBA sample count overflow")?;
+    if rgba_u16.len() != expected_samples {
+        return Err(format!(
+            "readback RGBA sample count mismatch: expected {expected_samples}, got {}",
+            rgba_u16.len()
+        )
+        .into());
+    }
+    let mut rgb = Vec::with_capacity(
+        pixel_count
+            .checked_mul(3)
+            .ok_or("readback RGB byte count overflow")?,
+    );
+    for pixel in rgba_u16.chunks_exact(4) {
+        rgb.push((pixel[0] >> 8) as u8);
+        rgb.push((pixel[1] >> 8) as u8);
+        rgb.push((pixel[2] >> 8) as u8);
+    }
+    Ok(rgb)
+}
+
+fn rgba_u16_to_ppm_p6_rgb8(
+    rgba_u16: &[u16],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let rgb = rgba_u16_to_rgb8_bytes(rgba_u16, width, height)?;
+    let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+    ppm.extend_from_slice(&rgb);
+    Ok(ppm)
+}
+
 fn json_escape(value: &str) -> String {
     let mut escaped = String::new();
     for ch in value.chars() {
@@ -7398,6 +7669,119 @@ fn qgs_file_presenter_manifest_json(
         result.artifact.image_written,
         result.artifact.manifest_written,
         json_escape(reason),
+        result.evidence.evidence_kind,
+        result.evidence.evidence_level,
+        monitor_projection.prepared_descriptor_present,
+        monitor_projection.submitted_to_presenter,
+        monitor_projection.frame_presented_test_boundary,
+        monitor_projection.frame_presented_real_backend,
+        monitor_projection.real_display_evidence_present,
+        monitor_projection.visual_verified,
+        setup_commands_executed,
+        setup_commands_accepted,
+        setup_commands_rejected,
+        json_escape(final_setup_state),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qgs_gpu_payload_readback_manifest_json(
+    result: &QgsFilePresenterSubmissionResult,
+    monitor_projection: &QgsQncMonitorProjection,
+    public_manifest_path: &str,
+    image_bytes_written: usize,
+    readback_checksum: u64,
+    readback_payload_bytes: usize,
+    setup_commands_executed: usize,
+    setup_commands_accepted: usize,
+    setup_commands_rejected: usize,
+    final_setup_state: &str,
+) -> String {
+    let payload = &result.submission.payload;
+    format!(
+        concat!(
+            "{{\n",
+            "  \"schema\": \"qgs.gpu-payload-readback-diagnostic.v1\",\n",
+            "  \"presenter_kind\": \"FilePresenter\",\n",
+            "  \"source_mode\": \"{:?}\",\n",
+            "  \"video_source\": \"proxy MP4\",\n",
+            "  \"audio_source\": \"original MXF\",\n",
+            "  \"proxy_aac\": \"not used\",\n",
+            "  \"public_source_uri\": \"{}\",\n",
+            "  \"private_path_exposed\": {},\n",
+            "  \"source_frame_index\": {},\n",
+            "  \"selected_preview_frame_index\": {},\n",
+            "  \"presentation_time_ms\": {:.3},\n",
+            "  \"duration_ms\": {:.3},\n",
+            "  \"payload_kind\": \"{:?}\",\n",
+            "  \"payload_format\": \"{:?}\",\n",
+            "  \"backend_path\": \"{:?}\",\n",
+            "  \"payload_id\": {},\n",
+            "  \"visible_width\": {},\n",
+            "  \"visible_height\": {},\n",
+            "  \"coded_width\": {},\n",
+            "  \"coded_height\": {},\n",
+            "  \"readback_attempted\": true,\n",
+            "  \"readback_available\": true,\n",
+            "  \"readback_format\": \"RgbaU16\",\n",
+            "  \"output_artifact_format\": \"PPM P6 RGB8\",\n",
+            "  \"conversion\": \"RgbaU16 high byte to RGB8; alpha discarded\",\n",
+            "  \"artifact_kind\": \"{:?}\",\n",
+            "  \"artifact_public_path\": \"{}\",\n",
+            "  \"manifest_public_path\": \"{}\",\n",
+            "  \"image_artifact_available\": {},\n",
+            "  \"image_bytes_written\": {},\n",
+            "  \"readback_payload_bytes\": {},\n",
+            "  \"readback_checksum\": \"0x{:016x}\",\n",
+            "  \"evidence_kind\": \"{:?}\",\n",
+            "  \"evidence_level\": \"{:?}\",\n",
+            "  \"monitor_projection\": {{\n",
+            "    \"prepared_descriptor_present\": {},\n",
+            "    \"submitted_to_presenter\": {},\n",
+            "    \"frame_presented_test_boundary\": {},\n",
+            "    \"frame_presented_real_backend\": {},\n",
+            "    \"real_display_evidence_present\": {},\n",
+            "    \"visual_verified\": {}\n",
+            "  }},\n",
+            "  \"session_setup\": {{\n",
+            "    \"commands_executed\": {},\n",
+            "    \"commands_accepted\": {},\n",
+            "    \"commands_rejected\": {},\n",
+            "    \"final_state\": \"{}\"\n",
+            "  }},\n",
+            "  \"real_display_output\": false,\n",
+            "  \"visual_verified\": false,\n",
+            "  \"realtime_playback\": false,\n",
+            "  \"av_sync\": false,\n",
+            "  \"device_output\": false,\n",
+            "  \"frame_presented_real_display_claim\": false\n",
+            "}}\n"
+        ),
+        payload.source_mode,
+        json_escape(&payload.public_source_uri),
+        payload.private_path_exposed || result.artifact.exposes_private_path(),
+        payload.source_frame,
+        payload
+            .selected_preview_frame
+            .map(|frame| frame.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        duration_ms(payload.presentation_time),
+        duration_ms(payload.duration),
+        payload.payload_kind,
+        payload.payload_format,
+        payload.backend_path,
+        payload.payload_id,
+        payload.visible_width,
+        payload.visible_height,
+        payload.coded_width,
+        payload.coded_height,
+        result.artifact.kind,
+        json_escape(&result.artifact.public_artifact_path),
+        json_escape(public_manifest_path),
+        result.artifact.image_written,
+        image_bytes_written,
+        readback_payload_bytes,
+        readback_checksum,
         result.evidence.evidence_kind,
         result.evidence.evidence_level,
         monitor_projection.prepared_descriptor_present,
@@ -8732,6 +9116,7 @@ fn broadcast_player_runtime_verification(
 struct ProxyVideoPayloadBindingProof {
     bindings: Vec<qgs_media_runtime::BroadcastVideoPayloadBinding>,
     gpu_processor: Nv12FrameProcessor,
+    readback_outputs: BTreeMap<u64, qgs_vulkan::ProcessedFrameOutput>,
     gpu_submissions: usize,
     gpu_completions: usize,
     device_name: String,
@@ -8766,6 +9151,7 @@ impl OriginalVideoPayloadBindingProof {
 fn finish_proxy_video_payload_bindings(
     proxy_video_slots: &[BroadcastPreparedVideoSlot],
     bindings_by_source: &mut BTreeMap<u64, qgs_media_runtime::BroadcastVideoPayloadBinding>,
+    readback_by_source: &mut BTreeMap<u64, qgs_vulkan::ProcessedFrameOutput>,
     gpu_processor: Nv12FrameProcessor,
     gpu_submissions: usize,
     gpu_completions: usize,
@@ -8786,9 +9172,19 @@ fn finish_proxy_video_payload_bindings(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let readback_outputs = proxy_video_slots
+        .iter()
+        .filter_map(|slot| {
+            let source_frame = slot.source_frame_index?;
+            readback_by_source
+                .remove(&source_frame)
+                .map(|output| (source_frame, output))
+        })
+        .collect::<BTreeMap<_, _>>();
     Ok(ProxyVideoPayloadBindingProof {
         bindings,
         gpu_processor,
+        readback_outputs,
         gpu_submissions,
         gpu_completions,
         device_name,
@@ -8799,6 +9195,20 @@ fn bind_proxy_preview_video_payloads(
     proxy_video: &qgs_mp4::Mp4VideoTrack,
     proxy_h264: &qgs_mp4::Mp4H264Summary,
     proxy_video_slots: &[BroadcastPreparedVideoSlot],
+) -> Result<ProxyVideoPayloadBindingProof, Box<dyn std::error::Error>> {
+    bind_proxy_preview_video_payloads_with_readback(
+        proxy_video,
+        proxy_h264,
+        proxy_video_slots,
+        false,
+    )
+}
+
+fn bind_proxy_preview_video_payloads_with_readback(
+    proxy_video: &qgs_mp4::Mp4VideoTrack,
+    proxy_h264: &qgs_mp4::Mp4H264Summary,
+    proxy_video_slots: &[BroadcastPreparedVideoSlot],
+    validation_readback: bool,
 ) -> Result<ProxyVideoPayloadBindingProof, Box<dyn std::error::Error>> {
     let discovery = VulkanDeviceDiscovery::new()?;
     let devices = discovery.enumerate_devices()?;
@@ -8867,11 +9277,12 @@ fn bind_proxy_preview_video_payloads(
             visible_height: proxy_h264.height,
             slot_count: proxy_video_slots.len().max(1),
             conversion: YcbcrConversion::Rec709Limited,
-            validation_readback: false,
+            validation_readback,
         },
     )?;
 
     let mut bindings_by_source = BTreeMap::new();
+    let mut readback_by_source = BTreeMap::new();
     let mut output_index = 0_u64;
     let mut gpu_submissions = 0_usize;
     let mut gpu_completions = 0_usize;
@@ -8895,7 +9306,12 @@ fn bind_proxy_preview_video_payloads(
                 let token = gpu_processor.submit_frame(&upload, identity)?;
                 gpu_submissions += 1;
                 cpu_pool.release(cpu_frame)?;
-                gpu_processor.wait_for_completion(token)?;
+                if validation_readback {
+                    let readback = gpu_processor.wait_for_frame(token)?;
+                    readback_by_source.insert(output_index, readback);
+                } else {
+                    gpu_processor.wait_for_completion(token)?;
+                }
                 gpu_completions += 1;
                 let payload = BroadcastVideoPayloadReference {
                     payload_id: token.get(),
@@ -8919,6 +9335,7 @@ fn bind_proxy_preview_video_payloads(
                     return finish_proxy_video_payload_bindings(
                         proxy_video_slots,
                         &mut bindings_by_source,
+                        &mut readback_by_source,
                         gpu_processor,
                         gpu_submissions,
                         gpu_completions,
@@ -8947,7 +9364,12 @@ fn bind_proxy_preview_video_payloads(
             let token = gpu_processor.submit_frame(&upload, identity)?;
             gpu_submissions += 1;
             cpu_pool.release(cpu_frame)?;
-            gpu_processor.wait_for_completion(token)?;
+            if validation_readback {
+                let readback = gpu_processor.wait_for_frame(token)?;
+                readback_by_source.insert(output_index, readback);
+            } else {
+                gpu_processor.wait_for_completion(token)?;
+            }
             gpu_completions += 1;
             let payload = BroadcastVideoPayloadReference {
                 payload_id: token.get(),
@@ -8971,6 +9393,7 @@ fn bind_proxy_preview_video_payloads(
                 return finish_proxy_video_payload_bindings(
                     proxy_video_slots,
                     &mut bindings_by_source,
+                    &mut readback_by_source,
                     gpu_processor,
                     gpu_submissions,
                     gpu_completions,
@@ -15127,6 +15550,7 @@ struct Args {
     qgs_session_runtime_control_paths: Option<(PathBuf, PathBuf)>,
     qgs_presenter_monitor_boundary_paths: Option<(PathBuf, PathBuf)>,
     qgs_file_presenter_diagnostic_paths: Option<(PathBuf, PathBuf)>,
+    qgs_gpu_payload_readback_diagnostic_paths: Option<(PathBuf, PathBuf)>,
     qgs_runtime_surface_e2e_paths: Option<(PathBuf, PathBuf)>,
     linux_audio_device_probe_path: Option<PathBuf>,
     pipewire_audio_prototype_path: Option<PathBuf>,
@@ -15216,6 +15640,8 @@ impl Args {
         let mut qgs_presenter_monitor_boundary_paths = None;
         let mut qgs_file_presenter_diagnostic_original = None;
         let mut qgs_file_presenter_diagnostic_paths = None;
+        let mut qgs_gpu_payload_readback_diagnostic_original = None;
+        let mut qgs_gpu_payload_readback_diagnostic_paths = None;
         let mut qgs_runtime_surface_e2e_original = None;
         let mut qgs_runtime_surface_e2e_paths = None;
         let mut linux_audio_device_probe_path = None;
@@ -15297,6 +15723,8 @@ impl Args {
         let mut next_arg_is_qgs_presenter_monitor_boundary_proxy = false;
         let mut next_arg_is_qgs_file_presenter_diagnostic_original = false;
         let mut next_arg_is_qgs_file_presenter_diagnostic_proxy = false;
+        let mut next_arg_is_qgs_gpu_payload_readback_diagnostic_original = false;
+        let mut next_arg_is_qgs_gpu_payload_readback_diagnostic_proxy = false;
         let mut next_arg_is_qgs_runtime_surface_e2e_original = false;
         let mut next_arg_is_qgs_runtime_surface_e2e_proxy = false;
         let mut next_arg_is_linux_audio_device_probe_path = false;
@@ -15437,6 +15865,17 @@ impl Args {
                 qgs_file_presenter_diagnostic_original = Some(PathBuf::from(arg));
                 next_arg_is_qgs_file_presenter_diagnostic_original = false;
                 next_arg_is_qgs_file_presenter_diagnostic_proxy = true;
+            } else if next_arg_is_qgs_gpu_payload_readback_diagnostic_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = qgs_gpu_payload_readback_diagnostic_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                qgs_gpu_payload_readback_diagnostic_paths = Some((original, proxy));
+                next_arg_is_qgs_gpu_payload_readback_diagnostic_proxy = false;
+            } else if next_arg_is_qgs_gpu_payload_readback_diagnostic_original {
+                qgs_gpu_payload_readback_diagnostic_original = Some(PathBuf::from(arg));
+                next_arg_is_qgs_gpu_payload_readback_diagnostic_original = false;
+                next_arg_is_qgs_gpu_payload_readback_diagnostic_proxy = true;
             } else if next_arg_is_qgs_presenter_monitor_boundary_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = qgs_presenter_monitor_boundary_original
@@ -15835,6 +16274,8 @@ impl Args {
                 next_arg_is_qgs_presenter_monitor_boundary_original = true;
             } else if arg == QGS_FILE_PRESENTER_DIAGNOSTIC_ARG {
                 next_arg_is_qgs_file_presenter_diagnostic_original = true;
+            } else if arg == QGS_GPU_PAYLOAD_READBACK_DIAGNOSTIC_ARG {
+                next_arg_is_qgs_gpu_payload_readback_diagnostic_original = true;
             } else if arg == QGS_RUNTIME_SURFACE_E2E_ARG {
                 next_arg_is_qgs_runtime_surface_e2e_original = true;
             } else if arg == LINUX_AUDIO_DEVICE_PROBE_ARG {
@@ -15912,6 +16353,7 @@ impl Args {
             qgs_session_runtime_control_paths,
             qgs_presenter_monitor_boundary_paths,
             qgs_file_presenter_diagnostic_paths,
+            qgs_gpu_payload_readback_diagnostic_paths,
             qgs_runtime_surface_e2e_paths,
             linux_audio_device_probe_path,
             pipewire_audio_prototype_path,
@@ -15966,13 +16408,15 @@ mod tests {
         build_sequential_original_audio_segment_for_duration, decode_s24be_i32, decode_s24le_i32,
         decode_u24le, default_qgs_input_plan_queue_requirements, discrete_4mono_evidence_label,
         duration_samples_to_frames, f32_buffer_stats, file_presenter_manifest_file_name,
-        json_escape, loudest_monitor_pair, manifest_json_contains_private_path,
+        gpu_payload_readback_image_file_name, gpu_payload_readback_manifest_file_name, json_escape,
+        loudest_monitor_pair, manifest_json_contains_private_path,
         mono_monitor_diagnostic_evidence_label, mxf_file_label, original_pcm_blocks_by_channel,
         original_segment_evidence_label, parse_manual_audible_confirmation,
         parse_monitor_track_arg, pcm_s24le_sample_to_f32, proxy_presentation_ordinals,
-        public_source_uri_stem, repeated_smoke_test_buffers, runtime_audio_payload_evidence_label,
-        sanitized_source_stem, selected_proxy_ordinals, smoke_test_buffer_count,
-        ManualAudibleConfirmation, SonyXmlSummary,
+        public_source_uri_stem, repeated_smoke_test_buffers, rgba_u16_to_ppm_p6_rgb8,
+        rgba_u16_to_rgb8_bytes, runtime_audio_payload_evidence_label, sanitized_source_stem,
+        selected_proxy_ordinals, smoke_test_buffer_count, ManualAudibleConfirmation,
+        SonyXmlSummary,
     };
     use qgs_media_runtime::{
         av_frame_audio_range, bind_broadcast_audio_payload, BroadcastPreparedAudioSlot,
@@ -16435,6 +16879,33 @@ mod tests {
         assert!(manifest_json_contains_private_path(
             "file:///tmp/frame.json"
         ));
+    }
+
+    #[test]
+    fn gpu_payload_readback_filenames_are_deterministic() {
+        assert_eq!(
+            gpu_payload_readback_image_file_name("qnc://local/media/proxy/Mironik 1560", 0),
+            "Mironik-1560-frame000000-proxy-preview-readback.ppm"
+        );
+        assert_eq!(
+            gpu_payload_readback_manifest_file_name("qnc://local/media/proxy/Mironik 1560", 0),
+            "Mironik-1560-frame000000-proxy-preview-readback-manifest.json"
+        );
+    }
+
+    #[test]
+    fn rgba_u16_readback_converts_to_ppm_rgb8_without_alpha() {
+        let rgba = vec![
+            0x0000, 0x8000, 0xffff, 0x1234, 0x7fff, 0x0100, 0x00ff, 0xffff,
+        ];
+
+        let rgb = rgba_u16_to_rgb8_bytes(&rgba, 2, 1).unwrap();
+        assert_eq!(rgb, vec![0x00, 0x80, 0xff, 0x7f, 0x01, 0x00]);
+
+        let ppm = rgba_u16_to_ppm_p6_rgb8(&rgba, 2, 1).unwrap();
+        assert!(ppm.starts_with(b"P6\n2 1\n255\n"));
+        assert_eq!(&ppm[b"P6\n2 1\n255\n".len()..], rgb.as_slice());
+        assert!(rgba_u16_to_rgb8_bytes(&rgba[..4], 2, 1).is_err());
     }
 
     #[test]

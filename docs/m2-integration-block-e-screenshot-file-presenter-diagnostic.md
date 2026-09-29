@@ -195,13 +195,13 @@ Block E does not implement:
 - QNC UI integration
 - export/render
 
-## Next Block
+## Follow-Up
 
-The recommended next display milestone is:
+Block E was followed by:
 
 ```text
-M2 Integration Block F — Wayland + Vulkan Presenter Boundary Prototype
+M2 Integration Block F — GPU Payload Readback / Visual Diagnostic Bridge
 ```
 
-That later block should remain separate from this file-presenter diagnostic and
-should only claim real display evidence when a real presenter provides it.
+That follow-up keeps the diagnostic file-presenter scope and attempts a bounded
+CPU-readable artifact before any real display presenter work.
