@@ -312,8 +312,9 @@ Block J does not claim:
 
 ## Next Recommended Block
 
-M2 Integration Block K — Broadcast Player Contract Freeze / QNC API Surface.
+M2 Integration Block K — Broadcast Player Running Runtime Demo.
 
-This should freeze the command/snapshot/event/fault surface enough for future
-QNC-facing adapter work, while still avoiding real display/audio backend
-implementation until the runtime contract is stable.
+This should exercise the operational runtime as a running backend player surface:
+load, prepare, cue, logical play ticks, pause, seek, replay, stop, and unload,
+while still avoiding real display/audio backend implementation, realtime claims,
+A/V sync claims, and QNC UI integration.

@@ -53,6 +53,10 @@ and what remains unimplemented.
   action, snapshot counters, backend warnings, and rejected-command no-mutation
   rules are modeled and tested. This is not realtime playback, real display
   output, A/V sync, or production audio-device verification.
+- `RuntimeBehaviorEvidence`: a running backend runtime demo exercises
+  deterministic load/prepare/cue/play/tick/pause/seek/stop/unload behavior and
+  reports live state transitions. This is not realtime playback, real display
+  output, A/V sync, or production audio-device verification.
 - `ManualAudibleSignalDetectedContentUnverified`: a human detected a slight
   hum/buzz from a native PipeWire path, but recognizable original audio content
   was not confirmed. This does not verify PCM content correctness, channel
@@ -128,6 +132,7 @@ For Sony FX6 sample 002:
 | device backend selection | `SelectionPolicyEvidence` | Backend-neutral selection policies identify diagnostic/future video and audio backends truthfully. Wayland/Vulkan is the QNC OS display target but remains `NotImplemented`, X11 is unsupported for QNC OS, and PipeWire prototypes are not production verified. |
 | broadcast player operational runtime | `OperationalStateEvidence` | Deterministic Broadcast Player runtime enforces command legality, advances logical frame/audio position on playing ticks, models seek/stop/completion, reports buffer health and warnings, and keeps real display, realtime playback, A/V sync, and production audio-device claims false. |
 | broadcast player fault and recovery rules | `FaultRecoveryPolicyEvidence` | Structured fault severity, scope, recovery action, snapshot counters, backend warnings, and rejected-command no-mutation rules are modeled and tested. Real display, realtime playback, A/V sync, and production audio-device claims remain false. |
+| broadcast player running runtime demo | `RuntimeBehaviorEvidence` | Running operational demo streams step-by-step backend player state, frame/audio progression, pause freeze, seek/reprepare/replay, stop, unload, buffer health, and non-claims using the operational runtime. Real display, realtime playback, A/V sync, and production audio-device claims remain false. |
 | simulated playback loop | `TestBoundaryEvidence` | Prepared slots flow through test audio/video boundaries deterministically. |
 | real speaker output | `NotImplemented` | No audible speaker output, audio-device clock, or full audio playback path exists; native PipeWire buffer submission is tracked separately. |
 | real display output | `NotImplemented` | No QNC OS Wayland/Vulkan presenter, optional DRM/KMS direct-output presenter, legacy X11 compatibility presenter, swapchain, or real display presenter exists. X11 is not a QNC OS target. |
@@ -187,6 +192,10 @@ The matrix intentionally does not overstate these areas:
   rules only. It is not a realtime scheduler, real display output, real backend
   `FramePresented`, visual verification, A/V sync, or production audio-device
   verification.
+- Broadcast Player running runtime demo evidence proves deterministic backend
+  runtime behavior over a scripted scenario only. It is not a realtime
+  scheduler, real display output, real backend `FramePresented`, visual
+  verification, A/V sync, production audio output, or full playback acceptance.
 - The audio content sanity audit is inspection evidence, not audible content
   verification.
 - Haswell CPU-bridge 1080p50 is not marked realtime verified.

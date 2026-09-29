@@ -5895,6 +5895,7 @@ pub enum BroadcastRuntimeVerificationLevel {
     SelectionPolicyEvidence,
     OperationalStateEvidence,
     FaultRecoveryPolicyEvidence,
+    RuntimeBehaviorEvidence,
     MediaInspected,
     PayloadExtracted,
     PayloadBound,
@@ -5927,6 +5928,7 @@ impl BroadcastRuntimeVerificationLevel {
             Self::SelectionPolicyEvidence => "SelectionPolicyEvidence",
             Self::OperationalStateEvidence => "OperationalStateEvidence",
             Self::FaultRecoveryPolicyEvidence => "FaultRecoveryPolicyEvidence",
+            Self::RuntimeBehaviorEvidence => "RuntimeBehaviorEvidence",
             Self::MediaInspected => "MediaInspected",
             Self::PayloadExtracted => "PayloadExtracted",
             Self::PayloadBound => "PayloadBound",
@@ -5992,6 +5994,7 @@ pub enum BroadcastRuntimeVerifiedSubsystem {
     DeviceBackendSelection,
     BroadcastPlayerOperationalRuntime,
     BroadcastPlayerFaultRecoveryRules,
+    BroadcastPlayerRunningRuntimeDemo,
     SimulatedPlaybackLoop,
     RealSpeakerOutput,
     RealDisplayOutput,
@@ -6043,6 +6046,7 @@ impl BroadcastRuntimeVerifiedSubsystem {
             Self::DeviceBackendSelection => "device backend selection",
             Self::BroadcastPlayerOperationalRuntime => "broadcast player operational runtime",
             Self::BroadcastPlayerFaultRecoveryRules => "broadcast player fault and recovery rules",
+            Self::BroadcastPlayerRunningRuntimeDemo => "broadcast player running runtime demo",
             Self::SimulatedPlaybackLoop => "simulated playback loop",
             Self::RealSpeakerOutput => "real speaker output",
             Self::RealDisplayOutput => "real display output",
@@ -6234,6 +6238,11 @@ impl BroadcastRuntimeVerificationMatrix {
                     subsystem: Subsystem::BroadcastPlayerFaultRecoveryRules,
                     level: Level::FaultRecoveryPolicyEvidence,
                     summary: "production-shaped fault severity, scope, recovery action, snapshot counters, backend warnings, and rejected-command no-mutation rules are modeled and tested; real display, realtime, A/V sync, and production audio-device claims remain false",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::BroadcastPlayerRunningRuntimeDemo,
+                    level: Level::RuntimeBehaviorEvidence,
+                    summary: "running Broadcast Player operational demo streams step-by-step state, frame/audio progression, pause freeze, seek/reprepare/replay, stop, unload, buffer health, and non-claims using the operational runtime",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::SimulatedPlaybackLoop,
@@ -10795,6 +10804,130 @@ mod tests {
     }
 
     #[test]
+    fn qgs_running_runtime_demo_sequence_advances_pauses_seeks_stops_and_unloads() {
+        let plan = sample_qgs_input_plan();
+        let active_end = plan.video_source.duration_frames;
+        let mut runtime =
+            QgsBroadcastPlayerOperationalRuntime::new(plan, QgsOperationalRuntimeConfig::default())
+                .unwrap();
+
+        assert!(
+            runtime
+                .execute(QgsBroadcastPlayerCommand::LoadPreparedInput)
+                .accepted
+        );
+        assert!(
+            runtime
+                .execute(QgsBroadcastPlayerCommand::Prepare {
+                    active_range: Some((0, active_end))
+                })
+                .accepted
+        );
+        assert!(
+            runtime
+                .execute(QgsBroadcastPlayerCommand::Cue { frame: 0 })
+                .accepted
+        );
+        assert!(
+            runtime
+                .execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 })
+                .accepted
+        );
+        assert_eq!(
+            runtime.snapshot().operational_status,
+            QgsBroadcastPlayerStatus::Ready
+        );
+        assert!(runtime.snapshot().buffer_health.prepared_frame_count > 0);
+        assert!(runtime.execute(QgsBroadcastPlayerCommand::Play).accepted);
+
+        for _ in 0..25 {
+            runtime.execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 });
+        }
+        assert_eq!(runtime.snapshot().current_frame, Some(25));
+        assert_eq!(
+            runtime.snapshot().current_audio_sample_range,
+            Some((24_000, 24_960))
+        );
+
+        assert!(runtime.execute(QgsBroadcastPlayerCommand::Pause).accepted);
+        let paused_frame = runtime.snapshot().current_frame;
+        runtime.execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 });
+        assert_eq!(runtime.snapshot().current_frame, paused_frame);
+
+        assert!(
+            runtime
+                .execute(QgsBroadcastPlayerCommand::Seek { frame: 50 })
+                .accepted
+        );
+        assert_eq!(runtime.snapshot().current_frame, Some(50));
+        assert_eq!(
+            runtime.snapshot().current_audio_sample_range,
+            Some((48_000, 48_960))
+        );
+        assert!(
+            runtime
+                .execute(QgsBroadcastPlayerCommand::Prepare {
+                    active_range: Some((0, active_end))
+                })
+                .accepted
+        );
+        assert!(
+            runtime
+                .execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 })
+                .accepted
+        );
+        let prepared = runtime.snapshot();
+        assert!(
+            prepared
+                .buffer_health
+                .prepared_start_frame
+                .unwrap_or(u64::MAX)
+                <= 50
+        );
+        assert!(
+            prepared
+                .buffer_health
+                .prepared_end_frame_exclusive
+                .unwrap_or_default()
+                > 50
+        );
+        assert!(!prepared.buffer_health.underrun);
+
+        assert!(runtime.execute(QgsBroadcastPlayerCommand::Play).accepted);
+        for _ in 0..25 {
+            runtime.execute(QgsBroadcastPlayerCommand::Tick { carrier_frame: 0 });
+        }
+        assert_eq!(runtime.snapshot().current_frame, Some(75));
+
+        assert!(runtime.execute(QgsBroadcastPlayerCommand::Stop).accepted);
+        assert_eq!(
+            runtime.snapshot().operational_status,
+            QgsBroadcastPlayerStatus::Stopped
+        );
+        assert!(runtime.snapshot().player.readiness.source_loaded);
+
+        assert!(runtime.execute(QgsBroadcastPlayerCommand::Unload).accepted);
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.operational_status, QgsBroadcastPlayerStatus::Empty);
+        assert!(!snapshot.player.readiness.source_loaded);
+        assert!(!snapshot.exposes_private_path());
+        assert_eq!(
+            snapshot.player.device_status.real_display_backend,
+            QgsDeviceBackendAvailability::NotImplemented.label()
+        );
+        assert!(!snapshot.player.readiness.visual_verified);
+        assert!(!snapshot.player.readiness.realtime_verified);
+        assert!(!snapshot.player.readiness.audio_device_verified);
+        assert!(!snapshot.player.readiness.av_sync_verified);
+        assert_eq!(
+            snapshot.player.device_status.x11_target,
+            "no / legacy non-target"
+        );
+        assert!(!snapshot.player.readiness.proxy_aac_authoritative);
+        assert!(snapshot.player.readiness.discrete_mono_audio);
+    }
+
+    #[test]
     fn exact_integer_rates_use_integer_timing() {
         let rate = RationalRate::new(50, 1).expect("rate");
         assert_eq!(rate.frame_offset(1).unwrap(), Duration::from_millis(20));
@@ -12147,6 +12280,18 @@ mod tests {
                 < BroadcastRuntimeVerificationLevel::RealtimeVerified
         );
         assert!(
+            BroadcastRuntimeVerificationLevel::RuntimeBehaviorEvidence
+                < BroadcastRuntimeVerificationLevel::VisualVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::RuntimeBehaviorEvidence
+                < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::RuntimeBehaviorEvidence
+                < BroadcastRuntimeVerificationLevel::RealtimeVerified
+        );
+        assert!(
             BroadcastRuntimeVerificationLevel::FilePresenterManifestWritten
                 < BroadcastRuntimeVerificationLevel::VisualVerified
         );
@@ -12361,6 +12506,27 @@ mod tests {
         assert_ne!(
             matrix
                 .entry(BroadcastRuntimeVerifiedSubsystem::BroadcastRuntimeAudioPayloadPipeWire)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
+        assert_eq!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::BroadcastPlayerRunningRuntimeDemo)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::RuntimeBehaviorEvidence
+        );
+        assert_ne!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::BroadcastPlayerRunningRuntimeDemo)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::VisualVerified
+        );
+        assert_ne!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::BroadcastPlayerRunningRuntimeDemo)
                 .unwrap()
                 .level,
             BroadcastRuntimeVerificationLevel::AudioDeviceVerified
