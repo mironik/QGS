@@ -26,7 +26,7 @@ use qgs_media_runtime::{
     broadcast_player_events_from_presentation_evidence, build_broadcast_audio_device_submission,
     build_broadcast_player_event_surface, build_broadcast_video_presenter_submission,
     classify_presentation, duration_abs_delta, duration_from_audio_samples,
-    evaluate_broadcast_preroll, max_video_timestamp_outside_audio_range,
+    evaluate_broadcast_preroll, max_video_timestamp_outside_audio_range, qgs_frames_for_duration,
     simulate_broadcast_player_runtime_loop, summarize_broadcast_device_boundary,
     summarize_broadcast_payload_bindings, summarize_broadcast_player_runtime_events,
     summarize_broadcast_prepared_slots, summarize_broadcast_runtime_contract, AudioFormat,
@@ -46,7 +46,8 @@ use qgs_media_runtime::{
     QgsInputPlanQueueRequirements, QgsOriginalProxyAssociationStatus, QgsPlaybackRepresentation,
     QgsPreparedAudioChannel, QgsPreparedAudioLayout, QgsPreparedInputDescriptor,
     QgsPreparedMediaBinding, QgsPreparedSourceIdentity, QgsPreparedStreamLayout,
-    QgsPreparedVideoTiming, RationalRate, RealTimeClock, TestAudioSink, TestPresentationSink,
+    QgsPreparedVideoTiming, QgsTransportEngine, QgsTransportEvent, RationalRate, RealTimeClock,
+    TestAudioSink, TestPresentationSink,
 };
 use qgs_mp4::{
     classify_video_track, nearest_random_access_before, MediaHealth, Mp4Source, Mp4TrackKind,
@@ -130,6 +131,7 @@ const PIPEWIRE_AUDIO_MONO_MONITOR_ARG: &str = "--pipewire-audio-mono-monitor";
 const PIPEWIRE_AUDIO_DISCRETE_4MONO_ARG: &str = "--pipewire-audio-discrete-4mono";
 const QNC_PREPARED_INPUT_DESCRIPTOR_ARG: &str = "--qnc-prepared-input-descriptor";
 const QGS_INPUT_PLAN_ARG: &str = "--qgs-input-plan";
+const QGS_TRANSPORT_ENGINE_PARITY_ARG: &str = "--qgs-transport-engine-parity";
 const WRITE_DIAGNOSTIC_WAV_ARG: &str = "--write-diagnostic-wav";
 const AUDIO_AUDIT_START_MS_ARG: &str = "--start-ms";
 const AUDIO_AUDIT_DURATION_MS_ARG: &str = "--duration-ms";
@@ -258,6 +260,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.qgs_input_plan_paths {
         return qgs_input_plan_report(&original, &proxy);
+    }
+    if let Some((original, proxy)) = args.qgs_transport_engine_parity_paths {
+        return qgs_transport_engine_parity_report(&original, &proxy);
     }
     if let Some(path) = args.linux_audio_device_probe_path {
         return linux_audio_device_probe(&path);
@@ -1758,6 +1763,158 @@ fn qgs_input_plan_report(
 
     descriptor_validation?;
     Ok(())
+}
+
+fn qgs_transport_engine_parity_report(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let descriptor = build_qnc_prepared_input_descriptor(original_path, proxy_path)?;
+    descriptor.validate()?;
+    let plan =
+        QgsInputPlan::from_descriptor(&descriptor, default_qgs_input_plan_queue_requirements())?;
+    let active_duration = Duration::from_millis(1_000);
+    let active_frames = qgs_frames_for_duration(active_duration, plan.video_source.timebase)?;
+
+    let mut engine = QgsTransportEngine::new();
+    let handle = engine.load_source(&plan)?;
+    engine.preload_source(&handle)?;
+    engine.set_active_source(&handle)?;
+    let active_range = engine.set_active_range_frames(0, active_frames)?;
+    let cue = engine.cue_frame(0)?;
+    let play_before_anchor = engine.play().is_err();
+    let play_ready_before_anchor = engine.snapshot().play_ready;
+    let anchor = engine.prepare_anchor()?;
+    let play_ready_after_anchor = engine.evaluate_play_ready();
+    let play_result = engine.play();
+    let snapshot = engine.snapshot();
+
+    println!("QGS Transport Engine Parity");
+    println!("---------------------------");
+    println!(
+        "Public original URI: {}",
+        descriptor.binding.original_media_uri
+    );
+    println!(
+        "Public proxy URI: {}",
+        descriptor
+            .binding
+            .proxy_media_uri
+            .as_deref()
+            .unwrap_or("<none>")
+    );
+    println!("Source handle: {}", handle.source_id);
+    println!("Source revision: {}", handle.revision.0);
+    println!(
+        "Source identity exposes private path: {}",
+        yes_no(handle.exposes_private_path())
+    );
+    println!(
+        "Active range: [{}..{}) frames, samples [{}..{})",
+        active_range.start_frame,
+        active_range.end_frame,
+        active_range.start_sample,
+        active_range.end_sample
+    );
+    println!("Active duration: {:.3}s", active_duration.as_secs_f64());
+    println!("Cue point: frame={} sample={}", cue.frame, cue.sample);
+    println!(
+        "Prepared anchor: frame={} sample={} revision={}",
+        anchor.frame, anchor.sample, anchor.revision.0
+    );
+    println!("Play before Ready rejected: {}", yes_no(play_before_anchor));
+    println!(
+        "play_ready before anchor: {}",
+        yes_no(play_ready_before_anchor)
+    );
+    println!(
+        "play_ready after anchor: {}",
+        yes_no(play_ready_after_anchor)
+    );
+    println!("Play result: {}", result_label(&play_result));
+    println!("Final status: {:?}", snapshot.status);
+    println!("No work on Play:");
+    println!(
+        "  source_open_on_play: {}",
+        snapshot.no_work_on_play.source_open_on_play
+    );
+    println!(
+        "  decode_on_play: {}",
+        snapshot.no_work_on_play.decode_on_play
+    );
+    println!(
+        "  queue_fill_on_play: {}",
+        snapshot.no_work_on_play.queue_fill_on_play
+    );
+    println!(
+        "  preroll_on_play: {}",
+        snapshot.no_work_on_play.preroll_on_play
+    );
+    println!(
+        "  anchor_prepare_on_play: {}",
+        snapshot.no_work_on_play.anchor_prepare_on_play
+    );
+    println!("Event count: {}", snapshot.events.len());
+    println!("Events:");
+    for (index, event) in snapshot.events.iter().enumerate() {
+        println!("  {:02}: {}", index, qgs_transport_event_label(event));
+    }
+    println!("UI involved: no");
+    println!("Export/render: no");
+    println!("Realtime: no");
+    println!("A/V sync: no");
+    println!("Device verification: no");
+
+    play_result?;
+    Ok(())
+}
+
+fn qgs_transport_event_label(event: &QgsTransportEvent) -> String {
+    match event {
+        QgsTransportEvent::TransportEngineCreated => "TransportEngineCreated".to_string(),
+        QgsTransportEvent::SourceLoaded { source_id, revision } => {
+            format!("SourceLoaded source={source_id} revision={}", revision.0)
+        }
+        QgsTransportEvent::SourcePreloaded { source_id, revision } => {
+            format!("SourcePreloaded source={source_id} revision={}", revision.0)
+        }
+        QgsTransportEvent::ActiveSourceChanged {
+            source_id,
+            revision,
+        } => format!(
+            "ActiveSourceChanged source={} revision={}",
+            source_id.as_deref().unwrap_or("<none>"),
+            revision.map(|value| value.0).unwrap_or(0)
+        ),
+        QgsTransportEvent::ActiveRangeSet {
+            start_frame,
+            end_frame,
+            start_sample,
+            end_sample,
+        } => format!(
+            "ActiveRangeSet frames=[{start_frame}..{end_frame}) samples=[{start_sample}..{end_sample})"
+        ),
+        QgsTransportEvent::CueCompleted { frame, sample } => {
+            format!("CueCompleted frame={frame} sample={sample}")
+        }
+        QgsTransportEvent::PreparedAnchorReady { frame, revision } => {
+            format!("PreparedAnchorReady frame={frame} revision={}", revision.0)
+        }
+        QgsTransportEvent::PlayReadinessChanged { ready } => {
+            format!("PlayReadinessChanged ready={}", yes_no(*ready))
+        }
+        QgsTransportEvent::TransportPlayRejected { reason } => {
+            format!("TransportPlayRejected reason={reason}")
+        }
+        QgsTransportEvent::TransportStarted { frame } => {
+            format!("TransportStarted frame={frame}")
+        }
+        QgsTransportEvent::TransportPaused => "TransportPaused".to_string(),
+        QgsTransportEvent::TransportStopped => "TransportStopped".to_string(),
+        QgsTransportEvent::TransportValidationFailed { reason } => {
+            format!("TransportValidationFailed reason={reason}")
+        }
+    }
 }
 
 fn result_label<T>(
@@ -12839,6 +12996,7 @@ struct Args {
     broadcast_player_runtime_verification_paths: Option<(PathBuf, PathBuf)>,
     qnc_prepared_input_descriptor_paths: Option<(PathBuf, PathBuf)>,
     qgs_input_plan_paths: Option<(PathBuf, PathBuf)>,
+    qgs_transport_engine_parity_paths: Option<(PathBuf, PathBuf)>,
     linux_audio_device_probe_path: Option<PathBuf>,
     pipewire_audio_prototype_path: Option<PathBuf>,
     pipewire_audio_native_prototype_path: Option<PathBuf>,
@@ -12909,6 +13067,8 @@ impl Args {
         let mut qnc_prepared_input_descriptor_paths = None;
         let mut qgs_input_plan_original = None;
         let mut qgs_input_plan_paths = None;
+        let mut qgs_transport_engine_parity_original = None;
+        let mut qgs_transport_engine_parity_paths = None;
         let mut linux_audio_device_probe_path = None;
         let mut pipewire_audio_prototype_path = None;
         let mut pipewire_audio_native_prototype_path = None;
@@ -12970,6 +13130,8 @@ impl Args {
         let mut next_arg_is_qnc_prepared_input_descriptor_proxy = false;
         let mut next_arg_is_qgs_input_plan_original = false;
         let mut next_arg_is_qgs_input_plan_proxy = false;
+        let mut next_arg_is_qgs_transport_engine_parity_original = false;
+        let mut next_arg_is_qgs_transport_engine_parity_proxy = false;
         let mut next_arg_is_linux_audio_device_probe_path = false;
         let mut next_arg_is_pipewire_audio_prototype_path = false;
         let mut next_arg_is_pipewire_audio_native_prototype_path = false;
@@ -13097,6 +13259,17 @@ impl Args {
                 qgs_input_plan_original = Some(PathBuf::from(arg));
                 next_arg_is_qgs_input_plan_original = false;
                 next_arg_is_qgs_input_plan_proxy = true;
+            } else if next_arg_is_qgs_transport_engine_parity_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = qgs_transport_engine_parity_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                qgs_transport_engine_parity_paths = Some((original, proxy));
+                next_arg_is_qgs_transport_engine_parity_proxy = false;
+            } else if next_arg_is_qgs_transport_engine_parity_original {
+                qgs_transport_engine_parity_original = Some(PathBuf::from(arg));
+                next_arg_is_qgs_transport_engine_parity_original = false;
+                next_arg_is_qgs_transport_engine_parity_proxy = true;
             } else if next_arg_is_qnc_prepared_input_descriptor_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = qnc_prepared_input_descriptor_original
@@ -13378,6 +13551,8 @@ impl Args {
                 next_arg_is_qnc_prepared_input_descriptor_original = true;
             } else if arg == QGS_INPUT_PLAN_ARG {
                 next_arg_is_qgs_input_plan_original = true;
+            } else if arg == QGS_TRANSPORT_ENGINE_PARITY_ARG {
+                next_arg_is_qgs_transport_engine_parity_original = true;
             } else if arg == LINUX_AUDIO_DEVICE_PROBE_ARG {
                 next_arg_is_linux_audio_device_probe_path = true;
             } else if arg == PIPEWIRE_AUDIO_PROTOTYPE_ARG {
@@ -13444,6 +13619,7 @@ impl Args {
             broadcast_player_runtime_verification_paths,
             qnc_prepared_input_descriptor_paths,
             qgs_input_plan_paths,
+            qgs_transport_engine_parity_paths,
             linux_audio_device_probe_path,
             pipewire_audio_prototype_path,
             pipewire_audio_native_prototype_path,

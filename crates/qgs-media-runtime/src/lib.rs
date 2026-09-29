@@ -810,6 +810,483 @@ impl QgsInputPlan {
     }
 }
 
+pub fn qgs_frames_for_duration(
+    duration: Duration,
+    rate: RationalRate,
+) -> Result<u64, PlaybackError> {
+    let nanos = duration.as_nanos();
+    let numerator = nanos
+        .checked_mul(u128::from(rate.numerator()))
+        .ok_or(PlaybackError::TimestampOverflow)?;
+    let denominator = NANOS_PER_SECOND
+        .checked_mul(u128::from(rate.denominator()))
+        .ok_or(PlaybackError::TimestampOverflow)?;
+    if denominator == 0 {
+        return Err(PlaybackError::InvalidRate);
+    }
+    u64::try_from(numerator / denominator).map_err(|_| PlaybackError::TimestampOverflow)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsTransportSourceRevision(pub u64);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsTransportSourceHandle {
+    pub source_id: String,
+    pub revision: QgsTransportSourceRevision,
+    pub video_uri: String,
+    pub audio_uri: String,
+    pub source_mode: QgsInputPlanSourceMode,
+    pub duration_frames: u64,
+    pub timebase: RationalRate,
+    pub audio_sample_rate: u32,
+}
+
+impl QgsTransportSourceHandle {
+    fn from_plan(plan: &QgsInputPlan, revision: QgsTransportSourceRevision) -> Self {
+        Self {
+            source_id: plan.video_source.media_uri.clone(),
+            revision,
+            video_uri: plan.video_source.media_uri.clone(),
+            audio_uri: plan.audio_source.media_uri.clone(),
+            source_mode: plan.source_mode,
+            duration_frames: plan.video_source.duration_frames,
+            timebase: plan.video_source.timebase,
+            audio_sample_rate: plan.audio_source.sample_rate,
+        }
+    }
+
+    pub fn exposes_private_path(&self) -> bool {
+        self.source_id.starts_with('/')
+            || self.video_uri.starts_with('/')
+            || self.audio_uri.starts_with('/')
+            || self.source_id.starts_with("file:")
+            || self.video_uri.starts_with("file:")
+            || self.audio_uri.starts_with("file:")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsTransportStatus {
+    Empty,
+    Loaded,
+    Ready,
+    Playing,
+    Paused,
+    Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsTransportActiveRange {
+    pub start_frame: u64,
+    pub end_frame: u64,
+    pub start_sample: u64,
+    pub end_sample: u64,
+}
+
+impl QgsTransportActiveRange {
+    pub fn from_frames(
+        handle: &QgsTransportSourceHandle,
+        start_frame: u64,
+        end_frame: u64,
+    ) -> Result<Self, PlaybackError> {
+        if start_frame >= end_frame || end_frame > handle.duration_frames {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        let start_sample =
+            frame_to_sample_boundary(start_frame, handle.timebase, handle.audio_sample_rate)?;
+        let end_sample =
+            frame_to_sample_boundary(end_frame, handle.timebase, handle.audio_sample_rate)?;
+        Ok(Self {
+            start_frame,
+            end_frame,
+            start_sample,
+            end_sample,
+        })
+    }
+
+    pub fn contains_frame(self, frame: u64) -> bool {
+        frame >= self.start_frame && frame < self.end_frame
+    }
+}
+
+fn frame_to_sample_boundary(
+    frame: u64,
+    timebase: RationalRate,
+    sample_rate: u32,
+) -> Result<u64, PlaybackError> {
+    let numerator = u128::from(frame)
+        .checked_mul(u128::from(timebase.denominator()))
+        .and_then(|value| value.checked_mul(u128::from(sample_rate)))
+        .ok_or(PlaybackError::TimestampOverflow)?;
+    let denominator = u128::from(timebase.numerator());
+    if denominator == 0 {
+        return Err(PlaybackError::InvalidRate);
+    }
+    u64::try_from(numerator / denominator).map_err(|_| PlaybackError::TimestampOverflow)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsTransportCuePoint {
+    pub frame: u64,
+    pub sample: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QgsTransportPreparedAnchor {
+    pub frame: u64,
+    pub sample: u64,
+    pub revision: QgsTransportSourceRevision,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QgsTransportNoWorkOnPlayCounters {
+    pub source_open_on_play: u32,
+    pub decode_on_play: u32,
+    pub queue_fill_on_play: u32,
+    pub preroll_on_play: u32,
+    pub anchor_prepare_on_play: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QgsTransportEvent {
+    TransportEngineCreated,
+    SourceLoaded {
+        source_id: String,
+        revision: QgsTransportSourceRevision,
+    },
+    SourcePreloaded {
+        source_id: String,
+        revision: QgsTransportSourceRevision,
+    },
+    ActiveSourceChanged {
+        source_id: Option<String>,
+        revision: Option<QgsTransportSourceRevision>,
+    },
+    ActiveRangeSet {
+        start_frame: u64,
+        end_frame: u64,
+        start_sample: u64,
+        end_sample: u64,
+    },
+    CueCompleted {
+        frame: u64,
+        sample: u64,
+    },
+    PreparedAnchorReady {
+        frame: u64,
+        revision: QgsTransportSourceRevision,
+    },
+    PlayReadinessChanged {
+        ready: bool,
+    },
+    TransportPlayRejected {
+        reason: &'static str,
+    },
+    TransportStarted {
+        frame: u64,
+    },
+    TransportPaused,
+    TransportStopped,
+    TransportValidationFailed {
+        reason: &'static str,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsTransportSnapshot {
+    pub status: QgsTransportStatus,
+    pub active_source: Option<QgsTransportSourceHandle>,
+    pub active_range: Option<QgsTransportActiveRange>,
+    pub cue: Option<QgsTransportCuePoint>,
+    pub prepared_anchor: Option<QgsTransportPreparedAnchor>,
+    pub play_ready: bool,
+    pub no_work_on_play: QgsTransportNoWorkOnPlayCounters,
+    pub events: Vec<QgsTransportEvent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QgsTransportSourceState {
+    handle: QgsTransportSourceHandle,
+    preloaded: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsTransportEngine {
+    sources: BTreeMap<String, QgsTransportSourceState>,
+    active_source_id: Option<String>,
+    active_range: Option<QgsTransportActiveRange>,
+    cue: Option<QgsTransportCuePoint>,
+    prepared_anchor: Option<QgsTransportPreparedAnchor>,
+    play_ready: bool,
+    next_revision: u64,
+    status: QgsTransportStatus,
+    no_work_on_play: QgsTransportNoWorkOnPlayCounters,
+    events: Vec<QgsTransportEvent>,
+}
+
+impl QgsTransportEngine {
+    pub fn new() -> Self {
+        Self {
+            sources: BTreeMap::new(),
+            active_source_id: None,
+            active_range: None,
+            cue: None,
+            prepared_anchor: None,
+            play_ready: false,
+            next_revision: 1,
+            status: QgsTransportStatus::Empty,
+            no_work_on_play: QgsTransportNoWorkOnPlayCounters::default(),
+            events: vec![QgsTransportEvent::TransportEngineCreated],
+        }
+    }
+
+    pub fn load_source(
+        &mut self,
+        plan: &QgsInputPlan,
+    ) -> Result<QgsTransportSourceHandle, PlaybackError> {
+        plan.validate()?;
+        let revision = QgsTransportSourceRevision(self.next_revision);
+        self.next_revision = self.next_revision.saturating_add(1);
+        let handle = QgsTransportSourceHandle::from_plan(plan, revision);
+        if handle.exposes_private_path() {
+            self.events
+                .push(QgsTransportEvent::TransportValidationFailed {
+                    reason: "source identity exposes private path",
+                });
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        self.sources.insert(
+            handle.source_id.clone(),
+            QgsTransportSourceState {
+                handle: handle.clone(),
+                preloaded: false,
+            },
+        );
+        self.status = QgsTransportStatus::Loaded;
+        self.play_ready = false;
+        self.events.push(QgsTransportEvent::SourceLoaded {
+            source_id: handle.source_id.clone(),
+            revision,
+        });
+        Ok(handle)
+    }
+
+    pub fn preload_source(
+        &mut self,
+        handle: &QgsTransportSourceHandle,
+    ) -> Result<(), PlaybackError> {
+        let state = self
+            .sources
+            .get_mut(&handle.source_id)
+            .ok_or(PlaybackError::InvalidRuntimeTransition)?;
+        if state.handle.revision != handle.revision {
+            self.events
+                .push(QgsTransportEvent::TransportValidationFailed {
+                    reason: "source revision mismatch",
+                });
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        state.preloaded = true;
+        self.events.push(QgsTransportEvent::SourcePreloaded {
+            source_id: handle.source_id.clone(),
+            revision: handle.revision,
+        });
+        self.evaluate_play_ready();
+        Ok(())
+    }
+
+    pub fn set_active_source(
+        &mut self,
+        handle: &QgsTransportSourceHandle,
+    ) -> Result<(), PlaybackError> {
+        let state = self
+            .sources
+            .get(&handle.source_id)
+            .ok_or(PlaybackError::InvalidRuntimeTransition)?;
+        if state.handle.revision != handle.revision {
+            self.events
+                .push(QgsTransportEvent::TransportValidationFailed {
+                    reason: "source revision mismatch",
+                });
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        self.active_source_id = Some(handle.source_id.clone());
+        self.active_range = None;
+        self.cue = None;
+        self.prepared_anchor = None;
+        self.play_ready = false;
+        self.events.push(QgsTransportEvent::ActiveSourceChanged {
+            source_id: Some(handle.source_id.clone()),
+            revision: Some(handle.revision),
+        });
+        Ok(())
+    }
+
+    pub fn set_active_range_frames(
+        &mut self,
+        start_frame: u64,
+        end_frame: u64,
+    ) -> Result<QgsTransportActiveRange, PlaybackError> {
+        let handle = self
+            .active_source()
+            .ok_or(PlaybackError::InvalidRuntimeTransition)?;
+        let range = QgsTransportActiveRange::from_frames(handle, start_frame, end_frame)?;
+        self.active_range = Some(range);
+        self.cue = None;
+        self.prepared_anchor = None;
+        self.play_ready = false;
+        self.events.push(QgsTransportEvent::ActiveRangeSet {
+            start_frame: range.start_frame,
+            end_frame: range.end_frame,
+            start_sample: range.start_sample,
+            end_sample: range.end_sample,
+        });
+        Ok(range)
+    }
+
+    pub fn cue_frame(&mut self, frame: u64) -> Result<QgsTransportCuePoint, PlaybackError> {
+        let handle = self
+            .active_source()
+            .ok_or(PlaybackError::InvalidRuntimeTransition)?;
+        let range = self
+            .active_range
+            .ok_or(PlaybackError::InvalidRuntimeTransition)?;
+        if !range.contains_frame(frame) {
+            self.events
+                .push(QgsTransportEvent::TransportValidationFailed {
+                    reason: "cue outside active range",
+                });
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        let sample = frame_to_sample_boundary(frame, handle.timebase, handle.audio_sample_rate)?;
+        let cue = QgsTransportCuePoint { frame, sample };
+        self.cue = Some(cue);
+        self.prepared_anchor = None;
+        self.play_ready = false;
+        self.events
+            .push(QgsTransportEvent::CueCompleted { frame, sample });
+        Ok(cue)
+    }
+
+    pub fn prepare_anchor(&mut self) -> Result<QgsTransportPreparedAnchor, PlaybackError> {
+        let handle = self
+            .active_source()
+            .ok_or(PlaybackError::InvalidRuntimeTransition)?;
+        let state = self
+            .sources
+            .get(&handle.source_id)
+            .ok_or(PlaybackError::InvalidRuntimeTransition)?;
+        if !state.preloaded {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        let cue = self.cue.ok_or(PlaybackError::InvalidRuntimeTransition)?;
+        let anchor = QgsTransportPreparedAnchor {
+            frame: cue.frame,
+            sample: cue.sample,
+            revision: handle.revision,
+        };
+        self.prepared_anchor = Some(anchor);
+        self.events.push(QgsTransportEvent::PreparedAnchorReady {
+            frame: anchor.frame,
+            revision: anchor.revision,
+        });
+        self.evaluate_play_ready();
+        Ok(anchor)
+    }
+
+    pub fn evaluate_play_ready(&mut self) -> bool {
+        let ready = self
+            .active_source()
+            .and_then(|handle| {
+                self.sources.get(&handle.source_id).map(|state| {
+                    state.preloaded
+                        && self.active_range.is_some()
+                        && self.cue.is_some()
+                        && self.prepared_anchor.is_some_and(|anchor| {
+                            anchor.revision == handle.revision
+                                && self.cue.is_some_and(|cue| cue.frame == anchor.frame)
+                        })
+                })
+            })
+            .unwrap_or(false);
+        if self.play_ready != ready {
+            self.events
+                .push(QgsTransportEvent::PlayReadinessChanged { ready });
+        }
+        self.play_ready = ready;
+        if ready && self.status != QgsTransportStatus::Playing {
+            self.status = QgsTransportStatus::Ready;
+        }
+        ready
+    }
+
+    pub fn play(&mut self) -> Result<(), PlaybackError> {
+        if !self.play_ready {
+            self.events.push(QgsTransportEvent::TransportPlayRejected {
+                reason: "not ready",
+            });
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        let anchor = self
+            .prepared_anchor
+            .ok_or(PlaybackError::InvalidRuntimeTransition)?;
+        self.status = QgsTransportStatus::Playing;
+        self.play_ready = false;
+        self.events
+            .push(QgsTransportEvent::PlayReadinessChanged { ready: false });
+        self.events.push(QgsTransportEvent::TransportStarted {
+            frame: anchor.frame,
+        });
+        Ok(())
+    }
+
+    pub fn pause(&mut self) -> Result<(), PlaybackError> {
+        if self.status != QgsTransportStatus::Playing {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        self.status = QgsTransportStatus::Paused;
+        self.events.push(QgsTransportEvent::TransportPaused);
+        Ok(())
+    }
+
+    pub fn stop(&mut self) -> Result<(), PlaybackError> {
+        if self.active_source_id.is_none() {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        self.status = QgsTransportStatus::Stopped;
+        self.play_ready = false;
+        self.events.push(QgsTransportEvent::TransportStopped);
+        Ok(())
+    }
+
+    pub fn active_source(&self) -> Option<&QgsTransportSourceHandle> {
+        self.active_source_id
+            .as_ref()
+            .and_then(|source_id| self.sources.get(source_id))
+            .map(|state| &state.handle)
+    }
+
+    pub fn snapshot(&self) -> QgsTransportSnapshot {
+        QgsTransportSnapshot {
+            status: self.status,
+            active_source: self.active_source().cloned(),
+            active_range: self.active_range,
+            cue: self.cue,
+            prepared_anchor: self.prepared_anchor,
+            play_ready: self.play_ready,
+            no_work_on_play: self.no_work_on_play,
+            events: self.events.clone(),
+        }
+    }
+}
+
+impl Default for QgsTransportEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BroadcastRuntimeState {
     Idle,
@@ -3692,6 +4169,11 @@ mod tests {
         }
     }
 
+    fn sample_qgs_input_plan() -> QgsInputPlan {
+        QgsInputPlan::from_descriptor(&sample_qgs_descriptor(), sample_qgs_queue_requirements())
+            .unwrap()
+    }
+
     #[test]
     fn qnc_prepared_descriptor_validates_proxy_picture_original_audio() {
         let descriptor = sample_qgs_descriptor();
@@ -3778,6 +4260,171 @@ mod tests {
         assert_eq!(
             QgsInputPlan::from_descriptor(&descriptor, sample_qgs_queue_requirements()),
             Err(PlaybackError::InvalidRuntimeTransition)
+        );
+    }
+
+    #[test]
+    fn qgs_transport_empty_engine_is_not_play_ready() {
+        let engine = QgsTransportEngine::new();
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.status, QgsTransportStatus::Empty);
+        assert!(!snapshot.play_ready);
+        assert_eq!(
+            snapshot.events,
+            vec![QgsTransportEvent::TransportEngineCreated]
+        );
+    }
+
+    #[test]
+    fn qgs_transport_load_source_creates_public_handle() {
+        let mut engine = QgsTransportEngine::new();
+        let handle = engine.load_source(&sample_qgs_input_plan()).unwrap();
+        assert_eq!(handle.revision, QgsTransportSourceRevision(1));
+        assert!(handle.source_id.starts_with("qnc://"));
+        assert!(!handle.exposes_private_path());
+        assert_eq!(handle.duration_frames, 100);
+    }
+
+    #[test]
+    fn qgs_transport_rejects_invalid_preload_and_active_handles() {
+        let mut engine = QgsTransportEngine::new();
+        let mut handle = engine.load_source(&sample_qgs_input_plan()).unwrap();
+        handle.revision = QgsTransportSourceRevision(99);
+        assert_eq!(
+            engine.preload_source(&handle),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+        assert_eq!(
+            engine.set_active_source(&handle),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+    }
+
+    #[test]
+    fn qgs_transport_validates_active_range() {
+        let mut engine = QgsTransportEngine::new();
+        let handle = engine.load_source(&sample_qgs_input_plan()).unwrap();
+        engine.set_active_source(&handle).unwrap();
+        assert_eq!(
+            engine.set_active_range_frames(10, 10),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+        assert_eq!(
+            engine.set_active_range_frames(0, 101),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+        let range = engine.set_active_range_frames(0, 50).unwrap();
+        assert_eq!(range.start_sample, 0);
+        assert_eq!(range.end_sample, 48_000);
+    }
+
+    #[test]
+    fn qgs_transport_rejects_cue_outside_half_open_range() {
+        let mut engine = QgsTransportEngine::new();
+        let handle = engine.load_source(&sample_qgs_input_plan()).unwrap();
+        engine.set_active_source(&handle).unwrap();
+        engine.set_active_range_frames(0, 50).unwrap();
+        assert_eq!(
+            engine.cue_frame(50),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+        assert_eq!(
+            engine.cue_frame(99),
+            Err(PlaybackError::InvalidRuntimeTransition)
+        );
+        assert_eq!(engine.cue_frame(49).unwrap().sample, 47_040);
+    }
+
+    #[test]
+    fn qgs_transport_prepared_anchor_is_required_for_play_ready() {
+        let mut engine = QgsTransportEngine::new();
+        let handle = engine.load_source(&sample_qgs_input_plan()).unwrap();
+        engine.preload_source(&handle).unwrap();
+        engine.set_active_source(&handle).unwrap();
+        engine.set_active_range_frames(0, 50).unwrap();
+        engine.cue_frame(0).unwrap();
+        assert!(!engine.evaluate_play_ready());
+        engine.prepare_anchor().unwrap();
+        assert!(engine.evaluate_play_ready());
+    }
+
+    #[test]
+    fn qgs_transport_play_rejects_before_ready_and_accepts_after_anchor() {
+        let mut engine = QgsTransportEngine::new();
+        let handle = engine.load_source(&sample_qgs_input_plan()).unwrap();
+        engine.preload_source(&handle).unwrap();
+        engine.set_active_source(&handle).unwrap();
+        engine.set_active_range_frames(0, 50).unwrap();
+        assert_eq!(engine.play(), Err(PlaybackError::InvalidRuntimeTransition));
+        engine.cue_frame(0).unwrap();
+        engine.prepare_anchor().unwrap();
+        assert!(engine.evaluate_play_ready());
+        engine.play().unwrap();
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.status, QgsTransportStatus::Playing);
+        assert_eq!(
+            snapshot.no_work_on_play,
+            QgsTransportNoWorkOnPlayCounters::default()
+        );
+    }
+
+    #[test]
+    fn qgs_transport_events_are_deterministic() {
+        let mut engine = QgsTransportEngine::new();
+        let handle = engine.load_source(&sample_qgs_input_plan()).unwrap();
+        engine.preload_source(&handle).unwrap();
+        engine.set_active_source(&handle).unwrap();
+        engine.set_active_range_frames(0, 50).unwrap();
+        engine.cue_frame(0).unwrap();
+        engine.prepare_anchor().unwrap();
+        engine.play().unwrap();
+        let kinds = engine
+            .snapshot()
+            .events
+            .into_iter()
+            .map(|event| match event {
+                QgsTransportEvent::TransportEngineCreated => "created",
+                QgsTransportEvent::SourceLoaded { .. } => "loaded",
+                QgsTransportEvent::SourcePreloaded { .. } => "preloaded",
+                QgsTransportEvent::ActiveSourceChanged { .. } => "active",
+                QgsTransportEvent::ActiveRangeSet { .. } => "range",
+                QgsTransportEvent::CueCompleted { .. } => "cue",
+                QgsTransportEvent::PreparedAnchorReady { .. } => "anchor",
+                QgsTransportEvent::PlayReadinessChanged { ready: true } => "ready",
+                QgsTransportEvent::PlayReadinessChanged { ready: false } => "not-ready",
+                QgsTransportEvent::TransportStarted { .. } => "started",
+                _ => "other",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                "created",
+                "loaded",
+                "preloaded",
+                "active",
+                "range",
+                "cue",
+                "anchor",
+                "ready",
+                "not-ready",
+                "started"
+            ]
+        );
+    }
+
+    #[test]
+    fn qgs_transport_sample_mapping_uses_source_facts() {
+        let plan = sample_qgs_input_plan();
+        assert_eq!(
+            qgs_frames_for_duration(Duration::from_millis(1_000), plan.video_source.timebase)
+                .unwrap(),
+            50
+        );
+        assert_eq!(
+            plan.samples_for_duration(Duration::from_millis(1_000))
+                .unwrap(),
+            48_000
         );
     }
 
