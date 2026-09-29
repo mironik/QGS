@@ -98,6 +98,7 @@ For Sony FX6 sample 002:
 | native PipeWire desktop mono listening helper | `DesktopMonoListeningHelperDrainCompleted` | One original MXF mono track is duplicated to L/R as an ad-hoc desktop listening helper and drained through PipeWire. This is not discrete mono broadcast output, production routing, channel certification, full playback, realtime playback, A/V sync, or `AudioDeviceVerified`. |
 | native PipeWire discrete 4-mono output boundary | `Discrete4MonoOutputDrainCompleted` | Original MXF track 1/2/3/4 can be submitted as output channel 1/2/3/4 to a native PipeWire 4-channel f32 boundary and drained. Physical channel mapping, production routing, full playback, realtime playback, A/V sync, and `AudioDeviceVerified` are not claimed. |
 | broadcast runtime audio payload to PipeWire | `RuntimeAudioPayloadDrainCompleted` | First prepared `ProxyPreview` Broadcast Player Runtime original-audio payload binding submits to native PipeWire and drains; an audible helper path exists but manual confirmation is tracked separately and does not imply full playback, realtime playback, A/V sync, channel certification, or full audio-device verification. |
+| runtime surface end-to-end acceptance | `TestBoundaryEvidence` | Integration Block A session runtime and Block B test presenter/monitor boundary run together as one backend scenario. Real display output, realtime playback, A/V sync, and visual verification remain unimplemented. |
 | simulated playback loop | `TestBoundaryEvidence` | Prepared slots flow through test audio/video boundaries deterministically. |
 | real speaker output | `NotImplemented` | No audible speaker output, audio-device clock, or full audio playback path exists; native PipeWire buffer submission is tracked separately. |
 | real display output | `NotImplemented` | No swapchain, Wayland, X11, DRM/KMS, or real display presenter exists. |
@@ -111,6 +112,9 @@ The matrix intentionally does not overstate these areas:
 - Test presenter evidence is not real display output.
 - Presenter/monitor boundary evidence from the test presenter is not real
   display output and is not visual verification.
+- Runtime surface end-to-end acceptance combines session commands with
+  test-presenter monitor evidence; it is not realtime playback, A/V sync, real
+  display output, or visual verification.
 - Test audio sink evidence is not real speaker output.
 - Native PipeWire buffer submission/drain evidence is not audible playback or
   `AudioDeviceVerified`.

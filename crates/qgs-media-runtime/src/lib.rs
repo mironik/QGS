@@ -3849,6 +3849,7 @@ pub enum BroadcastRuntimeVerifiedSubsystem {
     NativePipeWireDesktopMonoListeningHelper,
     NativePipeWireDiscrete4MonoOutputBoundary,
     BroadcastRuntimeAudioPayloadPipeWire,
+    RuntimeSurfaceE2eAcceptance,
     SimulatedPlaybackLoop,
     RealSpeakerOutput,
     RealDisplayOutput,
@@ -3893,6 +3894,7 @@ impl BroadcastRuntimeVerifiedSubsystem {
             Self::BroadcastRuntimeAudioPayloadPipeWire => {
                 "broadcast runtime audio payload to PipeWire"
             }
+            Self::RuntimeSurfaceE2eAcceptance => "runtime surface end-to-end acceptance",
             Self::SimulatedPlaybackLoop => "simulated playback loop",
             Self::RealSpeakerOutput => "real speaker output",
             Self::RealDisplayOutput => "real display output",
@@ -4049,6 +4051,11 @@ impl BroadcastRuntimeVerificationMatrix {
                     subsystem: Subsystem::BroadcastRuntimeAudioPayloadPipeWire,
                     level: Level::RuntimeAudioPayloadDrainCompleted,
                     summary: "first prepared ProxyPreview Broadcast Player Runtime audio payload binding submits to native PipeWire and drains; not full playback, realtime, A/V sync, or full audio-device verification",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::RuntimeSurfaceE2eAcceptance,
+                    level: Level::TestBoundaryEvidence,
+                    summary: "Integration Block A session runtime and Block B test presenter/monitor boundary run as one end-to-end backend scenario; real display, realtime, and visual verification are not claimed",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::SimulatedPlaybackLoop,
@@ -9034,6 +9041,72 @@ mod tests {
     }
 
     #[test]
+    fn runtime_surface_e2e_acceptance_keeps_monitor_evidence_scoped() {
+        let video_slot = &test_prepared_video_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
+        let video_binding = bind_broadcast_video_payload_ready(
+            video_slot,
+            BroadcastVideoPayloadReference {
+                payload_id: 504,
+                kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+                format: BroadcastVideoPayloadFormat::RgbaU16,
+                backend_path: BroadcastVideoPayloadBackendPath::VaapiCpuNv12Vulkan,
+                source_frame_index: video_slot.source_frame_index.unwrap(),
+                selected_preview_frame_index: video_slot.selected_preview_frame_index,
+                presentation_time: video_slot.presentation_time,
+                duration: video_slot.duration,
+                coded_width: 1920,
+                coded_height: 1088,
+                visible_width: 1920,
+                visible_height: 1080,
+                bounded_slot_index: video_slot.slot_index,
+                session_index: 0,
+            },
+        )
+        .unwrap();
+        let presentation_binding = BroadcastPresentationPayloadBinding {
+            presentation_slot_index: 0,
+            video_binding_index: video_binding.video_slot_index,
+            audio_binding_index: 0,
+            presentation_time: video_slot.presentation_time,
+            duration: video_slot.duration,
+            ready: true,
+            readiness: BroadcastPresentationPayloadReadiness::PayloadReady,
+        };
+        let mut presenter = BroadcastTestVideoPresenter::new(BroadcastTestVideoPresenterConfig {
+            accepted_kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+            accepted_format: BroadcastVideoPayloadFormat::RgbaU16,
+            visible_width: 1920,
+            visible_height: 1080,
+            coded_width: 1920,
+            coded_height: 1088,
+        })
+        .unwrap();
+
+        let result = submit_qgs_presenter_payload_to_test_boundary(
+            "qnc://local/media/proxy/e2e",
+            &presentation_binding,
+            &video_binding,
+            &mut presenter,
+        )
+        .unwrap();
+        let update = project_qgs_monitor_update_from_presenter_result(&result);
+
+        assert!(update.frame.prepared_payload_present);
+        assert!(update.submitted_to_presenter);
+        assert_eq!(
+            update.presenter_evidence_kind,
+            Some(QgsPresenterEvidenceKind::TestPresenterAccepted)
+        );
+        assert!(update.frame_presented_test_boundary);
+        assert!(!update.frame_presented_real_backend);
+        assert!(!update.real_display_evidence_present);
+        assert!(!update.visual_verified);
+        assert!(!update.private_path_exposed);
+        assert_eq!(presenter.accepted_count(), 1);
+        assert_eq!(presenter.rejected_count(), 0);
+    }
+
+    #[test]
     fn monitor_projection_flags_private_public_identity() {
         let video_slot = &test_prepared_video_slots(BroadcastVideoSourceMode::ProxyPreview)[0];
         let binding = bind_broadcast_video_payload_ready(
@@ -9163,6 +9236,13 @@ mod tests {
         );
         assert_eq!(
             matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::RuntimeSurfaceE2eAcceptance)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::TestBoundaryEvidence
+        );
+        assert_eq!(
+            matrix
                 .entry(BroadcastRuntimeVerifiedSubsystem::TestAudioSinkEvidence)
                 .unwrap()
                 .level,
@@ -9178,6 +9258,13 @@ mod tests {
         assert_ne!(
             matrix
                 .entry(BroadcastRuntimeVerifiedSubsystem::PresenterMonitorBoundary)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::VisualVerified
+        );
+        assert_ne!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::RuntimeSurfaceE2eAcceptance)
                 .unwrap()
                 .level,
             BroadcastRuntimeVerificationLevel::VisualVerified

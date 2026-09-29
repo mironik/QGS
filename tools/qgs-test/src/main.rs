@@ -149,6 +149,7 @@ const QGS_QNC_EVENT_PROJECTION_ARG: &str = "--qgs-qnc-event-projection";
 const QGS_SESSION_COMMAND_BOUNDARY_ARG: &str = "--qgs-session-command-boundary";
 const QGS_SESSION_RUNTIME_CONTROL_ARG: &str = "--qgs-session-runtime-control";
 const QGS_PRESENTER_MONITOR_BOUNDARY_ARG: &str = "--qgs-presenter-monitor-boundary";
+const QGS_RUNTIME_SURFACE_E2E_ARG: &str = "--qgs-runtime-surface-e2e";
 const WRITE_DIAGNOSTIC_WAV_ARG: &str = "--write-diagnostic-wav";
 const AUDIO_AUDIT_START_MS_ARG: &str = "--start-ms";
 const AUDIO_AUDIT_DURATION_MS_ARG: &str = "--duration-ms";
@@ -301,6 +302,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.qgs_presenter_monitor_boundary_paths {
         return qgs_presenter_monitor_boundary_report(&original, &proxy);
+    }
+    if let Some((original, proxy)) = args.qgs_runtime_surface_e2e_paths {
+        return qgs_runtime_surface_e2e_report(&original, &proxy);
     }
     if let Some(path) = args.linux_audio_device_probe_path {
         return linux_audio_device_probe(&path);
@@ -3335,6 +3339,245 @@ fn qgs_presenter_monitor_boundary_report(
     );
     println!("VisualVerified: no");
     println!("Private path exposed: {}", yes_no(private_path_exposed));
+
+    Ok(())
+}
+
+fn qgs_runtime_surface_e2e_report(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let descriptor = build_qnc_prepared_input_descriptor(original_path, proxy_path)?;
+    descriptor.validate()?;
+    let input_plan =
+        QgsInputPlan::from_descriptor(&descriptor, default_qgs_input_plan_queue_requirements())?;
+    let active_duration = Duration::from_millis(1_000);
+    let active_frames = qgs_frames_for_duration(active_duration, input_plan.video_source.timebase)?;
+    let source_uri = input_plan.video_source.media_uri.clone();
+    let proxy_uri = descriptor
+        .binding
+        .proxy_media_uri
+        .as_deref()
+        .unwrap_or(&source_uri)
+        .to_string();
+
+    let mut runtime = QgsSessionRuntime::new(input_plan, QgsSessionRuntimeConfig::default())?;
+    let commands = qgs_session_command_sequence(&source_uri, active_frames);
+    for command in commands.iter().take(8) {
+        runtime.enqueue(command.clone()).map_err(|err| {
+            format!(
+                "runtime surface e2e enqueue failed for id {}: {err:?}",
+                command.command_id
+            )
+        })?;
+    }
+
+    let mut command_results = Vec::new();
+    let mut projected_events = Vec::new();
+    let mut play_ready_before_play = false;
+    let mut prepared_buffer_count = 0usize;
+    let mut selected_prepared_frame = None;
+    while let Some(result) = runtime.execute_next() {
+        if result.command_id.0 == 5 {
+            play_ready_before_play = result.passive_view.readiness.play_ready;
+        }
+        if result.command_id.0 == 7 {
+            prepared_buffer_count = result.passive_view.prepared_buffer.prepared_frame_count;
+            selected_prepared_frame = result.passive_view.prepared_buffer.prepared_start_frame;
+        }
+        projected_events.extend(result.projected_events.clone());
+        command_results.push(result);
+    }
+    let tick_snapshot = runtime.snapshot();
+
+    let proxy = Mp4Source::open(proxy_path)?;
+    let proxy_video = proxy
+        .video
+        .as_ref()
+        .ok_or("proxy has no H.264 video track")?;
+    let proxy_h264 = classify_video_track(proxy_video)?;
+    let selected = selected_journalist_preview_frames(proxy_video)?;
+    let selected_frame = selected
+        .first()
+        .ok_or("proxy has no selected journalist preview frame")?;
+    let frame_duration = ProxyPlaybackProfile::Journalist50iPreview
+        .presentation_rate(RationalRate::new(
+            u64::from(proxy_video.frame_rate.numerator),
+            u64::from(proxy_video.frame_rate.denominator),
+        )?)?
+        .frame_duration()?;
+    let video_slot = BroadcastPreparedVideoSlot {
+        slot_index: 0,
+        source_mode: BroadcastVideoSourceMode::ProxyPreview,
+        video_source_role: BroadcastMediaSourceRole::ProxyPreviewVideo,
+        source_frame_index: Some(selected_frame.source_presentation_index),
+        selected_preview_frame_index: Some(selected_frame.preview_index),
+        presentation_time: selected_frame.start_time,
+        duration: frame_duration,
+        status: BroadcastPreparedVideoSlotStatus::Prepared,
+    };
+    let proxy_payload_proof = bind_proxy_preview_video_payloads(
+        proxy_video,
+        &proxy_h264,
+        std::slice::from_ref(&video_slot),
+    )?;
+    let video_binding = proxy_payload_proof
+        .bindings
+        .first()
+        .cloned()
+        .ok_or("proxy payload proof did not produce a binding")?;
+    let presentation_binding = BroadcastPresentationPayloadBinding {
+        presentation_slot_index: 0,
+        video_binding_index: video_binding.video_slot_index,
+        audio_binding_index: 0,
+        presentation_time: selected_frame.start_time,
+        duration: frame_duration,
+        ready: true,
+        readiness: BroadcastPresentationPayloadReadiness::PayloadReady,
+    };
+    let payload = video_binding
+        .payload
+        .as_ref()
+        .ok_or("runtime surface e2e missing proxy video payload")?;
+    let mut presenter = BroadcastTestVideoPresenter::new(BroadcastTestVideoPresenterConfig {
+        accepted_kind: BroadcastVideoPayloadKind::ProcessedGpuFrame,
+        accepted_format: BroadcastVideoPayloadFormat::RgbaU16,
+        visible_width: proxy_h264.width,
+        visible_height: proxy_h264.height,
+        coded_width: proxy_h264.coded_width,
+        coded_height: proxy_h264.coded_height,
+    })?;
+    let presenter_result = submit_qgs_presenter_payload_to_test_boundary(
+        proxy_uri.clone(),
+        &presentation_binding,
+        &video_binding,
+        &mut presenter,
+    )?;
+    let monitor_update = project_qgs_monitor_update_from_presenter_result(&presenter_result);
+    let monitor_projection = QgsQncMonitorProjection::from_presenter_update(&monitor_update);
+
+    for command in commands.iter().skip(8).take(2) {
+        runtime.enqueue(command.clone()).map_err(|err| {
+            format!(
+                "runtime surface e2e cleanup enqueue failed for id {}: {err:?}",
+                command.command_id
+            )
+        })?;
+    }
+    while let Some(result) = runtime.execute_next() {
+        projected_events.extend(result.projected_events.clone());
+        command_results.push(result);
+    }
+    let final_snapshot = runtime.snapshot();
+    let transcript = runtime.transcript();
+    let accepted_count = command_results
+        .iter()
+        .filter(|result| {
+            result
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.accepted)
+        })
+        .count();
+    let rejected_count = command_results
+        .iter()
+        .filter(|result| {
+            result
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| !outcome.accepted)
+        })
+        .count();
+    let event_sequence_monotonic = qgs_qnc_projected_sequence_is_monotonic(&projected_events);
+    let private_path_exposed = final_snapshot.private_path_exposed
+        || tick_snapshot.private_path_exposed
+        || monitor_projection.private_path_exposed
+        || transcript.exposes_private_path()
+        || projected_events
+            .iter()
+            .any(QgsQncEventEnvelope::exposes_private_path);
+    let presenter_evidence_kind = monitor_update
+        .presenter_evidence_kind
+        .map(|kind| format!("{kind:?}"))
+        .unwrap_or_else(|| "none".to_string());
+
+    println!("QGS Runtime Surface End-to-End Acceptance");
+    println!("-----------------------------------------");
+    println!(
+        "Public original URI: {}",
+        descriptor.binding.original_media_uri
+    );
+    println!("Public proxy URI: {proxy_uri}");
+    println!("Private path exposed: {}", yes_no(private_path_exposed));
+    println!("Command queue accepted count: {accepted_count}");
+    println!("Command queue rejected count: {rejected_count}");
+    println!(
+        "Transport play_ready before Play: {}",
+        yes_no(play_ready_before_play)
+    );
+    println!(
+        "Final transport state: {:?}",
+        final_snapshot.passive_view.transport.state
+    );
+    println!("Prepared buffer count: {prepared_buffer_count}");
+    println!(
+        "Selected prepared frame: {}",
+        qgs_optional_u64_label(
+            selected_prepared_frame.or(Some(selected_frame.source_presentation_index))
+        )
+    );
+    println!(
+        "Presenter boundary submitted: {}",
+        yes_no(monitor_update.submitted_to_presenter)
+    );
+    println!("Presenter kind: TestPresenter");
+    println!("Presenter evidence kind: {presenter_evidence_kind}");
+    println!(
+        "Test presenter accepted: {}",
+        yes_no(presenter.accepted_count() == 1 && presenter.rejected_count() == 0)
+    );
+    println!("Payload kind: {:?}", payload.kind);
+    println!("Payload format: {:?}", payload.format);
+    println!("Payload backend: {:?}", payload.backend_path);
+    println!("Monitor projection:");
+    println!(
+        "  prepared descriptor present: {}",
+        yes_no(monitor_projection.prepared_descriptor_present)
+    );
+    println!(
+        "  submitted to presenter: {}",
+        yes_no(monitor_projection.submitted_to_presenter)
+    );
+    println!(
+        "  real display evidence: {}",
+        if monitor_projection.real_display_evidence_present {
+            "present"
+        } else {
+            "none"
+        }
+    );
+    println!(
+        "  visual verified: {}",
+        yes_no(monitor_projection.visual_verified)
+    );
+    println!(
+        "  real presented: {}",
+        yes_no(monitor_projection.frame_presented_real_backend)
+    );
+    println!("Projected event count: {}", projected_events.len());
+    println!(
+        "Event sequence monotonic: {}",
+        yes_no(event_sequence_monotonic)
+    );
+    println!("Final passive view summary:");
+    print_qgs_qnc_passive_view(&final_snapshot.passive_view);
+    println!("Runtime surface non-claims:");
+    println!("  realtime playback: no");
+    println!("  A/V sync: no");
+    println!("  real display output: no");
+    println!("  FramePresented real display: no");
+    println!("  AudioDeviceVerified: no");
+    println!("  RealtimeVerified: no");
 
     Ok(())
 }
@@ -14523,6 +14766,7 @@ struct Args {
     qgs_session_command_boundary_paths: Option<(PathBuf, PathBuf)>,
     qgs_session_runtime_control_paths: Option<(PathBuf, PathBuf)>,
     qgs_presenter_monitor_boundary_paths: Option<(PathBuf, PathBuf)>,
+    qgs_runtime_surface_e2e_paths: Option<(PathBuf, PathBuf)>,
     linux_audio_device_probe_path: Option<PathBuf>,
     pipewire_audio_prototype_path: Option<PathBuf>,
     pipewire_audio_native_prototype_path: Option<PathBuf>,
@@ -14609,6 +14853,8 @@ impl Args {
         let mut qgs_session_runtime_control_paths = None;
         let mut qgs_presenter_monitor_boundary_original = None;
         let mut qgs_presenter_monitor_boundary_paths = None;
+        let mut qgs_runtime_surface_e2e_original = None;
+        let mut qgs_runtime_surface_e2e_paths = None;
         let mut linux_audio_device_probe_path = None;
         let mut pipewire_audio_prototype_path = None;
         let mut pipewire_audio_native_prototype_path = None;
@@ -14686,6 +14932,8 @@ impl Args {
         let mut next_arg_is_qgs_session_runtime_control_proxy = false;
         let mut next_arg_is_qgs_presenter_monitor_boundary_original = false;
         let mut next_arg_is_qgs_presenter_monitor_boundary_proxy = false;
+        let mut next_arg_is_qgs_runtime_surface_e2e_original = false;
+        let mut next_arg_is_qgs_runtime_surface_e2e_proxy = false;
         let mut next_arg_is_linux_audio_device_probe_path = false;
         let mut next_arg_is_pipewire_audio_prototype_path = false;
         let mut next_arg_is_pipewire_audio_native_prototype_path = false;
@@ -14802,6 +15050,17 @@ impl Args {
             } else if next_arg_is_pipewire_audio_prototype_path {
                 pipewire_audio_prototype_path = Some(PathBuf::from(arg));
                 next_arg_is_pipewire_audio_prototype_path = false;
+            } else if next_arg_is_qgs_runtime_surface_e2e_proxy {
+                let proxy = PathBuf::from(arg);
+                let original = qgs_runtime_surface_e2e_original
+                    .take()
+                    .unwrap_or_else(|| PathBuf::from(""));
+                qgs_runtime_surface_e2e_paths = Some((original, proxy));
+                next_arg_is_qgs_runtime_surface_e2e_proxy = false;
+            } else if next_arg_is_qgs_runtime_surface_e2e_original {
+                qgs_runtime_surface_e2e_original = Some(PathBuf::from(arg));
+                next_arg_is_qgs_runtime_surface_e2e_original = false;
+                next_arg_is_qgs_runtime_surface_e2e_proxy = true;
             } else if next_arg_is_qgs_presenter_monitor_boundary_proxy {
                 let proxy = PathBuf::from(arg);
                 let original = qgs_presenter_monitor_boundary_original
@@ -15198,6 +15457,8 @@ impl Args {
                 next_arg_is_qgs_session_runtime_control_original = true;
             } else if arg == QGS_PRESENTER_MONITOR_BOUNDARY_ARG {
                 next_arg_is_qgs_presenter_monitor_boundary_original = true;
+            } else if arg == QGS_RUNTIME_SURFACE_E2E_ARG {
+                next_arg_is_qgs_runtime_surface_e2e_original = true;
             } else if arg == LINUX_AUDIO_DEVICE_PROBE_ARG {
                 next_arg_is_linux_audio_device_probe_path = true;
             } else if arg == PIPEWIRE_AUDIO_PROTOTYPE_ARG {
@@ -15272,6 +15533,7 @@ impl Args {
             qgs_session_command_boundary_paths,
             qgs_session_runtime_control_paths,
             qgs_presenter_monitor_boundary_paths,
+            qgs_runtime_surface_e2e_paths,
             linux_audio_device_probe_path,
             pipewire_audio_prototype_path,
             pipewire_audio_native_prototype_path,
