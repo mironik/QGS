@@ -7211,7 +7211,9 @@ fn broadcast_runtime_contract(
     println!("Video source: proxy MP4");
     println!("Proxy AAC: not used");
     println!("Preview profile: journalist-50i-preview");
-    println!("Clock owner: future QNC application/runtime policy, not QGS UI");
+    println!(
+        "Clock policy: future QGS Broadcast Player Runtime/device backend policy; QNC applications observe and control it through session and transport commands."
+    );
     println!("Contract owner: QGS backend-neutral Broadcast Player Runtime");
     println!(
         "Session: audio_role={:?} video_role={:?} sample_clock_aware={} ui_dependent={}",
