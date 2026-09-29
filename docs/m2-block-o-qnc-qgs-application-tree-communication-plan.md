@@ -7,6 +7,12 @@ This is an architecture and planning block. It does not implement IPC, QNC UI,
 runtime behavior, Wayland/Vulkan, production PipeWire audio, export/render, or a
 new monolithic player.
 
+Update after M2 Block S: the QNC-side bridge shape is now planned in
+`docs/m2-block-s-qnc-bridge-prototype-plan.md`. Block S keeps the bridge in QNC,
+not QGS, and defines how QNC should map `PreparedInput`, private resolver
+bindings, generation-checked commands, snapshots, events, and faults into the
+QGS Broadcast Player backend surface.
+
 ## Purpose
 
 The target product shape is:

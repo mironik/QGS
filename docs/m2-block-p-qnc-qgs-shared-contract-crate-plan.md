@@ -13,6 +13,13 @@ reply, snapshot, event, fault, recovery, generation, privacy, and device-status
 fields. That implementation is intentionally not the shared
 `qnc-qgs-contract` crate, and it does not add IPC or QNC UI integration.
 
+Update after M2 Block S: the QNC-side bridge prototype plan consumes this
+planned field surface from the QNC side. The bridge remains a QNC adapter that
+maps QNC `PreparedInput`, private resolver bindings, commands, snapshots,
+events, and faults to the QGS backend shape. It is still not the shared
+`qnc-qgs-contract` crate and does not implement IPC, QNC UI integration,
+realtime playback, A/V sync, or device output.
+
 ## Purpose
 
 QNC is the application. It owns UI, forms, DB, workflow, public media identity,
