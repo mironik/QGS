@@ -48,14 +48,14 @@ use qgs_media_runtime::{
     BroadcastVideoSourceMode, FrameIdentity as PlaybackFrameIdentity, OriginalAudioTrack,
     PcmAudioBlock, PcmAudioBlockLayout, PcmAudioPacket, PcmEndian, PcmSampleFormat, PlaybackClock,
     PlaybackConfig, PlaybackState, PresentationDecision, QgsActiveRangeTiming,
-    QgsAudioOutputBackendKind, QgsAudioRepresentation, QgsBroadcastPlayerCommand,
-    QgsBroadcastPlayerCore, QgsBroadcastPlayerOperationalRuntime, QgsBroadcastPlayerSnapshot,
-    QgsBroadcastPlayerStatus, QgsBufferDiscardReason, QgsDeviceBackendSelection,
-    QgsDeviceBackendSelector, QgsDeviceSelectionPolicy, QgsFilePresenterSubmissionResult,
-    QgsFrameClock, QgsFrameClockMode, QgsFrameClockRate, QgsInputPlan,
-    QgsInputPlanQueueRequirements, QgsOperationalRuntimeConfig, QgsOperationalRuntimeSnapshot,
-    QgsOriginalProxyAssociationStatus, QgsPlaybackRepresentation, QgsPlayoutBufferLimits,
-    QgsPlayoutBufferState, QgsPreparedAudioChannel, QgsPreparedAudioLayout,
+    QgsAudioOutputBackendKind, QgsAudioRepresentation, QgsBroadcastPlayerAssembly,
+    QgsBroadcastPlayerCommand, QgsBroadcastPlayerCore, QgsBroadcastPlayerOperationalRuntime,
+    QgsBroadcastPlayerSnapshot, QgsBroadcastPlayerStatus, QgsBufferDiscardReason,
+    QgsDeviceBackendSelection, QgsDeviceBackendSelector, QgsDeviceSelectionPolicy,
+    QgsFilePresenterSubmissionResult, QgsFrameClock, QgsFrameClockMode, QgsFrameClockRate,
+    QgsInputPlan, QgsInputPlanQueueRequirements, QgsOperationalRuntimeConfig,
+    QgsOperationalRuntimeSnapshot, QgsOriginalProxyAssociationStatus, QgsPlaybackRepresentation,
+    QgsPlayoutBufferLimits, QgsPlayoutBufferState, QgsPreparedAudioChannel, QgsPreparedAudioLayout,
     QgsPreparedInputDescriptor, QgsPreparedMediaBinding, QgsPreparedSourceIdentity,
     QgsPreparedStreamLayout, QgsPreparedVideoTiming, QgsQncCommandEnvelope, QgsQncEventEnvelope,
     QgsQncMonitorProjection, QgsQncPassiveView, QgsQncPlayerCommand, QgsQncSessionCommandExecutor,
@@ -4592,21 +4592,17 @@ fn qgs_broadcast_player_run_report(
     proxy_path: &Path,
     options: QgsBroadcastPlayerRunOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let descriptor = build_qnc_prepared_input_descriptor(original_path, proxy_path)?;
-    descriptor.validate()?;
-    let plan =
-        QgsInputPlan::from_descriptor(&descriptor, default_qgs_input_plan_queue_requirements())?;
-    let active_frames = plan.video_source.duration_frames;
+    let assembly = build_qgs_broadcast_player_assembly(original_path, proxy_path)?;
+    let active_frames = assembly.active_frame_count();
     let requested_run_frames = options.frames.max(1);
     let first_run_frames = requested_run_frames.min(active_frames.saturating_sub(1));
     let seek_frame = qgs_resolve_run_seek_frame(options.seek_frame, active_frames);
     let second_run_frames = requested_run_frames.min(active_frames.saturating_sub(seek_frame + 1));
-    let mut runtime =
-        QgsBroadcastPlayerOperationalRuntime::new(plan, QgsOperationalRuntimeConfig::default())?;
+    let mut runtime = assembly.new_operational_runtime()?;
 
     match options.view {
-        QgsBroadcastPlayerRunView::Compact => print_running_runtime_compact_header(),
-        QgsBroadcastPlayerRunView::Detailed => print_running_runtime_detailed_header(),
+        QgsBroadcastPlayerRunView::Compact => print_running_runtime_compact_header(&assembly),
+        QgsBroadcastPlayerRunView::Detailed => print_running_runtime_detailed_header(&assembly),
     }
 
     let load = runtime.execute(QgsBroadcastPlayerCommand::LoadPreparedInput);
@@ -4906,8 +4902,10 @@ fn qgs_resolve_run_seek_frame(requested: Option<u64>, active_frames: u64) -> u64
     }
 }
 
-fn print_running_runtime_compact_header() {
+fn print_running_runtime_compact_header(assembly: &QgsBroadcastPlayerAssembly) {
     println!("QGS Broadcast Player Runtime");
+    println!("assembly: modular broadcast player runtime");
+    println!("modules: {}", assembly.module_labels().join(", "));
     println!("mode: ProxyPreview");
     println!("video: proxy MP4");
     println!("audio: original MXF mono lanes");
@@ -4919,10 +4917,12 @@ fn print_running_runtime_compact_header() {
     println!();
 }
 
-fn print_running_runtime_detailed_header() {
+fn print_running_runtime_detailed_header(assembly: &QgsBroadcastPlayerAssembly) {
     println!("QGS Broadcast Player Runtime");
     println!("----------------------------");
     println!("Runtime surface: running operational backend player");
+    println!("assembly: modular broadcast player runtime");
+    println!("modules: {}", assembly.module_labels().join(", "));
     println!("source: qnc://local media identity (private path hidden)");
     println!("mode: ProxyPreview");
     println!("video: proxy MP4");
@@ -5234,19 +5234,17 @@ fn qgs_broadcast_player_control_session_report(
     proxy_path: &Path,
     script: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let descriptor = build_qnc_prepared_input_descriptor(original_path, proxy_path)?;
-    descriptor.validate()?;
-    let plan =
-        QgsInputPlan::from_descriptor(&descriptor, default_qgs_input_plan_queue_requirements())?;
-    let active_frames = plan.video_source.duration_frames;
+    let assembly = build_qgs_broadcast_player_assembly(original_path, proxy_path)?;
+    let active_frames = assembly.active_frame_count();
     let commands = QgsControlSessionScriptCommand::parse_script(script)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-    let mut runtime =
-        QgsBroadcastPlayerOperationalRuntime::new(plan, QgsOperationalRuntimeConfig::default())?;
+    let mut runtime = assembly.new_operational_runtime()?;
     let mut accepted_count = 0_usize;
     let mut rejected_count = 0_usize;
 
     println!("QGS Broadcast Player Control Session");
+    println!("assembly: modular broadcast player runtime");
+    println!("modules: {}", assembly.module_labels().join(", "));
     println!("mode: ProxyPreview");
     println!("video: proxy MP4");
     println!("audio: original MXF mono lanes");
@@ -6108,6 +6106,18 @@ fn default_qgs_input_plan_queue_requirements() -> QgsInputPlanQueueRequirements 
         max_video_queue: 8,
         max_audio_queue: 8,
     }
+}
+
+fn build_qgs_broadcast_player_assembly(
+    original_path: &Path,
+    proxy_path: &Path,
+) -> Result<QgsBroadcastPlayerAssembly, Box<dyn std::error::Error>> {
+    let descriptor = build_qnc_prepared_input_descriptor(original_path, proxy_path)?;
+    descriptor.validate()?;
+    Ok(QgsBroadcastPlayerAssembly::from_prepared_descriptor(
+        &descriptor,
+        default_qgs_input_plan_queue_requirements(),
+    )?)
 }
 
 fn build_qnc_prepared_input_descriptor(

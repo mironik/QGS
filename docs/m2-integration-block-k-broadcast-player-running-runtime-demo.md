@@ -23,9 +23,15 @@ Block K builds directly on:
 - Integration Block H device backend selection.
 - Integration Block I operational runtime.
 - Integration Block J fault and recovery rules.
+- M2 Block M modular Broadcast Player assembly.
 
 It does not introduce a second player model. The demo uses the operational
 runtime methods and snapshots already established by those blocks.
+
+With Block M, the command constructs the runtime through
+`QgsBroadcastPlayerAssembly` where practical. The assembly is the composition
+root for the existing LEGO modules; it does not replace the operational runtime
+or duplicate transport/preroll/frame-clock behavior.
 
 ## Command Scenario
 
@@ -194,8 +200,8 @@ Fixed run mode shows the backend player behavior through one operator scenario.
 Control session mode shows QNC-style command control: qgs-test sends explicit
 commands such as `load`, `prepare`, `cue:0`, `play:10`, `pause`, `seek:50`,
 `stop`, and `unload`, then prints the resulting runtime snapshot after each
-command. Both modes use the same operational runtime and preserve the same
-truth boundaries.
+command. With Block M, both modes use the modular assembly to construct the
+same operational runtime and preserve the same truth boundaries.
 
 ## Sony FX6 Sample 002 Result
 

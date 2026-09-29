@@ -106,6 +106,38 @@ Forbidden:
 | Integration Block A | `session_control` orchestration around Phase 28. |
 | Integration Block B | `presenter_boundary` and monitor projection. |
 | Integration Block C | End-to-end wiring acceptance across existing modules. |
+| M2 Block M | `broadcast_player_assembly` composition root over the existing modules. |
+
+## Broadcast Player Assembly Layer
+
+M2 Block M adds `QgsBroadcastPlayerAssembly` as the visible composition root for
+the QGS Broadcast Player Runtime. This restores the broadcast engine as a
+product concept without making it a monolith.
+
+The assembly wires existing LEGO modules:
+
+- input plan
+- transport core
+- frame clock facts
+- preroll/prepared window
+- video payload provider
+- audio payload provider
+- audio device boundary
+- presenter boundary
+- device backend selection
+- fault/recovery
+- event surface
+- snapshot projection
+- session facade/control surface
+
+The assembly does not implement module internals. It constructs and connects
+modules, provides public-safe module inventory, and creates the operational
+runtime used by operator run and QNC control session commands.
+
+`qgs-test` remains CLI orchestration and printing only. Future QNC applications
+may later control the same assembled runtime through session/control surfaces,
+but QNC UI does not own QGS backend timing facts, source-mode validation,
+prepared state, or device policy.
 
 ## Current Acceptable Couplings
 

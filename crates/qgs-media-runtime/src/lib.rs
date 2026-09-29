@@ -5393,6 +5393,267 @@ impl QgsBroadcastPlayerOperationalRuntime {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QgsBroadcastPlayerAssemblyModuleKind {
+    InputPlan,
+    TransportCore,
+    FrameClock,
+    PrerollManager,
+    VideoPayloadProvider,
+    AudioPayloadProvider,
+    AudioDeviceBoundary,
+    PresenterBoundary,
+    DeviceBackendSelection,
+    FaultRecovery,
+    EventSurface,
+    SnapshotProjection,
+    SessionFacade,
+}
+
+impl QgsBroadcastPlayerAssemblyModuleKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::InputPlan => "input_plan",
+            Self::TransportCore => "transport",
+            Self::FrameClock => "frame_clock",
+            Self::PrerollManager => "preroll",
+            Self::VideoPayloadProvider => "video_payload",
+            Self::AudioPayloadProvider => "audio_payload",
+            Self::AudioDeviceBoundary => "audio_device_boundary",
+            Self::PresenterBoundary => "presenter_boundary",
+            Self::DeviceBackendSelection => "device_selection",
+            Self::FaultRecovery => "fault_recovery",
+            Self::EventSurface => "event_surface",
+            Self::SnapshotProjection => "snapshot_projection",
+            Self::SessionFacade => "session_facade",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsBroadcastPlayerAssemblyModule {
+    pub kind: QgsBroadcastPlayerAssemblyModuleKind,
+    pub owns: &'static str,
+    pub boundary: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QgsBroadcastPlayerAssemblySnapshot {
+    pub source_mode: QgsInputPlanSourceMode,
+    pub video_source_role: QgsPlaybackRepresentation,
+    pub audio_source_role: QgsAudioRepresentation,
+    pub public_video_uri: String,
+    pub public_audio_uri: String,
+    pub original_audio_authoritative: bool,
+    pub proxy_aac_authoritative: bool,
+    pub discrete_mono_lanes: bool,
+    pub private_path_exposed: bool,
+    pub device_selection: QgsDeviceBackendSelection,
+    pub modules: Vec<QgsBroadcastPlayerAssemblyModule>,
+}
+
+impl QgsBroadcastPlayerAssemblySnapshot {
+    pub fn module_labels(&self) -> Vec<&'static str> {
+        self.modules
+            .iter()
+            .map(|module| module.kind.label())
+            .collect()
+    }
+
+    pub fn exposes_private_path(&self) -> bool {
+        self.private_path_exposed
+            || qgs_projection_text_exposes_private_path(&self.public_video_uri)
+            || qgs_projection_text_exposes_private_path(&self.public_audio_uri)
+            || self.device_selection.exposes_private_path()
+    }
+}
+
+/// Composition root for the QGS Broadcast Player Runtime LEGO modules.
+///
+/// This type wires existing backend-neutral modules together. It deliberately
+/// does not implement transport state, frame-clock math, preroll policy,
+/// decode, presenter internals, audio-device internals, or QNC UI behavior.
+pub struct QgsBroadcastPlayerAssembly {
+    plan: QgsInputPlan,
+    operational_config: QgsOperationalRuntimeConfig,
+    device_policy: QgsDeviceSelectionPolicy,
+    modules: Vec<QgsBroadcastPlayerAssemblyModule>,
+}
+
+impl QgsBroadcastPlayerAssembly {
+    pub fn from_prepared_descriptor(
+        descriptor: &QgsPreparedInputDescriptor,
+        queue_requirements: QgsInputPlanQueueRequirements,
+    ) -> Result<Self, PlaybackError> {
+        let plan = QgsInputPlan::from_descriptor(descriptor, queue_requirements)?;
+        Self::from_input_plan(plan)
+    }
+
+    pub fn from_input_plan(plan: QgsInputPlan) -> Result<Self, PlaybackError> {
+        Self::with_config(
+            plan,
+            QgsOperationalRuntimeConfig::default(),
+            QgsDeviceSelectionPolicy::PreviewOnQncOs,
+        )
+    }
+
+    pub fn with_config(
+        plan: QgsInputPlan,
+        operational_config: QgsOperationalRuntimeConfig,
+        device_policy: QgsDeviceSelectionPolicy,
+    ) -> Result<Self, PlaybackError> {
+        plan.validate()?;
+        operational_config.validate()?;
+        let assembly = Self {
+            plan,
+            operational_config,
+            device_policy,
+            modules: Self::default_modules(),
+        };
+        assembly.validate_media_policy()?;
+        Ok(assembly)
+    }
+
+    pub fn input_plan(&self) -> &QgsInputPlan {
+        &self.plan
+    }
+
+    pub fn active_frame_count(&self) -> u64 {
+        self.plan.video_source.duration_frames
+    }
+
+    pub fn module_labels(&self) -> Vec<&'static str> {
+        self.modules
+            .iter()
+            .map(|module| module.kind.label())
+            .collect()
+    }
+
+    pub fn device_selection(&self) -> QgsDeviceBackendSelection {
+        QgsDeviceBackendSelector::select(self.device_policy)
+    }
+
+    pub fn new_control_core(&self) -> Result<QgsBroadcastPlayerCore, PlaybackError> {
+        QgsBroadcastPlayerCore::new(self.plan.clone())
+    }
+
+    pub fn new_operational_runtime(
+        &self,
+    ) -> Result<QgsBroadcastPlayerOperationalRuntime, PlaybackError> {
+        QgsBroadcastPlayerOperationalRuntime::new(self.plan.clone(), self.operational_config)
+    }
+
+    pub fn snapshot(&self) -> QgsBroadcastPlayerAssemblySnapshot {
+        QgsBroadcastPlayerAssemblySnapshot {
+            source_mode: self.plan.source_mode,
+            video_source_role: self.plan.video_source.representation,
+            audio_source_role: self.plan.audio_source.representation,
+            public_video_uri: self.plan.video_source.media_uri.clone(),
+            public_audio_uri: self.plan.audio_source.media_uri.clone(),
+            original_audio_authoritative: self.plan.audio_source.representation
+                == QgsAudioRepresentation::Original,
+            proxy_aac_authoritative: false,
+            discrete_mono_lanes: self.discrete_mono_lanes(),
+            private_path_exposed: false,
+            device_selection: self.device_selection(),
+            modules: self.modules.clone(),
+        }
+    }
+
+    fn validate_media_policy(&self) -> Result<(), PlaybackError> {
+        if self.plan.audio_source.representation != QgsAudioRepresentation::Original
+            || !self.discrete_mono_lanes()
+            || self.device_selection().selected_video_backend
+                == QgsVideoPresenterBackendKind::X11LegacyNonTarget
+            || self.snapshot().exposes_private_path()
+        {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        Ok(())
+    }
+
+    fn discrete_mono_lanes(&self) -> bool {
+        !self.plan.audio_source.lanes.is_empty()
+            && self
+                .plan
+                .audio_source
+                .lanes
+                .iter()
+                .all(|lane| lane.channel_index == 0)
+    }
+
+    fn default_modules() -> Vec<QgsBroadcastPlayerAssemblyModule> {
+        use QgsBroadcastPlayerAssemblyModuleKind as Kind;
+        vec![
+            QgsBroadcastPlayerAssemblyModule {
+                kind: Kind::InputPlan,
+                owns: "original/proxy media identity, source mode, public URI identity",
+                boundary: "does not own transport state or device output",
+            },
+            QgsBroadcastPlayerAssemblyModule {
+                kind: Kind::TransportCore,
+                owns: "load, prepare, cue, play, pause, seek, stop, unload",
+                boundary: "does not open media or build readiness on Play",
+            },
+            QgsBroadcastPlayerAssemblyModule {
+                kind: Kind::FrameClock,
+                owns: "logical frame progression and frame/sample mapping facts",
+                boundary: "does not claim realtime scheduling",
+            },
+            QgsBroadcastPlayerAssemblyModule {
+                kind: Kind::PrerollManager,
+                owns: "bounded prepared window and no-play-before-ready facts",
+                boundary: "does not own decode or device queues",
+            },
+            QgsBroadcastPlayerAssemblyModule {
+                kind: Kind::VideoPayloadProvider,
+                owns: "proxy preview payload status now and original-media payload status later",
+                boundary: "does not present frames to a real display",
+            },
+            QgsBroadcastPlayerAssemblyModule {
+                kind: Kind::AudioPayloadProvider,
+                owns: "authoritative original MXF mono-lane payload facts",
+                boundary: "does not use proxy AAC as runtime truth",
+            },
+            QgsBroadcastPlayerAssemblyModule {
+                kind: Kind::AudioDeviceBoundary,
+                owns: "PipeWire prototype evidence and replaceable audio boundary facts",
+                boundary: "does not claim production AudioDeviceVerified",
+            },
+            QgsBroadcastPlayerAssemblyModule {
+                kind: Kind::PresenterBoundary,
+                owns: "test/file/readback presenter diagnostics and future presenter boundary",
+                boundary: "does not claim real display output",
+            },
+            QgsBroadcastPlayerAssemblyModule {
+                kind: Kind::DeviceBackendSelection,
+                owns: "preview-qnc-os, diagnostic, headless, and future backend policy",
+                boundary: "does not implement device backends",
+            },
+            QgsBroadcastPlayerAssemblyModule {
+                kind: Kind::FaultRecovery,
+                owns: "structured runtime faults and recovery suggestions",
+                boundary: "does not silently recover",
+            },
+            QgsBroadcastPlayerAssemblyModule {
+                kind: Kind::EventSurface,
+                owns: "QNC-shaped public-safe event facts",
+                boundary: "does not expose private paths",
+            },
+            QgsBroadcastPlayerAssemblyModule {
+                kind: Kind::SnapshotProjection,
+                owns: "operator/QNC-readable passive runtime state",
+                boundary: "does not mutate runtime behavior",
+            },
+            QgsBroadcastPlayerAssemblyModule {
+                kind: Kind::SessionFacade,
+                owns: "clean control surface for qgs-test and future QNC apps",
+                boundary: "does not own module internals",
+            },
+        ]
+    }
+}
+
 fn qgs_projection_text_exposes_private_path(value: &str) -> bool {
     value.starts_with('/') || value.starts_with("file:") || value.contains("file:")
 }
@@ -8821,6 +9082,36 @@ mod tests {
             descriptor.validate(),
             Err(PlaybackError::InvalidAudioFormat)
         );
+    }
+
+    #[test]
+    fn broadcast_player_assembly_preserves_media_policy() {
+        let assembly =
+            QgsBroadcastPlayerAssembly::from_input_plan(sample_qgs_input_plan()).unwrap();
+        let snapshot = assembly.snapshot();
+
+        assert_eq!(snapshot.source_mode, QgsInputPlanSourceMode::ProxyPreview);
+        assert_eq!(snapshot.video_source_role, QgsPlaybackRepresentation::Proxy);
+        assert_eq!(snapshot.audio_source_role, QgsAudioRepresentation::Original);
+        assert!(snapshot.original_audio_authoritative);
+        assert!(!snapshot.proxy_aac_authoritative);
+        assert!(snapshot.discrete_mono_lanes);
+        assert!(!snapshot.exposes_private_path());
+        assert_ne!(
+            snapshot.device_selection.selected_video_backend,
+            QgsVideoPresenterBackendKind::X11LegacyNonTarget
+        );
+    }
+
+    #[test]
+    fn broadcast_player_assembly_creates_operational_runtime_without_private_paths() {
+        let assembly =
+            QgsBroadcastPlayerAssembly::from_input_plan(sample_qgs_input_plan()).unwrap();
+        let runtime = assembly.new_operational_runtime().unwrap();
+
+        assert!(!runtime.snapshot().exposes_private_path());
+        assert!(assembly.module_labels().contains(&"input_plan"));
+        assert!(assembly.module_labels().contains(&"session_facade"));
     }
 
     #[test]
