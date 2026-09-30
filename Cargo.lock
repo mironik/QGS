@@ -657,6 +657,9 @@ dependencies = [
 [[package]]
 name = "qgs-media-runtime"
 version = "0.1.0"
+dependencies = [
+ "qnc-qgs-contract",
+]
 
 [[package]]
 name = "qgs-mp4"
@@ -736,6 +739,18 @@ dependencies = [
  "qgs-vaapi",
  "qgs-vulkan",
 ]
+
+[[package]]
+name = "qnc-qgs-bridge"
+version = "0.1.0"
+dependencies = [
+ "qgs-media-runtime",
+ "qnc-qgs-contract",
+]
+
+[[package]]
+name = "qnc-qgs-contract"
+version = "0.1.0"
 
 [[package]]
 name = "quote"

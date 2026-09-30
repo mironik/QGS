@@ -5,3 +5,4 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+qnc-qgs-contract = { path = "../qnc-qgs-contract" }

@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub use qnc_qgs_contract;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -788,6 +790,7 @@ pub enum QgsQncPreparedInputMappingError {
     MissingOriginalAudio,
     InvalidSourceMode,
     SelectedPictureMismatch,
+    PlaybackInputMismatch,
     ProxyAudioCannotBeAuthoritative,
     NoAudioLanes,
     StereoCollapseRejected,
@@ -798,14 +801,17 @@ pub enum QgsQncPreparedInputMappingError {
     InvalidDescriptor,
 }
 
-impl std::fmt::Display for QgsQncPreparedInputMappingError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let message = match self {
+impl QgsQncPreparedInputMappingError {
+    pub const fn label(self) -> &'static str {
+        match self {
             Self::MissingPublicSourceUri => "missing public source URI",
             Self::MissingOriginalAudio => "missing authoritative original audio",
             Self::InvalidSourceMode => "invalid source mode",
             Self::SelectedPictureMismatch => {
                 "selected picture representation does not match source mode"
+            }
+            Self::PlaybackInputMismatch => {
+                "playback input does not match source mode and selected picture"
             }
             Self::ProxyAudioCannotBeAuthoritative => "proxy AAC cannot be authoritative",
             Self::NoAudioLanes => "no original audio lanes",
@@ -815,8 +821,13 @@ impl std::fmt::Display for QgsQncPreparedInputMappingError {
             Self::TimingCompatibilityUnknown => "original/proxy timing compatibility unknown",
             Self::InvalidProjectAudio => "invalid project audio",
             Self::InvalidDescriptor => "mapped QGS descriptor did not validate",
-        };
-        f.write_str(message)
+        }
+    }
+}
+
+impl std::fmt::Display for QgsQncPreparedInputMappingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
     }
 }
 
@@ -851,6 +862,9 @@ impl QgsQncPreparedInputLike {
             (QgsInputPlanSourceMode::ProxyPreview, QgsQncRepresentationLike::Proxy)
             | (QgsInputPlanSourceMode::OriginalMedia, QgsQncRepresentationLike::Original) => {}
             _ => return Err(QgsQncPreparedInputMappingError::SelectedPictureMismatch),
+        }
+        if !self.playback_input_agrees() {
+            return Err(QgsQncPreparedInputMappingError::PlaybackInputMismatch);
         }
         if self.stream_layout.audio_channels.is_empty() {
             return Err(QgsQncPreparedInputMappingError::NoAudioLanes);
@@ -976,6 +990,196 @@ impl QgsQncPreparedInputLike {
             private_path_exposed: self.private_binding.private_path_exposed,
         })
     }
+
+    pub fn exposes_private_path(&self) -> bool {
+        self.private_binding.private_path_exposed
+            || qgs_projection_text_exposes_private_path(&self.private_binding.original_binding_ref)
+            || self
+                .private_binding
+                .proxy_binding_ref
+                .as_deref()
+                .is_some_and(qgs_projection_text_exposes_private_path)
+            || qgs_projection_text_exposes_private_path(&self.source_identity.public_source_uri)
+            || qgs_projection_text_exposes_private_path(&self.source_identity.source_id)
+            || qgs_projection_text_exposes_private_path(&self.source_identity.workspace_db_uri)
+            || self
+                .source_identity
+                .original_media_id
+                .as_deref()
+                .is_some_and(qgs_projection_text_exposes_private_path)
+            || self
+                .source_identity
+                .proxy_media_id
+                .as_deref()
+                .is_some_and(qgs_projection_text_exposes_private_path)
+    }
+
+    fn playback_input_agrees(&self) -> bool {
+        let proxy_available = self.stream_layout.proxy_video.is_some();
+        match self.playback_input {
+            QgsQncPlaybackInputLike::Original => {
+                self.source_mode == QgsInputPlanSourceMode::OriginalMedia
+                    && self.selected_picture_representation == QgsQncRepresentationLike::Original
+            }
+            QgsQncPlaybackInputLike::Proxy => {
+                proxy_available
+                    && self.source_mode == QgsInputPlanSourceMode::ProxyPreview
+                    && self.selected_picture_representation == QgsQncRepresentationLike::Proxy
+            }
+            QgsQncPlaybackInputLike::ProxyIfAvailable => {
+                if proxy_available {
+                    self.source_mode == QgsInputPlanSourceMode::ProxyPreview
+                        && self.selected_picture_representation == QgsQncRepresentationLike::Proxy
+                } else {
+                    self.source_mode == QgsInputPlanSourceMode::OriginalMedia
+                        && self.selected_picture_representation
+                            == QgsQncRepresentationLike::Original
+                }
+            }
+        }
+    }
+
+    pub fn from_contract(
+        input: qnc_qgs_contract::PreparedInput,
+    ) -> Result<Self, QgsQncPreparedInputMappingError> {
+        input.validate().map_err(qgs_mapping_error_from_contract)?;
+        let bit_depth = u8::try_from(input.stream_layout.audio_bit_depth)
+            .map_err(|_| QgsQncPreparedInputMappingError::InvalidDescriptor)?;
+        let original_video = qgs_video_from_contract(input.stream_layout.original_video)?;
+        let proxy_video = input
+            .stream_layout
+            .proxy_video
+            .map(qgs_video_from_contract)
+            .transpose()?;
+        Ok(Self {
+            contract_version: input.contract_version,
+            descriptor_revision: input.descriptor_revision,
+            source_identity: QgsQncSourceIdentityLike {
+                public_source_uri: input.source_identity.public_source_uri,
+                source_id: input.source_identity.source_id,
+                workspace_db_uri: input.source_identity.workspace_db_uri,
+                original_media_id: input.source_identity.original_media_id,
+                proxy_media_id: input.source_identity.proxy_media_id,
+            },
+            private_binding: QgsQncPrivateBindingLike {
+                original_binding_ref: input.private_binding.original_binding_ref,
+                proxy_binding_ref: input.private_binding.proxy_binding_ref,
+                original_bound: input.private_binding.original_bound,
+                proxy_bound: input.private_binding.proxy_bound,
+                private_path_exposed: input.private_binding.private_path_exposed,
+            },
+            playback_input: match input.playback_input {
+                qnc_qgs_contract::PlaybackInput::Original => QgsQncPlaybackInputLike::Original,
+                qnc_qgs_contract::PlaybackInput::Proxy => QgsQncPlaybackInputLike::Proxy,
+                qnc_qgs_contract::PlaybackInput::ProxyIfAvailable => {
+                    QgsQncPlaybackInputLike::ProxyIfAvailable
+                }
+            },
+            selected_picture_representation: match input.selected_picture_representation {
+                qnc_qgs_contract::PictureRepresentation::Original => {
+                    QgsQncRepresentationLike::Original
+                }
+                qnc_qgs_contract::PictureRepresentation::Proxy => QgsQncRepresentationLike::Proxy,
+            },
+            authoritative_audio_representation: match input.authoritative_audio_representation {
+                qnc_qgs_contract::AudioRepresentation::Original => {
+                    QgsQncAudioRepresentationLike::Original
+                }
+                qnc_qgs_contract::AudioRepresentation::ProxyAac => {
+                    QgsQncAudioRepresentationLike::ProxyAac
+                }
+            },
+            source_mode: match input.source_mode {
+                qnc_qgs_contract::SourceMode::ProxyPreview => QgsInputPlanSourceMode::ProxyPreview,
+                qnc_qgs_contract::SourceMode::OriginalMedia => {
+                    QgsInputPlanSourceMode::OriginalMedia
+                }
+            },
+            active_range: input.active_range.map(|range| QgsQncFrameRangeLike {
+                start_frame: range.start_frame,
+                end_frame_exclusive: range.end_frame_exclusive,
+            }),
+            project_audio: QgsQncProjectAudioLike {
+                channels: input.project_audio.channels,
+                sample_rate_hz: input.project_audio.sample_rate_hz,
+            },
+            stream_layout: QgsQncStreamLayoutLike {
+                original_video,
+                proxy_video,
+                audio_sample_rate: input.stream_layout.audio_sample_rate,
+                audio_bit_depth: bit_depth,
+                audio_channels: input
+                    .stream_layout
+                    .audio_channels
+                    .into_iter()
+                    .map(|lane| QgsQncAudioChannelLike {
+                        lane_index: lane.lane_index,
+                        source_track_index: lane.source_track_index,
+                        source_channel_index: lane.source_channel_index,
+                        channel_kind: match lane.channel_kind {
+                            qnc_qgs_contract::ChannelKind::Mono => QgsQncAudioChannelKindLike::Mono,
+                            qnc_qgs_contract::ChannelKind::StereoCollapsed => {
+                                QgsQncAudioChannelKindLike::StereoCollapsed
+                            }
+                        },
+                        authoritative: lane.authoritative,
+                    })
+                    .collect(),
+            },
+            original_proxy_timing_compatible: input.original_proxy_timing_compatible,
+            proxy_aac_authoritative: input.proxy_aac_authoritative,
+        })
+    }
+
+    pub fn frozen_block_x_proxy_preview() -> Self {
+        Self::from_contract(qnc_qgs_contract::PreparedInput::frozen_proxy_preview())
+            .expect("block x proxy fixture")
+    }
+
+    pub fn frozen_block_x_original_media() -> Self {
+        Self::from_contract(qnc_qgs_contract::PreparedInput::frozen_original_media())
+            .expect("block x original fixture")
+    }
+}
+
+fn qgs_video_from_contract(
+    timing: qnc_qgs_contract::VideoTiming,
+) -> Result<QgsQncVideoInputLike, QgsQncPreparedInputMappingError> {
+    Ok(QgsQncVideoInputLike {
+        timebase: RationalRate::new(timing.frame_rate.numerator, timing.frame_rate.denominator)
+            .map_err(|_| QgsQncPreparedInputMappingError::InvalidDescriptor)?,
+        duration_frames: timing.duration_frames,
+        duration: timing.duration,
+    })
+}
+
+fn qgs_mapping_error_from_contract(
+    error: qnc_qgs_contract::ContractError,
+) -> QgsQncPreparedInputMappingError {
+    use qnc_qgs_contract::ContractError as Contract;
+    match error {
+        Contract::InvalidFrameRate => QgsQncPreparedInputMappingError::InvalidDescriptor,
+        Contract::InvalidProjectAudio => QgsQncPreparedInputMappingError::InvalidProjectAudio,
+        Contract::MissingPublicSourceUri => QgsQncPreparedInputMappingError::MissingPublicSourceUri,
+        Contract::MissingOriginalAudio => QgsQncPreparedInputMappingError::MissingOriginalAudio,
+        Contract::InvalidSourceMode => QgsQncPreparedInputMappingError::InvalidSourceMode,
+        Contract::SelectedPictureMismatch => {
+            QgsQncPreparedInputMappingError::SelectedPictureMismatch
+        }
+        Contract::PlaybackInputMismatch => QgsQncPreparedInputMappingError::PlaybackInputMismatch,
+        Contract::ProxyAudioCannotBeAuthoritative => {
+            QgsQncPreparedInputMappingError::ProxyAudioCannotBeAuthoritative
+        }
+        Contract::NoAudioLanes => QgsQncPreparedInputMappingError::NoAudioLanes,
+        Contract::StereoCollapseRejected => QgsQncPreparedInputMappingError::StereoCollapseRejected,
+        Contract::PrivatePathExposureRejected => {
+            QgsQncPreparedInputMappingError::PrivatePathExposureRejected
+        }
+        Contract::InvalidActiveRange => QgsQncPreparedInputMappingError::InvalidActiveRange,
+        Contract::TimingCompatibilityUnknown => {
+            QgsQncPreparedInputMappingError::TimingCompatibilityUnknown
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1011,6 +1215,15 @@ pub struct QgsInputPlanQueueRequirements {
 }
 
 impl QgsInputPlanQueueRequirements {
+    pub const fn standard() -> Self {
+        Self {
+            min_video_frames: 3,
+            min_audio_ranges: 3,
+            max_video_queue: 8,
+            max_audio_queue: 8,
+        }
+    }
+
     pub fn validate(self) -> Result<(), PlaybackError> {
         if self.min_video_frames == 0
             || self.min_audio_ranges == 0
@@ -4657,6 +4870,7 @@ pub enum QgsQncCommandPayload {
     Frame { frame: u64 },
     Play { frame_count: Option<u64> },
     Preroll { target_frame: Option<u64> },
+    PreparedInput { input: QgsQncPreparedInputLike },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4699,6 +4913,13 @@ impl QgsQncCommandRequestEnvelope {
                 .session_id
                 .as_ref()
                 .is_some_and(|session| qgs_projection_text_exposes_private_path(&session.0))
+            || match &self.payload {
+                QgsQncCommandPayload::PreparedInput { input } => input.exposes_private_path(),
+                QgsQncCommandPayload::Empty
+                | QgsQncCommandPayload::Frame { .. }
+                | QgsQncCommandPayload::Play { .. }
+                | QgsQncCommandPayload::Preroll { .. } => false,
+            }
     }
 }
 
@@ -4832,6 +5053,7 @@ pub struct QgsQncRuntimeSnapshot {
     pub prepared_window: Option<QgsQncPreparedWindowView>,
     pub video_payload_ready: bool,
     pub audio_payload_ready: bool,
+    pub transport_ready: bool,
     pub buffer_status: &'static str,
     pub device_status: QgsQncControlDeviceStatus,
     pub active_faults: Vec<QgsQncFaultRecord>,
@@ -4963,6 +5185,7 @@ pub struct QgsQncControlSurface {
     generation: QgsQncGeneration,
     next_event_sequence: u64,
     active_frame_count: u64,
+    loaded_active_range: Option<(u64, u64)>,
 }
 
 impl QgsQncControlSurface {
@@ -4976,7 +5199,13 @@ impl QgsQncControlSurface {
             generation: QgsQncGeneration(0),
             next_event_sequence: 1,
             active_frame_count: assembly.active_frame_count(),
+            loaded_active_range: None,
         })
+    }
+
+    fn prepared_active_range(&self) -> (u64, u64) {
+        self.loaded_active_range
+            .unwrap_or((0, self.active_frame_count))
     }
 
     pub const fn generation(&self) -> QgsQncGeneration {
@@ -5162,18 +5391,84 @@ impl QgsQncControlSurface {
         }
     }
 
+    fn load_prepared_input(
+        &mut self,
+        request: &QgsQncCommandRequestEnvelope,
+    ) -> QgsQncControlExecution {
+        let input = match &request.payload {
+            QgsQncCommandPayload::Empty => {
+                return self.execute_single(
+                    QgsBroadcastPlayerCommand::LoadPreparedInput,
+                    QgsQncControlEventKind::SourceLoaded,
+                );
+            }
+            QgsQncCommandPayload::PreparedInput { input } => input,
+            QgsQncCommandPayload::Frame { .. }
+            | QgsQncCommandPayload::Play { .. }
+            | QgsQncCommandPayload::Preroll { .. } => {
+                return QgsQncControlExecution::rejected(
+                    "load requires empty or prepared input payload",
+                );
+            }
+        };
+        if self.runtime.snapshot().operational_status != QgsBroadcastPlayerStatus::Empty {
+            return QgsQncControlExecution::rejected("source already loaded");
+        }
+        if input.exposes_private_path() {
+            return QgsQncControlExecution::rejected("private path exposure rejected");
+        }
+        let mapping = match input.map_to_qgs_descriptor() {
+            Ok(mapping) => mapping,
+            Err(error) => return QgsQncControlExecution::rejected(error.label()),
+        };
+        let duration_frames = mapping
+            .descriptor
+            .layout
+            .selected_video(mapping.descriptor.selected_picture)
+            .map(|timing| timing.duration_frames)
+            .unwrap_or(0);
+        if let Some(range) = mapping.active_range {
+            if range.end_frame_exclusive > duration_frames {
+                return QgsQncControlExecution::rejected(
+                    "prepared input active range exceeds source duration",
+                );
+            }
+        }
+        let assembly = match QgsBroadcastPlayerAssembly::from_prepared_descriptor(
+            &mapping.descriptor,
+            QgsInputPlanQueueRequirements::standard(),
+        ) {
+            Ok(assembly) => assembly,
+            Err(_) => {
+                return QgsQncControlExecution::rejected("mapped QGS descriptor did not validate")
+            }
+        };
+        let mut replacement = match assembly.new_operational_runtime() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                return QgsQncControlExecution::rejected("mapped QGS descriptor did not validate")
+            }
+        };
+        let loaded = replacement.execute(QgsBroadcastPlayerCommand::LoadPreparedInput);
+        if loaded.accepted {
+            self.active_frame_count = assembly.active_frame_count();
+            self.loaded_active_range = mapping
+                .active_range
+                .map(|range| (range.start_frame, range.end_frame_exclusive));
+            self.runtime = replacement;
+        }
+        QgsQncControlExecution::from_result(loaded, QgsQncControlEventKind::SourceLoaded)
+    }
+
     fn execute_control_command(
         &mut self,
         request: &QgsQncCommandRequestEnvelope,
     ) -> QgsQncControlExecution {
         match request.command {
-            QgsQncCommandKind::LoadPreparedInput => self.execute_single(
-                QgsBroadcastPlayerCommand::LoadPreparedInput,
-                QgsQncControlEventKind::SourceLoaded,
-            ),
+            QgsQncCommandKind::LoadPreparedInput => self.load_prepared_input(request),
             QgsQncCommandKind::Prepare => self.execute_single(
                 QgsBroadcastPlayerCommand::Prepare {
-                    active_range: Some((0, self.active_frame_count)),
+                    active_range: Some(self.prepared_active_range()),
                 },
                 QgsQncControlEventKind::PreparedInputAccepted,
             ),
@@ -5188,7 +5483,7 @@ impl QgsQncControlSurface {
                 let mut execution = QgsQncControlExecution::default();
                 if self.runtime.snapshot().operational_status == QgsBroadcastPlayerStatus::Paused {
                     let prepare = self.runtime.execute(QgsBroadcastPlayerCommand::Prepare {
-                        active_range: Some((0, self.active_frame_count)),
+                        active_range: Some(self.prepared_active_range()),
                     });
                     if !prepare.accepted {
                         return QgsQncControlExecution::from_result(
@@ -5386,6 +5681,7 @@ impl QgsQncControlSurface {
             prepared_window,
             video_payload_ready: player.readiness.video_payload_ready,
             audio_payload_ready: player.readiness.audio_payload_ready,
+            transport_ready: player.readiness.transport_ready,
             buffer_status,
             device_status: QgsQncControlDeviceStatus::from_player(&player.device_status),
             active_faults,
@@ -7290,6 +7586,11 @@ pub enum BroadcastRuntimeVerificationLevel {
     ContractPlanEvidence,
     DescriptorMappingEvidence,
     QncControlSurfaceShapeEvidence,
+    LiveRuntimeLoopEvidence,
+    LiveControlInputEvidence,
+    LiveDiagnosticOutputEvidence,
+    ContractCrateSkeletonEvidence,
+    InProcessBridgeEvidence,
     MediaInspected,
     PayloadExtracted,
     PayloadBound,
@@ -7328,6 +7629,11 @@ impl BroadcastRuntimeVerificationLevel {
             Self::ContractPlanEvidence => "ContractPlanEvidence",
             Self::DescriptorMappingEvidence => "DescriptorMappingEvidence",
             Self::QncControlSurfaceShapeEvidence => "QncControlSurfaceShapeEvidence",
+            Self::LiveRuntimeLoopEvidence => "LiveRuntimeLoopEvidence",
+            Self::LiveControlInputEvidence => "LiveControlInputEvidence",
+            Self::LiveDiagnosticOutputEvidence => "LiveDiagnosticOutputEvidence",
+            Self::ContractCrateSkeletonEvidence => "ContractCrateSkeletonEvidence",
+            Self::InProcessBridgeEvidence => "InProcessBridgeEvidence",
             Self::MediaInspected => "MediaInspected",
             Self::PayloadExtracted => "PayloadExtracted",
             Self::PayloadBound => "PayloadBound",
@@ -7399,6 +7705,11 @@ pub enum BroadcastRuntimeVerifiedSubsystem {
     QncQgsSharedContractCratePlan,
     QncPreparedInputToQgsDescriptorMapping,
     QncCompatibleQgsControlSurfaceShape,
+    BroadcastPlayerLiveRuntimeLoop,
+    BroadcastPlayerLiveControlInput,
+    BroadcastPlayerLiveDiagnosticOutput,
+    QncQgsSharedContractCrateSkeleton,
+    QncQgsInProcessBridgePrototype,
     SimulatedPlaybackLoop,
     RealSpeakerOutput,
     RealDisplayOutput,
@@ -7460,6 +7771,11 @@ impl BroadcastRuntimeVerifiedSubsystem {
                 "QNC PreparedInput to QGS descriptor mapping"
             }
             Self::QncCompatibleQgsControlSurfaceShape => "QNC-compatible QGS control surface shape",
+            Self::BroadcastPlayerLiveRuntimeLoop => "broadcast player live runtime loop",
+            Self::BroadcastPlayerLiveControlInput => "broadcast player live control input",
+            Self::BroadcastPlayerLiveDiagnosticOutput => "broadcast player live diagnostic output",
+            Self::QncQgsSharedContractCrateSkeleton => "QNC/QGS shared contract crate skeleton",
+            Self::QncQgsInProcessBridgePrototype => "QNC/QGS in-process bridge prototype",
             Self::SimulatedPlaybackLoop => "simulated playback loop",
             Self::RealSpeakerOutput => "real speaker output",
             Self::RealDisplayOutput => "real display output",
@@ -7675,12 +7991,37 @@ impl BroadcastRuntimeVerificationMatrix {
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::QncPreparedInputToQgsDescriptorMapping,
                     level: Level::DescriptorMappingEvidence,
-                    summary: "QGS-side QNC-like adapter types validate source identity, private binding opacity, source mode, original-audio authority, discrete mono lanes, project audio, timing compatibility, and map into QGS descriptors/input plans/assemblies without IPC, QNC UI, realtime, A/V sync, or device-output claims",
+                    summary: "QGS-side QNC-like adapter types validate source identity, private binding opacity, playback input agreement, source mode, original-audio authority, discrete mono lanes, project audio, and timing compatibility; frozen Block X fixtures map without Phase 22 descriptor synthesis, IPC, QNC UI, realtime, A/V sync, or device-output claims",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::QncCompatibleQgsControlSurfaceShape,
                     level: Level::QncControlSurfaceShapeEvidence,
                     summary: "QgsQncControlSurface accepts QNC-shaped command envelopes, echoes command ids, checks generation, rejects stale commands without mutation, returns public-safe snapshots/events/faults/recovery, and preserves device/source non-claims over existing runtime modules; no shared crate, IPC, QNC UI, realtime, A/V sync, or device-output claim was added",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::BroadcastPlayerLiveRuntimeLoop,
+                    level: Level::LiveRuntimeLoopEvidence,
+                    summary: "operator live loop ticks the existing control surface and operational runtime with a bounded logical or wall-paced preview; this is not a realtime scheduler, real display, A/V sync, or production audio-device verification",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::BroadcastPlayerLiveControlInput,
+                    level: Level::LiveControlInputEvidence,
+                    summary: "stdin pause, play, seek, status, stop, and quit go through QgsQncControlSurface with generation checks; this is not IPC, QNC UI, or a second player state machine",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::BroadcastPlayerLiveDiagnosticOutput,
+                    level: Level::LiveDiagnosticOutputEvidence,
+                    summary: "optional preview-file artifacts and original-MXF PipeWire desktop-monitor or 4-mono chunks follow the live playhead; defaults are off, proxy AAC is unused, and real display, visual verification, production routing, realtime, and A/V sync are not claimed",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::QncQgsSharedContractCrateSkeleton,
+                    level: Level::ContractCrateSkeletonEvidence,
+                    summary: "dependency-free qnc-qgs-contract holds draft prepared-input, identity, and command payload shapes; QGS maps them in-process. No IPC, QNC UI, Vulkan, PipeWire, serde, realtime, or device-output claim",
+                },
+                BroadcastRuntimeVerificationEntry {
+                    subsystem: Subsystem::QncQgsInProcessBridgePrototype,
+                    level: Level::InProcessBridgeEvidence,
+                    summary: "qnc-qgs-bridge sends contract prepared input through the QGS control surface and projects public snapshots; it does not own playback, IPC, QNC UI, decode, or device output",
                 },
                 BroadcastRuntimeVerificationEntry {
                     subsystem: Subsystem::SimulatedPlaybackLoop,
@@ -7744,6 +8085,24 @@ impl BroadcastRuntimeVerificationMatrix {
             return Err(PlaybackError::InvalidRuntimeTransition);
         }
         if level(Subsystem::TestAudioSinkEvidence)? > Level::TestBoundaryEvidence {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        if level(Subsystem::BroadcastPlayerLiveRuntimeLoop)? >= Level::RealtimeVerified {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        if level(Subsystem::BroadcastPlayerLiveControlInput)? >= Level::RealtimeVerified {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        if level(Subsystem::BroadcastPlayerLiveDiagnosticOutput)? >= Level::VisualVerified
+            || level(Subsystem::BroadcastPlayerLiveDiagnosticOutput)? >= Level::AudioDeviceVerified
+            || level(Subsystem::BroadcastPlayerLiveDiagnosticOutput)? >= Level::RealtimeVerified
+        {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        if level(Subsystem::QncQgsSharedContractCrateSkeleton)? >= Level::RealtimeVerified {
+            return Err(PlaybackError::InvalidRuntimeTransition);
+        }
+        if level(Subsystem::QncQgsInProcessBridgePrototype)? >= Level::RealtimeVerified {
             return Err(PlaybackError::InvalidRuntimeTransition);
         }
         Ok(())
@@ -10358,6 +10717,89 @@ mod tests {
     }
 
     #[test]
+    fn frozen_block_x_fixtures_map_without_phase22_descriptor_synthesis() {
+        let proxy = QgsQncPreparedInputLike::frozen_block_x_proxy_preview();
+        let original = QgsQncPreparedInputLike::frozen_block_x_original_media();
+        assert_eq!(proxy.contract_version, qnc_qgs_contract::CONTRACT_VERSION);
+        assert!(!proxy.contract_version.contains("phase22"));
+        assert_ne!(
+            proxy.source_identity.source_id,
+            sample_qgs_descriptor().identity.clip_id
+        );
+        assert_ne!(
+            proxy.source_identity.public_source_uri,
+            "qnc://local/source/clip"
+        );
+
+        let proxy_mapping = proxy.map_to_qgs_descriptor().expect("proxy fixture");
+        assert_eq!(
+            proxy_mapping.descriptor.selected_picture,
+            QgsPlaybackRepresentation::Proxy
+        );
+        assert_eq!(
+            proxy_mapping.descriptor.authoritative_audio,
+            QgsAudioRepresentation::Original
+        );
+        assert!(
+            !proxy_mapping
+                .descriptor
+                .audio_layout
+                .proxy_aac_authoritative
+        );
+        assert_eq!(proxy_mapping.descriptor.audio_layout.channels.len(), 4);
+        assert!(!proxy_mapping.private_path_exposed);
+        assert!(!proxy_mapping
+            .descriptor
+            .identity
+            .source_record_uri
+            .contains(&proxy.private_binding.original_binding_ref));
+        assert!(!proxy_mapping
+            .descriptor
+            .binding
+            .original_media_uri
+            .starts_with('/'));
+        assert_eq!(proxy_mapping.active_range.unwrap().end_frame_exclusive, 100);
+        let plan = QgsInputPlan::from_descriptor(
+            &proxy_mapping.descriptor,
+            sample_qgs_queue_requirements(),
+        )
+        .expect("proxy plan");
+        assert_eq!(plan.source_mode, QgsInputPlanSourceMode::ProxyPreview);
+        assert_eq!(
+            plan.audio_source.representation,
+            QgsAudioRepresentation::Original
+        );
+
+        let original_mapping = original.map_to_qgs_descriptor().expect("original fixture");
+        assert_eq!(
+            original_mapping.descriptor.selected_picture,
+            QgsPlaybackRepresentation::Original
+        );
+        assert_eq!(original_mapping.active_range.unwrap().start_frame, 10);
+        assert!(!original_mapping
+            .descriptor
+            .identity
+            .source_record_uri
+            .contains("opaque-original"));
+        let original_plan = QgsInputPlan::from_descriptor(
+            &original_mapping.descriptor,
+            sample_qgs_queue_requirements(),
+        )
+        .expect("original plan");
+        assert_eq!(
+            original_plan.video_source.media_uri,
+            original_plan.audio_source.media_uri
+        );
+
+        let mut mismatch = proxy;
+        mismatch.playback_input = QgsQncPlaybackInputLike::Original;
+        assert_eq!(
+            mismatch.map_to_qgs_descriptor().unwrap_err(),
+            QgsQncPreparedInputMappingError::PlaybackInputMismatch
+        );
+    }
+
+    #[test]
     fn qnc_like_mapping_rejects_proxy_aac_as_authoritative() {
         let mut input = sample_qnc_like_input();
         input.authoritative_audio_representation = QgsQncAudioRepresentationLike::ProxyAac;
@@ -12045,6 +12487,83 @@ mod tests {
             .iter()
             .any(|event| event.event_kind == QgsQncControlEventKind::SourceLoaded));
         assert!(!reply.exposes_private_path());
+    }
+
+    #[test]
+    fn load_prepared_input_payload_replaces_prebaked_plan() {
+        let mut surface = qgs_test_control_surface();
+        let input = QgsQncPreparedInputLike::frozen_block_x_original_media();
+        let reply = surface.handle_command(qgs_control_request(
+            "cmd-load-fixture",
+            &surface,
+            QgsQncCommandKind::LoadPreparedInput,
+            QgsQncCommandPayload::PreparedInput { input },
+        ));
+        assert!(reply.accepted, "{:?}", reply.rejection_reason);
+        assert_eq!(
+            reply.snapshot.public_source_uri.as_deref(),
+            Some("qnc://fixture/media/original/block-x-original-media")
+        );
+        assert_eq!(
+            reply.snapshot.source_mode,
+            Some(QgsInputPlanSourceMode::OriginalMedia)
+        );
+        assert_eq!(
+            reply.snapshot.picture_representation,
+            Some(QgsPlaybackRepresentation::Original)
+        );
+        assert!(!reply.snapshot.proxy_aac_authoritative);
+        assert!(!reply.exposes_private_path());
+        assert!(!reply
+            .snapshot
+            .public_source_uri
+            .unwrap()
+            .contains("opaque-original"));
+
+        let prepare = surface.handle_command(qgs_control_request(
+            "cmd-prepare-fixture",
+            &surface,
+            QgsQncCommandKind::Prepare,
+            QgsQncCommandPayload::Empty,
+        ));
+        assert!(prepare.accepted, "{:?}", prepare.rejection_reason);
+        assert_eq!(prepare.snapshot.active_range, Some((10, 90)));
+
+        let second = surface.handle_command(qgs_control_request(
+            "cmd-load-again",
+            &surface,
+            QgsQncCommandKind::LoadPreparedInput,
+            QgsQncCommandPayload::PreparedInput {
+                input: QgsQncPreparedInputLike::frozen_block_x_proxy_preview(),
+            },
+        ));
+        assert!(!second.accepted);
+        assert_eq!(second.rejection_reason, Some("source already loaded"));
+        assert_eq!(
+            second.snapshot.public_source_uri.as_deref(),
+            Some("qnc://fixture/media/original/block-x-original-media")
+        );
+    }
+
+    #[test]
+    fn load_prepared_input_payload_rejects_private_path_without_mutation() {
+        let mut surface = qgs_test_control_surface();
+        let before = surface.snapshot();
+        let mut input = QgsQncPreparedInputLike::frozen_block_x_proxy_preview();
+        input.private_binding.private_path_exposed = true;
+        let reply = surface.handle_command(qgs_control_request(
+            "cmd-private",
+            &surface,
+            QgsQncCommandKind::LoadPreparedInput,
+            QgsQncCommandPayload::PreparedInput { input },
+        ));
+        assert!(!reply.accepted);
+        assert_eq!(reply.generation_after, QgsQncGeneration(0));
+        assert_eq!(
+            surface.snapshot().public_source_uri,
+            before.public_source_uri
+        );
+        assert!(reply.exposes_private_path());
     }
 
     #[test]
@@ -14480,6 +14999,47 @@ mod tests {
                 .unwrap()
                 .level,
             BroadcastRuntimeVerificationLevel::RealtimeVerified
+        );
+        assert_eq!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::BroadcastPlayerLiveRuntimeLoop)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::LiveRuntimeLoopEvidence
+        );
+        assert_eq!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::BroadcastPlayerLiveControlInput)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::LiveControlInputEvidence
+        );
+        assert_eq!(
+            matrix
+                .entry(BroadcastRuntimeVerifiedSubsystem::BroadcastPlayerLiveDiagnosticOutput)
+                .unwrap()
+                .level,
+            BroadcastRuntimeVerificationLevel::LiveDiagnosticOutputEvidence
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::LiveRuntimeLoopEvidence
+                < BroadcastRuntimeVerificationLevel::RealtimeVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::LiveControlInputEvidence
+                < BroadcastRuntimeVerificationLevel::RealtimeVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::LiveDiagnosticOutputEvidence
+                < BroadcastRuntimeVerificationLevel::VisualVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::LiveDiagnosticOutputEvidence
+                < BroadcastRuntimeVerificationLevel::AudioDeviceVerified
+        );
+        assert!(
+            BroadcastRuntimeVerificationLevel::LiveDiagnosticOutputEvidence
+                < BroadcastRuntimeVerificationLevel::RealtimeVerified
         );
     }
 

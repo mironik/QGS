@@ -80,6 +80,17 @@ and what remains unimplemented.
   Broadcast Player assembly and runtime modules. This is not the shared
   contract crate, IPC, QNC UI integration, realtime playback, real display
   output, A/V sync, or production audio-device verification.
+- `LiveRuntimeLoopEvidence`: an operator live loop ticks the existing control
+  surface with a bounded logical or wall-paced preview. This is not a realtime
+  scheduler, real display output, A/V sync, or production audio-device
+  verification.
+- `LiveControlInputEvidence`: stdin pause, play, seek, status, stop, and quit
+  go through the QNC-shaped control surface. This is not IPC, QNC UI, or a
+  second player state machine.
+- `LiveDiagnosticOutputEvidence`: optional preview-file artifacts and
+  original-MXF PipeWire monitor or 4-mono chunks follow the live playhead.
+  Defaults are off. This is not real display, visual verification, production
+  routing, realtime playback, or A/V sync.
 - `ManualAudibleSignalDetectedContentUnverified`: a human detected a slight
   hum/buzz from a native PipeWire path, but recognizable original audio content
   was not confirmed. This does not verify PCM content correctness, channel
@@ -159,8 +170,13 @@ For Sony FX6 sample 002:
 | broadcast player modular runtime assembly | `AssemblySurfaceEvidence` | `QgsBroadcastPlayerAssembly` is a composition root over input planning, transport, frame-clock facts, preroll, payload providers, device selection, fault/recovery, events, snapshots, and session/control surfaces. It creates existing operational runtimes without duplicating player logic or claiming real display, realtime playback, A/V sync, or production audio-device verification. |
 | QNC broadcast engine reuse/parity audit | `ArchitectureAuditEvidence` | QNC broadcast/player contracts, behavior, backend responsibilities, UI/DB/workflow ownership, QGS equivalents, reusable concepts, non-reusable implementation areas, and remaining QGS gaps were audited after Block M. No runtime feature or device claim was added. |
 | QNC/QGS shared contract crate plan | `ContractPlanEvidence` | Future shared contract scope, versioning, source identity, prepared input descriptor, command/reply/snapshot/event/fault fields, mapping tables, ownership, and privacy rules were planned. No shared crate, IPC, runtime behavior, or device claim was added. |
-| QNC PreparedInput to QGS descriptor mapping | `DescriptorMappingEvidence` | QGS-side QNC-like adapter types validate source identity, private binding opacity, source mode, original-audio authority, discrete mono lanes, project audio, timing compatibility, and map into `QgsPreparedInputDescriptor`, `QgsInputPlan`, and `QgsBroadcastPlayerAssembly`. No IPC, QNC UI integration, realtime playback, A/V sync, or device-output claim was added. |
+| QNC PreparedInput to QGS descriptor mapping | `DescriptorMappingEvidence` | QGS-side QNC-like adapter types validate source identity, private binding opacity, playback input agreement, source mode, original-audio authority, discrete mono lanes, project audio, and timing compatibility. Frozen Block X fixtures map without Phase 22 descriptor synthesis. No IPC, QNC UI integration, realtime playback, A/V sync, or device-output claim was added. |
 | QNC-compatible QGS control surface shape | `QncControlSurfaceShapeEvidence` | `QgsQncControlSurface` accepts QNC-shaped command envelopes, echoes command ids, checks generation, rejects stale commands without mutation, returns public-safe snapshots/events/faults/recovery, and preserves device/source non-claims over existing runtime modules. No shared crate, IPC, QNC UI integration, realtime playback, A/V sync, or device-output claim was added. |
+| broadcast player live runtime loop | `LiveRuntimeLoopEvidence` | Operator live loop ticks the existing control surface and operational runtime with a bounded logical or wall-paced preview. This is not a realtime scheduler, real display, A/V sync, or production audio-device verification. |
+| broadcast player live control input | `LiveControlInputEvidence` | Stdin pause, play, seek, status, stop, and quit go through `QgsQncControlSurface` with generation checks. This is not IPC, QNC UI, or a second player state machine. |
+| broadcast player live diagnostic output | `LiveDiagnosticOutputEvidence` | Optional preview-file artifacts and original-MXF PipeWire desktop-monitor or 4-mono chunks follow the live playhead. Defaults are off, proxy AAC is unused, and real display, visual verification, production routing, realtime, and A/V sync are not claimed. |
+| QNC/QGS shared contract crate skeleton | `ContractCrateSkeletonEvidence` | Dependency-free `qnc-qgs-contract` holds draft prepared-input, identity, and command payload shapes. QGS maps them in-process. No IPC, QNC UI, Vulkan, PipeWire, serde, realtime, or device-output claim. |
+| QNC/QGS in-process bridge prototype | `InProcessBridgeEvidence` | `qnc-qgs-bridge` sends contract prepared input through the QGS control surface and projects public snapshots. `QncHostPreparedRecord` copies the QNC `PreparedInput` field subset and applies QNC picture selection. The command script covers load, prepare, cue, preroll, play, pause, seek, stop, and unload.  Passive projection maps those public facts onto monitor, timeline, wave, and status shapes: the playhead follows a confirmed carrier frame, and monitor picture waits for visual verification. Operator actions `TogglePlayPause`, `Step`, and `Cue` wait for that carrier frame. `player_view` answers the QNC client predicates: confirmed position, transport readiness, playback start, and the source frame interval. Video stays hidden. It does not own playback, IPC, QNC UI, decode, or device output. |
 | simulated playback loop | `TestBoundaryEvidence` | Prepared slots flow through test audio/video boundaries deterministically. |
 | real speaker output | `NotImplemented` | No audible speaker output, audio-device clock, or full audio playback path exists; native PipeWire buffer submission is tracked separately. |
 | real display output | `NotImplemented` | No QNC OS Wayland/Vulkan presenter, optional DRM/KMS direct-output presenter, legacy X11 compatibility presenter, swapchain, or real display presenter exists. X11 is not a QNC OS target. |
@@ -229,6 +245,15 @@ The matrix intentionally does not overstate these areas:
   modules. It is not the shared contract crate, IPC, QNC UI integration,
   realtime playback, real display output, A/V sync, or production audio-device
   verification.
+- Broadcast Player live runtime loop evidence proves a bounded operator loop
+  over the existing control surface. It is not a realtime scheduler, real
+  display output, A/V sync, or production audio-device verification.
+- Broadcast Player live control input evidence proves stdin commands go through
+  the control surface. It is not IPC, QNC UI, or a second player state machine.
+- Broadcast Player live diagnostic output evidence proves optional preview files
+  and original-MXF PipeWire chunks. It is not real display, visual verification,
+  production routing, realtime playback, or A/V sync. A covered chunk is not
+  new playback, and `submitted-monitor` is not `AudioDeviceVerified`.
 - Broadcast Player modular runtime assembly evidence proves composition and
   module ownership clarity only. It is not a monolithic player implementation,
   realtime scheduler, real display output, visual verification, A/V sync,

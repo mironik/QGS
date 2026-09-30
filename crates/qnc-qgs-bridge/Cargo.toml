@@ -1,0 +1,10 @@
+[package]
+name = "qnc-qgs-bridge"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "In-process QNC-side facade over the QGS broadcast-player control surface."
+
+[dependencies]
+qnc-qgs-contract = { path = "../qnc-qgs-contract" }
+qgs-media-runtime = { path = "../qgs-media-runtime" }

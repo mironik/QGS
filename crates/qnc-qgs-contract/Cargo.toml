@@ -1,0 +1,8 @@
+[package]
+name = "qnc-qgs-contract"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "Draft QNC/QGS broadcast-player contract types. No backend dependencies."
+
+[dependencies]

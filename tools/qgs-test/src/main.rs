@@ -156,6 +156,7 @@ const PIPEWIRE_AUDIO_DISCRETE_4MONO_ARG: &str = "--pipewire-audio-discrete-4mono
 const QNC_PREPARED_INPUT_DESCRIPTOR_ARG: &str = "--qnc-prepared-input-descriptor";
 const QGS_INPUT_PLAN_ARG: &str = "--qgs-input-plan";
 const QGS_QNC_PREPARED_INPUT_MAPPING_ARG: &str = "--qgs-qnc-prepared-input-mapping";
+const QGS_QNC_PREPARED_INPUT_FIXTURE_ARG: &str = "--qgs-qnc-prepared-input-fixture";
 const QGS_TRANSPORT_ENGINE_PARITY_ARG: &str = "--qgs-transport-engine-parity";
 const QGS_FRAME_CLOCK_PARITY_ARG: &str = "--qgs-frame-clock-parity";
 const QGS_PLAYOUT_BUFFER_TICK_ARG: &str = "--qgs-playout-buffer-tick";
@@ -317,6 +318,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some((original, proxy)) = args.qgs_qnc_prepared_input_mapping_paths {
         return qgs_qnc_prepared_input_mapping_report(&original, &proxy);
+    }
+    if let Some(fixture) = args.qgs_qnc_prepared_input_fixture.as_deref() {
+        return qgs_qnc_prepared_input_fixture_report(fixture);
     }
     if let Some((original, proxy)) = args.qgs_input_plan_paths {
         return qgs_input_plan_report(&original, &proxy);
@@ -1893,6 +1897,79 @@ fn qgs_input_plan_report(
     println!("  A/V sync: no");
 
     descriptor_validation?;
+    Ok(())
+}
+
+fn qgs_qnc_prepared_input_fixture_report(
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let input = match name {
+        "proxy-preview" => QgsQncPreparedInputLike::frozen_block_x_proxy_preview(),
+        "original-media" => QgsQncPreparedInputLike::frozen_block_x_original_media(),
+        _ => {
+            return Err(
+                "fixture expects proxy-preview or original-media, not a media path".into(),
+            );
+        }
+    };
+    let mapping = input.map_to_qgs_descriptor()?;
+    let plan = QgsInputPlan::from_descriptor(
+        &mapping.descriptor,
+        default_qgs_input_plan_queue_requirements(),
+    )?;
+    let public_text = format!(
+        "{} {} {} {}",
+        mapping.descriptor.identity.source_record_uri,
+        mapping.descriptor.identity.workspace_db_uri,
+        mapping.descriptor.binding.original_media_uri,
+        mapping.descriptor.binding.proxy_media_uri.as_deref().unwrap_or("")
+    );
+    println!("QGS QNC PreparedInput Fixture");
+    println!("-----------------------------");
+    println!("Fixture: {name}");
+    println!(
+        "Shared contract: {} {}",
+        qgs_media_runtime::qnc_qgs_contract::CONTRACT_NAME,
+        qgs_media_runtime::qnc_qgs_contract::CONTRACT_VERSION
+    );
+    println!("Derived from Phase 22 descriptor: no");
+    println!("Playback input: {:?}", input.playback_input);
+    println!("Source mode: {:?}", plan.source_mode);
+    println!(
+        "Selected picture: {:?}",
+        mapping.descriptor.selected_picture
+    );
+    println!(
+        "Authoritative audio: {:?}",
+        mapping.descriptor.authoritative_audio
+    );
+    println!(
+        "Proxy AAC authoritative: {}",
+        yes_no(mapping.descriptor.audio_layout.proxy_aac_authoritative)
+    );
+    println!(
+        "Original audio lanes: {}",
+        mapping.descriptor.audio_layout.channels.len()
+    );
+    println!(
+        "Active range: {}",
+        mapping
+            .active_range
+            .map(|range| format!("{}..{}", range.start_frame, range.end_frame_exclusive))
+            .unwrap_or_else(|| "none".to_string())
+    );
+    println!(
+        "Private binding ref in public output: {}",
+        yes_no(public_text.contains(&input.private_binding.original_binding_ref))
+    );
+    println!(
+        "Private path exposed: {}",
+        yes_no(mapping.private_path_exposed || public_text.starts_with('/') || public_text.contains("file:"))
+    );
+    println!("Realtime: no");
+    println!("A/V sync: no");
+    println!("Real display: no");
+    println!("Production audio: no");
     Ok(())
 }
 
@@ -4805,6 +4882,7 @@ impl QgsBroadcastPlayerLiveVideoOutputMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QgsBroadcastPlayerLiveAudioOutputMode {
     None,
+    PipeWireDesktopMonitor,
     PipeWireMonitor,
     PipeWire4Mono,
 }
@@ -4813,18 +4891,78 @@ impl QgsBroadcastPlayerLiveAudioOutputMode {
     fn parse(value: &std::ffi::OsStr) -> Result<Self, &'static str> {
         match value.to_string_lossy().as_ref() {
             "none" => Ok(Self::None),
+            "pipewire-desktop-monitor" => Ok(Self::PipeWireDesktopMonitor),
             "pipewire-monitor" => Ok(Self::PipeWireMonitor),
             "pipewire-4mono" => Ok(Self::PipeWire4Mono),
-            _ => Err("expects none, pipewire-monitor, or pipewire-4mono"),
+            _ => Err("expects none, pipewire-desktop-monitor, pipewire-monitor, or pipewire-4mono"),
         }
     }
 
     const fn label(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::PipeWireMonitor => "pipewire-monitor",
+            Self::PipeWireDesktopMonitor => "pipewire-desktop-monitor",
+            Self::PipeWireMonitor => "pipewire-desktop-monitor",
             Self::PipeWire4Mono => "pipewire-4mono",
         }
+    }
+
+    const fn output_channels(self) -> &'static [u16] {
+        match self {
+            Self::None => &[],
+            Self::PipeWireDesktopMonitor | Self::PipeWireMonitor => &[3, 0],
+            Self::PipeWire4Mono => &[0, 1, 2, 3],
+        }
+    }
+
+    const fn submitted_label(self) -> &'static str {
+        match self {
+            Self::None => "off",
+            Self::PipeWireDesktopMonitor | Self::PipeWireMonitor => "submitted-monitor",
+            Self::PipeWire4Mono => "submitted-4mono",
+        }
+    }
+}
+
+/// Cursor for live PipeWire chunks. A submitted range stays covered until seek,
+/// stop, or a new source resets it. Skipping a covered range is not playback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QgsLiveAudioCoverage {
+    covered_until_sample: u64,
+    submitted: bool,
+}
+
+impl QgsLiveAudioCoverage {
+    const fn new() -> Self {
+        Self {
+            covered_until_sample: 0,
+            submitted: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.covered_until_sample = 0;
+    }
+
+    fn skip_label(&self, start_sample: u64) -> Option<&'static str> {
+        if start_sample < self.covered_until_sample {
+            Some(if self.submitted { "covered" } else { "pending" })
+        } else {
+            None
+        }
+    }
+
+    fn next_submit_start(&self, start_sample: u64) -> Option<u64> {
+        if start_sample < self.covered_until_sample {
+            None
+        } else {
+            Some(start_sample)
+        }
+    }
+
+    fn mark_submitted(&mut self, start_sample: u64, sample_count: u64) {
+        self.submitted = true;
+        self.covered_until_sample = start_sample.saturating_add(sample_count);
     }
 }
 
@@ -4853,10 +4991,10 @@ impl Default for QgsBroadcastPlayerLiveOptions {
             view: QgsBroadcastPlayerRunView::Compact,
             pace: QgsBroadcastPlayerLivePace::Logical,
             no_interactive: false,
-            video_output: QgsBroadcastPlayerLiveVideoOutputMode::PreviewFiles,
+            video_output: QgsBroadcastPlayerLiveVideoOutputMode::None,
             audio_output: QgsBroadcastPlayerLiveAudioOutputMode::None,
             output_dir: PathBuf::from("target/qgs-live-preview"),
-            preview_every: 5,
+            preview_every: 100,
         }
     }
 }
@@ -4928,9 +5066,10 @@ struct QgsLiveAudioOutput {
     original_path: PathBuf,
     index: PcmAudioIndex,
     sample_rate: u32,
+    source_total_samples: u64,
     mode: QgsBroadcastPlayerLiveAudioOutputMode,
     preview_every: u64,
-    submitted: bool,
+    coverage: QgsLiveAudioCoverage,
     submissions: u64,
     bytes_copied: usize,
 }
@@ -4969,7 +5108,8 @@ impl QgsLiveOutputCoordinator {
         };
         let audio = match options.audio_output {
             QgsBroadcastPlayerLiveAudioOutputMode::None => None,
-            QgsBroadcastPlayerLiveAudioOutputMode::PipeWireMonitor
+            QgsBroadcastPlayerLiveAudioOutputMode::PipeWireDesktopMonitor
+            | QgsBroadcastPlayerLiveAudioOutputMode::PipeWireMonitor
             | QgsBroadcastPlayerLiveAudioOutputMode::PipeWire4Mono => {
                 Some(QgsLiveAudioOutput::new(
                     original_path,
@@ -4987,6 +5127,20 @@ impl QgsLiveOutputCoordinator {
         snapshot: &QgsQncRuntimeSnapshot,
         source_timebase: RationalRate,
     ) -> QgsLiveOutputTickResult {
+        if snapshot.status != QgsBroadcastPlayerStatus::Playing {
+            return QgsLiveOutputTickResult {
+                video_status: if self.video.is_some() {
+                    "paused"
+                } else {
+                    "off"
+                },
+                audio_status: if self.audio.is_some() {
+                    "paused"
+                } else {
+                    "off"
+                },
+            };
+        }
         let video_status = self
             .video
             .as_mut()
@@ -5005,7 +5159,7 @@ impl QgsLiveOutputCoordinator {
 
     fn video_label(&self) -> &'static str {
         if self.video.is_some() {
-            "preview-files"
+            "diagnostic preview files"
         } else {
             "none"
         }
@@ -5022,8 +5176,16 @@ impl QgsLiveOutputCoordinator {
         self.video.as_ref().map(|video| video.output_dir.as_path())
     }
 
+    fn reset_audio_coverage(&mut self) {
+        if let Some(audio) = self.audio.as_mut() {
+            audio.coverage.reset();
+        }
+    }
+
     fn audio_submitted(&self) -> bool {
-        self.audio.as_ref().is_some_and(|audio| audio.submitted)
+        self.audio
+            .as_ref()
+            .is_some_and(|audio| audio.coverage.submitted)
     }
 
     fn audio_submissions(&self) -> u64 {
@@ -5079,7 +5241,7 @@ impl QgsLivePreviewFileOutput {
         match self.write_frame_artifacts(frame, snapshot, source_timebase, &readback) {
             Ok(()) => {
                 self.output_index = self.output_index.saturating_add(1);
-                "written"
+                "diagnostic-written"
             }
             Err(_) => "failed",
         }
@@ -5162,76 +5324,100 @@ impl QgsLiveAudioOutput {
             .filter(|track| track.kind == TrackKind::Audio)
             .collect::<Vec<_>>();
         let source_format = original_linux_pcm_audio_format(&audio_tracks)?;
+        let source_total_samples = audio_audit_total_samples_from_index(&index)?;
         Ok(Self {
             original_path: original_path.to_path_buf(),
             index,
             sample_rate: source_format.sample_rate,
+            source_total_samples,
             mode,
             preview_every: preview_every.max(1),
-            submitted: false,
+            coverage: QgsLiveAudioCoverage::new(),
             submissions: 0,
             bytes_copied: 0,
         })
     }
 
     fn emit(&mut self, tick: u64, snapshot: &QgsQncRuntimeSnapshot) -> &'static str {
-        if !tick.is_multiple_of(self.preview_every) {
+        let emit_every = match self.mode {
+            QgsBroadcastPlayerLiveAudioOutputMode::PipeWireDesktopMonitor
+            | QgsBroadcastPlayerLiveAudioOutputMode::PipeWireMonitor => 25,
+            QgsBroadcastPlayerLiveAudioOutputMode::PipeWire4Mono => self.preview_every,
+            QgsBroadcastPlayerLiveAudioOutputMode::None => 1,
+        };
+        if !tick.is_multiple_of(emit_every.max(1)) {
             return "skipped";
         }
         let Some((start_sample, end_sample)) = snapshot.current_audio_sample_range else {
             return "missing-range";
         };
         let per_frame_samples = end_sample.saturating_sub(start_sample).max(1);
-        let audio_frames_per_chunk = self
-            .preview_every
-            .min(QGS_BROADCAST_PLAYER_LIVE_AUDIO_MAX_FRAMES_PER_CHUNK)
-            .max(1);
-        let sample_count = match per_frame_samples.checked_mul(audio_frames_per_chunk) {
+        if self.coverage.next_submit_start(start_sample).is_none() {
+            return self.coverage.skip_label(start_sample).unwrap_or("pending");
+        }
+        let audio_frames_per_chunk = match self.mode {
+            QgsBroadcastPlayerLiveAudioOutputMode::PipeWireDesktopMonitor
+            | QgsBroadcastPlayerLiveAudioOutputMode::PipeWireMonitor => 25,
+            QgsBroadcastPlayerLiveAudioOutputMode::PipeWire4Mono => self
+                .preview_every
+                .min(QGS_BROADCAST_PLAYER_LIVE_AUDIO_MAX_FRAMES_PER_CHUNK)
+                .max(1),
+            QgsBroadcastPlayerLiveAudioOutputMode::None => 0,
+        };
+        let mut sample_count = match per_frame_samples.checked_mul(audio_frames_per_chunk) {
             Some(value) => value,
             None => return "failed",
         };
-        let buffer = match self.build_buffer(start_sample, sample_count) {
-            Ok(buffer) => buffer,
+        if sample_count == 0 {
+            return "off";
+        }
+        if let Some(remaining) = self.source_total_samples.checked_sub(start_sample) {
+            sample_count = sample_count.min(remaining);
+        } else {
+            return "missing-range";
+        }
+        let samples_per_buffer = match u32::try_from(per_frame_samples) {
+            Ok(value) => value,
             Err(_) => return "failed",
         };
-        let output_frames = match u32::try_from(sample_count) {
-            Ok(value) => value,
+        let buffers = match self.build_buffers(start_sample, sample_count, samples_per_buffer) {
+            Ok(buffer) => buffer,
             Err(_) => return "failed",
         };
         let stream_format = PipeWireStreamFormat {
             sample_rate: self.sample_rate,
-            channels: 4,
+            channels: u32::try_from(self.mode.output_channels().len()).unwrap_or(0),
             sample_format: PipeWireAudioSampleFormat::F32Interleaved,
         };
         match submit_native_pipewire_buffers(
             stream_format,
-            vec![buffer],
-            output_frames,
-            Duration::from_secs(2),
+            buffers,
+            samples_per_buffer,
+            Duration::from_secs(5),
         ) {
             Ok(report) if report.buffer_submitted => {
-                self.submitted = true;
                 self.submissions = self.submissions.saturating_add(1);
                 self.bytes_copied = self.bytes_copied.saturating_add(report.bytes_copied);
-                if self.mode == QgsBroadcastPlayerLiveAudioOutputMode::PipeWireMonitor {
-                    "submitted-monitor"
-                } else {
-                    "submitted-4mono"
-                }
+                self.coverage.mark_submitted(start_sample, sample_count);
+                self.mode.submitted_label()
             }
             Ok(_) => "not-submitted",
             Err(_) => "failed",
         }
     }
 
-    fn build_buffer(
+    fn build_buffers(
         &self,
         start_sample: u64,
         sample_count: u64,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        samples_per_buffer: u32,
+    ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
         let end_sample = start_sample
             .checked_add(sample_count)
             .ok_or("live audio sample range overflow")?;
+        if samples_per_buffer == 0 || sample_count % u64::from(samples_per_buffer) != 0 {
+            return Err("live audio output range must align to PCM block size".into());
+        }
         let blocks = build_original_pcm_blocks_from_index_range(
             &self.original_path,
             &self.index,
@@ -5239,14 +5425,25 @@ impl QgsLiveAudioOutput {
             end_sample,
         )?;
         let track_groups = original_pcm_blocks_by_channel(&blocks, self.sample_rate)?;
-        let channels = [0_u16, 1, 2, 3];
-        build_audio_audit_f32_interleaved_range(
-            &track_groups,
-            &channels,
-            self.sample_rate,
-            start_sample,
-            u32::try_from(sample_count)?,
-        )
+        let mut buffers = Vec::new();
+        let buffer_count = sample_count / u64::from(samples_per_buffer);
+        for buffer_index in 0..buffer_count {
+            let buffer_start = start_sample
+                .checked_add(
+                    buffer_index
+                        .checked_mul(u64::from(samples_per_buffer))
+                        .ok_or("live audio buffer start overflow")?,
+                )
+                .ok_or("live audio buffer start overflow")?;
+            buffers.push(build_audio_audit_f32_interleaved_range(
+                &track_groups,
+                self.mode.output_channels(),
+                self.sample_rate,
+                buffer_start,
+                samples_per_buffer,
+            )?);
+        }
+        Ok(buffers)
     }
 }
 
@@ -5601,6 +5798,7 @@ fn qgs_broadcast_player_live_report(
     proxy_path: &Path,
     options: QgsBroadcastPlayerLiveOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    qgs_live_apply_quiet_backend_environment(&options);
     let assembly = build_qgs_broadcast_player_assembly(original_path, proxy_path)?;
     let active_frames = assembly.active_frame_count();
     if active_frames == 0 {
@@ -5750,6 +5948,7 @@ fn qgs_broadcast_player_live_report(
                 if let Some(reason) = qgs_live_process_input_command(
                     &line,
                     &mut surface,
+                    &mut live_outputs,
                     source_timebase,
                     active_frames,
                     options.view,
@@ -5807,6 +6006,9 @@ fn qgs_broadcast_player_live_report(
                     QgsQncCommandPayload::Frame { frame: target },
                 );
                 qgs_live_count_reply(&seek, &mut accepted, &mut rejected, &mut projected_events);
+                if seek.accepted {
+                    live_outputs.reset_audio_coverage();
+                }
                 let prepare_after_seek = qgs_live_send(
                     &mut surface,
                     &mut command_ordinal,
@@ -5909,6 +6111,9 @@ fn qgs_broadcast_player_live_report(
         QgsQncCommandPayload::Empty,
     );
     qgs_live_count_reply(&stop, &mut accepted, &mut rejected, &mut projected_events);
+    if stop.accepted {
+        live_outputs.reset_audio_coverage();
+    }
     match options.view {
         QgsBroadcastPlayerRunView::Compact => {
             println!();
@@ -5988,6 +6193,18 @@ fn qgs_broadcast_player_live_report(
     Ok(())
 }
 
+fn qgs_live_apply_quiet_backend_environment(options: &QgsBroadcastPlayerLiveOptions) {
+    if options.video_output != QgsBroadcastPlayerLiveVideoOutputMode::PreviewFiles {
+        return;
+    }
+    if std::env::var_os("LIBVA_MESSAGING_LEVEL").is_none() {
+        std::env::set_var("LIBVA_MESSAGING_LEVEL", "1");
+    }
+    if std::env::var_os("MESA_DEBUG").is_none() {
+        std::env::set_var("MESA_DEBUG", "silent");
+    }
+}
+
 fn qgs_live_spawn_input_thread(enabled: bool) -> Option<mpsc::Receiver<String>> {
     if !enabled {
         return None;
@@ -6009,6 +6226,7 @@ fn qgs_live_spawn_input_thread(enabled: bool) -> Option<mpsc::Receiver<String>> 
 fn qgs_live_process_input_command(
     line: &str,
     surface: &mut QgsQncControlSurface,
+    live_outputs: &mut QgsLiveOutputCoordinator,
     source_timebase: RationalRate,
     active_frames: u64,
     view: QgsBroadcastPlayerRunView,
@@ -6072,6 +6290,9 @@ fn qgs_live_process_input_command(
                 QgsQncCommandPayload::Frame { frame: target },
             );
             qgs_live_count_reply(&seek, accepted, rejected, projected_events);
+            if seek.accepted {
+                live_outputs.reset_audio_coverage();
+            }
             let prepare = qgs_live_send(
                 surface,
                 command_ordinal,
@@ -6152,6 +6373,7 @@ fn qgs_live_process_input_command(
             qgs_live_count_reply(&reply, accepted, rejected, projected_events);
             if reply.accepted {
                 *live_ticking = false;
+                live_outputs.reset_audio_coverage();
             }
             qgs_live_print_control_reply("STOP", &reply, view, source_timebase);
         }
@@ -6295,9 +6517,14 @@ fn print_broadcast_player_live_compact_header(
     println!("mode: ProxyPreview");
     let video_target = outputs
         .video_output_dir()
-        .map(|path| format!("{} / latest.ppm", path.display()))
+        .map(|path| {
+            format!(
+                "diagnostic preview files -> {} / latest.ppm",
+                path.display()
+            )
+        })
         .unwrap_or_else(|| "none".to_string());
-    println!("video: proxy MP4 -> {video_target}");
+    println!("video: {video_target}");
     println!(
         "audio: original MXF mono lanes -> {}",
         outputs.audio_label()
@@ -6339,6 +6566,7 @@ fn print_broadcast_player_live_detailed_header(
     println!("modules: {}", assembly.module_labels().join(", "));
     println!("mode: ProxyPreview");
     println!("video: proxy MP4");
+    println!("video output meaning: diagnostic only unless preview-window is implemented");
     println!("audio: original MXF discrete mono lanes");
     println!("video output mode: {}", options.video_output.label());
     if let Some(output_dir) = outputs.video_output_dir() {
@@ -6408,7 +6636,7 @@ fn print_broadcast_player_live_compact_tick(
     output: &QgsLiveOutputTickResult,
 ) {
     println!(
-        "tick={tick:06} frame={:<4} t={} audio={:<18} window={:<9} buffer={} video_out={} audio_out={}",
+        "tick={tick:06} frame={:<4} t={} audio={:<18} window={:<9} buffer={} video={} audio={}",
         qgs_optional_u64_label(snapshot.current_frame),
         qgs_live_snapshot_media_time_label(snapshot, source_timebase),
         qgs_optional_sample_range_label(snapshot.current_audio_sample_range),
@@ -19206,6 +19434,7 @@ struct Args {
     broadcast_player_runtime_verification_paths: Option<(PathBuf, PathBuf)>,
     qnc_prepared_input_descriptor_paths: Option<(PathBuf, PathBuf)>,
     qgs_qnc_prepared_input_mapping_paths: Option<(PathBuf, PathBuf)>,
+    qgs_qnc_prepared_input_fixture: Option<String>,
     qgs_input_plan_paths: Option<(PathBuf, PathBuf)>,
     qgs_transport_engine_parity_paths: Option<(PathBuf, PathBuf)>,
     qgs_frame_clock_parity_paths: Option<(PathBuf, PathBuf)>,
@@ -19298,6 +19527,7 @@ impl Args {
         let mut qnc_prepared_input_descriptor_paths = None;
         let mut qgs_qnc_prepared_input_mapping_original = None;
         let mut qgs_qnc_prepared_input_mapping_paths = None;
+        let mut qgs_qnc_prepared_input_fixture = None;
         let mut qgs_input_plan_original = None;
         let mut qgs_input_plan_paths = None;
         let mut qgs_transport_engine_parity_original = None;
@@ -19400,6 +19630,7 @@ impl Args {
         let mut next_arg_is_qnc_prepared_input_descriptor_proxy = false;
         let mut next_arg_is_qgs_qnc_prepared_input_mapping_original = false;
         let mut next_arg_is_qgs_qnc_prepared_input_mapping_proxy = false;
+        let mut next_arg_is_qgs_qnc_prepared_input_fixture = false;
         let mut next_arg_is_qgs_input_plan_original = false;
         let mut next_arg_is_qgs_input_plan_proxy = false;
         let mut next_arg_is_qgs_transport_engine_parity_original = false;
@@ -19840,6 +20071,9 @@ impl Args {
                     .unwrap_or_else(|| PathBuf::from(""));
                 qgs_qnc_prepared_input_mapping_paths = Some((original, proxy));
                 next_arg_is_qgs_qnc_prepared_input_mapping_proxy = false;
+            } else if next_arg_is_qgs_qnc_prepared_input_fixture {
+                qgs_qnc_prepared_input_fixture = Some(arg.to_string_lossy().into_owned());
+                next_arg_is_qgs_qnc_prepared_input_fixture = false;
             } else if next_arg_is_qgs_qnc_prepared_input_mapping_original {
                 qgs_qnc_prepared_input_mapping_original = Some(PathBuf::from(arg));
                 next_arg_is_qgs_qnc_prepared_input_mapping_original = false;
@@ -20114,6 +20348,8 @@ impl Args {
                 next_arg_is_qnc_prepared_input_descriptor_original = true;
             } else if arg == QGS_QNC_PREPARED_INPUT_MAPPING_ARG {
                 next_arg_is_qgs_qnc_prepared_input_mapping_original = true;
+            } else if arg == QGS_QNC_PREPARED_INPUT_FIXTURE_ARG {
+                next_arg_is_qgs_qnc_prepared_input_fixture = true;
             } else if arg == QGS_INPUT_PLAN_ARG {
                 next_arg_is_qgs_input_plan_original = true;
             } else if arg == QGS_TRANSPORT_ENGINE_PARITY_ARG {
@@ -20244,6 +20480,7 @@ impl Args {
             broadcast_player_runtime_verification_paths,
             qnc_prepared_input_descriptor_paths,
             qgs_qnc_prepared_input_mapping_paths,
+            qgs_qnc_prepared_input_fixture,
             qgs_input_plan_paths,
             qgs_transport_engine_parity_paths,
             qgs_frame_clock_parity_paths,
@@ -20344,7 +20581,7 @@ mod tests {
         qgs_running_runtime_persistent_warning_lines, repeated_smoke_test_buffers,
         rgba_u16_to_ppm_p6_rgb8, rgba_u16_to_rgb8_bytes, runtime_audio_payload_evidence_label,
         sanitized_source_stem, selected_proxy_ordinals, smoke_test_buffer_count,
-        ManualAudibleConfirmation, QgsBroadcastPlayerLiveAudioOutputMode,
+        ManualAudibleConfirmation, QgsBroadcastPlayerLiveAudioOutputMode, QgsLiveAudioCoverage,
         QgsBroadcastPlayerLiveInputCommand, QgsBroadcastPlayerLiveOptions,
         QgsBroadcastPlayerLivePace, QgsBroadcastPlayerLiveVideoOutputMode,
         QgsBroadcastPlayerRunView, QgsControlSessionScriptCommand, SonyXmlSummary,
@@ -20534,13 +20771,13 @@ mod tests {
         assert!(!options.no_interactive);
         assert_eq!(
             options.video_output,
-            QgsBroadcastPlayerLiveVideoOutputMode::PreviewFiles
+            QgsBroadcastPlayerLiveVideoOutputMode::None
         );
         assert_eq!(
             options.audio_output,
             QgsBroadcastPlayerLiveAudioOutputMode::None
         );
-        assert_eq!(options.preview_every, 5);
+        assert_eq!(options.preview_every, 100);
     }
 
     #[test]
@@ -20552,6 +20789,12 @@ mod tests {
         assert_eq!(
             QgsBroadcastPlayerLiveVideoOutputMode::parse(std::ffi::OsStr::new("preview-files")),
             Ok(QgsBroadcastPlayerLiveVideoOutputMode::PreviewFiles)
+        );
+        assert_eq!(
+            QgsBroadcastPlayerLiveAudioOutputMode::parse(std::ffi::OsStr::new(
+                "pipewire-desktop-monitor"
+            )),
+            Ok(QgsBroadcastPlayerLiveAudioOutputMode::PipeWireDesktopMonitor)
         );
         assert_eq!(
             QgsBroadcastPlayerLiveAudioOutputMode::parse(std::ffi::OsStr::new("pipewire-monitor")),
@@ -20566,6 +20809,21 @@ mod tests {
             QgsBroadcastPlayerLiveAudioOutputMode::parse(std::ffi::OsStr::new("proxy-aac"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn live_audio_coverage_resubmits_from_the_new_range_after_seek_reset() {
+        let mut coverage = QgsLiveAudioCoverage::new();
+        assert_eq!(coverage.next_submit_start(0), Some(0));
+        coverage.mark_submitted(0, 24_000);
+        assert_eq!(coverage.next_submit_start(960), None);
+        assert_eq!(coverage.skip_label(960), Some("covered"));
+        assert_ne!(coverage.skip_label(0), Some("playing"));
+        coverage.reset();
+        assert_eq!(coverage.covered_until_sample, 0);
+        assert_eq!(coverage.next_submit_start(0), Some(0));
+        assert_eq!(coverage.skip_label(0), None);
+        assert!(coverage.submitted);
     }
 
     #[test]
@@ -20601,6 +20859,7 @@ mod tests {
             }),
             video_payload_ready: true,
             audio_payload_ready: true,
+            transport_ready: true,
             buffer_status: "ready",
             device_status: QgsQncControlDeviceStatus {
                 device_policy: "preview-qnc-os",
