@@ -13,7 +13,13 @@ use qgs_audio_pipewire::{
     submit_native_pipewire_buffers, MonoS24LeTrack, PipeWireAudioSampleFormat,
     PipeWireStreamFormat,
 };
+use qgs_broadcast_player::{
+    AudioOutputMode, LiveOutputCoordinator, LiveOutputTickResult, LiveVideoOutputMode,
+};
 use qgs_core::{BackendDecodedSurface, DecoderBackend, DeviceDiscovery, VideoCapabilityDiscovery};
+use qgs_h264_422p10::{
+    H264422P10Decoder, H264422P10Frame, H264422P10PictureDecodeError, H264422P10Profile,
+};
 use qgs_linux::{
     connect_socket, default_socket_path, inspect_native_pipewire_stream_boundary,
     probe_linux_audio_device_boundary, receive_message, receive_message_with_attachments,
@@ -113,6 +119,7 @@ const HASWELL_VIDEO_DIAGNOSTIC_ARG: &str = "--haswell-video-diagnostic";
 const MXF_INSPECT_ARG: &str = "--mxf-inspect";
 const SOFTWARE_DECODE_MXF_ARG: &str = "--software-decode-mxf";
 const SOFTWARE_GPU_MXF_ARG: &str = "--software-gpu-mxf";
+const NATIVE_ORIGINAL_VIDEO_DECODE_ARG: &str = "--native-original-video-decode";
 const PROXY_PROOF_ARG: &str = "--proxy-proof";
 const PROXY_THROUGHPUT_ARG: &str = "--proxy-throughput";
 const PROXY_PLAYBACK_ARG: &str = "--proxy-playback";
@@ -186,7 +193,6 @@ const QGS_BROADCAST_PLAYER_LIVE_VIDEO_OUTPUT_ARG: &str = "--video-output";
 const QGS_BROADCAST_PLAYER_LIVE_AUDIO_OUTPUT_ARG: &str = "--audio-output";
 const QGS_BROADCAST_PLAYER_LIVE_OUTPUT_DIR_ARG: &str = "--output-dir";
 const QGS_BROADCAST_PLAYER_LIVE_PREVIEW_EVERY_ARG: &str = "--preview-every";
-const QGS_BROADCAST_PLAYER_LIVE_AUDIO_MAX_FRAMES_PER_CHUNK: u64 = 5;
 const QGS_BROADCAST_PLAYER_RUN_SEEK_FRAME_ARG: &str = "--seek-frame";
 const QGS_BROADCAST_PLAYER_RUN_VIEW_ARG: &str = "--view";
 const QGS_BROADCAST_PLAYER_CONTROL_SCRIPT_ARG: &str = "--script";
@@ -222,6 +228,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(path) = args.software_gpu_mxf_path {
         return software_gpu_mxf(&path);
+    }
+    if let Some(path) = args.native_original_video_decode_path {
+        return native_original_video_decode_mxf(&path);
     }
     if let Some((original, proxy)) = args.proxy_proof_paths {
         return proxy_proof(&args.socket_path, &original, &proxy);
@@ -1900,16 +1909,12 @@ fn qgs_input_plan_report(
     Ok(())
 }
 
-fn qgs_qnc_prepared_input_fixture_report(
-    name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn qgs_qnc_prepared_input_fixture_report(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let input = match name {
         "proxy-preview" => QgsQncPreparedInputLike::frozen_block_x_proxy_preview(),
         "original-media" => QgsQncPreparedInputLike::frozen_block_x_original_media(),
         _ => {
-            return Err(
-                "fixture expects proxy-preview or original-media, not a media path".into(),
-            );
+            return Err("fixture expects proxy-preview or original-media, not a media path".into());
         }
     };
     let mapping = input.map_to_qgs_descriptor()?;
@@ -1922,7 +1927,12 @@ fn qgs_qnc_prepared_input_fixture_report(
         mapping.descriptor.identity.source_record_uri,
         mapping.descriptor.identity.workspace_db_uri,
         mapping.descriptor.binding.original_media_uri,
-        mapping.descriptor.binding.proxy_media_uri.as_deref().unwrap_or("")
+        mapping
+            .descriptor
+            .binding
+            .proxy_media_uri
+            .as_deref()
+            .unwrap_or("")
     );
     println!("QGS QNC PreparedInput Fixture");
     println!("-----------------------------");
@@ -1964,7 +1974,11 @@ fn qgs_qnc_prepared_input_fixture_report(
     );
     println!(
         "Private path exposed: {}",
-        yes_no(mapping.private_path_exposed || public_text.starts_with('/') || public_text.contains("file:"))
+        yes_no(
+            mapping.private_path_exposed
+                || public_text.starts_with('/')
+                || public_text.contains("file:")
+        )
     );
     println!("Realtime: no");
     println!("A/V sync: no");
@@ -4877,6 +4891,14 @@ impl QgsBroadcastPlayerLiveVideoOutputMode {
             Self::PreviewWindow => "preview-window",
         }
     }
+
+    const fn to_brick(self) -> LiveVideoOutputMode {
+        match self {
+            Self::None => LiveVideoOutputMode::None,
+            Self::PreviewFiles => LiveVideoOutputMode::PreviewFiles,
+            Self::PreviewWindow => LiveVideoOutputMode::PreviewWindow,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4907,62 +4929,13 @@ impl QgsBroadcastPlayerLiveAudioOutputMode {
         }
     }
 
-    const fn output_channels(self) -> &'static [u16] {
+    const fn to_brick(self) -> AudioOutputMode {
         match self {
-            Self::None => &[],
-            Self::PipeWireDesktopMonitor | Self::PipeWireMonitor => &[3, 0],
-            Self::PipeWire4Mono => &[0, 1, 2, 3],
+            Self::None => AudioOutputMode::None,
+            Self::PipeWireDesktopMonitor => AudioOutputMode::PipeWireDesktopMonitor,
+            Self::PipeWireMonitor => AudioOutputMode::PipeWireMonitor,
+            Self::PipeWire4Mono => AudioOutputMode::PipeWire4Mono,
         }
-    }
-
-    const fn submitted_label(self) -> &'static str {
-        match self {
-            Self::None => "off",
-            Self::PipeWireDesktopMonitor | Self::PipeWireMonitor => "submitted-monitor",
-            Self::PipeWire4Mono => "submitted-4mono",
-        }
-    }
-}
-
-/// Cursor for live PipeWire chunks. A submitted range stays covered until seek,
-/// stop, or a new source resets it. Skipping a covered range is not playback.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct QgsLiveAudioCoverage {
-    covered_until_sample: u64,
-    submitted: bool,
-}
-
-impl QgsLiveAudioCoverage {
-    const fn new() -> Self {
-        Self {
-            covered_until_sample: 0,
-            submitted: false,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.covered_until_sample = 0;
-    }
-
-    fn skip_label(&self, start_sample: u64) -> Option<&'static str> {
-        if start_sample < self.covered_until_sample {
-            Some(if self.submitted { "covered" } else { "pending" })
-        } else {
-            None
-        }
-    }
-
-    fn next_submit_start(&self, start_sample: u64) -> Option<u64> {
-        if start_sample < self.covered_until_sample {
-            None
-        } else {
-            Some(start_sample)
-        }
-    }
-
-    fn mark_submitted(&mut self, start_sample: u64, sample_count: u64) {
-        self.submitted = true;
-        self.covered_until_sample = start_sample.saturating_add(sample_count);
     }
 }
 
@@ -5049,401 +5022,42 @@ impl QgsBroadcastPlayerLiveInputCommand {
     }
 }
 
-#[derive(Clone, Debug)]
-struct QgsLiveOutputTickResult {
-    video_status: &'static str,
-    audio_status: &'static str,
+fn qgs_live_output_coordinator(
+    original_path: &Path,
+    proxy_path: &Path,
+    options: &QgsBroadcastPlayerLiveOptions,
+) -> Result<LiveOutputCoordinator, Box<dyn std::error::Error>> {
+    LiveOutputCoordinator::new(
+        original_path,
+        proxy_path,
+        options.video_output.to_brick(),
+        options.audio_output.to_brick(),
+        &options.output_dir,
+        options.preview_every,
+    )
 }
 
-struct QgsLivePreviewFileOutput {
-    proxy_path: PathBuf,
-    output_dir: PathBuf,
-    preview_every: u64,
-    output_index: u64,
-}
-
-struct QgsLiveAudioOutput {
-    original_path: PathBuf,
-    index: PcmAudioIndex,
-    sample_rate: u32,
-    source_total_samples: u64,
-    mode: QgsBroadcastPlayerLiveAudioOutputMode,
-    preview_every: u64,
-    coverage: QgsLiveAudioCoverage,
-    submissions: u64,
-    bytes_copied: usize,
-}
-
-struct QgsLiveOutputCoordinator {
-    video: Option<QgsLivePreviewFileOutput>,
-    audio: Option<QgsLiveAudioOutput>,
-}
-
-impl QgsLiveOutputCoordinator {
-    fn new(
-        original_path: &Path,
-        proxy_path: &Path,
-        options: &QgsBroadcastPlayerLiveOptions,
-        source_timebase: RationalRate,
-        start_frame: u64,
-        run_limit: u64,
-        active_frames: u64,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let video = match options.video_output {
-            QgsBroadcastPlayerLiveVideoOutputMode::None => None,
-            QgsBroadcastPlayerLiveVideoOutputMode::PreviewFiles => {
-                Some(QgsLivePreviewFileOutput::new(
-                    proxy_path,
-                    &options.output_dir,
-                    options.preview_every,
-                    source_timebase,
-                    start_frame,
-                    run_limit,
-                    active_frames,
-                )?)
-            }
-            QgsBroadcastPlayerLiveVideoOutputMode::PreviewWindow => {
-                return Err("preview-window output is not implemented yet; use --video-output preview-files".into());
-            }
-        };
-        let audio = match options.audio_output {
-            QgsBroadcastPlayerLiveAudioOutputMode::None => None,
-            QgsBroadcastPlayerLiveAudioOutputMode::PipeWireDesktopMonitor
-            | QgsBroadcastPlayerLiveAudioOutputMode::PipeWireMonitor
-            | QgsBroadcastPlayerLiveAudioOutputMode::PipeWire4Mono => {
-                Some(QgsLiveAudioOutput::new(
-                    original_path,
-                    options.audio_output,
-                    options.preview_every,
-                )?)
-            }
-        };
-        Ok(Self { video, audio })
-    }
-
-    fn emit_for_snapshot(
-        &mut self,
-        tick: u64,
-        snapshot: &QgsQncRuntimeSnapshot,
-        source_timebase: RationalRate,
-    ) -> QgsLiveOutputTickResult {
-        if snapshot.status != QgsBroadcastPlayerStatus::Playing {
-            return QgsLiveOutputTickResult {
-                video_status: if self.video.is_some() {
-                    "paused"
-                } else {
-                    "off"
-                },
-                audio_status: if self.audio.is_some() {
-                    "paused"
-                } else {
-                    "off"
-                },
-            };
-        }
-        let video_status = self
-            .video
-            .as_mut()
-            .map(|video| video.emit(tick, snapshot, source_timebase))
-            .unwrap_or("off");
-        let audio_status = self
-            .audio
-            .as_mut()
-            .map(|audio| audio.emit(tick, snapshot))
-            .unwrap_or("off");
-        QgsLiveOutputTickResult {
-            video_status,
-            audio_status,
-        }
-    }
-
-    fn video_label(&self) -> &'static str {
-        if self.video.is_some() {
-            "diagnostic preview files"
-        } else {
-            "none"
-        }
-    }
-
-    fn audio_label(&self) -> &'static str {
-        self.audio
-            .as_ref()
-            .map(|audio| audio.mode.label())
-            .unwrap_or("none")
-    }
-
-    fn video_output_dir(&self) -> Option<&Path> {
-        self.video.as_ref().map(|video| video.output_dir.as_path())
-    }
-
-    fn reset_audio_coverage(&mut self) {
-        if let Some(audio) = self.audio.as_mut() {
-            audio.coverage.reset();
-        }
-    }
-
-    fn audio_submitted(&self) -> bool {
-        self.audio
-            .as_ref()
-            .is_some_and(|audio| audio.coverage.submitted)
-    }
-
-    fn audio_submissions(&self) -> u64 {
-        self.audio
-            .as_ref()
-            .map(|audio| audio.submissions)
-            .unwrap_or(0)
-    }
-
-    fn audio_bytes_copied(&self) -> usize {
-        self.audio
-            .as_ref()
-            .map(|audio| audio.bytes_copied)
-            .unwrap_or(0)
+fn qgs_live_engine_picture_status(snapshot: &QgsQncRuntimeSnapshot) -> &'static str {
+    match snapshot.picture_representation {
+        Some(QgsPlaybackRepresentation::Original) => "original-picture",
+        Some(QgsPlaybackRepresentation::Proxy) => "proxy-picture",
+        None => "missing-picture",
     }
 }
 
-impl QgsLivePreviewFileOutput {
-    fn new(
-        proxy_path: &Path,
-        output_dir: &Path,
-        preview_every: u64,
-        _source_timebase: RationalRate,
-        _start_frame: u64,
-        _run_limit: u64,
-        _active_frames: u64,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        std::fs::create_dir_all(output_dir)?;
-        Ok(Self {
-            proxy_path: proxy_path.to_path_buf(),
-            output_dir: output_dir.to_path_buf(),
-            preview_every: preview_every.max(1),
-            output_index: 0,
-        })
-    }
-
-    fn emit(
-        &mut self,
-        tick: u64,
-        snapshot: &QgsQncRuntimeSnapshot,
-        source_timebase: RationalRate,
-    ) -> &'static str {
-        if !tick.is_multiple_of(self.preview_every) {
-            return "skipped";
-        }
-        let Some(frame) = snapshot.current_frame else {
-            return "missing-frame";
-        };
-        let readback = match self.read_proxy_frame(frame, source_timebase) {
-            Ok(readback) => readback,
-            Err(_) => return "failed",
-        };
-        match self.write_frame_artifacts(frame, snapshot, source_timebase, &readback) {
-            Ok(()) => {
-                self.output_index = self.output_index.saturating_add(1);
-                "diagnostic-written"
-            }
-            Err(_) => "failed",
-        }
-    }
-
-    fn read_proxy_frame(
-        &self,
-        frame: u64,
-        source_timebase: RationalRate,
-    ) -> Result<qgs_vulkan::ProcessedFrameOutput, Box<dyn std::error::Error>> {
-        let proxy = Mp4Source::open(&self.proxy_path)?;
-        let proxy_video = proxy
-            .video
-            .as_ref()
-            .ok_or("proxy has no H.264 video track")?;
-        let proxy_h264 = classify_video_track(proxy_video)?;
-        let slot = BroadcastPreparedVideoSlot {
-            slot_index: 0,
-            source_mode: BroadcastVideoSourceMode::ProxyPreview,
-            video_source_role: BroadcastMediaSourceRole::ProxyPreviewVideo,
-            source_frame_index: Some(frame),
-            selected_preview_frame_index: Some(frame),
-            presentation_time: source_timebase.frame_offset(frame)?,
-            duration: source_timebase.frame_duration()?,
-            status: BroadcastPreparedVideoSlotStatus::Prepared,
-        };
-        let proof = bind_proxy_preview_video_payloads_with_readback(
-            proxy_video,
-            &proxy_h264,
-            std::slice::from_ref(&slot),
-            true,
-        )?;
-        proof
-            .readback_outputs
-            .into_iter()
-            .next()
-            .map(|(_, readback)| readback)
-            .ok_or_else(|| "live preview proxy readback missing".into())
-    }
-
-    fn write_frame_artifacts(
-        &self,
-        frame: u64,
-        snapshot: &QgsQncRuntimeSnapshot,
-        source_timebase: RationalRate,
-        readback: &qgs_vulkan::ProcessedFrameOutput,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let ppm_bytes =
-            rgba_u16_to_ppm_p6_rgb8(&readback.rgba_u16, readback.width, readback.height)?;
-        let frame_name = qgs_live_preview_frame_file_name(self.output_index);
-        let frame_path = self.output_dir.join(&frame_name);
-        let latest_path = self.output_dir.join("latest.ppm");
-        File::create(&frame_path)?.write_all(&ppm_bytes)?;
-        File::create(&latest_path)?.write_all(&ppm_bytes)?;
-        let latest_json = qgs_live_preview_latest_json(
-            frame,
-            snapshot,
-            source_timebase,
-            &frame_name,
-            readback.width,
-            readback.height,
-            ppm_bytes.len(),
-            readback.checksum,
-        );
-        File::create(self.output_dir.join("latest.json"))?.write_all(latest_json.as_bytes())?;
-        Ok(())
+fn qgs_live_source_mode_label(snapshot: &QgsQncRuntimeSnapshot) -> &'static str {
+    match snapshot.source_mode {
+        Some(QgsInputPlanSourceMode::ProxyPreview) => "ProxyPreview",
+        Some(QgsInputPlanSourceMode::OriginalMedia) => "OriginalMedia",
+        None => "none",
     }
 }
 
-impl QgsLiveAudioOutput {
-    fn new(
-        original_path: &Path,
-        mode: QgsBroadcastPlayerLiveAudioOutputMode,
-        preview_every: u64,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let index = open_pcm_audio_index(original_path)?;
-        let audio_tracks = index
-            .tracks
-            .iter()
-            .filter(|track| track.kind == TrackKind::Audio)
-            .collect::<Vec<_>>();
-        let source_format = original_linux_pcm_audio_format(&audio_tracks)?;
-        let source_total_samples = audio_audit_total_samples_from_index(&index)?;
-        Ok(Self {
-            original_path: original_path.to_path_buf(),
-            index,
-            sample_rate: source_format.sample_rate,
-            source_total_samples,
-            mode,
-            preview_every: preview_every.max(1),
-            coverage: QgsLiveAudioCoverage::new(),
-            submissions: 0,
-            bytes_copied: 0,
-        })
-    }
-
-    fn emit(&mut self, tick: u64, snapshot: &QgsQncRuntimeSnapshot) -> &'static str {
-        let emit_every = match self.mode {
-            QgsBroadcastPlayerLiveAudioOutputMode::PipeWireDesktopMonitor
-            | QgsBroadcastPlayerLiveAudioOutputMode::PipeWireMonitor => 25,
-            QgsBroadcastPlayerLiveAudioOutputMode::PipeWire4Mono => self.preview_every,
-            QgsBroadcastPlayerLiveAudioOutputMode::None => 1,
-        };
-        if !tick.is_multiple_of(emit_every.max(1)) {
-            return "skipped";
-        }
-        let Some((start_sample, end_sample)) = snapshot.current_audio_sample_range else {
-            return "missing-range";
-        };
-        let per_frame_samples = end_sample.saturating_sub(start_sample).max(1);
-        if self.coverage.next_submit_start(start_sample).is_none() {
-            return self.coverage.skip_label(start_sample).unwrap_or("pending");
-        }
-        let audio_frames_per_chunk = match self.mode {
-            QgsBroadcastPlayerLiveAudioOutputMode::PipeWireDesktopMonitor
-            | QgsBroadcastPlayerLiveAudioOutputMode::PipeWireMonitor => 25,
-            QgsBroadcastPlayerLiveAudioOutputMode::PipeWire4Mono => self
-                .preview_every
-                .min(QGS_BROADCAST_PLAYER_LIVE_AUDIO_MAX_FRAMES_PER_CHUNK)
-                .max(1),
-            QgsBroadcastPlayerLiveAudioOutputMode::None => 0,
-        };
-        let mut sample_count = match per_frame_samples.checked_mul(audio_frames_per_chunk) {
-            Some(value) => value,
-            None => return "failed",
-        };
-        if sample_count == 0 {
-            return "off";
-        }
-        if let Some(remaining) = self.source_total_samples.checked_sub(start_sample) {
-            sample_count = sample_count.min(remaining);
-        } else {
-            return "missing-range";
-        }
-        let samples_per_buffer = match u32::try_from(per_frame_samples) {
-            Ok(value) => value,
-            Err(_) => return "failed",
-        };
-        let buffers = match self.build_buffers(start_sample, sample_count, samples_per_buffer) {
-            Ok(buffer) => buffer,
-            Err(_) => return "failed",
-        };
-        let stream_format = PipeWireStreamFormat {
-            sample_rate: self.sample_rate,
-            channels: u32::try_from(self.mode.output_channels().len()).unwrap_or(0),
-            sample_format: PipeWireAudioSampleFormat::F32Interleaved,
-        };
-        match submit_native_pipewire_buffers(
-            stream_format,
-            buffers,
-            samples_per_buffer,
-            Duration::from_secs(5),
-        ) {
-            Ok(report) if report.buffer_submitted => {
-                self.submissions = self.submissions.saturating_add(1);
-                self.bytes_copied = self.bytes_copied.saturating_add(report.bytes_copied);
-                self.coverage.mark_submitted(start_sample, sample_count);
-                self.mode.submitted_label()
-            }
-            Ok(_) => "not-submitted",
-            Err(_) => "failed",
-        }
-    }
-
-    fn build_buffers(
-        &self,
-        start_sample: u64,
-        sample_count: u64,
-        samples_per_buffer: u32,
-    ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
-        let end_sample = start_sample
-            .checked_add(sample_count)
-            .ok_or("live audio sample range overflow")?;
-        if samples_per_buffer == 0 || sample_count % u64::from(samples_per_buffer) != 0 {
-            return Err("live audio output range must align to PCM block size".into());
-        }
-        let blocks = build_original_pcm_blocks_from_index_range(
-            &self.original_path,
-            &self.index,
-            start_sample,
-            end_sample,
-        )?;
-        let track_groups = original_pcm_blocks_by_channel(&blocks, self.sample_rate)?;
-        let mut buffers = Vec::new();
-        let buffer_count = sample_count / u64::from(samples_per_buffer);
-        for buffer_index in 0..buffer_count {
-            let buffer_start = start_sample
-                .checked_add(
-                    buffer_index
-                        .checked_mul(u64::from(samples_per_buffer))
-                        .ok_or("live audio buffer start overflow")?,
-                )
-                .ok_or("live audio buffer start overflow")?;
-            buffers.push(build_audio_audit_f32_interleaved_range(
-                &track_groups,
-                self.mode.output_channels(),
-                self.sample_rate,
-                buffer_start,
-                samples_per_buffer,
-            )?);
-        }
-        Ok(buffers)
+fn qgs_live_picture_label(snapshot: &QgsQncRuntimeSnapshot) -> &'static str {
+    match snapshot.picture_representation {
+        Some(QgsPlaybackRepresentation::Proxy) => "proxy MP4",
+        Some(QgsPlaybackRepresentation::Original) => "original picture",
+        None => "none",
     }
 }
 
@@ -5469,8 +5083,8 @@ fn qgs_live_preview_latest_json(
             "  \"media_time\": \"{}\",\n",
             "  \"audio_sample_range\": \"{}\",\n",
             "  \"prepared_window\": \"{}\",\n",
-            "  \"source_mode\": \"ProxyPreview\",\n",
-            "  \"video_source\": \"proxy MP4\",\n",
+            "  \"source_mode\": \"{}\",\n",
+            "  \"video_source\": \"{}\",\n",
             "  \"audio_source\": \"original MXF\",\n",
             "  \"proxy_aac_authoritative\": false,\n",
             "  \"real_display\": \"no\",\n",
@@ -5487,6 +5101,8 @@ fn qgs_live_preview_latest_json(
         qgs_live_snapshot_media_time_label(snapshot, source_timebase),
         qgs_optional_sample_range_label(snapshot.current_audio_sample_range),
         qgs_qnc_optional_frame_window_label(snapshot.prepared_window.as_ref()),
+        qgs_live_source_mode_label(snapshot),
+        qgs_live_picture_label(snapshot),
         json_escape(frame_file_name),
         width,
         height,
@@ -5814,15 +5430,7 @@ fn qgs_broadcast_player_live_report(
         .unwrap_or(remaining_frames)
         .max(1)
         .min(remaining_frames);
-    let mut live_outputs = QgsLiveOutputCoordinator::new(
-        original_path,
-        proxy_path,
-        &options,
-        source_timebase,
-        start_frame,
-        run_limit,
-        active_frames,
-    )?;
+    let mut live_outputs = qgs_live_output_coordinator(original_path, proxy_path, &options)?;
     let mut surface = QgsQncControlSurface::from_assembly(&assembly, "qgs-test-live-runtime-loop")?;
     let mut accepted = 0_u64;
     let mut rejected = 0_u64;
@@ -5969,7 +5577,26 @@ fn qgs_broadcast_player_live_report(
         }
 
         let snapshot = surface.snapshot();
-        let output_result = live_outputs.emit_for_snapshot(processed, &snapshot, source_timebase);
+        let output_result = live_outputs.emit_for_snapshot(
+            processed,
+            &snapshot,
+            |parts, frame_name, image_bytes| {
+                qgs_live_preview_latest_json(
+                    parts.frame,
+                    &snapshot,
+                    source_timebase,
+                    frame_name,
+                    parts.width,
+                    parts.height,
+                    image_bytes,
+                    parts.checksum,
+                )
+            },
+        );
+        if output_result.video_status == "window-closed" || live_outputs.preview_window_closed() {
+            stop_reason = "preview-window-closed";
+            break;
+        }
         if processed == 0 || processed % status_every == 0 {
             match options.view {
                 QgsBroadcastPlayerRunView::Compact => print_broadcast_player_live_compact_tick(
@@ -6226,7 +5853,7 @@ fn qgs_live_spawn_input_thread(enabled: bool) -> Option<mpsc::Receiver<String>> 
 fn qgs_live_process_input_command(
     line: &str,
     surface: &mut QgsQncControlSurface,
-    live_outputs: &mut QgsLiveOutputCoordinator,
+    live_outputs: &mut LiveOutputCoordinator,
     source_timebase: RationalRate,
     active_frames: u64,
     view: QgsBroadcastPlayerRunView,
@@ -6511,7 +6138,7 @@ fn qgs_live_count_reply(
 fn print_broadcast_player_live_compact_header(
     assembly: &QgsBroadcastPlayerAssembly,
     options: &QgsBroadcastPlayerLiveOptions,
-    outputs: &QgsLiveOutputCoordinator,
+    outputs: &LiveOutputCoordinator,
 ) {
     println!("QGS Broadcast Player Live");
     println!("mode: ProxyPreview");
@@ -6523,7 +6150,7 @@ fn print_broadcast_player_live_compact_header(
                 path.display()
             )
         })
-        .unwrap_or_else(|| "none".to_string());
+        .unwrap_or_else(|| outputs.video_label().to_string());
     println!("video: {video_target}");
     println!(
         "audio: original MXF mono lanes -> {}",
@@ -6555,7 +6182,7 @@ fn print_broadcast_player_live_compact_header(
 fn print_broadcast_player_live_detailed_header(
     assembly: &QgsBroadcastPlayerAssembly,
     options: &QgsBroadcastPlayerLiveOptions,
-    outputs: &QgsLiveOutputCoordinator,
+    outputs: &LiveOutputCoordinator,
     run_limit: u64,
 ) {
     println!("QGS Broadcast Player Live");
@@ -6566,7 +6193,16 @@ fn print_broadcast_player_live_detailed_header(
     println!("modules: {}", assembly.module_labels().join(", "));
     println!("mode: ProxyPreview");
     println!("video: proxy MP4");
-    println!("video output meaning: diagnostic only unless preview-window is implemented");
+    println!(
+        "video output meaning: {}",
+        match options.video_output {
+            QgsBroadcastPlayerLiveVideoOutputMode::PreviewWindow => {
+                "Wayland monitor window of engine pixels; not a display presenter and not VisualVerified"
+            }
+            QgsBroadcastPlayerLiveVideoOutputMode::PreviewFiles => "diagnostic preview files",
+            QgsBroadcastPlayerLiveVideoOutputMode::None => "off",
+        }
+    );
     println!("audio: original MXF discrete mono lanes");
     println!("video output mode: {}", options.video_output.label());
     if let Some(output_dir) = outputs.video_output_dir() {
@@ -6633,7 +6269,7 @@ fn print_broadcast_player_live_compact_tick(
     tick: u64,
     snapshot: &QgsQncRuntimeSnapshot,
     source_timebase: RationalRate,
-    output: &QgsLiveOutputTickResult,
+    output: &LiveOutputTickResult,
 ) {
     println!(
         "tick={tick:06} frame={:<4} t={} audio={:<18} window={:<9} buffer={} video={} audio={}",
@@ -6651,7 +6287,7 @@ fn print_broadcast_player_live_detailed_tick(
     tick: u64,
     snapshot: &QgsQncRuntimeSnapshot,
     source_timebase: RationalRate,
-    output: &QgsLiveOutputTickResult,
+    output: &LiveOutputTickResult,
 ) {
     println!("[LIVE TICK {tick:06}]");
     println!("status: {:?}", snapshot.status);
@@ -16844,6 +16480,220 @@ fn max_u16_delta(left: &[u16], right: &[u16]) -> Result<u16, Box<dyn std::error:
         .unwrap_or(0))
 }
 
+fn native_original_video_decode_mxf(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    let source = MediaSource::parse(&bytes)?;
+    let first_access_unit = source.extract_video_access_unit(&bytes, 0)?;
+    let parsed = qgs_codec_h264::parse_annex_b_access_unit(&first_access_unit)?;
+    let profile = H264422P10Profile {
+        profile: parsed.profile,
+        bit_depth: parsed.desc.bit_depth.get(),
+        chroma: parsed.desc.chroma,
+        coded_width: parsed.desc.coded_width,
+        coded_height: parsed.desc.coded_height,
+        visible_width: parsed.desc.visible_region.width,
+        visible_height: parsed.desc.visible_region.height,
+        scan_mode: parsed.desc.scan_mode,
+    };
+    let sony_shape = profile == H264422P10Profile::sony_fx6_original();
+    let bounded_access_units = source.index.video.len().min(12);
+    let mut decoder = H264422P10Decoder::new(profile.clone());
+    let mut report_parser_state = qgs_codec_h264::H264DecoderState::new();
+    let mut output_frames = 0_usize;
+    let mut output_bytes = 0_usize;
+    let mut submitted_access_units = 0_usize;
+
+    println!("QGS native original MXF H.264 4:2:2 10-bit decode");
+    println!(
+        "input: {}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<original-mxf>")
+    );
+    println!("source: original MXF video");
+    println!("proxy video used: no");
+    println!("proxy AAC used: no");
+    println!("ffmpeg/rsmpeg/libav: not used");
+    println!(
+        "profile: {:?} {}bit {:?} coded={}x{} visible={}x{}",
+        profile.profile,
+        profile.bit_depth,
+        profile.chroma,
+        profile.coded_width,
+        profile.coded_height,
+        profile.visible_width,
+        profile.visible_height
+    );
+    println!("sony-fx6 original shape: {}", yes_no(sony_shape));
+    println!(
+        "pps transform_8x8_mode: {}",
+        yes_no(parsed.picture.transform_8x8_mode_flag)
+    );
+    println!(
+        "pps constrained_intra_pred: {}",
+        yes_no(parsed.picture.constrained_intra_pred_flag)
+    );
+    println!(
+        "pps weighted_pred: {} weighted_bipred_idc={}",
+        yes_no(parsed.picture.weighted_pred_flag),
+        parsed.picture.weighted_bipred_idc
+    );
+    println!("mxf video access units: {}", source.index.video.len());
+    println!("bounded submitted access units: {bounded_access_units}");
+
+    for index in 0..bounded_access_units {
+        let access_unit = source.extract_video_access_unit(&bytes, index)?;
+        let report = report_parser_state.parse_access_unit(&access_unit)?;
+        println!(
+            "submit AU {index:02}: slices={} kind={:?} first_mb={} cabac_init={} bytes={}",
+            report.slices.len(),
+            report.slices[0].kind,
+            report.slices[0].first_mb_in_slice,
+            report.slices[0].cabac_init_idc,
+            access_unit.len()
+        );
+        if report.slices.len() > 1 {
+            let slice_starts = report
+                .slices
+                .iter()
+                .map(|slice| slice.first_mb_in_slice.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            println!("  slice first_mb list: {slice_starts}");
+            let ref_counts = report
+                .slices
+                .iter()
+                .map(|slice| {
+                    format!(
+                        "{}:L0={} L1={}",
+                        slice.first_mb_in_slice,
+                        slice.num_ref_idx_l0_active_minus1.saturating_add(1),
+                        slice.num_ref_idx_l1_active_minus1.saturating_add(1)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            println!("  active ref counts: {ref_counts}");
+            let slice_offsets = report
+                .slices
+                .iter()
+                .map(|slice| {
+                    let alignment =
+                        qgs_h264_422p10::slice::slice_payload_from_parsed(&report, slice)
+                            .map(|payload| {
+                                format!(
+                                    "align={} all_ones={}",
+                                    payload.cabac_alignment_bits,
+                                    yes_no(payload.cabac_alignment_all_ones)
+                                )
+                            })
+                            .unwrap_or_else(|error| format!("align_error={error}"));
+                    format!(
+                        "{}@{}b(mod8={};{})",
+                        slice.first_mb_in_slice,
+                        slice.slice_data_bit_offset,
+                        slice.slice_data_bit_offset % 8,
+                        alignment
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            println!("  slice data offsets: {slice_offsets}");
+        }
+        match decoder.submit_access_unit(&access_unit) {
+            Ok(outputs) => {
+                submitted_access_units += 1;
+                println!("  output frames={}", outputs.len());
+                for output in outputs {
+                    output_frames = output_frames.saturating_add(1);
+                    output_bytes =
+                        output_bytes.saturating_add(print_native_original_video_frame(output)?);
+                }
+            }
+            Err(error) => {
+                println!("  decoder boundary: {error}");
+                if let H264422P10PictureDecodeError::IncompletePicture { slice_reports, .. } =
+                    &error
+                {
+                    let slice_summary = slice_reports
+                        .iter()
+                        .map(|slice| {
+                            let last_mb = slice
+                                .last_macroblock
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "none".to_string());
+                            let cbp = slice
+                                .last_coded_block_pattern
+                                .map(|value| format!("0x{value:02x}"))
+                                .unwrap_or_else(|| "none".to_string());
+                            let cabac = match (slice.cabac_bit_position, slice.cabac_payload_bits) {
+                                (Some(position), Some(total)) => {
+                                    format!("cabac_bits={position}/{total}")
+                                }
+                                _ => "cabac_bits=unknown".to_string(),
+                            };
+                            format!(
+                                "{}:{}/{}:{}:last_mb={}:type={}:cbp={}:{}",
+                                slice.first_macroblock,
+                                slice.reconstructed_macroblocks,
+                                slice.expected_macroblocks,
+                                slice.stop_reason,
+                                last_mb,
+                                slice.last_macroblock_type,
+                                cbp,
+                                cabac
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    println!("  slice decode report first_mb:count = {slice_summary}");
+                }
+                let flushed = decoder.flush()?;
+                if !flushed.is_empty() {
+                    println!("  boundary flush decoded original frames={}", flushed.len());
+                }
+                for output in flushed {
+                    output_frames = output_frames.saturating_add(1);
+                    output_bytes =
+                        output_bytes.saturating_add(print_native_original_video_frame(output)?);
+                }
+                println!("submitted access units before boundary: {submitted_access_units}");
+                println!("decoded frames before boundary: {output_frames}");
+                println!("decoded owned yuv422p10le bytes before boundary: {output_bytes}");
+                return Err(Box::new(error));
+            }
+        }
+    }
+
+    for output in decoder.flush()? {
+        output_frames = output_frames.saturating_add(1);
+        output_bytes = output_bytes.saturating_add(print_native_original_video_frame(output)?);
+    }
+
+    println!("decoded frames: {output_frames}");
+    println!("decoded owned yuv422p10le bytes: {output_bytes}");
+    println!("real display: no");
+    println!("visual verified: no");
+    println!("realtime verified: no");
+    Ok(())
+}
+
+fn print_native_original_video_frame(
+    output: H264422P10Frame,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    output.validate_layout()?;
+    let bytes = output.owned_bytes();
+    println!(
+        "    frame {:02}: y={} cb={} cr={} bytes={}",
+        output.presentation_index,
+        output.y.data.len(),
+        output.cb.data.len(),
+        output.cr.data.len(),
+        bytes
+    );
+    Ok(bytes)
+}
+
 fn decode_positioned_access_units_with_context(
     config: DecoderConfig,
     access_units: &[(u64, Vec<u8>)],
@@ -19413,6 +19263,7 @@ struct Args {
     mxf_inspect_path: Option<PathBuf>,
     software_decode_mxf_path: Option<PathBuf>,
     software_gpu_mxf_path: Option<PathBuf>,
+    native_original_video_decode_path: Option<PathBuf>,
     proxy_proof_paths: Option<(PathBuf, PathBuf)>,
     proxy_throughput_paths: Option<(PathBuf, PathBuf)>,
     proxy_playback_paths: Option<(PathBuf, PathBuf)>,
@@ -19487,6 +19338,8 @@ impl Args {
         let mut next_arg_is_software_decode_mxf_path = false;
         let mut software_gpu_mxf_path = None;
         let mut next_arg_is_software_gpu_mxf_path = false;
+        let mut native_original_video_decode_path = None;
+        let mut next_arg_is_native_original_video_decode_path = false;
         let mut proxy_proof_original = None;
         let mut proxy_proof_paths = None;
         let mut proxy_throughput_original = None;
@@ -20279,6 +20132,9 @@ impl Args {
             } else if next_arg_is_software_gpu_mxf_path {
                 software_gpu_mxf_path = Some(PathBuf::from(arg));
                 next_arg_is_software_gpu_mxf_path = false;
+            } else if next_arg_is_native_original_video_decode_path {
+                native_original_video_decode_path = Some(PathBuf::from(arg));
+                next_arg_is_native_original_video_decode_path = false;
             } else if next_arg_is_software_decode_mxf_path {
                 software_decode_mxf_path = Some(PathBuf::from(arg));
                 next_arg_is_software_decode_mxf_path = false;
@@ -20298,6 +20154,8 @@ impl Args {
                 next_arg_is_software_decode_mxf_path = true;
             } else if arg == SOFTWARE_GPU_MXF_ARG {
                 next_arg_is_software_gpu_mxf_path = true;
+            } else if arg == NATIVE_ORIGINAL_VIDEO_DECODE_ARG {
+                next_arg_is_native_original_video_decode_path = true;
             } else if arg == PROXY_PROOF_ARG {
                 next_arg_is_proxy_original = true;
             } else if arg == PROXY_THROUGHPUT_ARG {
@@ -20459,6 +20317,7 @@ impl Args {
             mxf_inspect_path,
             software_decode_mxf_path,
             software_gpu_mxf_path,
+            native_original_video_decode_path,
             proxy_proof_paths,
             proxy_throughput_paths,
             proxy_playback_paths,
@@ -20581,11 +20440,12 @@ mod tests {
         qgs_running_runtime_persistent_warning_lines, repeated_smoke_test_buffers,
         rgba_u16_to_ppm_p6_rgb8, rgba_u16_to_rgb8_bytes, runtime_audio_payload_evidence_label,
         sanitized_source_stem, selected_proxy_ordinals, smoke_test_buffer_count,
-        ManualAudibleConfirmation, QgsBroadcastPlayerLiveAudioOutputMode, QgsLiveAudioCoverage,
+        ManualAudibleConfirmation, QgsBroadcastPlayerLiveAudioOutputMode,
         QgsBroadcastPlayerLiveInputCommand, QgsBroadcastPlayerLiveOptions,
         QgsBroadcastPlayerLivePace, QgsBroadcastPlayerLiveVideoOutputMode,
         QgsBroadcastPlayerRunView, QgsControlSessionScriptCommand, SonyXmlSummary,
     };
+    use qgs_broadcast_player::AudioCoverage;
     use qgs_media_runtime::{
         av_frame_audio_range, bind_broadcast_audio_payload, BroadcastPreparedAudioSlot,
         BroadcastVideoSourceMode, PcmAudioBlock, PcmAudioBlockLayout, PcmEndian, PcmSampleFormat,
@@ -20813,7 +20673,7 @@ mod tests {
 
     #[test]
     fn live_audio_coverage_resubmits_from_the_new_range_after_seek_reset() {
-        let mut coverage = QgsLiveAudioCoverage::new();
+        let mut coverage = AudioCoverage::new();
         assert_eq!(coverage.next_submit_start(0), Some(0));
         coverage.mark_submitted(0, 24_000);
         assert_eq!(coverage.next_submit_start(960), None);
@@ -20824,6 +20684,33 @@ mod tests {
         assert_eq!(coverage.next_submit_start(0), Some(0));
         assert_eq!(coverage.skip_label(0), None);
         assert!(coverage.submitted);
+    }
+
+    #[test]
+    fn letterbox_scales_source_pixels_into_the_center() {
+        let rgb8 = vec![
+            255, 0, 0, //
+            0, 255, 0, //
+            0, 0, 255, //
+            255, 255, 255,
+        ];
+        let mut buffer = vec![1_u32; 24];
+        qgs_broadcast_player::presenter_boundary::blit_rgb8_letterbox(
+            2,
+            2,
+            &rgb8,
+            6,
+            4,
+            &mut buffer,
+        );
+        assert_eq!(buffer[0], 0);
+        assert_eq!(buffer[1], 255 << 16);
+        assert_eq!(buffer[2], 255 << 16);
+        assert_eq!(buffer[3], 255 << 8);
+        assert_eq!(buffer[4], 255 << 8);
+        assert_eq!(buffer[5], 0);
+        assert_eq!(buffer[13], 255);
+        assert_eq!(buffer[15], (255 << 16) | (255 << 8) | 255);
     }
 
     #[test]
@@ -20889,8 +20776,29 @@ mod tests {
             6_220_817,
             0x1234,
         );
+        assert!(json.contains("\"source_mode\": \"ProxyPreview\""));
         assert!(json.contains("\"video_source\": \"proxy MP4\""));
         assert!(json.contains("\"audio_source\": \"original MXF\""));
+        let mut original = snapshot.clone();
+        original.source_mode = Some(QgsInputPlanSourceMode::OriginalMedia);
+        original.picture_representation = Some(QgsPlaybackRepresentation::Original);
+        let original_json = super::qgs_live_preview_latest_json(
+            12,
+            &original,
+            RationalRate::new(50, 1).unwrap(),
+            "frame_000002.ppm",
+            1920,
+            1080,
+            6_220_817,
+            0x1234,
+        );
+        assert!(original_json.contains("\"source_mode\": \"OriginalMedia\""));
+        assert!(original_json.contains("\"video_source\": \"original picture\""));
+        assert!(!original_json.contains("proxy MP4"));
+        assert_eq!(
+            super::qgs_live_engine_picture_status(&original),
+            "original-picture"
+        );
         assert!(json.contains("\"proxy_aac_authoritative\": false"));
         assert!(json.contains("\"real_display\": \"no\""));
         assert!(json.contains("\"visual_verified\": false"));

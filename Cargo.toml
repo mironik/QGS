@@ -2,7 +2,9 @@
 members = [
     "crates/qgs-codec-h264",
     "crates/qgs-audio-pipewire",
+    "crates/qgs-broadcast-player",
     "crates/qgs-core",
+    "crates/qgs-h264-422p10",
     "crates/qgs-linux",
     "crates/qgs-mp4",
     "crates/qgs-mxf",

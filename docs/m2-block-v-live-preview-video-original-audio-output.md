@@ -94,7 +94,10 @@ target/qgs-live-preview/latest.json
 This is diagnostic visible preview artifact output, not player display and not
 a real display presenter.
 
-`--video-output preview-window` is reserved and currently reports unsupported.
+`--video-output preview-window` opens a Wayland window and draws pixels the live
+engine already produced for the player playhead and picture selection. It
+follows every playing frame. It is a monitor preview, not a Wayland + Vulkan
+swapchain presenter, and it does not set `real_display` or `visual_verified`.
 QNC OS display direction remains Wayland + Vulkan, not X11.
 
 ## Audio Output Mode
@@ -142,7 +145,7 @@ New options:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--video-output none|preview-files|preview-window` | `none` | Preview output mode. `preview-files` is diagnostic; `preview-window` is not implemented yet. |
+| `--video-output none|preview-files|preview-window` | `none` | Preview output mode. `preview-files` writes diagnostic PPM files from engine pixels. `preview-window` draws those same engine pixels in a Wayland monitor window and is not a certified display presenter. |
 | `--audio-output none|pipewire-desktop-monitor|pipewire-monitor|pipewire-4mono` | `none` | Original-MXF-derived audio output mode. |
 | `--output-dir <path>` | `target/qgs-live-preview` | Preview artifact directory. |
 | `--preview-every <n>` | `100` | Emit diagnostic preview output every `n` logical frames. |
@@ -297,7 +300,8 @@ Even when preview files and PipeWire submissions succeed:
 
 ## Limitations
 
-- Preview output is file-based, not a window.
+- Live video path is player (playhead/picture) → GPU engine → monitor (PPM or window). Proxy uses VAAPI + `Nv12FrameProcessor`; original uses software decode + `GpuFrameProcessor` YUV422P10. Monitor blits GPU readback only. Decode stays outside `qgs-media-runtime`.
+- `preview-files` writes PPM files from that readback. `preview-window` is a Wayland monitor window of the same readback, not a swapchain presenter.
 - Preview-file output is diagnostic and not the default player output.
 - Preview files are bounded by `--max-frames` and `--preview-every`.
 - PipeWire audio submission is chunked and bounded, not continuous realtime

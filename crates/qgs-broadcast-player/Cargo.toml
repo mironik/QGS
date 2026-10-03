@@ -1,0 +1,22 @@
+[package]
+name = "qgs-broadcast-player"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "Media-capable Broadcast Player LEGO bricks (decode/GPU/audio/monitor)"
+
+[dependencies]
+qgs-audio-pipewire = { path = "../qgs-audio-pipewire" }
+qgs-codec-h264 = { path = "../qgs-codec-h264" }
+qgs-core = { path = "../qgs-core" }
+qgs-h264-422p10 = { path = "../qgs-h264-422p10" }
+qgs-linux = { path = "../qgs-linux" }
+qgs-media-runtime = { path = "../qgs-media-runtime" }
+qgs-mp4 = { path = "../qgs-mp4" }
+qgs-mxf = { path = "../qgs-mxf" }
+qgs-protocol = { path = "../qgs-protocol" }
+qgs-software-video = { path = "../qgs-software-video" }
+qgs-vaapi = { path = "../qgs-vaapi" }
+qgs-vulkan = { path = "../qgs-vulkan" }
+softbuffer = { version = "0.4.6", default-features = false, features = ["wayland"] }
+winit = { version = "0.30.12", default-features = false, features = ["rwh_06", "wayland", "wayland-csd-adwaita"] }

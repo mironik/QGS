@@ -1,0 +1,10 @@
+[package]
+name = "qgs-h264-422p10"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "Narrow QGS H.264 High 4:2:2 10-bit original-video decode brick"
+
+[dependencies]
+qgs-codec-h264 = { path = "../qgs-codec-h264" }
+qgs-protocol = { path = "../qgs-protocol" }
