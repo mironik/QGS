@@ -390,6 +390,8 @@ fn parse_annex_b_access_unit_with_state(
                     &state.dpb,
                     1_u32 << u32::from(sps.log2_max_frame_num()),
                     reader.bits_read(),
+                    pps.num_ref_idx_l0_default_active_minus1,
+                    pps.num_ref_idx_l1_default_active_minus1,
                 )?);
             }
             UnitType::AccessUnitDelimiter
@@ -455,6 +457,8 @@ fn parsed_slice(
     dpb: &[DpbPicture],
     max_frame_num: u32,
     bits_after_nal_header: u32,
+    default_num_ref_idx_l0_active_minus1: u32,
+    default_num_ref_idx_l1_active_minus1: u32,
 ) -> Result<ParsedH264Slice, H264Error> {
     if header.field_pic != FieldPic::Frame {
         return Err(H264Error::UnsupportedFeature("field pictures"));
@@ -470,8 +474,12 @@ fn parsed_slice(
     let offset = 8_u32
         .checked_add(bits_after_nal_header)
         .ok_or(H264Error::UnsupportedFeature("oversized slice header"))?;
-    let (num_ref_idx_l0_active_minus1, num_ref_idx_l1_active_minus1) =
-        num_ref_indices(header, &kind)?;
+    let (num_ref_idx_l0_active_minus1, num_ref_idx_l1_active_minus1) = num_ref_indices(
+        header,
+        &kind,
+        default_num_ref_idx_l0_active_minus1,
+        default_num_ref_idx_l1_active_minus1,
+    )?;
     let current_poc = match header.pic_order_cnt_lsb {
         Some(PicOrderCountLsb::Frame(value))
         | Some(PicOrderCountLsb::FieldsAbsolute {
@@ -517,7 +525,12 @@ fn va_slice_type(family: &SliceFamily) -> Result<u8, H264Error> {
     }
 }
 
-fn num_ref_indices(header: &SliceHeader, kind: &H264SliceKind) -> Result<(u8, u8), H264Error> {
+fn num_ref_indices(
+    header: &SliceHeader,
+    kind: &H264SliceKind,
+    default_l0_active_minus1: u32,
+    default_l1_active_minus1: u32,
+) -> Result<(u8, u8), H264Error> {
     let (l0, l1) = match (&header.num_ref_idx_active, kind) {
         (
             Some(NumRefIdxActive::P {
@@ -533,8 +546,8 @@ fn num_ref_indices(header: &SliceHeader, kind: &H264SliceKind) -> Result<(u8, u8
             H264SliceKind::B,
         ) => (*num_ref_idx_l0_active_minus1, *num_ref_idx_l1_active_minus1),
         (_, H264SliceKind::I) => (0, 0),
-        (None, H264SliceKind::P) => (0, 0),
-        (None, H264SliceKind::B) => (0, 0),
+        (None, H264SliceKind::P) => (default_l0_active_minus1, 0),
+        (None, H264SliceKind::B) => (default_l0_active_minus1, default_l1_active_minus1),
         _ => return Err(H264Error::UnsupportedFeature("reference index syntax")),
     };
     Ok((

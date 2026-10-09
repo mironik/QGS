@@ -83,6 +83,10 @@ impl CabacNonZeroState422 {
         self.slice_first_mb = slice_first_mb;
     }
 
+    pub fn set_unavailable_nonzero(&mut self, unavailable_nonzero: bool) {
+        self.unavailable_nonzero = unavailable_nonzero;
+    }
+
     pub fn new_i_slice(grid: MacroblockGrid) -> Self {
         Self {
             unavailable_nonzero: true,
@@ -104,6 +108,13 @@ impl CabacNonZeroState422 {
         let left = self.luma4x4_left_count(address, block_index);
         let top = self.luma4x4_top_count(address, block_index);
         usize::from(left > 0) + 2 * usize::from(top > 0)
+    }
+
+    pub fn luma4x4_counts(&self, address: MacroblockAddress) -> [u8; 16] {
+        self.luma4x4
+            .get(address.address as usize)
+            .copied()
+            .unwrap_or([0; 16])
     }
 
     pub fn set_luma4x4_count(

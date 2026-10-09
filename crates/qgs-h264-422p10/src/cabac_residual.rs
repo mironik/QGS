@@ -2,6 +2,7 @@ use std::{cell::RefCell, fmt, rc::Rc};
 
 use crate::cabac::{CabacContext, CabacDecoder, CabacError, CabacInitValue};
 use crate::residual::{ResidualBlock4x4, ResidualBlock8x8};
+use rusty_h264_common::cabac_tables::CTX_INIT;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CabacResidual4x4Contexts {
@@ -121,6 +122,20 @@ pub fn i_slice_residual_context_bank(qp_y: u8) -> Rc<RefCell<Vec<CabacContext>>>
     Rc::new(RefCell::new(bank))
 }
 
+pub fn pb_slice_residual_context_bank(
+    qp_y: u8,
+    cabac_init_idc: u8,
+) -> Rc<RefCell<Vec<CabacContext>>> {
+    let qp = i16::from(qp_y);
+    let model = usize::from(cabac_init_idc).saturating_add(1).min(3);
+    let mut bank = vec![CabacContext::new(0, false); 460];
+    for index in 85..=275 {
+        let (m, n) = CTX_INIT[index][model];
+        bank[index] = CabacInitValue::new(m as i8, n as i8).initialize(qp);
+    }
+    Rc::new(RefCell::new(bank))
+}
+
 impl CabacResidual8x8Contexts {
     pub fn i_slice(qp_y: u8) -> Self {
         let qp = i16::from(qp_y);
@@ -133,6 +148,25 @@ impl CabacResidual8x8Contexts {
             }),
             coeff_abs_level_minus1: std::array::from_fn(|index| {
                 cabac_i_init(426 + index).initialize(qp)
+            }),
+        }
+    }
+
+    pub fn pb_slice(qp_y: u8, cabac_init_idc: u8) -> Self {
+        let qp = i16::from(qp_y);
+        let model = usize::from(cabac_init_idc).saturating_add(1).min(3);
+        Self {
+            significant_coeff_flag: std::array::from_fn(|index| {
+                let (m, n) = CTX_INIT[402 + index][model];
+                CabacInitValue::new(m as i8, n as i8).initialize(qp)
+            }),
+            last_significant_coeff_flag: std::array::from_fn(|index| {
+                let (m, n) = CTX_INIT[417 + index][model];
+                CabacInitValue::new(m as i8, n as i8).initialize(qp)
+            }),
+            coeff_abs_level_minus1: std::array::from_fn(|index| {
+                let (m, n) = CTX_INIT[426 + index][model];
+                CabacInitValue::new(m as i8, n as i8).initialize(qp)
             }),
         }
     }

@@ -5,7 +5,7 @@ use crate::macroblock_type::{
     b_slice_macroblock_type_from_code, b_sub_macroblock_type_from_code,
     i_slice_macroblock_type_from_code, p_slice_macroblock_type_from_code, BSliceMacroblockType,
     BSubMacroblockType, CodedBlockPatternChroma, ISliceMacroblockType, MacroblockTypeError,
-    PSliceMacroblockType,
+    PSliceMacroblockType, PSubMacroblockType,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,6 +68,17 @@ pub struct CabacTransformSize8x8Contexts {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CabacBSubMbTypeContexts {
     pub bins: [CabacContext; 4],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CabacPSubMbTypeContexts {
+    pub bins: [CabacContext; 3],
+}
+
+impl CabacPSubMbTypeContexts {
+    pub fn flat(context: CabacContext) -> Self {
+        Self { bins: [context; 3] }
+    }
 }
 
 impl CabacBSubMbTypeContexts {
@@ -268,12 +279,21 @@ pub fn decode_p_slice_macroblock_type(
     decoder: &mut CabacDecoder<'_>,
     contexts: &mut CabacPSliceMbTypeContexts,
 ) -> Result<PSliceMacroblockType, CabacMacroblockError> {
-    let prefix = decoder.decode_truncated_unary_symbol(&mut contexts.prefix, 5)?;
-    if prefix < 5 {
-        let code = u8::try_from(prefix).map_err(|_| CabacMacroblockError::SymbolOverflow)?;
+    if !decoder.decode_decision(&mut contexts.prefix[0])? {
+        if !decoder.decode_decision(&mut contexts.prefix[1])? {
+            let code = 3 * u8::from(decoder.decode_decision(&mut contexts.prefix[2])?);
+            return Ok(p_slice_macroblock_type_from_code(code)?);
+        }
+        let code = 2 - u8::from(decoder.decode_decision(&mut contexts.prefix[3])?);
         return Ok(p_slice_macroblock_type_from_code(code)?);
     }
-    let intra = decode_inter_slice_intra_macroblock_type(decoder, &mut contexts.intra)?;
+
+    // ctxIdx 17 is shared by the P inter branch and the first bin of the
+    // embedded I macroblock type.
+    contexts.intra.branch[0] = contexts.prefix[3];
+    let intra_result = decode_inter_slice_intra_macroblock_type(decoder, &mut contexts.intra);
+    contexts.prefix[3] = contexts.intra.branch[0];
+    let intra = intra_result?;
     Ok(PSliceMacroblockType::Intra(intra))
 }
 
@@ -281,7 +301,15 @@ pub fn decode_b_slice_macroblock_type(
     decoder: &mut CabacDecoder<'_>,
     contexts: &mut CabacBSliceMbTypeContexts,
 ) -> Result<BSliceMacroblockType, CabacMacroblockError> {
-    if !decode_b_mb_type_bin(decoder, contexts, 0)? {
+    decode_b_slice_macroblock_type_with_context(decoder, contexts, 0)
+}
+
+pub fn decode_b_slice_macroblock_type_with_context(
+    decoder: &mut CabacDecoder<'_>,
+    contexts: &mut CabacBSliceMbTypeContexts,
+    neighbor_context: usize,
+) -> Result<BSliceMacroblockType, CabacMacroblockError> {
+    if !decode_b_mb_type_bin(decoder, contexts, neighbor_context.min(2))? {
         return Ok(BSliceMacroblockType::Direct16x16);
     }
 
@@ -300,7 +328,14 @@ pub fn decode_b_slice_macroblock_type(
     } else {
         match bits {
             13 => {
-                let intra = decode_inter_slice_intra_macroblock_type(decoder, &mut contexts.intra)?;
+                // ctxIdx 32 is shared by the outer B mb_type prefix and the
+                // first bin of the embedded I mb_type. Keep the single
+                // normative context state across that syntax boundary.
+                contexts.intra.branch[0] = contexts.prefix[5];
+                let intra_result =
+                    decode_inter_slice_intra_macroblock_type(decoder, &mut contexts.intra);
+                contexts.prefix[5] = contexts.intra.branch[0];
+                let intra = intra_result?;
                 return Ok(BSliceMacroblockType::Intra(intra));
             }
             14 => 11,
@@ -347,6 +382,22 @@ pub fn decode_b_sub_macroblock_type(
     code = code.saturating_add(2 * u8::from(decoder.decode_decision(&mut contexts.bins[3])?));
     code = code.saturating_add(u8::from(decoder.decode_decision(&mut contexts.bins[3])?));
     Ok(b_sub_macroblock_type_from_code(code)?)
+}
+
+pub fn decode_p_sub_macroblock_type(
+    decoder: &mut CabacDecoder<'_>,
+    contexts: &mut CabacPSubMbTypeContexts,
+) -> Result<PSubMacroblockType, CabacMacroblockError> {
+    if decoder.decode_decision(&mut contexts.bins[0])? {
+        return Ok(PSubMacroblockType::L0_8x8);
+    }
+    if !decoder.decode_decision(&mut contexts.bins[1])? {
+        return Ok(PSubMacroblockType::L0_8x4);
+    }
+    if decoder.decode_decision(&mut contexts.bins[2])? {
+        return Ok(PSubMacroblockType::L0_4x8);
+    }
+    Ok(PSubMacroblockType::L0_4x4)
 }
 
 #[derive(Debug)]
@@ -442,8 +493,8 @@ mod tests {
     #[test]
     fn p_slice_macroblock_type_can_decode_intra_suffix() {
         let mut decoder = CabacDecoder::new(&[0, 0, 0, 0, 0]).unwrap();
-        let mut contexts = CabacPSliceMbTypeContexts::flat(CabacContext::new(0, true));
-        contexts.intra.branch[0] = CabacContext::new(0, false);
+        let mut contexts = CabacPSliceMbTypeContexts::flat(CabacContext::new(0, false));
+        contexts.prefix[0] = CabacContext::new(0, true);
 
         let mb_type = decode_p_slice_macroblock_type(&mut decoder, &mut contexts).unwrap();
 
@@ -471,6 +522,22 @@ mod tests {
         let sub_type = decode_b_sub_macroblock_type(&mut decoder, &mut contexts).unwrap();
 
         assert_eq!(sub_type, BSubMacroblockType::Direct8x8);
+    }
+
+    #[test]
+    fn p_sub_macroblock_type_decodes_all_partition_shapes() {
+        let decode = |mps: [bool; 3]| {
+            let mut decoder = CabacDecoder::new(&[0, 0, 0]).unwrap();
+            let mut contexts = CabacPSubMbTypeContexts {
+                bins: mps.map(|value| CabacContext::new(0, value)),
+            };
+            decode_p_sub_macroblock_type(&mut decoder, &mut contexts).unwrap()
+        };
+
+        assert_eq!(decode([true, false, false]), PSubMacroblockType::L0_8x8);
+        assert_eq!(decode([false, false, false]), PSubMacroblockType::L0_8x4);
+        assert_eq!(decode([false, true, true]), PSubMacroblockType::L0_4x8);
+        assert_eq!(decode([false, true, false]), PSubMacroblockType::L0_4x4);
     }
 
     #[test]

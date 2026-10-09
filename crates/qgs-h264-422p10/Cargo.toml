@@ -8,3 +8,4 @@ description = "Narrow QGS H.264 High 4:2:2 10-bit original-video decode brick"
 [dependencies]
 qgs-codec-h264 = { path = "../qgs-codec-h264" }
 qgs-protocol = { path = "../qgs-protocol" }
+rusty_h264-common = { version = "0.16.0", default-features = false, features = ["std"] }

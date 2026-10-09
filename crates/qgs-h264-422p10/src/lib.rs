@@ -8,6 +8,7 @@ pub mod cabac_motion;
 pub mod cabac_nonzero;
 pub mod cabac_residual;
 pub mod cabac_residual_422;
+mod deblock;
 pub mod decoder;
 pub mod frame;
 pub mod macroblock;
@@ -458,6 +459,8 @@ mod tests {
 
     const PROFESSIONAL_LONG_GOP_FIXTURE: &[u8] =
         include_bytes!("../../../tests/fixtures/h264/professional-422-10bit-long-gop-128x72.h264");
+    const PROFESSIONAL_IDR_FIXTURE: &[u8] =
+        include_bytes!("../../../tests/fixtures/h264/professional-422-10bit-idr-128x72.h264");
 
     #[test]
     fn sony_fx6_original_profile_is_exact() {
@@ -595,6 +598,71 @@ mod tests {
         assert_eq!(output_pocs.len(), 12);
         assert_ne!(decode_pocs, output_pocs);
         assert!(output_pocs.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[test]
+    fn idr_fixture_reconstructs_yuv422p10le_planes() {
+        let access_units = split_access_units_for_test(PROFESSIONAL_IDR_FIXTURE);
+        assert_eq!(access_units.len(), 1);
+        let profile = H264422P10Profile {
+            profile: H264Profile::High422Intra,
+            coded_width: 128,
+            coded_height: 80,
+            visible_width: 128,
+            visible_height: 72,
+            scan_mode: ScanMode::Progressive,
+            ..H264422P10Profile::sony_fx6_original()
+        };
+        let mut decoder = H264422P10Decoder::new(profile);
+        let frame = decoder
+            .decode_access_unit(&access_units[0])
+            .expect("IDR 4:2:2 10-bit access unit reconstructs one picture");
+        frame.validate_layout().expect("yuv422p10le layout");
+        assert_eq!(frame.coded_width, 128);
+        assert_eq!(frame.coded_height, 80);
+        assert_eq!(frame.visible_width, 128);
+        assert_eq!(frame.visible_height, 72);
+        assert_eq!(
+            frame.owned_bytes(),
+            expected_yuv422p10le_owned_bytes(128, 80).unwrap()
+        );
+        assert!(
+            frame.y.data.iter().any(|byte| *byte != 0),
+            "reconstructed luma plane is empty"
+        );
+    }
+
+    #[test]
+    fn long_gop_fixture_reconstructs_twelve_yuv422p10le_pictures() {
+        let access_units = split_access_units_for_test(PROFESSIONAL_LONG_GOP_FIXTURE);
+        assert_eq!(access_units.len(), 12);
+        let profile = H264422P10Profile {
+            coded_width: 128,
+            coded_height: 80,
+            visible_width: 128,
+            visible_height: 72,
+            scan_mode: ScanMode::Progressive,
+            ..H264422P10Profile::sony_fx6_original()
+        };
+        let mut decoder = H264422P10Decoder::new(profile);
+        let mut frames = Vec::new();
+        for access_unit in &access_units {
+            frames.extend(
+                decoder
+                    .submit_access_unit(access_unit)
+                    .expect("access unit"),
+            );
+        }
+        frames.extend(decoder.flush().expect("flush"));
+        assert_eq!(frames.len(), 12);
+        for frame in &frames {
+            frame.validate_layout().expect("yuv422p10le layout");
+            assert_eq!(
+                frame.owned_bytes(),
+                expected_yuv422p10le_owned_bytes(128, 80).unwrap()
+            );
+            assert!(frame.y.data.iter().any(|byte| *byte != 0));
+        }
     }
 
     #[test]

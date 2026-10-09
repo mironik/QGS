@@ -2,8 +2,9 @@ use crate::cabac::CabacDecoder;
 use crate::cabac_nonzero::CabacNonZeroState422;
 use crate::cabac_residual::{
     decode_residual_4x4_ac_category, decode_residual_4x4_category,
-    decode_residual_chroma422_dc_category, i_slice_residual_context_bank, CabacResidualCategory,
-    CabacResidualCategoryContexts, CabacResidualDecodeReport, CabacResidualError,
+    decode_residual_chroma422_dc_category, i_slice_residual_context_bank,
+    pb_slice_residual_context_bank, CabacResidualCategory, CabacResidualCategoryContexts,
+    CabacResidualDecodeReport, CabacResidualError,
 };
 use crate::macroblock_type::{CodedBlockPatternChroma, MacroblockAddress, MacroblockGrid};
 use crate::residual::ResidualBlock4x4;
@@ -22,7 +23,9 @@ impl Intra16x16LumaResidual422 {
         let dc = inverse_intra16x16_dc_transform(self.dc.coeffs, qp_y);
         std::array::from_fn(|block_index| {
             let mut block = self.ac[block_index].clone();
-            block.coeffs[0][0] = dc[block_index / 4][block_index % 4];
+            let block_x = (block_index & 1) + ((block_index >> 2) & 1) * 2;
+            let block_y = ((block_index >> 1) & 1) + ((block_index >> 3) & 1) * 2;
+            block.coeffs[0][0] = dc[block_y][block_x];
             block
         })
     }
@@ -37,10 +40,11 @@ pub struct Chroma422Residual {
 }
 
 impl Chroma422Residual {
-    pub fn into_reconstruction_blocks(self, qp_y: u8) -> [[ResidualBlock4x4; 8]; 2] {
+    pub fn into_reconstruction_blocks(self, qp_cb: u8, qp_cr: u8) -> [[ResidualBlock4x4; 8]; 2] {
+        let quantizers = [qp_cb, qp_cr];
         std::array::from_fn(|plane| {
             let dc_levels = chroma422_dc_levels(&self.dc[plane]);
-            let dc = inverse_chroma422_dc_transform(dc_levels, qp_y);
+            let dc = inverse_chroma422_dc_transform(dc_levels, quantizers[plane]);
             std::array::from_fn(|block_index| {
                 let mut block = self.ac[plane][block_index].clone();
                 block.coeffs[0][0] = dc[block_index / 2][block_index % 2];
@@ -63,8 +67,26 @@ pub struct CabacResidualDecoder422 {
 impl CabacResidualDecoder422 {
     pub fn new_i_slice(grid: MacroblockGrid, qp_y: u8) -> Self {
         let bank = i_slice_residual_context_bank(qp_y);
+        Self::with_bank(grid, bank, true)
+    }
+
+    pub fn new_pb_slice(grid: MacroblockGrid, qp_y: u8, cabac_init_idc: u8) -> Self {
+        let bank = pb_slice_residual_context_bank(qp_y, cabac_init_idc);
+        Self::with_bank(grid, bank, false)
+    }
+
+    fn with_bank(
+        grid: MacroblockGrid,
+        bank: std::rc::Rc<std::cell::RefCell<Vec<crate::cabac::CabacContext>>>,
+        unavailable_nonzero: bool,
+    ) -> Self {
+        let nonzero = if unavailable_nonzero {
+            CabacNonZeroState422::new_i_slice(grid)
+        } else {
+            CabacNonZeroState422::new(grid)
+        };
         Self {
-            nonzero: CabacNonZeroState422::new_i_slice(grid),
+            nonzero,
             luma16_dc: CabacResidualCategoryContexts::i_slice_with_bank(
                 CabacResidualCategory::Luma16Dc,
                 bank.clone(),
@@ -94,6 +116,10 @@ impl CabacResidualDecoder422 {
 
     pub fn set_slice_first_mb(&mut self, slice_first_mb: u32) {
         self.nonzero.set_slice_first_mb(slice_first_mb);
+    }
+
+    pub fn set_current_macroblock_intra(&mut self, intra: bool) {
+        self.nonzero.set_unavailable_nonzero(intra);
     }
 
     pub fn decode_intra16x16_luma(
@@ -148,6 +174,15 @@ impl CabacResidualDecoder422 {
             reports[block_index] = residual.report;
         }
         Ok((blocks, reports))
+    }
+
+    pub fn decode_inter4x4_luma(
+        &mut self,
+        cabac: &mut CabacDecoder<'_>,
+        address: MacroblockAddress,
+        coded_block_pattern_luma: u8,
+    ) -> Result<([ResidualBlock4x4; 16], [CabacResidualDecodeReport; 16]), CabacResidualError> {
+        self.decode_intra4x4_luma(cabac, address, coded_block_pattern_luma)
     }
 
     pub fn decode_chroma_422(
@@ -238,6 +273,22 @@ impl CabacResidualDecoder422 {
                 self.nonzero.set_luma4x4_count(address, block, count);
             }
         }
+    }
+
+    pub fn record_inter_absent(&mut self, address: MacroblockAddress) {
+        self.record_inter_luma_absent(address);
+        self.record_inter_chroma_absent(address);
+    }
+
+    pub fn record_inter_luma_absent(&mut self, address: MacroblockAddress) {
+        self.nonzero.clear_luma4x4(address);
+    }
+
+    pub fn record_inter_chroma_absent(&mut self, address: MacroblockAddress) {
+        for plane in 0..2 {
+            self.nonzero.set_chroma422_dc_count(address, plane, 0);
+        }
+        self.nonzero.clear_chroma422_ac(address);
     }
 
     pub fn record_chroma422_dc(
@@ -395,7 +446,7 @@ mod tests {
             ac_reports: std::array::from_fn(|_| zero_reports_8()),
         };
 
-        let blocks = residual.into_reconstruction_blocks(24);
+        let blocks = residual.into_reconstruction_blocks(24, 24);
 
         assert!(blocks[0].iter().all(|block| block.coeffs[0][0] > 0));
         assert!(blocks[1].iter().all(|block| block.coeffs[0][0] == 0));

@@ -99,7 +99,6 @@ fn decode_mvd_ueg3_suffix(
     }
     let suffix = decoder.decode_bypass_exp_golomb(3)?;
     code.checked_add(suffix)
-        .and_then(|value| value.checked_add(1))
         .ok_or(CabacMotionError::ComponentOverflow)
 }
 

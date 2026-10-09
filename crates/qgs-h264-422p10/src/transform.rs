@@ -38,23 +38,26 @@ pub fn inverse_transform_4x4(coeffs: [[i32; 4]; 4], pred: [[u16; 4]; 4]) -> [[u1
     out
 }
 
-pub fn inverse_transform_8x8(mut coeffs: [[i32; 8]; 8], pred: [[u16; 8]; 8]) -> [[u16; 8]; 8] {
-    coeffs[0][0] += 32;
+pub fn inverse_transform_8x8(coeffs: [[i32; 8]; 8], pred: [[u16; 8]; 8]) -> [[u16; 8]; 8] {
+    // Level scan stores the transpose of the block the inverse transform reads.
     let mut tmp = [[0_i32; 8]; 8];
     for column in 0..8 {
-        let input = std::array::from_fn(|row| coeffs[row][column]);
+        let input = std::array::from_fn(|row| coeffs[column][row]);
         let transformed = inverse_transform_8x8_1d(input);
         for row in 0..8 {
             tmp[row][column] = transformed[row];
         }
     }
 
-    std::array::from_fn(|row| {
-        let transformed = inverse_transform_8x8_1d(tmp[row]);
-        std::array::from_fn(|column| {
-            clip10(i32::from(pred[row][column]).saturating_add(transformed[column] >> 6))
-        })
-    })
+    let mut output = [[0_u16; 8]; 8];
+    for column in 0..8 {
+        let transformed = inverse_transform_8x8_1d(tmp[column]);
+        for row in 0..8 {
+            output[row][column] =
+                clip10(i32::from(pred[row][column]).saturating_add((transformed[row] + 32) >> 6));
+        }
+    }
+    output
 }
 
 fn inverse_transform_8x8_1d(input: [i32; 8]) -> [i32; 8] {
@@ -89,18 +92,21 @@ fn inverse_transform_8x8_1d(input: [i32; 8]) -> [i32; 8] {
 pub fn inverse_intra16x16_dc_transform(levels: [[i32; 4]; 4], qp: u8) -> [[i32; 4]; 4] {
     let transformed = hadamard_4x4(levels);
     let qp = i32::from(qp).clamp(0, 63);
-    let qbits = qp / 6;
-    let scale = 16 * NORM_ADJUST_4X4_DC[(qp % 6) as usize];
     std::array::from_fn(|row| {
-        std::array::from_fn(|column| {
-            let value = transformed[row][column] * scale;
-            if qp >= 12 {
-                value << (qbits - 2)
-            } else {
-                (value + (1 << (1 - qbits))) >> (2 - qbits)
-            }
-        })
+        std::array::from_fn(|column| scale_dc_coefficient(transformed[row][column], qp))
     })
+}
+
+fn scale_dc_coefficient(transformed: i32, qp: i32) -> i32 {
+    let qbits = qp / 6;
+    let level_scale = i64::from(16 * NORM_ADJUST_4X4_DC[(qp % 6) as usize]);
+    let value = i64::from(transformed) * level_scale;
+    let scaled = if qp >= 36 {
+        value << (qbits - 6)
+    } else {
+        (value + (1_i64 << (5 - qbits))) >> (6 - qbits)
+    };
+    scaled.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 pub fn inverse_chroma422_dc_transform(levels: [[i32; 2]; 4], qp: u8) -> [[i32; 2]; 4] {
@@ -123,17 +129,9 @@ pub fn inverse_chroma422_dc_transform(levels: [[i32; 2]; 4], qp: u8) -> [[i32; 2
     }
 
     let qp = i32::from(qp).clamp(0, 63);
-    let qbits = qp / 6;
-    let scale = 16 * NORM_ADJUST_4X4_DC[(qp % 6) as usize];
+    let qp_dc = qp + 3;
     std::array::from_fn(|row| {
-        std::array::from_fn(|column| {
-            let value = transformed[row][column] * scale;
-            if qp >= 12 {
-                value << (qbits - 2)
-            } else {
-                (value + (1 << (1 - qbits))) >> (2 - qbits)
-            }
-        })
+        std::array::from_fn(|column| scale_dc_coefficient(transformed[row][column], qp_dc))
     })
 }
 
@@ -150,13 +148,18 @@ fn hadamard_4x4(input: [[i32; 4]; 4]) -> [[i32; 4]; 4] {
         tmp[row][3] = a3 - a2;
     }
 
-    std::array::from_fn(|row| {
-        let a0 = tmp[0][row] + tmp[3][row];
-        let a1 = tmp[1][row] + tmp[2][row];
-        let a2 = tmp[1][row] - tmp[2][row];
-        let a3 = tmp[0][row] - tmp[3][row];
-        [a0 + a1, a3 + a2, a0 - a1, a3 - a2]
-    })
+    let mut transformed = [[0_i32; 4]; 4];
+    for column in 0..4 {
+        let a0 = tmp[0][column] + tmp[3][column];
+        let a1 = tmp[1][column] + tmp[2][column];
+        let a2 = tmp[1][column] - tmp[2][column];
+        let a3 = tmp[0][column] - tmp[3][column];
+        let rows = [a0 + a1, a3 + a2, a0 - a1, a3 - a2];
+        for row in 0..4 {
+            transformed[row][column] = rows[row];
+        }
+    }
+    transformed
 }
 
 pub fn intra16x16_dc_prediction(
@@ -193,13 +196,19 @@ pub fn intra16x16_horizontal_prediction(left: [u16; 16]) -> [[u16; 16]; 16] {
     out
 }
 
-pub fn intra16x16_plane_prediction(top: [u16; 16], left: [u16; 16]) -> [[u16; 16]; 16] {
+pub fn intra16x16_plane_prediction(
+    top: [u16; 16],
+    left: [u16; 16],
+    top_left: u16,
+) -> [[u16; 16]; 16] {
     let mut h = 0_i32;
     let mut v = 0_i32;
-    for i in 1..=8 {
-        let mirrored = 7_usize.saturating_sub(i);
-        h += (i as i32) * (i32::from(top[7 + i]) - i32::from(top[mirrored]));
-        v += (i as i32) * (i32::from(left[7 + i]) - i32::from(left[mirrored]));
+    for i in 0..8 {
+        let weight = i as i32 + 1;
+        let top_mirror = if i < 7 { top[6 - i] } else { top_left };
+        let left_mirror = if i < 7 { left[6 - i] } else { top_left };
+        h += weight * (i32::from(top[8 + i]) - i32::from(top_mirror));
+        v += weight * (i32::from(left[8 + i]) - i32::from(left_mirror));
     }
     let a = 16 * (i32::from(top[15]) + i32::from(left[15]));
     let b = (5 * h + 32) >> 6;
@@ -287,6 +296,26 @@ mod tests {
     }
 
     #[test]
+    fn chroma422_dc_scale_uses_qp_plus_three_below_the_high_threshold() {
+        let mut levels = [[0_i32; 2]; 4];
+        levels[0][0] = 1;
+
+        let dc = inverse_chroma422_dc_transform(levels, 30);
+
+        assert!(dc.iter().flatten().all(|value| *value == 112));
+    }
+
+    #[test]
+    fn chroma422_dc_scale_keeps_qp_plus_three_at_the_high_threshold() {
+        let mut levels = [[0_i32; 2]; 4];
+        levels[0][0] = 1;
+
+        let dc = inverse_chroma422_dc_transform(levels, 33);
+
+        assert!(dc.iter().flatten().all(|value| *value == 160));
+    }
+
+    #[test]
     fn intra_dc_prediction_uses_midpoint_when_unavailable() {
         assert_eq!(intra16x16_dc_prediction(None, None), [[512_u16; 16]; 16]);
     }
@@ -306,8 +335,24 @@ mod tests {
         let top = std::array::from_fn(|index| (400 + index as u16) as u16);
         let left = std::array::from_fn(|index| (500 + index as u16) as u16);
 
-        let out = intra16x16_plane_prediction(top, left);
+        let out = intra16x16_plane_prediction(top, left, 399);
 
         assert!(out[15][15] > out[0][0]);
+    }
+
+    #[test]
+    fn intra_plane_prediction_uses_the_top_left_corner_in_the_last_term() {
+        let mut top = [0_u16; 16];
+        top[0] = 80;
+        top[15] = 100;
+        let left = [0_u16; 16];
+
+        let predicted = intra16x16_plane_prediction(top, left, 0);
+
+        assert_eq!(predicted[0][0], 46);
+        assert_ne!(
+            predicted[0][0],
+            intra16x16_plane_prediction(top, left, 80)[0][0]
+        );
     }
 }

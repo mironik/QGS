@@ -87,6 +87,9 @@ impl Intra16x16Macroblock {
         top_luma: Option<[u16; 16]>,
         left_luma: Option<[u16; 16]>,
     ) -> Result<(), MacroblockReconstructionError> {
+        let top_left = (mb_x > 0 && mb_y > 0)
+            .then(|| frame.y.get(mb_x * 16 - 1, mb_y * 16 - 1))
+            .flatten();
         if !reconstruct_intra16x16_luma_dc(
             frame,
             mb_x,
@@ -96,6 +99,7 @@ impl Intra16x16Macroblock {
             &self.luma,
             top_luma,
             left_luma,
+            top_left,
         ) {
             return Err(MacroblockReconstructionError::OutOfBounds);
         }
@@ -118,8 +122,9 @@ pub fn reconstruct_intra16x16_luma_dc(
     residuals: &[ResidualBlock4x4; 16],
     top: Option<[u16; 16]>,
     left: Option<[u16; 16]>,
+    top_left: Option<u16>,
 ) -> bool {
-    let Some(prediction) = intra16x16_luma_prediction(prediction_mode, top, left) else {
+    let Some(prediction) = intra16x16_luma_prediction(prediction_mode, top, left, top_left) else {
         return false;
     };
     reconstruct_intra16x16_luma(frame, mb_x, mb_y, qp, residuals, prediction)
@@ -129,6 +134,7 @@ pub fn intra16x16_luma_prediction(
     prediction_mode: Intra16x16PredictionMode,
     top: Option<[u16; 16]>,
     left: Option<[u16; 16]>,
+    top_left: Option<u16>,
 ) -> Option<[[u16; 16]; 16]> {
     match prediction_mode {
         Intra16x16PredictionMode::Vertical => top
@@ -138,10 +144,12 @@ pub fn intra16x16_luma_prediction(
             .map(intra16x16_horizontal_prediction)
             .or_else(|| Some(intra16x16_dc_prediction(top, left))),
         Intra16x16PredictionMode::Dc => Some(intra16x16_dc_prediction(top, left)),
-        Intra16x16PredictionMode::Plane => top
-            .zip(left)
-            .map(|(top, left)| intra16x16_plane_prediction(top, left))
-            .or_else(|| Some(intra16x16_dc_prediction(top, left))),
+        Intra16x16PredictionMode::Plane => match (top, left, top_left) {
+            (Some(top), Some(left), Some(top_left)) => {
+                Some(intra16x16_plane_prediction(top, left, top_left))
+            }
+            _ => Some(intra16x16_dc_prediction(top, left)),
+        },
     }
 }
 
@@ -161,7 +169,7 @@ pub fn reconstruct_intra16x16_luma(
     for (block_index, residual) in residuals.iter().enumerate() {
         let (block_x, block_y) = luma4x4_position(block_index);
         let block_prediction = prediction_block(&prediction, block_x, block_y);
-        let reconstructed = residual.reconstruct_with_prediction(qp, block_prediction);
+        let reconstructed = residual.reconstruct_with_prescaled_dc(qp, block_prediction);
         let x = base_x + block_x * 4;
         let y = base_y + block_y * 4;
         if !frame.y.write_block(x, y, &reconstructed) {
@@ -244,7 +252,7 @@ pub fn reconstruct_intra4x4_luma(
         let (block_x, block_y) = luma4x4_position(block_index);
         let x = base_x + block_x * 4;
         let y = base_y + block_y * 4;
-        let prediction = intra4x4_prediction(frame, x, y, modes[block_index])?;
+        let prediction = intra4x4_prediction(frame, x, y, block_index, modes[block_index])?;
         let reconstructed = residuals[block_index].reconstruct_with_prediction(qp, prediction);
         if !frame.y.write_block(x, y, &reconstructed) {
             return Err(MacroblockReconstructionError::OutOfBounds);
@@ -271,7 +279,7 @@ pub fn reconstruct_intra8x8_luma(
             let block_index = block_y * 2 + block_x;
             let x = base_x + block_x * 8;
             let y = base_y + block_y * 8;
-            let prediction = intra8x8_prediction(frame, x, y, modes[block_index])?;
+            let prediction = intra8x8_prediction(frame, x, y, block_index, modes[block_index])?;
             let reconstructed = residuals[block_index].reconstruct_with_prediction(qp, prediction);
             if !frame.y.write_block(x, y, &reconstructed) {
                 return Err(MacroblockReconstructionError::OutOfBounds);
@@ -316,7 +324,7 @@ pub fn reconstruct_chroma_422_intra(
             let block_index = block_y * 2 + block_x;
             let block_prediction = chroma_prediction_block(&prediction, block_x, block_y);
             let reconstructed =
-                residuals[block_index].reconstruct_with_prediction(qp, block_prediction);
+                residuals[block_index].reconstruct_with_prescaled_dc(qp, block_prediction);
             let x = base_x + block_x * 4;
             let y = base_y + block_y * 4;
             if !plane.write_block(x, y, &reconstructed) {
@@ -388,21 +396,50 @@ fn chroma_422_prediction(
 }
 
 fn chroma_422_dc_prediction(top: Option<[u16; 8]>, left: Option<[u16; 16]>) -> [[u16; 8]; 16] {
-    let dc = match (top, left) {
+    let sum4 = |samples: &[u16]| samples.iter().map(|value| u32::from(*value)).sum::<u32>();
+    match (top, left) {
         (Some(top), Some(left)) => {
-            let sum_top: u32 = top.iter().map(|value| u32::from(*value)).sum();
-            let sum_left: u32 = left.iter().map(|value| u32::from(*value)).sum();
-            ((sum_top + sum_left + 12) / 24) as u16
+            let top_left = sum4(&top[0..4]);
+            let top_right = sum4(&top[4..8]);
+            let left_bands = [
+                sum4(&left[0..4]),
+                sum4(&left[4..8]),
+                sum4(&left[8..12]),
+                sum4(&left[12..16]),
+            ];
+            let values = [
+                ((top_left + left_bands[0] + 4) >> 3) as u16,
+                ((top_right + 2) >> 2) as u16,
+                ((left_bands[1] + 2) >> 2) as u16,
+                ((top_right + left_bands[1] + 4) >> 3) as u16,
+                ((left_bands[2] + 2) >> 2) as u16,
+                ((top_right + left_bands[2] + 4) >> 3) as u16,
+                ((left_bands[3] + 2) >> 2) as u16,
+                ((top_right + left_bands[3] + 4) >> 3) as u16,
+            ];
+            std::array::from_fn(|row| {
+                let band = row / 4;
+                let left_dc = values[band * 2];
+                let right_dc = values[band * 2 + 1];
+                [
+                    left_dc, left_dc, left_dc, left_dc, right_dc, right_dc, right_dc, right_dc,
+                ]
+            })
         }
         (Some(top), None) => {
-            ((top.iter().map(|value| u32::from(*value)).sum::<u32>() + 4) / 8) as u16
+            let left_dc = ((sum4(&top[0..4]) + 2) >> 2) as u16;
+            let right_dc = ((sum4(&top[4..8]) + 2) >> 2) as u16;
+            [[
+                left_dc, left_dc, left_dc, left_dc, right_dc, right_dc, right_dc, right_dc,
+            ]; 16]
         }
-        (None, Some(left)) => {
-            ((left.iter().map(|value| u32::from(*value)).sum::<u32>() + 8) / 16) as u16
-        }
-        (None, None) => 512,
-    };
-    [[dc; 8]; 16]
+        (None, Some(left)) => std::array::from_fn(|row| {
+            let band = sum4(&left[row / 4 * 4..row / 4 * 4 + 4]);
+            let dc = ((band + 2) >> 2) as u16;
+            [dc; 8]
+        }),
+        (None, None) => [[512; 8]; 16],
+    }
 }
 
 fn chroma_422_plane_prediction(top: [u16; 8], left: [u16; 16], top_left: u16) -> [[u16; 8]; 16] {
@@ -460,6 +497,41 @@ pub fn add_chroma_residual_422(
     true
 }
 
+pub fn add_chroma_residual_422_prescaled(
+    frame: &mut DecodedFrame422P10,
+    plane: ChromaPlane,
+    mb_x: usize,
+    mb_y: usize,
+    qp: u8,
+    residuals: &[ResidualBlock4x4; 8],
+) -> bool {
+    let base_x = mb_x.saturating_mul(8);
+    let base_y = mb_y.saturating_mul(16);
+    let plane = match plane {
+        ChromaPlane::Cb => &mut frame.cb,
+        ChromaPlane::Cr => &mut frame.cr,
+    };
+    if base_x + 8 > plane.width || base_y + 16 > plane.height {
+        return false;
+    }
+    for block_y in 0..4 {
+        for block_x in 0..2 {
+            let block_index = block_y * 2 + block_x;
+            let x = base_x + block_x * 4;
+            let y = base_y + block_y * 4;
+            let Some(prediction) = read_plane_block(plane, x, y) else {
+                return false;
+            };
+            let reconstructed =
+                residuals[block_index].reconstruct_with_prescaled_dc(qp, prediction);
+            if !plane.write_block(x, y, &reconstructed) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn read_luma_block(frame: &DecodedFrame422P10, x: usize, y: usize) -> Option<[[u16; 4]; 4]> {
     read_plane_block(&frame.y, x, y)
 }
@@ -478,6 +550,7 @@ fn intra4x4_prediction(
     frame: &DecodedFrame422P10,
     x: usize,
     y: usize,
+    block_index: usize,
     mode: Intra4x4PredictionMode,
 ) -> Result<[[u16; 4]; 4], MacroblockReconstructionError> {
     let top = (y > 0)
@@ -519,7 +592,7 @@ fn intra4x4_prediction(
         }
         Intra4x4PredictionMode::Dc => Ok(intra4x4_dc_prediction(top, left)),
         Intra4x4PredictionMode::DiagonalDownLeft => {
-            let Some(top8) = top8_samples(frame, x, y) else {
+            let Some(top8) = top8_samples(frame, x, y, block_index) else {
                 return Ok(intra4x4_dc_prediction(top, left));
             };
             Ok(std::array::from_fn(|row| {
@@ -582,12 +655,14 @@ fn intra4x4_prediction(
                                 top[(index + 1).min(3)],
                             )
                         }
+                    } else if z == -1 {
+                        avg3(left[0], top_left, top[0])
                     } else {
-                        let index = ((-z - 1) / 2) as usize;
+                        let depth = (-z) as usize;
                         avg3(
-                            sample_left_with_top(left, top_left, index + 1),
-                            sample_left_with_top(left, top_left, index),
-                            sample_left_with_top(left, top_left, index.saturating_sub(1)),
+                            sample_left_with_top(left, top_left, depth),
+                            sample_left_with_top(left, top_left, depth - 1),
+                            sample_left_with_top(left, top_left, depth - 2),
                         )
                     }
                 })
@@ -615,19 +690,21 @@ fn intra4x4_prediction(
                                 left[(index + 1).min(3)],
                             )
                         }
+                    } else if z == -1 {
+                        avg3(top[0], top_left, left[0])
                     } else {
-                        let index = ((-z - 1) / 2) as usize;
+                        let depth = (-z) as usize;
                         avg3(
-                            sample_top_with_left(top, top_left, index + 1),
-                            sample_top_with_left(top, top_left, index),
-                            sample_top_with_left(top, top_left, index.saturating_sub(1)),
+                            sample_top_with_left(top, top_left, depth),
+                            sample_top_with_left(top, top_left, depth - 1),
+                            sample_top_with_left(top, top_left, depth - 2),
                         )
                     }
                 })
             }))
         }
         Intra4x4PredictionMode::VerticalLeft => {
-            let Some(top8) = top8_samples(frame, x, y) else {
+            let Some(top8) = top8_samples(frame, x, y, block_index) else {
                 return Ok(intra4x4_dc_prediction(top, left));
             };
             Ok(std::array::from_fn(|row| {
@@ -669,18 +746,12 @@ fn intra8x8_prediction(
     frame: &DecodedFrame422P10,
     x: usize,
     y: usize,
+    block_index: usize,
     mode: Intra4x4PredictionMode,
 ) -> Result<[[u16; 8]; 8], MacroblockReconstructionError> {
-    let top = (y > 0)
-        .then(|| {
-            let mut samples = [0_u16; 8];
-            for (index, sample) in samples.iter_mut().enumerate() {
-                *sample = frame.y.get(x + index, y - 1)?;
-            }
-            Some(samples)
-        })
-        .flatten();
-    let left = (x > 0)
+    let raw_top_left = top_left_sample(frame, x, y);
+    let raw_top16 = top16_samples(frame, x, y, block_index);
+    let raw_left = (x > 0)
         .then(|| {
             let mut samples = [0_u16; 8];
             for (index, sample) in samples.iter_mut().enumerate() {
@@ -689,6 +760,20 @@ fn intra8x8_prediction(
             Some(samples)
         })
         .flatten();
+    let top16 = raw_top16
+        .map(|(samples, has_top_right)| filter_intra8x8_top(samples, raw_top_left, has_top_right));
+    let top = top16.map(|samples| {
+        let mut top = [0_u16; 8];
+        top.copy_from_slice(&samples[..8]);
+        top
+    });
+    let left = raw_left.map(|samples| filter_intra8x8_left(samples, raw_top_left));
+    let top_left = match (raw_top_left, raw_top16, raw_left) {
+        (Some(top_left), Some((top, _)), Some(left)) => {
+            Some(filter_intra8x8_top_left(top_left, top[0], left[0]))
+        }
+        _ => None,
+    };
     match mode {
         Intra4x4PredictionMode::Vertical => {
             if let Some(top) = top {
@@ -709,7 +794,7 @@ fn intra8x8_prediction(
         }
         Intra4x4PredictionMode::Dc => Ok(intra8x8_dc_prediction(top, left)),
         Intra4x4PredictionMode::DiagonalDownLeft => {
-            let Some(top16) = top16_samples(frame, x, y) else {
+            let Some(top16) = top16 else {
                 return Ok(intra8x8_dc_prediction(top, left));
             };
             Ok(std::array::from_fn(|row| {
@@ -724,8 +809,7 @@ fn intra8x8_prediction(
             }))
         }
         Intra4x4PredictionMode::DiagonalDownRight => {
-            let (Some(top), Some(left), Some(top_left)) = (top, left, top_left_sample(frame, x, y))
-            else {
+            let (Some(top), Some(left), Some(top_left)) = (top, left, top_left) else {
                 return Ok(intra8x8_dc_prediction(top, left));
             };
             Ok(std::array::from_fn(|row| {
@@ -759,8 +843,7 @@ fn intra8x8_prediction(
             }))
         }
         Intra4x4PredictionMode::VerticalRight => {
-            let (Some(top), Some(left), Some(top_left)) = (top, left, top_left_sample(frame, x, y))
-            else {
+            let (Some(top), Some(left), Some(top_left)) = (top, left, top_left) else {
                 return Ok(intra8x8_dc_prediction(top, left));
             };
             Ok(std::array::from_fn(|row| {
@@ -780,20 +863,21 @@ fn intra8x8_prediction(
                                 top[(index + 1).min(7)],
                             )
                         }
+                    } else if z == -1 {
+                        avg3(left[0], top_left, top[0])
                     } else {
-                        let index = ((-z - 1) / 2) as usize;
+                        let depth = (-z) as usize;
                         avg3(
-                            sample_left8_with_top(left, top_left, index + 1),
-                            sample_left8_with_top(left, top_left, index),
-                            sample_left8_with_top(left, top_left, index.saturating_sub(1)),
+                            sample_left8_with_top(left, top_left, depth),
+                            sample_left8_with_top(left, top_left, depth - 1),
+                            sample_left8_with_top(left, top_left, depth - 2),
                         )
                     }
                 })
             }))
         }
         Intra4x4PredictionMode::HorizontalDown => {
-            let (Some(top), Some(left), Some(top_left)) = (top, left, top_left_sample(frame, x, y))
-            else {
+            let (Some(top), Some(left), Some(top_left)) = (top, left, top_left) else {
                 return Ok(intra8x8_dc_prediction(top, left));
             };
             Ok(std::array::from_fn(|row| {
@@ -813,19 +897,21 @@ fn intra8x8_prediction(
                                 left[(index + 1).min(7)],
                             )
                         }
+                    } else if z == -1 {
+                        avg3(top[0], top_left, left[0])
                     } else {
-                        let index = ((-z - 1) / 2) as usize;
+                        let depth = (-z) as usize;
                         avg3(
-                            sample_top8_with_left(top, top_left, index + 1),
-                            sample_top8_with_left(top, top_left, index),
-                            sample_top8_with_left(top, top_left, index.saturating_sub(1)),
+                            sample_top8_with_left(top, top_left, depth),
+                            sample_top8_with_left(top, top_left, depth - 1),
+                            sample_top8_with_left(top, top_left, depth - 2),
                         )
                     }
                 })
             }))
         }
         Intra4x4PredictionMode::VerticalLeft => {
-            let Some(top16) = top16_samples(frame, x, y) else {
+            let Some(top16) = top16 else {
                 return Ok(intra8x8_dc_prediction(top, left));
             };
             Ok(std::array::from_fn(|row| {
@@ -875,30 +961,154 @@ fn intra8x8_dc_prediction(top: Option<[u16; 8]>, left: Option<[u16; 8]>) -> [[u1
     [[value; 8]; 8]
 }
 
-fn top16_samples(frame: &DecodedFrame422P10, x: usize, y: usize) -> Option<[u16; 16]> {
+fn top16_samples(
+    frame: &DecodedFrame422P10,
+    x: usize,
+    y: usize,
+    block_index: usize,
+) -> Option<([u16; 16], bool)> {
     if y == 0 {
         return None;
     }
+    let first_unavailable_4x4 = block_index.saturating_add(1).saturating_mul(4);
     let mut samples = [0_u16; 16];
-    for (index, sample) in samples.iter_mut().enumerate() {
-        *sample = frame
-            .y
-            .get((x + index).min(frame.y.width.saturating_sub(1)), y - 1)?;
+    let mut available = [false; 16];
+    for index in 0..16 {
+        let sample_x = x + index;
+        if intra4x4_sample_available(frame, x, y, first_unavailable_4x4, sample_x, y - 1) {
+            samples[index] = frame.y.get(sample_x, y - 1)?;
+            available[index] = true;
+        }
     }
-    Some(samples)
+    if !available[..8].iter().all(|sample| *sample) {
+        return None;
+    }
+    // Spec 8.3.2.2.3: undecoded samples to the top-right repeat p[7, -1].
+    let has_top_right = available[8..].iter().all(|sample| *sample);
+    if !has_top_right {
+        let replicate = samples[7];
+        for sample in &mut samples[8..] {
+            *sample = replicate;
+        }
+    }
+    Some((samples, has_top_right))
 }
 
-fn top8_samples(frame: &DecodedFrame422P10, x: usize, y: usize) -> Option<[u16; 8]> {
+fn filter_intra8x8_top(top: [u16; 16], top_left: Option<u16>, has_top_right: bool) -> [u16; 16] {
+    let mut filtered = [0_u16; 16];
+    filtered[0] = match top_left {
+        Some(top_left) => {
+            (u32::from(top_left) + 2 * u32::from(top[0]) + u32::from(top[1]) + 2) >> 2
+        }
+        None => (3 * u32::from(top[0]) + u32::from(top[1]) + 2) >> 2,
+    } as u16;
+    for index in 1..7 {
+        filtered[index] = ((u32::from(top[index - 1])
+            + 2 * u32::from(top[index])
+            + u32::from(top[index + 1])
+            + 2)
+            >> 2) as u16;
+    }
+    let right = if has_top_right { top[8] } else { top[7] };
+    filtered[7] = ((u32::from(right) + 2 * u32::from(top[7]) + u32::from(top[6]) + 2) >> 2) as u16;
+    if has_top_right {
+        for index in 8..15 {
+            filtered[index] = ((u32::from(top[index - 1])
+                + 2 * u32::from(top[index])
+                + u32::from(top[index + 1])
+                + 2)
+                >> 2) as u16;
+        }
+        filtered[15] = ((u32::from(top[14]) + 3 * u32::from(top[15]) + 2) >> 2) as u16;
+    } else {
+        for sample in &mut filtered[8..] {
+            *sample = top[7];
+        }
+    }
+    filtered
+}
+
+fn filter_intra8x8_left(left: [u16; 8], top_left: Option<u16>) -> [u16; 8] {
+    let mut filtered = [0_u16; 8];
+    let corner = top_left.unwrap_or(left[0]);
+    filtered[0] =
+        ((u32::from(corner) + 2 * u32::from(left[0]) + u32::from(left[1]) + 2) >> 2) as u16;
+    for index in 1..7 {
+        filtered[index] = ((u32::from(left[index - 1])
+            + 2 * u32::from(left[index])
+            + u32::from(left[index + 1])
+            + 2)
+            >> 2) as u16;
+    }
+    filtered[7] = ((u32::from(left[6]) + 3 * u32::from(left[7]) + 2) >> 2) as u16;
+    filtered
+}
+
+fn filter_intra8x8_top_left(top_left: u16, top: u16, left: u16) -> u16 {
+    ((u32::from(left) + 2 * u32::from(top_left) + u32::from(top) + 2) >> 2) as u16
+}
+
+fn top8_samples(
+    frame: &DecodedFrame422P10,
+    x: usize,
+    y: usize,
+    block_index: usize,
+) -> Option<[u16; 8]> {
     if y == 0 {
         return None;
     }
     let mut samples = [0_u16; 8];
-    for (index, sample) in samples.iter_mut().enumerate() {
-        *sample = frame
-            .y
-            .get((x + index).min(frame.y.width.saturating_sub(1)), y - 1)?;
+    let mut available = [false; 8];
+    for index in 0..8 {
+        let sample_x = x + index;
+        if intra4x4_sample_available(frame, x, y, block_index, sample_x, y - 1) {
+            samples[index] = frame.y.get(sample_x, y - 1)?;
+            available[index] = true;
+        }
+    }
+    if !available[..4].iter().all(|sample| *sample) {
+        return None;
+    }
+    // Spec 8.3.1.2.2: undecoded top-right samples repeat p[3, -1].
+    if !available[4..].iter().all(|sample| *sample) {
+        let replicate = samples[3];
+        for sample in &mut samples[4..] {
+            *sample = replicate;
+        }
     }
     Some(samples)
+}
+
+fn intra4x4_sample_available(
+    frame: &DecodedFrame422P10,
+    current_x: usize,
+    current_y: usize,
+    current_block: usize,
+    sample_x: usize,
+    sample_y: usize,
+) -> bool {
+    if sample_x >= frame.y.width || sample_y >= frame.y.height {
+        return false;
+    }
+    let mb_x = current_x / 16;
+    let mb_y = current_y / 16;
+    let sample_mb_x = sample_x / 16;
+    let sample_mb_y = sample_y / 16;
+    if sample_mb_y < mb_y || sample_mb_x < mb_x {
+        return true;
+    }
+    if sample_mb_y > mb_y || sample_mb_x > mb_x {
+        return false;
+    }
+    let block_x = (sample_x % 16) / 4;
+    let block_y = (sample_y % 16) / 4;
+    luma4x4_block_index(block_x, block_y) < current_block
+}
+
+fn luma4x4_block_index(block_x: usize, block_y: usize) -> usize {
+    let block_x = block_x as u32;
+    let block_y = block_y as u32;
+    ((block_y & 1) << 1 | (block_x & 1) | ((block_x & 2) << 1) | ((block_y & 2) << 2)) as usize
 }
 
 fn intra4x4_dc_prediction(top: Option<[u16; 4]>, left: Option<[u16; 4]>) -> [[u16; 4]; 4] {
@@ -1042,7 +1252,8 @@ mod tests {
             Intra16x16PredictionMode::Dc,
             &residuals,
             None,
-            None
+            None,
+            None,
         ));
 
         assert!(frame.y.get(0, 0).unwrap() > 512);
@@ -1063,7 +1274,8 @@ mod tests {
             Intra16x16PredictionMode::Dc,
             &residuals,
             None,
-            None
+            None,
+            None,
         ));
     }
 
@@ -1229,6 +1441,48 @@ mod tests {
     }
 
     #[test]
+    fn intra8x8_top_right_repeats_the_last_available_sample() {
+        let mut frame = DecodedFrame422P10::new(32, 16, 32, 16);
+        for x in 8..16 {
+            assert!(frame.y.set(x, 7, 400));
+        }
+
+        let predicted =
+            intra8x8_prediction(&frame, 8, 8, 3, Intra4x4PredictionMode::DiagonalDownLeft).unwrap();
+
+        assert_eq!(predicted[7][7], 400);
+    }
+
+    #[test]
+    fn intra8x8_vertical_filters_the_reference_row() {
+        let mut frame = DecodedFrame422P10::new(32, 16, 32, 16);
+        assert!(frame.y.set(15, 7, 1000));
+
+        let predicted =
+            intra8x8_prediction(&frame, 8, 8, 3, Intra4x4PredictionMode::Vertical).unwrap();
+
+        assert_eq!(predicted[0][7], 750);
+    }
+
+    #[test]
+    fn intra4x4_vertical_right_uses_the_top_sample_on_the_left_diagonal() {
+        let mut frame = DecodedFrame422P10::new(16, 16, 16, 16);
+        assert!(frame.y.set(3, 3, 50));
+        assert!(frame.y.set(4, 3, 400));
+        assert!(frame.y.set(3, 4, 100));
+        assert!(frame.y.set(3, 5, 200));
+        assert!(frame.y.set(3, 6, 300));
+
+        let predicted =
+            intra4x4_prediction(&frame, 4, 4, 0, Intra4x4PredictionMode::VerticalRight).unwrap();
+
+        assert_eq!(predicted[1][0], 150);
+        assert_eq!(predicted[3][1], 150);
+        assert_eq!(predicted[2][0], 113);
+        assert_eq!(predicted[3][0], 200);
+    }
+
+    #[test]
     fn reconstruct_intra8x8_luma_supports_dc() {
         let mut frame = DecodedFrame422P10::new(16, 16, 16, 16);
         let modes = [Intra4x4PredictionMode::Dc; 4];
@@ -1291,9 +1545,17 @@ mod tests {
         let top = std::array::from_fn(|index| 300 + index as u16);
         let left = std::array::from_fn(|index| 400 + index as u16);
 
-        macroblock
-            .reconstruct_into(&mut frame, 0, 0, Some(top), Some(left))
-            .unwrap();
+        assert!(reconstruct_intra16x16_luma_dc(
+            &mut frame,
+            0,
+            0,
+            macroblock.qp_y,
+            macroblock.prediction,
+            &macroblock.luma,
+            Some(top),
+            Some(left),
+            Some(299),
+        ));
 
         assert!(frame.y.get(15, 15).unwrap() > frame.y.get(0, 0).unwrap());
     }

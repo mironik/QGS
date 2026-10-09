@@ -37,6 +37,14 @@ pub enum PSliceMacroblockType {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PSubMacroblockType {
+    L0_8x8,
+    L0_8x4,
+    L0_4x8,
+    L0_4x4,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BPredictionList {
     L0,
     L1,

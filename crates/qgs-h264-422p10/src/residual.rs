@@ -231,6 +231,16 @@ impl ResidualBlock4x4 {
     pub fn reconstruct_with_prediction(&self, qp: u8, prediction: [[u16; 4]; 4]) -> [[u16; 4]; 4] {
         inverse_transform_4x4(self.inverse_quant_flat(qp), prediction)
     }
+
+    pub fn reconstruct_with_prescaled_dc(
+        &self,
+        qp: u8,
+        prediction: [[u16; 4]; 4],
+    ) -> [[u16; 4]; 4] {
+        let mut levels = self.inverse_quant_flat(qp);
+        levels[0][0] = self.coeffs[0][0];
+        inverse_transform_4x4(levels, prediction)
+    }
 }
 
 impl ResidualBlock8x8 {
@@ -288,7 +298,8 @@ pub fn inverse_quant_8x8_flat(coeffs: [[i32; 8]; 8], qp: u8) -> [[i32; 8]; 8] {
     let matrix = &DEQUANT_8X8_FLAT[(qp % 6) as usize];
     std::array::from_fn(|row| {
         std::array::from_fn(|column| {
-            let value = i64::from(coeffs[row][column]) * i64::from(matrix[row][column]);
+            // Flat LevelScale is normAdjust times the default weight 16.
+            let value = i64::from(coeffs[row][column]) * i64::from(matrix[row][column]) * 16;
             let scaled = if qbits >= 0 {
                 value << qbits
             } else {
@@ -353,7 +364,7 @@ mod tests {
 
         let quantized = block.inverse_quant_flat(36);
 
-        assert_eq!(quantized[0][0], 20);
+        assert_eq!(quantized[0][0], 320);
         assert_eq!(quantized[0][1], 0);
     }
 
